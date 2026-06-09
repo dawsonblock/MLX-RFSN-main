@@ -8,9 +8,10 @@ The implementation uses mx.sum(shifted, axis=-1) instead of:
 """
 import ast
 import textwrap
-import mlx.core as mx
 import numpy as np
 import pytest
+
+mx = pytest.importorskip("mlx.core")
 
 from rfsn_v11.quant.packing import pack_indices, unpack_indices, pack_signs, unpack_signs
 

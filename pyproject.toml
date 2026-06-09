@@ -3,9 +3,9 @@ requires = ["setuptools>=70.0", "wheel", "setuptools_scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rfsn-v10"
+name = "mlx-rfsn"
 dynamic = ["version"]
-description = "RFSN v10 - Quantized KV-cache + decode-time sparse-attention runtime for MLX/Apple Silicon"
+description = "MLX-RFSN Fusion Alpha - Quantized KV-cache + sparse-attention runtime for Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = {text = "MIT"}
@@ -22,7 +22,7 @@ keywords = [
     "inference",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
@@ -68,16 +68,17 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/rfsn_v10"
-Documentation = "https://github.com/yourusername/rfsn_v10#readme"
-Repository = "https://github.com/yourusername/rfsn_v10"
-Issues = "https://github.com/yourusername/rfsn_v10/issues"
+Homepage = "https://github.com/dawsonblock/MLX-RFSN-main"
+Documentation = "https://github.com/dawsonblock/MLX-RFSN-main#readme"
+Repository = "https://github.com/dawsonblock/MLX-RFSN-main"
+Issues = "https://github.com/dawsonblock/MLX-RFSN-main/issues"
 
 [project.scripts]
 rfsn-benchmark = "rfsn_v10.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["rfsn_v10*", "agent_core*", "tools*"]
+include = ["rfsn_v10*", "rfsn_v11*", "agent_core*", "tools*"]
+exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["*.pyc", "__pycache__/*", "*.so", "*.dylib"]

@@ -38,6 +38,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .._version import __version__
 from ..model_loader import load_model_auto
 from ..runtime.generation import GenerationConfig, RFSNGenerator
 
@@ -91,7 +92,7 @@ class ChatCompletionResponse(BaseModel):
 
 app = FastAPI(
     title="RFSN v10 Inference Server",
-    version="10.0.0-beta",
+    version=__version__,
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -150,7 +151,7 @@ def _load_generator() -> RFSNGenerator:
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness/readiness probe for orchestrators (Kubernetes, etc.)."""
-    return {"status": "healthy", "version": "10.0.0-beta"}
+    return {"status": "healthy", "version": __version__}
 
 
 # ---------------------------------------------------------------------------

@@ -3,4 +3,5 @@ global-exclude __pycache__
 prune .kilo
 prune .pytest_cache
 prune .mypy_cache
+prune external
 recursive-include artifacts/proof/main12 *.json *.md

@@ -1,16 +1,16 @@
-# RFSN v10 — Release Manifest
+# MLX-RFSN — Release Manifest (Fusion Alpha)
 
 ## Release identification
 
 | Field | Value |
 |-------|-------|
-| Release name | `rfsn_v10_qjl_alpha_candidate_3` |
-| Git branch | `qjl-beta-repair-finalization` |
-| Git commit | `2d3afc2` (beta: Python 3.11.9, deep analysis fixes, all gates passing) |
-| Broken snapshot tag | `qjl-beta-repair-broken-snapshot` (preserved, do not delete) |
-| Build date | 2026-06-07 |
+| Release name | `mlx-rfsn-fusion-alpha-1` |
+| Git branch | `mlx-rfsn-fusion-cleanup` |
+| Git commit | (see `git log -1 --oneline`) |
+| Frozen snapshot branch | `mlx-rfsn-current-snapshot` (preserved, do not delete) |
+| Build date | 2026-06-08 |
 | Python requirement | `>=3.11,<3.13` |
-| Development status | `3 - Alpha` |
+| Development status | `3 - Alpha Candidate` |
 
 ---
 
@@ -147,9 +147,10 @@ Guard test: `tests/test_no_placeholder_source.py` — prevents regression.
 
 ---
 
-## Beta promotion checklist
+## Alpha → Stable promotion checklist
 
-The classifier must remain `3 - Alpha` until **all** items below are checked:
+The status remains `3 - Alpha Candidate` until **all** items below are checked.
+Do not promote to stable until the kv_shootout benchmark has run and a winner is selected.
 
 - [x] `python -m compileall -q rfsn_v10 tests` — PASS
 - [x] `pytest tests/test_no_placeholder_source.py` — PASS
@@ -161,6 +162,9 @@ The classifier must remain `3 - Alpha` until **all** items below are checked:
 - [x] Benchmarks re-run with quality metrics — PASS (KV cosine 0.99998 ≥ 0.999 threshold)
 - [x] Server backend error handling — PASS (400/503, never 500)
 - [x] `rfsn_v10.__version__` exported correctly — PASS
+- [ ] `rfsn_v11` tests collect cleanly with `pytest.importorskip` guards
+- [ ] `benchmarks/kv_shootout.py --quick` produces `artifacts/bench/shootout/results.json`
+- [ ] Winner selected from shootout; README and manifest updated
 
 ---
 
@@ -169,13 +173,7 @@ The classifier must remain `3 - Alpha` until **all** items below are checked:
 **Do not zip from Finder.** Use:
 
 ```bash
-git archive --format=zip HEAD -o rfsn_v10_qjl_alpha_candidate_3.zip
-```
-
-After all beta promotion checklist items are complete:
-
-```bash
-git archive --format=zip HEAD -o rfsn_v10_qjl_beta_candidate_1.zip
+git archive --format=zip HEAD -o mlx-rfsn-fusion-alpha-1.zip
 ```
 
 Verify the archive is clean:
@@ -183,7 +181,7 @@ Verify the archive is clean:
 ```bash
 python -c "
 import zipfile, sys
-with zipfile.ZipFile('rfsn_v10_qjl_alpha_candidate_3.zip') as z:
+with zipfile.ZipFile('mlx-rfsn-fusion-alpha-1.zip') as z:
     bad = [n for n in z.namelist() if '__pycache__' in n or n.endswith('.pyc') or '.DS_Store' in n]
     print(f'{len(z.namelist())} files, {len(bad)} junk files')
     if bad: sys.exit(1)

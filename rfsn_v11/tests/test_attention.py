@@ -10,25 +10,11 @@ import math
 import numpy as np
 import pytest
 
-try:
-    import mlx.core as mx
-    MLX_AVAILABLE = True
-except ImportError:
-    MLX_AVAILABLE = False
+mx = pytest.importorskip("mlx.core")
 
-try:
-    from rfsn_v11.attention.sparse_dispatch import (
-        AdaptiveBlockSparseAttention,
-        causal_attention_dense,
-    )
-    ATTN_AVAILABLE = True
-except Exception:
-    ATTN_AVAILABLE = False
-
-
-pytestmark = pytest.mark.skipif(
-    not (MLX_AVAILABLE and ATTN_AVAILABLE),
-    reason="MLX or attention module not available",
+from rfsn_v11.attention.sparse_dispatch import (  # noqa: E402
+    AdaptiveBlockSparseAttention,
+    causal_attention_dense,
 )
 
 
