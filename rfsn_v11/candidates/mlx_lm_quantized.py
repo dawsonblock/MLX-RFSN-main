@@ -26,10 +26,12 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
         self.name = f"mlx_lm_quantized_kv_b{kv_bits}"
 
     def is_available(self) -> bool:
+        # kv_bits flows through generate() **kwargs → stream_generate → generate_step
+        # Check generate_step directly since generate() uses **kwargs
         try:
             import inspect
-            import mlx_lm
-            sig = inspect.signature(mlx_lm.generate)
+            from mlx_lm.utils import generate_step
+            sig = inspect.signature(generate_step)
             return "kv_bits" in sig.parameters
         except Exception:
             return False
@@ -40,6 +42,7 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
         tokenizer: Any,
         prompt: str,
         max_tokens: int = 200,
+        temp: float = 0.0,
     ) -> CandidateResult:
         if not self.is_available():
             return CandidateResult(
@@ -48,14 +51,16 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
                 prompt=prompt,
                 passed_quality_gate=False,
                 notes=(
-                    "mlx_lm.generate() does not expose kv_bits in this install. "
+                    "mlx_lm.utils.generate_step does not expose kv_bits. "
                     "Upgrade mlx-lm or skip this candidate."
                 ),
-                error="kv_bits parameter not available",
+                error="kv_bits parameter not available in generate_step",
             )
         try:
             import mlx_lm
 
+            from mlx_lm.sample_utils import make_sampler
+            sampler = make_sampler(temp=temp)
             t0 = time.perf_counter()
             output = mlx_lm.generate(
                 model,
@@ -63,6 +68,8 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
                 prompt=prompt,
                 max_tokens=max_tokens,
                 kv_bits=self.kv_bits,
+                kv_group_size=64,
+                sampler=sampler,
                 verbose=False,
             )
             total_ms = (time.perf_counter() - t0) * 1000

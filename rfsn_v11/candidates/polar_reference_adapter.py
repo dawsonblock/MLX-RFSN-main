@@ -51,6 +51,7 @@ class PolarReferenceAdapter(KVCompressionCandidate):
         tokenizer: Any,
         prompt: str,
         max_tokens: int = 200,
+        temp: float = 0.0,
     ) -> CandidateResult:
         if not self.is_available():
             return CandidateResult(
@@ -65,12 +66,15 @@ class PolarReferenceAdapter(KVCompressionCandidate):
 
             # Reference: run without compression to measure baseline quality.
             # Full PolarQuant KV integration is in rfsn_v11/quant/value_quant.py.
+            from mlx_lm.sample_utils import make_sampler
+            sampler = make_sampler(temp=temp)
             t0 = time.perf_counter()
             output = mlx_lm.generate(
                 model,
                 tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
+                sampler=sampler,
                 verbose=False,
             )
             total_ms = (time.perf_counter() - t0) * 1000

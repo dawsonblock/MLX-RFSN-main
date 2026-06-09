@@ -71,6 +71,7 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
         tokenizer: Any,
         prompt: str,
         max_tokens: int = 200,
+        temp: float = 0.0,
     ) -> CandidateResult:
         if not self.is_available():
             return CandidateResult(
@@ -97,12 +98,15 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 scales, biases = mx.quantize(tensor, bits=self.bits, group_size=self.group_size)
                 return tensor, scales, biases
 
+            from mlx_lm.sample_utils import make_sampler
+            sampler = make_sampler(temp=temp)
             t0 = time.perf_counter()
             output = mlx_lm.generate(
                 model,
                 tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
+                sampler=sampler,
                 verbose=False,
             )
             total_ms = (time.perf_counter() - t0) * 1000

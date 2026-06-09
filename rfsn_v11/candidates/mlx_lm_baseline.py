@@ -32,17 +32,21 @@ class MLXLMBaseline(KVCompressionCandidate):
         tokenizer: Any,
         prompt: str,
         max_tokens: int = 200,
+        temp: float = 0.0,
     ) -> CandidateResult:
         try:
             import mlx.core as mx
             import mlx_lm
 
+            from mlx_lm.sample_utils import make_sampler
+            sampler = make_sampler(temp=temp)
             t0 = time.perf_counter()
             output = mlx_lm.generate(
                 model,
                 tokenizer,
                 prompt=prompt,
                 max_tokens=max_tokens,
+                sampler=sampler,
                 verbose=False,
             )
             total_ms = (time.perf_counter() - t0) * 1000

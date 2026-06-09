@@ -99,6 +99,7 @@ class KVCompressionCandidate:
         tokenizer: Any,
         prompt: str,
         max_tokens: int = 200,
+        temp: float = 0.0,
     ) -> CandidateResult:
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement run()"
