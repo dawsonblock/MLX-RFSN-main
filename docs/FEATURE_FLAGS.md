@@ -8,7 +8,8 @@ All experimental features are **disabled by default**. Enable them only if you u
 |------|---------|-------------|
 | `RFSN_BACKEND` | `mlx` | Backend: `mlx` or `numpy` |
 | `RFSN_MODEL_ID` | — | Required: model ID or local path |
-| `RFSN_ENABLE_QUANTIZED_KV` | `false` | v10 KV compression — enable after benchmarking on your model/context |
+| `RFSN_ENABLE_KV_COMPRESSION` | `false` | v10 KV compression — enable after benchmarking on your model/context |
+| `RFSN_ENABLE_QUANTIZED_KV` | `false` | **Deprecated alias** for `RFSN_ENABLE_KV_COMPRESSION` (emits warning) |
 | `RFSN_ENABLE_SPARSE_DECODE` | `false` | Sparse decode (**not benchmark-proven**) |
 
 ## Server Flags

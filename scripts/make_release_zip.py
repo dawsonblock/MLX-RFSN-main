@@ -60,21 +60,36 @@ def _is_excluded(rel_path: str) -> bool:
 
 def _git_tracked_files(root: Path) -> list[Path]:
     """Return all files tracked by git in *root*."""
-    result = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        files = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            p = root / line
+            if p.is_file():
+                files.append(p)
+        return files
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Git not available or not a git repo - fall back to filesystem scan
+        return _filesystem_scan_files(root)
+
+
+def _filesystem_scan_files(root: Path) -> list[Path]:
+    """Scan filesystem for files, respecting _EXCLUDE_PATTERNS."""
     files = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        p = root / line
-        if p.is_file():
-            files.append(p)
+    for file_path in root.rglob("*"):
+        if file_path.is_file():
+            rel = str(file_path.relative_to(root))
+            if not _is_excluded(rel):
+                files.append(file_path)
     return files
 
 
@@ -119,10 +134,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Output:  {zip_path}")
     print()
 
-    try:
-        tracked = _git_tracked_files(root)
-    except subprocess.CalledProcessError as exc:
-        sys.exit(f"git ls-files failed: {exc.stderr.strip()}")
+    tracked = _git_tracked_files(root)
+    if not tracked:
+        sys.exit("No files found to include in release ZIP")
 
     included: list[tuple[str, Path]] = []
     excluded: list[str] = []
@@ -157,7 +171,9 @@ def main(argv: list[str] | None = None) -> None:
             "Delete it or change --version before re-running."
         )
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(
+        zip_path, "w", compression=zipfile.ZIP_DEFLATED
+    ) as zf:
         for rel, abs_path in included:
             arcname = os.path.join(f"rfsn-v10-{version}", rel)
             zf.write(abs_path, arcname)

@@ -23,7 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ALEMBIC_INI = _REPO_ROOT / "rfsn_v11" / "alembic.ini"
 _SCRIPT_LOCATION = _REPO_ROOT / "rfsn_v11" / "alembic"
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.integration, pytest.mark.db]
 
 
 def _run_alembic(cmd: list[str], db_url: str) -> subprocess.CompletedProcess:
@@ -48,12 +48,14 @@ def test_alembic_upgrade_head(tmp_path):
 
     result = _run_alembic(["upgrade", "head"], db_url)
     assert result.returncode == 0, (
-        f"alembic upgrade head failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        f"alembic upgrade head failed:\nSTDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}"
     )
 
 
 def test_telemetry_events_table_exists(tmp_path):
-    """After upgrade head the telemetry_events table must exist with all columns."""
+    """After upgrade head the telemetry_events table must exist with all columns.
+    """
     import sqlalchemy as sa
 
     db_file = tmp_path / "test_schema.db"
@@ -65,7 +67,9 @@ def test_telemetry_events_table_exists(tmp_path):
     engine = sa.create_engine(db_url)
     inspector = sa.inspect(engine)
     tables = inspector.get_table_names()
-    assert "telemetry_events" in tables, f"telemetry_events not found in tables: {tables}"
+    assert "telemetry_events" in tables, (
+        f"telemetry_events not found in tables: {tables}"
+    )
 
     columns = {col["name"] for col in inspector.get_columns("telemetry_events")}
     required = {

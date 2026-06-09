@@ -1,10 +1,10 @@
-# RFSN v10 Main 28 — Alpha Candidate
+# RFSN v10.2 Stable Alpha
 
-## Status: RFSN v10 Main 28
+## Status: RFSN v10.2 Stable Alpha
 
-**Alpha candidate.** Telemetry tickets reconciled, inference server
-(FastAPI + SSE) implemented for mlx/torch backends, compile + packaging + CPU gates passing.
-MLX-dependent tests pass on Apple Silicon. Docker compose runs healthcheck only (not inference).
+**Stable alpha.** Critical packaging and deployment issues resolved, server hardening
+completed, and comprehensive test coverage added. Ready for local Apple Silicon MLX research
+server deployment with proper wheel installation and release tooling.
 
 To verify the current state locally:
 
@@ -25,7 +25,7 @@ python scripts/release_gate.py --cpu-only        # must print: Gate: 9 passed, 0
 | CUDA backend | **Not implemented** |
 | Full portable runtime | Not implemented — MLX required for core runtime |
 | End-to-end speedup | Not proven — decode TPS comparable, compression overhead makes total slower at short contexts |
-| Production deployment | FastAPI server — `/v1/chat/completions` with SSE streaming (mlx/torch only) |
+| Production deployment | FastAPI server — `/v1/chat/completions` with SSE streaming, authentication, and proper wheel packaging (mlx/numpy) |
 | Docker | Healthcheck validation + ClickHouse telemetry (CPU-only, no inference) |
 | >8-bit compression | Uses raw uint32 fallback — bit-packing is real for 2-8 bit only |
 | Experimental Metal | No Metal kernels exist for the experimental quantization paths |
@@ -38,7 +38,7 @@ python scripts/release_gate.py --cpu-only        # must print: Gate: 9 passed, 0
 | Platform | Status |
 |----------|--------|
 | Apple Silicon + MLX | Supported (primary runtime) |
-| NumPy CPU | Partial — kernel validation, config, security tests pass; MLX-dependent runtime tests skip |
+| NumPy CPU | Supported — kernel validation, config, security tests pass; MLX-dependent runtime tests skip |
 | Linux / CI | CPU tests pass; MLX suites skip cleanly |
 | CUDA | Not implemented |
 | macOS x86 (Intel) | MLX not supported on Intel Macs — NumPy-only |

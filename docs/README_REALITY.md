@@ -10,7 +10,7 @@
 | MLX model loading (HuggingFace or local) | Stable |
 | OpenAI-compatible FastAPI server | Stable |
 | Baseline dense generation | Stable |
-| v10 KV compression (k8_v5 + WHT bitpack) | Stable — **off by default**; set `RFSN_ENABLE_QUANTIZED_KV=true` after benchmarking |
+| v10 KV compression (k8_v5 + WHT bitpack) | Stable — **off by default**; set `RFSN_ENABLE_KV_COMPRESSION=true` after benchmarking |
 | Streaming SSE (queue-bridge, non-blocking) | Stable |
 | CPU-safe test suite | Stable |
 | Telemetry with HMAC prompt hashing | Stable |

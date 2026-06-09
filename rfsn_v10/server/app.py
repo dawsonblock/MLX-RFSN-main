@@ -140,8 +140,8 @@ class ChatCompletionResponse(BaseModel):
 app = FastAPI(
     title="RFSN v10 Inference Server",
     version=__version__,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if _server_cfg.enable_docs else None,
+    redoc_url="/redoc" if _server_cfg.enable_docs else None,
 )
 
 # Lazy-loaded singletons
@@ -154,7 +154,7 @@ _sparse_decode_enabled: bool = False
 
 
 def _get_model_id() -> str:
-    model_id = os.environ.get("RFSN_MODEL_ID", "").strip()
+    model_id = _rfsn_cfg.model.id.strip()
     if not model_id:
         raise RuntimeError(
             "RFSN_MODEL_ID is not set.  "
@@ -171,8 +171,8 @@ def _load_generator() -> RFSNGenerator:
         return _generator
 
     model_id = _get_model_id()
-    backend = os.environ.get("RFSN_BACKEND", "mlx").lower()
-    _sparse_decode_enabled = _env_bool("RFSN_ENABLE_SPARSE_DECODE", False)
+    backend = _rfsn_cfg.backend.name.lower() or None
+    _sparse_decode_enabled = _rfsn_cfg.runtime.sparse_decode_enabled
     _kv_compression_enabled = _rfsn_cfg.runtime.enable_kv_compression
 
     _model, _tokenizer = load_model_auto(model_id, backend=backend)
@@ -219,13 +219,13 @@ async def health() -> dict:
     return {
         "status": "ok",
         "version": __version__,
-        "backend": os.environ.get("RFSN_BACKEND", "mlx"),
+        "backend": _rfsn_cfg.backend.name or "auto",
         "model_loaded": _generator is not None,
         "model_id": _model_id_loaded or None,
         "kv_compression": _kv_compression_enabled,
         "sparse_decode": _sparse_decode_enabled,
         "telemetry": False,
-        "host": os.environ.get("RFSN_HOST", "127.0.0.1"),
+        "host": _server_cfg.host,
         "api_key_required": _REQUIRE_API_KEY,
         "max_concurrent_requests": _server_cfg.max_concurrent_requests,
     }
@@ -241,13 +241,18 @@ async def metrics() -> dict:
 async def list_models(_auth=Depends(_require_auth)) -> dict:
     """List available models (OpenAI-compatible)."""
     models = []
-    if _model_id_loaded:
+    
+    # Show configured model even if not yet loaded
+    configured_model_id = _rfsn_cfg.model.id.strip()
+    if configured_model_id:
         models.append({
-            "id": _model_id_loaded,
+            "id": configured_model_id,
             "object": "model",
             "created": int(time.time()),
             "owned_by": "rfsn-v10",
+            "loaded": _generator is not None,
         })
+    
     return {"object": "list", "data": models}
 
 
@@ -394,10 +399,12 @@ setInterval(refresh, 3000);
 </html>"""
 
 
-@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard() -> str:
-    """Local monitoring dashboard.  Polls /health every 3 seconds."""
-    return _DASHBOARD_HTML
+# Conditional dashboard endpoint
+if _server_cfg.enable_dashboard:
+    @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+    async def dashboard(_auth=Depends(_require_auth)) -> str:
+        """Local monitoring dashboard.  Polls /health every 3 seconds."""
+        return _DASHBOARD_HTML
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +468,8 @@ async def chat_completions(
         stream=request.stream,
     )
 
+    _metrics["requests_total"] += 1
+
     if request.stream:
         return StreamingResponse(
             _sse_stream(generator, prompt, cfg),
@@ -468,7 +477,6 @@ async def chat_completions(
         )
 
     # Non-streaming: acquire semaphore slot, run in thread
-    _metrics["requests_total"] += 1
     t_start = time.monotonic()
     async with _generation_semaphore:
         try:

@@ -87,6 +87,17 @@ class QuantizationConfig(BaseModel):
     enable_incoherent_signs: bool = Field(default=True)
 
 
+class ModelConfig(BaseModel):
+    """Model configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        default="",
+        description="Model identifier or local path",
+    )
+
+
 class BackendConfig(BaseModel):
     """Kernel backend configuration."""
 
@@ -222,6 +233,7 @@ class RFSNConfig(BaseModel):
     quantization: QuantizationConfig = Field(
         default_factory=QuantizationConfig
     )
+    model: ModelConfig = Field(default_factory=ModelConfig)
     backend: BackendConfig = Field(default_factory=BackendConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -254,6 +266,9 @@ class RFSNConfig(BaseModel):
                 enable_wal=(
                     os.getenv("RFSN_ENABLE_WAL", "true").lower() == "true"
                 ),
+            ),
+            model=ModelConfig(
+                id=os.getenv("RFSN_MODEL_ID", ""),
             ),
             backend=BackendConfig(
                 name=os.getenv("RFSN_BACKEND", ""),
