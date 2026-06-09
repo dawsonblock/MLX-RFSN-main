@@ -1,0 +1,51 @@
+{
+  "release_ready": true,
+  "python": "3.11.9",
+  "checks_passed": 7,
+  "checks_failed": 0,
+  "tests_passed": 0,
+  "tests_failed": 0,
+  "mlx_tests": "skipped",
+  "git_commit": "2584515",
+  "timestamp": "2026-06-09T19:33:37Z",
+  "checks": [
+    {
+      "name": "python_version",
+      "passed": true,
+      "detail": "3.11.9",
+      "message": "OK"
+    },
+    {
+      "name": "compileall",
+      "passed": true,
+      "message": "All rfsn_v10 .py files compile OK"
+    },
+    {
+      "name": "stable_imports",
+      "passed": true,
+      "message": "All stable imports OK"
+    },
+    {
+      "name": "no_forbidden_v10_imports",
+      "passed": true,
+      "message": "No forbidden imports"
+    },
+    {
+      "name": "no_placeholder_source",
+      "passed": true,
+      "message": "No placeholders found"
+    },
+    {
+      "name": "config_defaults_safe",
+      "passed": true,
+      "message": "All experimental flags default to False"
+    },
+    {
+      "name": "pytest_cpu_safe",
+      "passed": true,
+      "message": "sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute",
+      "duration_s": 14.85,
+      "returncode": 0
+    }
+  ]
+}

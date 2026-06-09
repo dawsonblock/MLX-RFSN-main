@@ -112,6 +112,35 @@ class TelemetryConfig(BaseModel):
     database: str = Field(default="default")
 
 
+class ServerConfig(BaseModel):
+    """FastAPI server configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host: str = Field(default="127.0.0.1", description="Bind host (127.0.0.1 for local-only, 0.0.0.0 for LAN)")
+    port: int = Field(default=8000, ge=1, le=65535)
+    require_api_key: bool = Field(default=False, description="Require Authorization: Bearer <key>")
+    api_key: str = Field(default="", description="API key (required when require_api_key=True)")
+    max_prompt_chars: int = Field(default=24000, ge=1)
+    max_tokens_limit: int = Field(default=4096, ge=1)
+    request_timeout_seconds: int = Field(default=120, ge=1)
+    enable_dashboard: bool = Field(default=True, description="Serve /dashboard static HTML")
+    enable_docs: bool = Field(default=True, description="Serve /docs and /redoc")
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, v, info):
+        # Delay require_api_key check to model_post_init
+        return v
+
+    def model_post_init(self, __context) -> None:
+        if self.require_api_key and not self.api_key:
+            raise ValueError(
+                "ServerConfig.api_key must be set when require_api_key=True. "
+                "Set RFSN_API_KEY in environment."
+            )
+
+
 class ExperimentalConfig(BaseModel):
     """Opt-in gates for experimental / unvalidated features.
 
@@ -155,6 +184,7 @@ class RFSNConfig(BaseModel):
     )
     backend: BackendConfig = Field(default_factory=BackendConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    server: ServerConfig = Field(default_factory=ServerConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     experimental: ExperimentalConfig = Field(default_factory=ExperimentalConfig)
 
@@ -197,6 +227,23 @@ class RFSNConfig(BaseModel):
                 ),
                 auth_token=os.getenv("RFSN_CLICKHOUSE_TOKEN", ""),
                 database=os.getenv("RFSN_CLICKHOUSE_DB", "default"),
+            ),
+            server=ServerConfig(
+                host=os.getenv("RFSN_HOST", "127.0.0.1"),
+                port=int(os.getenv("RFSN_PORT", "8000")),
+                require_api_key=(
+                    os.getenv("RFSN_REQUIRE_API_KEY", "false").lower() == "true"
+                ),
+                api_key=os.getenv("RFSN_API_KEY", ""),
+                max_prompt_chars=int(os.getenv("RFSN_MAX_PROMPT_CHARS", "24000")),
+                max_tokens_limit=int(os.getenv("RFSN_MAX_TOKENS_LIMIT", "4096")),
+                request_timeout_seconds=int(os.getenv("RFSN_REQUEST_TIMEOUT_SECONDS", "120")),
+                enable_dashboard=(
+                    os.getenv("RFSN_ENABLE_DASHBOARD", "true").lower() == "true"
+                ),
+                enable_docs=(
+                    os.getenv("RFSN_ENABLE_DOCS", "true").lower() == "true"
+                ),
             ),
             runtime=RuntimeConfig(
                 default_quant_mode=os.getenv(

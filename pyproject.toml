@@ -74,6 +74,10 @@ Repository = "https://github.com/dawsonblock/MLX-RFSN-main"
 Issues = "https://github.com/dawsonblock/MLX-RFSN-main/issues"
 
 [project.scripts]
+rfsn-server = "rfsn_v10.server.cli:main"
+rfsn-bench = "benchmarks.candidate_shootout:main"
+rfsn-health = "rfsn_v10.server.cli:health_check"
+rfsn-config-check = "rfsn_v10.server.cli:config_check"
 rfsn-benchmark = "rfsn_v10.cli:main"
 
 [tool.setuptools.packages.find]
@@ -90,11 +94,21 @@ fallback_version = "10.1.0.dev0"
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"
-testpaths = ["tests"]
+testpaths = ["tests", "rfsn_v11/tests"]
 timeout = 300
 filterwarnings = [
     "ignore::DeprecationWarning:mlx",
     "ignore::UserWarning",
+]
+markers = [
+    "unit: fast unit tests, no external deps",
+    "integration: integration tests",
+    "mlx: requires Apple Silicon + MLX",
+    "slow: slow tests (>10s)",
+    "security: security and privacy tests",
+    "benchmark: benchmark tests (not for CI)",
+    "experimental: experimental candidate tests",
+    "server: server/API tests",
 ]
 
 [tool.ruff]

@@ -1,18 +1,22 @@
-# external/
+# external/ — Read-Only References
 
-Reference repositories. These are **not runtime dependencies** and are
-not packaged into the rfsn_v10 or rfsn_v11 wheels.
+These repositories are included for reference only. They are **not imported** by the stable runtime (`rfsn_v10`) and are **not included** in the published package.
 
-| Directory         | Source                          | Role                                      |
-|-------------------|---------------------------------|-------------------------------------------|
-| `turboquant-mlx/` | turboquant-mlx-main             | TurboQuant V2 attention/rotation ideas    |
-| `mlx-turboquant/` | mlx-turboquant-main             | PolarQuant / Lloyd-Max value quant ideas  |
-| `vmlx/`           | vmlx-main                       | Serving reference (do not merge)          |
-| `turbovec/`       | (add later)                     | RAG/vector memory — not KV cache          |
-| `vllm-kivi/`      | (notes only)                    | KIVI NVIDIA reference — not Apple path    |
+Any idea taken from `external/` must be:
+1. Re-implemented cleanly behind a candidate adapter in `rfsn_v11/candidates/`
+2. Benchmarked via `benchmarks/kv_shootout.py` before use
+3. Promoted only after passing the quality gate in `docs/CANDIDATE_PROMOTION.md`
 
-## Usage
+## Contents
 
-Browse these directories for algorithmic ideas.
-Adapters that use these ideas live in `rfsn_v11/candidates/`.
-Do not import from these paths at runtime.
+| Directory | Source | Notes |
+|-----------|--------|-------|
+| `turboquant-mlx/` | TurboQuant-MLX | QR rotation + MLX native quantized_matmul |
+| `mlx-turboquant/` | MLX-TurboQuant | PolarQuant codebook-based KV compression |
+| `vmlx/` | VMLX | Apple Silicon MLX model serving experiments |
+
+## Import Contract
+
+`rfsn_v10` must never import from `external/`. This is enforced by:
+- `tests/test_no_v11_import_from_v10.py` (import boundary test)
+- `pyproject.toml` package discovery exclusions
