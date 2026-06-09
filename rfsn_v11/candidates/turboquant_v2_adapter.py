@@ -1,69 +1,150 @@
-"""Candidate: TurboQuant-MLX V2.
+"""Candidate: TurboQuant-MLX V2 — real KV-cache compression.
 
-Reimplements the core ideas from external/turboquant-mlx as a clean adapter.
-Does NOT import from external/ at runtime — logic is rebuilt here.
+Wires external/turboquant-mlx's TurboQuantKVCacheV2 into the generation
+loop via mlx_lm.utils.generate_step(prompt_cache=...) and the
+turboquant SDPA patch.
 
-Key ideas (from external/turboquant-mlx/turboquant/):
-  - cache_v2.py:     QR rotation + MLX native mx.quantize
-  - rotation.py:     generate_rotation_matrix (QR decomp, det=+1 fix)
-  - attention_v2.py: quantized_matmul scoring
+Key design
+----------
+- Applies turboquant.patch before generation; reverts after.
+- Builds one TurboQuantKVCacheV2 per transformer layer.
+- head_dim is auto-detected from model.args.
+- Rotation is enabled only when head_dim >= 128 (designed for 128-dim
+  heads; on Qwen2.5-0.5B head_dim=64 rotation degrades quality).
+- After generation, computes real size_ratio from cache.nbytes vs fp16.
+
+Source: external/turboquant-mlx/turboquant/cache_v2.py
+        external/turboquant-mlx/turboquant/patch.py
+        external/turboquant-mlx/run_llm.py
 
 Status: experimental candidate — must pass quality gate before promotion.
 """
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
 
+# Absolute path to external/turboquant-mlx so the import works regardless
+# of working directory.
+_EXT_TQ = str(
+    Path(__file__).parent.parent.parent / "external" / "turboquant-mlx"
+)
 
-def _build_rotation_matrix(head_dim: int, seed: int = 42) -> Any:
-    """QR rotation matrix for uniform distribution pre-quantization.
 
-    Equivalent to external/turboquant-mlx/turboquant/rotation.py
-    generate_rotation_matrix() but inlined so we have no runtime dep on external/.
-    """
-    import mlx.core as mx
-
-    mx.random.seed(seed)
-    G = mx.random.normal((head_dim, head_dim))
-    mx.eval(G)
-    Q, R = mx.linalg.qr(G, stream=mx.cpu)
-    mx.eval(Q)
-    # Sign correction: ensure det(Q) = +1
-    diag_sign = mx.sign(mx.diag(R))
-    Q = Q * diag_sign[None, :]
-    mx.eval(Q)
-    return Q
+def _ensure_ext_on_path() -> None:
+    if _EXT_TQ not in sys.path:
+        sys.path.insert(0, _EXT_TQ)
 
 
 class TurboQuantV2Candidate(KVCompressionCandidate):
-    """TurboQuant V2: random QR rotation + MLX native affine quantization."""
+    """TurboQuant V2: random QR rotation + MLX native quantized_matmul.
+
+    This is a *real* KV-cache candidate: generation runs through a
+    TurboQuantKVCacheV2 prompt cache, not plain mlx_lm.generate().
+    """
 
     def __init__(
         self,
         bits: int = 4,
         group_size: int = 64,
-        use_rotation: bool = True,
         seed: int = 42,
     ) -> None:
         self.bits = bits
         self.group_size = group_size
-        self.use_rotation = use_rotation
         self.seed = seed
-        self.name = (
-            f"turboquant_v2_b{bits}_gs{group_size}"
-            f"{'_rot' if use_rotation else '_norot'}"
-        )
+        # Name includes 'rot' when rotation will be applied (head_dim >= 128).
+        # We set the full name at run-time once we know head_dim; use a
+        # placeholder here for display purposes.
+        self.name = f"turboquant_v2_b{bits}_gs{group_size}_rot"
 
     def is_available(self) -> bool:
         try:
+            _ensure_ext_on_path()
             import mlx.core as mx  # noqa: F401
             import mlx_lm  # noqa: F401
+            from turboquant.cache_v2 import TurboQuantKVCacheV2  # noqa: F401
+            import turboquant.patch  # noqa: F401
             return True
         except ImportError:
             return False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_head_dim(model: Any) -> int:
+        """Auto-detect head dimension from model.args."""
+        args = getattr(model, "args", None)
+        if args is not None:
+            hd = getattr(args, "head_dim", None)
+            if hd is not None:
+                return int(hd)
+            hidden = getattr(args, "hidden_size", None)
+            n_heads = getattr(args, "num_attention_heads", None)
+            if hidden and n_heads:
+                return hidden // n_heads
+        # Fallback: inspect first layer attention
+        for attr in ("self_attn", "attention", "attn"):
+            layer = model.layers[0] if model.layers else None
+            if layer and hasattr(layer, attr):
+                a = getattr(layer, attr)
+                if hasattr(a, "head_dim"):
+                    return int(a.head_dim)
+        raise ValueError(
+            "Cannot auto-detect head_dim from model. "
+            "Pass it explicitly or check model.args."
+        )
+
+    def _build_cache(self, model: Any, head_dim: int, use_rotation: bool) -> list:
+        _ensure_ext_on_path()
+        from turboquant.cache_v2 import TurboQuantKVCacheV2
+
+        n_layers = len(model.layers)
+        return [
+            TurboQuantKVCacheV2(
+                head_dim=head_dim,
+                bits=self.bits,
+                group_size=self.group_size,
+                use_rotation=use_rotation,
+                use_normalization=False,  # lean path: no per-vector norm
+                seed=self.seed + i,
+            )
+            for i in range(n_layers)
+        ]
+
+    @staticmethod
+    def _cache_nbytes(caches: list) -> int:
+        total = 0
+        for c in caches:
+            if c.keys is not None:
+                for arr in c.keys:
+                    total += arr[..., : c.offset, :].nbytes
+                for arr in c.values:
+                    total += arr[..., : c.offset, :].nbytes
+        return total
+
+    @staticmethod
+    def _cache_fp16_nbytes(caches: list) -> int:
+        """Equivalent size if KV were stored in float16."""
+        total = 0
+        for c in caches:
+            if c.keys is not None:
+                T = c.offset
+                # keys[0] is the packed data tensor; shape = (B, H, capacity, packed_dim)
+                B, H = c.keys[0].shape[:2]
+                D = c.head_dim
+                # float16 = 2 bytes per element
+                total += B * H * T * D * 2 * 2  # keys + values
+        return total
+
+    # ------------------------------------------------------------------
+    # Main run
+    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -79,59 +160,117 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 model_id="unknown",
                 prompt=prompt,
                 passed_quality_gate=False,
-                error="mlx or mlx_lm not available",
+                error="turboquant-mlx or mlx/mlx_lm not available",
             )
         try:
+            _ensure_ext_on_path()
             import mlx.core as mx
-            import mlx_lm
-
-            rotation_matrix = (
-                _build_rotation_matrix(128, seed=self.seed)
-                if self.use_rotation
-                else None
-            )
-
-            def _rotate_and_quantize(tensor: mx.array) -> tuple[mx.array, mx.array, mx.array]:
-                """Apply QR rotation then mx.quantize."""
-                if rotation_matrix is not None and tensor.shape[-1] == rotation_matrix.shape[0]:
-                    tensor = tensor @ rotation_matrix
-                scales, biases = mx.quantize(tensor, bits=self.bits, group_size=self.group_size)
-                return tensor, scales, biases
-
+            import turboquant.patch as tq_patch
             from mlx_lm.sample_utils import make_sampler
-            sampler = make_sampler(temp=temp)
-            t0 = time.perf_counter()
-            output = mlx_lm.generate(
-                model,
-                tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                verbose=False,
-            )
-            total_ms = (time.perf_counter() - t0) * 1000
+            from mlx_lm.utils import generate_step
 
-            input_ids = tokenizer.encode(prompt)
-            output_ids = tokenizer.encode(output)
-            gen_tokens = max(len(output_ids) - len(input_ids), 1)
-            tps = gen_tokens / (total_ms / 1000)
+            head_dim = self._detect_head_dim(model)
+            use_rotation = head_dim >= 128
+
+            # Update name now that we know rotation decision
+            self.name = (
+                f"turboquant_v2_b{self.bits}_gs{self.group_size}"
+                f"{'_rot' if use_rotation else '_norot'}"
+            )
+
+            # Apply SDPA patch and force-sync all already-imported model modules.
+            # tq_patch.apply() only patches mlx_lm.models.base; any model module
+            # (e.g. qwen2) that was imported before the patch and holds a local
+            # reference to scaled_dot_product_attention needs to be updated too.
+            tq_patch.apply()
+            import mlx_lm.models.base as _base
+            _patched_fn = _base.scaled_dot_product_attention
+            for _mod_name, _mod in list(sys.modules.items()):
+                if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                    if hasattr(_mod, "scaled_dot_product_attention"):
+                        _mod.scaled_dot_product_attention = _patched_fn
+            try:
+                caches = self._build_cache(model, head_dim, use_rotation)
+
+                input_ids = mx.array(tokenizer.encode(prompt))
+                sampler = make_sampler(temp=temp)
+
+                tokens: list[int] = []
+                t0 = time.perf_counter()
+                for token, _logprobs in generate_step(
+                    prompt=input_ids,
+                    model=model,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    prompt_cache=caches,
+                ):
+                    tok_id = (
+                        token.item() if hasattr(token, "item") else int(token)
+                    )
+                    if tok_id in tokenizer.eos_token_ids:
+                        break
+                    tokens.append(tok_id)
+
+                total_ms = (time.perf_counter() - t0) * 1000
+                mx.eval(*[c.keys[0] for c in caches if c.keys is not None][:1] or [mx.array(0)])
+
+                gen_tokens = max(len(tokens), 1)
+                tps = gen_tokens / (total_ms / 1000)
+                generated_text = tokenizer.decode(tokens)
+
+                # Real compression ratio from cache memory
+                compressed_bytes = self._cache_nbytes(caches)
+                fp16_bytes = self._cache_fp16_nbytes(caches)
+                if fp16_bytes > 0 and compressed_bytes > 0:
+                    size_ratio = round(compressed_bytes / fp16_bytes, 4)
+                    compression_factor = round(fp16_bytes / compressed_bytes, 3)
+                else:
+                    size_ratio = None
+                    compression_factor = None
+
+            finally:
+                tq_patch.revert()
+                # Re-sync all model modules to the now-reverted original
+                _orig_fn = _base.scaled_dot_product_attention
+                for _mod_name, _mod in list(sys.modules.items()):
+                    if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                        if hasattr(_mod, "scaled_dot_product_attention"):
+                            _mod.scaled_dot_product_attention = _orig_fn
 
             return CandidateResult(
                 name=self.name,
-                model_id=getattr(model, "name_or_path", "unknown"),
+                model_id=getattr(
+                    getattr(model, "args", model), "model_type", "unknown"
+                ),
                 prompt=prompt,
                 total_ms=total_ms,
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
-                generated_text=output,
+                generated_text=generated_text,
+                size_ratio=size_ratio,
+                compression_factor=compression_factor,
                 passed_quality_gate=False,  # filled by shootout quality eval
                 notes=(
                     f"TurboQuant V2: b{self.bits} gs{self.group_size} "
-                    f"rotation={self.use_rotation}  "
-                    "Ideas from external/turboquant-mlx/turboquant/cache_v2.py"
+                    f"rotation={use_rotation} head_dim={head_dim}  "
+                    f"Real KV cache via TurboQuantKVCacheV2 + SDPA patch.  "
+                    f"Source: external/turboquant-mlx/turboquant/cache_v2.py"
                 ),
             )
         except Exception as exc:
+            # Make sure patch is always reverted on error
+            try:
+                _ensure_ext_on_path()
+                import turboquant.patch as tq_patch  # type: ignore[import]
+                import mlx_lm.models.base as _base_err
+                tq_patch.revert()
+                _orig_err = _base_err.scaled_dot_product_attention
+                for _mn, _mm in list(sys.modules.items()):
+                    if _mn.startswith("mlx_lm.models.") and _mm is not None:
+                        if hasattr(_mm, "scaled_dot_product_attention"):
+                            _mm.scaled_dot_product_attention = _orig_err
+            except Exception:
+                pass
             return CandidateResult(
                 name=self.name,
                 model_id="unknown",

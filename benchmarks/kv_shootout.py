@@ -13,7 +13,10 @@ Usage
     python benchmarks/kv_shootout.py
 
     # Specific model only
-    python benchmarks/kv_shootout.py --model Qwen/Qwen2.5-0.5B-Instruct
+    python benchmarks/kv_shootout.py --model Qwen/Qwen2.5-1.5B-Instruct
+
+    # Extended: 3B model
+    python benchmarks/kv_shootout.py --model Qwen/Qwen2.5-3B-Instruct
 
 Outputs
 -------
@@ -70,11 +73,10 @@ from rfsn_v11.candidates.quality_gates import (
 # ---------------------------------------------------------------------------
 
 MODELS_FULL = [
-    "Qwen/Qwen2.5-0.5B-Instruct",
-    "Qwen/Qwen2.5-1.5B-Instruct",
+    "Qwen/Qwen2.5-1.5B-Instruct",  # primary: head_dim=128, ideal for TQ rotation
 ]
 MODELS_QUICK = [
-    "Qwen/Qwen2.5-0.5B-Instruct",
+    "Qwen/Qwen2.5-0.5B-Instruct",  # quick iteration: head_dim=64, fast load
 ]
 
 PROMPTS_FULL = [
@@ -118,7 +120,7 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
         RFSNV10Candidate("k8_v5_gs32"),
         RFSNV10Candidate("k8_v5_gs64"),
         RFSNV11Candidate(key_bits=8, value_bits=4, group_size=64, use_wht=True, dim=128),
-        TurboQuantV2Candidate(bits=4, group_size=64, use_rotation=True),
+        TurboQuantV2Candidate(bits=4, group_size=64),
         PolarReferenceAdapter(bits=4, dim=128),
     ]
 
