@@ -13,12 +13,18 @@ Exit code 0 = release ready.  Exit code 1 = one or more checks failed.
 """
 from __future__ import annotations
 
+# Suppress bytecode generation to avoid dirty artifact false positives
+import sys
+
+sys.dont_write_bytecode = True
+
 import argparse
 import ast
 import importlib
 import json
+import os
+import re
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -42,19 +48,35 @@ def check_python_version() -> dict:
 
 
 def check_compile_all() -> dict:
-    """Byte-compile all rfsn_v10 source files; catch syntax errors."""
-    import compileall
-    import io
-    buf = io.StringIO()
-    ok = compileall.compile_dir(
-        str(REPO_ROOT / "rfsn_v10"),
-        quiet=2,
-        force=True,
-    )
+    """Byte-compile all project source files; catch syntax errors."""
+    compile_targets = [
+        "rfsn_v10",
+        "rfsn_v11",
+        "benchmarks",
+        "tests",
+        "scripts",
+    ]
+    all_ok = True
+    errors = []
+    # Run compileall in subprocess with bytecode disabled
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    for target in compile_targets:
+        target_path = REPO_ROOT / target
+        if not target_path.exists():
+            continue
+        cmd = [
+            sys.executable, "-m", "compileall",
+            "-q", "-f", str(target_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, env=env, cwd=REPO_ROOT)
+        if result.returncode != 0:
+            all_ok = False
+            errors.append(target)
     return {
-        "name": "compileall",
-        "passed": bool(ok),
-        "message": "All rfsn_v10 .py files compile OK" if ok else "Compilation errors found",
+        "name": "compileall_full_repo",
+        "passed": all_ok,
+        "message": "All project .py files compile OK" if all_ok else f"Compilation errors in: {', '.join(errors)}",
     }
 
 
@@ -185,6 +207,84 @@ def check_config_defaults() -> dict:
         return {"name": "config_defaults_safe", "passed": False, "message": str(exc)}
 
 
+def check_project_scripts() -> dict:
+    """Parse [project.scripts] from pyproject.toml and validate imports.
+
+    Runs in a subprocess to avoid polluting the release-gate process's
+    sys.modules with entry-point modules that may have side effects.
+    """
+    helper = """
+import sys, importlib, json, tomllib
+from pathlib import Path
+REPO_ROOT = Path(sys.argv[1])
+data = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
+scripts = data.get('project', {}).get('scripts', {})
+failures = []
+for name, target in scripts.items():
+    module_name, _, attr = target.partition(':')
+    try:
+        module = importlib.import_module(module_name)
+        if attr and not hasattr(module, attr):
+            failures.append(f"{name}: {target} missing attribute '{attr}'")
+    except Exception as exc:
+        failures.append(f"{name}: {target} import failed: {exc}")
+print(json.dumps(failures))
+"""
+    try:
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", helper, str(REPO_ROOT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=REPO_ROOT,
+        )
+        if result.returncode != 0:
+            return {
+                "name": "project_script_entrypoints",
+                "passed": False,
+                "message": (result.stderr or result.stdout).strip()[:200],
+            }
+        failures = json.loads(result.stdout.strip())
+        ok = len(failures) == 0
+        return {
+            "name": "project_script_entrypoints",
+            "passed": ok,
+            "message": "All entry points importable" if ok else "; ".join(failures[:5]),
+        }
+    except Exception as exc:
+        return {"name": "project_script_entrypoints", "passed": False, "message": str(exc)}
+
+
+def check_no_dirty_artifacts() -> dict:
+    """Scan for cache/build artifacts that should not ship."""
+    forbidden_dirs = {"__pycache__", ".pytest_cache", ".rfsn_cache", ".tmp", ".mypy_cache", ".ruff_cache"}
+    forbidden_suffixes = {".pyc", ".pyo", ".egg-info"}
+    # Only check source dirs that should be clean, not runtime-created caches
+    source_dirs = ["rfsn_v10", "rfsn_v11", "benchmarks", "tests", "scripts", "tools"]
+    bad = []
+    for src_dir in source_dirs:
+        dir_path = REPO_ROOT / src_dir
+        if not dir_path.exists():
+            continue
+        for path in dir_path.rglob("*"):
+            if ".git" in path.parts:
+                continue
+            parts = set(path.parts)
+            in_forbidden_dir = bool(parts & forbidden_dirs)
+            if in_forbidden_dir:
+                bad.append(str(path.relative_to(REPO_ROOT)))
+            elif path.suffix in forbidden_suffixes:
+                bad.append(str(path.relative_to(REPO_ROOT)))
+    ok = len(bad) == 0
+    return {
+        "name": "dirty_artifact_scan",
+        "passed": ok,
+        "message": "No dirty artifacts found" if ok else f"{len(bad)} artifact(s): " + "; ".join(bad[:10]),
+    }
+
+
 def run_pytest(markers: str, label: str) -> dict:
     """Run pytest with the given marker expression."""
     cmd = [
@@ -224,13 +324,15 @@ def main() -> int:
 
     checks = []
 
-    # Always run
+    # Always run - dirty artifact scan first before any cache-creating operations
     checks.append(check_python_version())
+    checks.append(check_no_dirty_artifacts())
     checks.append(check_compile_all())
     checks.append(check_stable_imports())
     checks.append(check_no_forbidden_v10_imports())
     checks.append(check_no_placeholder_source())
     checks.append(check_config_defaults())
+    checks.append(check_project_scripts())
 
     # CPU-safe pytest
     checks.append(run_pytest(
@@ -255,8 +357,6 @@ def main() -> int:
     for c in checks:
         if c["name"] == "pytest_cpu_safe":
             msg = c.get("message", "")
-            # Parse "42 passed" from pytest summary line
-            import re
             m = re.search(r"(\d+) passed", msg)
             if m:
                 tests_passed = int(m.group(1))
@@ -264,10 +364,8 @@ def main() -> int:
             if m2:
                 tests_failed = int(m2.group(1))
 
-    import os
-    import subprocess as _sp
     try:
-        git_commit = _sp.check_output(
+        git_commit = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT, text=True
         ).strip()
     except Exception:

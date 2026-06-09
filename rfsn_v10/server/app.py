@@ -43,6 +43,7 @@ import asyncio
 import json
 import os
 import time
+import threading
 from threading import Thread
 from typing import AsyncIterator
 
@@ -71,10 +72,18 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
+
 _REQUIRE_API_KEY: bool = _env_bool("RFSN_REQUIRE_API_KEY", False)
 _API_KEY: str = os.environ.get("RFSN_API_KEY", "")
 _MAX_PROMPT_CHARS: int = _env_int("RFSN_MAX_PROMPT_CHARS", 24000)
 _MAX_TOKENS_LIMIT: int = _env_int("RFSN_MAX_TOKENS_LIMIT", 4096)
+_REQUEST_TIMEOUT_SECONDS: float = _env_float("RFSN_REQUEST_TIMEOUT_SECONDS", 120.0)
 
 
 # ---------------------------------------------------------------------------
@@ -407,14 +416,20 @@ async def chat_completions(
         )
 
     # Non-streaming: run generation in thread to avoid blocking the event loop
-    result = await asyncio.to_thread(
-        generator.chat,
-        prompt,
-        max_new_tokens=cfg.max_new_tokens,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        repetition_penalty=cfg.repetition_penalty,
-    )
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                generator.chat,
+                prompt,
+                max_new_tokens=cfg.max_new_tokens,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
+                repetition_penalty=cfg.repetition_penalty,
+            ),
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Generation timed out")
     return ChatCompletionResponse(
         id=f"rfsn-{int(time.time() * 1000)}",
         created=int(time.time()),
@@ -444,6 +459,8 @@ async def _sse_stream(
     loop = asyncio.get_running_loop()
     created = int(time.time())
     id_prefix = f"rfsn-{created}"
+    deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
+    stop_event = threading.Event()
 
     def _worker() -> None:
         try:
@@ -457,6 +474,8 @@ async def _sse_stream(
                     stop_sequences=cfg.stop_sequences,
                 )
             ):
+                if stop_event.is_set():
+                    return
                 payload = {
                     "id": f"{id_prefix}-{idx}",
                     "object": "chat.completion.chunk",
@@ -480,13 +499,36 @@ async def _sse_stream(
 
     Thread(target=_worker, daemon=True).start()
 
-    while True:
-        item = await queue.get()
-        if item is None:
-            break
-        if isinstance(item, Exception):
-            raise item
-        yield item
+    timed_out = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                timed_out = True
+                break
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        stop_event.set()
+
+    if timed_out:
+        error_payload = {
+            "id": f"{id_prefix}-error",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": _model_id_loaded or "rfsn-v10",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "error": "Generation timed out",
+        }
+        yield f"data: {json.dumps(error_payload)}\n\n"
 
     yield "data: [DONE]\n\n"
 

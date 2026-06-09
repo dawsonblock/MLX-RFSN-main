@@ -75,7 +75,7 @@ Issues = "https://github.com/dawsonblock/MLX-RFSN-main/issues"
 
 [project.scripts]
 rfsn-server = "rfsn_v10.server.cli:main"
-rfsn-bench = "benchmarks.candidate_shootout:main"
+rfsn-bench = "benchmarks.kv_shootout:main"
 rfsn-health = "rfsn_v10.server.cli:health_check"
 rfsn-config-check = "rfsn_v10.server.cli:config_check"
 rfsn-benchmark = "rfsn_v10.cli:main"
@@ -103,6 +103,7 @@ filterwarnings = [
 markers = [
     "unit: fast unit tests, no external deps",
     "integration: integration tests",
+    "e2e: end-to-end tests (requires full stack)",
     "mlx: requires Apple Silicon + MLX",
     "slow: slow tests (>10s)",
     "security: security and privacy tests",
