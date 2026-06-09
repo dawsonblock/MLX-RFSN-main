@@ -1,0 +1,41 @@
+{
+  "release": "experimental",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "rows": [
+    {
+      "config": "baseline_fp16",
+      "fp16_kv_bytes": 12816384,
+      "total_compressed_bytes": 12816384,
+      "actual_compression_ratio": 1.0,
+      "memory_basis": "mean_per_prompt_real_model_cache"
+    },
+    {
+      "config": "k8_v5_gs64",
+      "fp16_kv_bytes": 12816384,
+      "total_compressed_bytes": 5747840,
+      "actual_compression_ratio": 2.2297739672642245,
+      "memory_basis": "mean_per_prompt_real_model_cache"
+    },
+    {
+      "config": "k8_v5_gs32",
+      "fp16_kv_bytes": 12816384,
+      "total_compressed_bytes": 6148352,
+      "actual_compression_ratio": 2.084523462547362,
+      "memory_basis": "mean_per_prompt_real_model_cache"
+    },
+    {
+      "config": "adaptive",
+      "fp16_kv_bytes": 12816384,
+      "total_compressed_bytes": 5640992,
+      "actual_compression_ratio": 2.2720088948894097,
+      "memory_basis": "mean_per_prompt_real_model_cache"
+    },
+    {
+      "config": "experimental_hybrid",
+      "fp16_kv_bytes": 12816384,
+      "total_compressed_bytes": 5640992,
+      "actual_compression_ratio": 2.2720088948894097,
+      "memory_basis": "mean_per_prompt_real_model_cache"
+    }
+  ]
+}

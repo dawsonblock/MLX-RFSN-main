@@ -1,0 +1,123 @@
+{
+  "release": "experimental",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 512,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 1698.831749999954,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000037252903,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": 0.00018481746622001083,
+          "latency_ms": 1676.9460420000541,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.9998603388667107,
+          "logit_cosine_min": 0.9996200799942017,
+          "logit_max_abs_diff": 0.30239887023344636,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.996875,
+          "kl_divergence_mean": 1.4271906221274833e-05,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 1024,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 1852.7453750011773,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999823048711,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": 2.970100058519165e-05,
+          "latency_ms": 1848.75645899956,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.999779581092298,
+          "logit_cosine_min": 0.9987245202064514,
+          "logit_max_abs_diff": 0.3741045529022813,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.9875,
+          "kl_divergence_mean": 5.122775567967253e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 2048,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 2723.0280420008057,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000027939677,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": -1.067734194748482e-05,
+          "latency_ms": 2928.464124999664,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.9997455207630992,
+          "logit_cosine_min": 0.9988797307014465,
+          "logit_max_abs_diff": 0.38737590331584215,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.9625,
+          "kl_divergence_mean": 2.1226472823876463e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "experimental_hybrid",
+    "best_memory_config_passing_all_contexts": "experimental_hybrid",
+    "rejected_configs": [],
+    "production_ready": false
+  }
+}

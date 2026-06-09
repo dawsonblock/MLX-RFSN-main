@@ -1,0 +1,75 @@
+name: Refresh Proof Baseline
+
+on:
+    workflow_dispatch:
+        inputs:
+            profile:
+                description: Proof profile name
+                required: false
+                default: "main10"
+            iterations:
+                description: Iterations per benchmark scenario
+                required: false
+                default: "3"
+
+jobs:
+    refresh-proof-baseline:
+        runs-on: macos-latest
+        permissions:
+            contents: write
+            pull-requests: write
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+
+            - name: Install dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  python -m pip install -e .
+
+            - name: Regenerate proof baseline
+              run: |
+                  python3 scripts/generate_proof_artifacts.py \
+                    --profile "${{ inputs.profile }}" \
+                    --output-dir "benchmarks/proof_baselines/${{ inputs.profile }}" \
+                    --iterations "${{ inputs.iterations }}"
+
+                  python3 scripts/generate_plots.py \
+                    --input-dir "benchmarks/proof_baselines/${{ inputs.profile }}" \
+                    --output-dir results/plots
+
+            - name: Generate trend report against refreshed baseline
+              run: |
+                  python3 scripts/compare_proof_runs.py \
+                    --profile "${{ inputs.profile }}" \
+                    --baseline-dir "benchmarks/proof_baselines/${{ inputs.profile }}" \
+                    --current-dir "benchmarks/proof_baselines/${{ inputs.profile }}" \
+                    --strict-missing \
+                    --output-json "benchmarks/proof_baselines/${{ inputs.profile }}/trend_report.json" \
+                    --output-md "benchmarks/proof_baselines/${{ inputs.profile }}/trend_report.md"
+
+            - name: Create pull request
+              uses: peter-evans/create-pull-request@v6
+              with:
+                  branch: ci/refresh-proof-baseline
+                  delete-branch: true
+                  title: "Refresh proof baseline artifacts"
+                  commit-message: "chore: refresh proof baseline artifacts"
+                  body: |
+                      Automated baseline refresh from workflow_dispatch.
+
+                      Includes regenerated proof artifacts in benchmarks/proof_baselines/${{ inputs.profile }}
+                      and updated trend report for review.
+                  add-paths: |
+                      benchmarks/proof_baselines/${{ inputs.profile }}/kv_cache_runs.json
+                      benchmarks/proof_baselines/${{ inputs.profile }}/e2e_scenarios.json
+                      benchmarks/proof_baselines/${{ inputs.profile }}/proof_summary.md
+                      benchmarks/proof_baselines/${{ inputs.profile }}/trend_report.json
+                      benchmarks/proof_baselines/${{ inputs.profile }}/trend_report.md
+                      results/plots/*.png
+                      results/plots/*.txt

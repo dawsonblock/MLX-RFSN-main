@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+LEGACY_NON_SERVE_DIAGNOSTIC_FLAGS = {
+    # sessions.ts still parses old log lines from `python -m vmlx_engine.server
+    # --model <path>` so the UI can recover a model path from historical output.
+    # It is not emitted by the current `vmlx_engine.cli serve` launcher.
+    "--model",
+}
+
+
+def _serve_cli_flags() -> set[str]:
+    source = (ROOT / "vmlx_engine" / "cli.py").read_text(encoding="utf-8")
+    serve_block = source[
+        source.index('serve_parser = subparsers.add_parser("serve"'):
+        source.index('bench_parser = subparsers.add_parser("bench"')
+    ]
+    return set(re.findall(r'["\'](--[a-z0-9][a-z0-9-]*)["\']', serve_block))
+
+
+def _panel_source_flags() -> dict[str, set[str]]:
+    rels = (
+        "panel/src/main/sessions.ts",
+        "panel/src/renderer/src/components/sessions/SessionSettings.tsx",
+        "panel/src/renderer/src/components/sessions/SessionConfigForm.tsx",
+        "panel/src/renderer/src/components/sessions/ServerSettingsDrawer.tsx",
+        "panel/src/renderer/src/components/sessions/CreateSession.tsx",
+    )
+    return {
+        rel: set(re.findall(r'["\'](--[a-z0-9][a-z0-9-]*)["\']', (ROOT / rel).read_text(encoding="utf-8")))
+        for rel in rels
+    }
+
+
+def _constant_flag_set(rel: str, const_name: str, _seen: set[str] | None = None) -> set[str]:
+    _seen = set(_seen or ())
+    if const_name in _seen:
+        return set()
+    _seen.add(const_name)
+    source = (ROOT / rel).read_text(encoding="utf-8")
+    start = source.index(f"const {const_name}")
+    end = source.index("])", start)
+    block = source[start:end]
+    flags = set(re.findall(r'["\'](--[a-z0-9][a-z0-9-]*)["\']', block))
+    for spread in re.findall(r"\.\.\.([A-Z0-9_]+)", block):
+        flags.update(_constant_flag_set(rel, spread, _seen))
+    return flags
+
+
+def _serve_cli_value_flags() -> set[str]:
+    """Approximate argparse serve flags that consume a following value.
+
+    The additional-args sanitizer must skip the next token for these flags when
+    it strips stale DSV4 launch overrides. Otherwise a blocked flag such as
+    ``--max-tokens 32768`` would leave ``32768`` behind as a positional-looking
+    argument and break the launch command.
+    """
+
+    source = (ROOT / "vmlx_engine" / "cli.py").read_text(encoding="utf-8")
+    serve_block = source[
+        source.index('serve_parser = subparsers.add_parser("serve"'):
+        source.index('bench_parser = subparsers.add_parser("bench"')
+    ]
+    value_flags: set[str] = set()
+    for match in re.finditer(r"serve_parser\.add_argument\((?P<body>.*?)\n    \)", serve_block, re.S):
+        body = match.group("body")
+        flag_match = re.search(r'["\'](--[a-z0-9][a-z0-9-]*)["\']', body)
+        if not flag_match:
+            continue
+        flag = flag_match.group(1)
+        if "action=\"store_true\"" in body or "action='store_true'" in body:
+            continue
+        if "action=\"store_false\"" in body or "action='store_false'" in body:
+            continue
+        value_flags.add(flag)
+    return value_flags
+
+
+def test_panel_serve_flags_are_registered_engine_cli_flags() -> None:
+    """The app must not emit or preview serve flags argparse cannot accept."""
+
+    serve_flags = _serve_cli_flags()
+    panel_flags = _panel_source_flags()
+    missing = {}
+    for rel, flags in panel_flags.items():
+        unsupported = sorted(flags - serve_flags - LEGACY_NON_SERVE_DIAGNOSTIC_FLAGS)
+        if unsupported:
+            missing[rel] = unsupported
+    assert missing == {}
+
+
+def test_dsv4_advanced_args_blocklist_names_real_serve_flags() -> None:
+    """DSV4 stale-arg sanitizer should track real serve flags, not dead names."""
+
+    source = (ROOT / "panel" / "src" / "main" / "sessions.ts").read_text(encoding="utf-8")
+    start = source.index("const DSV4_ADDITIONAL_ARG_BLOCKLIST")
+    end = source.index("])", start)
+    block = source[start:end]
+    blocked = set(re.findall(r'["\'](--[a-z0-9][a-z0-9-]*)["\']', block))
+    assert blocked, "DSV4 blocklist unexpectedly empty"
+    assert sorted(blocked - _serve_cli_flags()) == []
+
+
+def test_runtime_and_preview_additional_arg_filters_share_blocklists() -> None:
+    """Runtime launch and UI command preview must strip the same stale flags."""
+
+    names = (
+        "ADDITIONAL_ARG_VALUE_FLAGS",
+        "IMAGE_ADDITIONAL_ARG_BLOCKLIST",
+        "TEXT_ADDITIONAL_ARG_BLOCKLIST",
+        "DSV4_ADDITIONAL_ARG_BLOCKLIST",
+    )
+    runtime_rel = "panel/src/main/sessions.ts"
+    preview_rel = "panel/src/renderer/src/components/sessions/SessionSettings.tsx"
+    for name in names:
+        assert _constant_flag_set(preview_rel, name) == _constant_flag_set(runtime_rel, name)
+
+
+def test_dsv4_stale_value_flags_strip_their_values_in_preview_and_runtime() -> None:
+    """Blocked DSV4 Advanced Args must not leave orphan values behind."""
+
+    dsv4_blocked = _constant_flag_set(
+        "panel/src/main/sessions.ts",
+        "DSV4_ADDITIONAL_ARG_BLOCKLIST",
+    )
+    serve_value_flags = _serve_cli_value_flags()
+    blocked_value_flags = dsv4_blocked & serve_value_flags
+    expected_value_skip_flags = _constant_flag_set(
+        "panel/src/main/sessions.ts",
+        "ADDITIONAL_ARG_VALUE_FLAGS",
+    )
+
+    assert sorted(blocked_value_flags - expected_value_skip_flags) == []
+
+
+def test_text_stale_value_flags_strip_their_values_in_preview_and_runtime() -> None:
+    """Non-DSV4 sessions must not let stale Advanced Args override UI/autodetect."""
+
+    text_blocked = _constant_flag_set(
+        "panel/src/main/sessions.ts",
+        "TEXT_ADDITIONAL_ARG_BLOCKLIST",
+    )
+    serve_value_flags = _serve_cli_value_flags()
+    blocked_value_flags = text_blocked & serve_value_flags
+    expected_value_skip_flags = _constant_flag_set(
+        "panel/src/main/sessions.ts",
+        "ADDITIONAL_ARG_VALUE_FLAGS",
+    )
+
+    assert sorted(blocked_value_flags - expected_value_skip_flags) == []
+    for flag in (
+        "--max-tokens",
+        "--max-prompt-tokens",
+        "--default-enable-thinking",
+        "--default-repetition-penalty",
+        "--reasoning-parser",
+        "--tool-call-parser",
+        "--enable-auto-tool-choice",
+        "--host",
+        "--port",
+        "--timeout",
+        "--rate-limit",
+        "--log-level",
+        "--allowed-origins",
+        "--served-model-name",
+        "--chat-template",
+        "--chat-template-kwargs",
+        "--mcp-config",
+        "--mcp-enabled-servers",
+        "--mcp-disabled-tools",
+        "--api-key",
+        "--uds",
+        "--wake-timeout",
+        "--inference-endpoints",
+        "--native-mtp-depth",
+        "--native-mtp-sampling-policy",
+        "--use-paged-cache",
+        "--kv-cache-quantization",
+    ):
+        assert flag in text_blocked
+
+
+def test_panel_cli_flag_contract_covers_dsv4_cache_and_output_boundaries() -> None:
+    """Pin the risky rows Eric called out so this file stays purpose-built."""
+
+    sessions = (ROOT / "panel" / "src" / "main" / "sessions.ts").read_text(encoding="utf-8")
+    assert "--dsv4-enable-prefix-cache" in sessions
+    assert "--use-paged-cache" in sessions
+    assert "--enable-block-disk-cache" in sessions
+    assert "--kv-cache-quantization" in sessions
+    assert "--max-tokens" in sessions
+    assert "--max-prompt-tokens" in sessions
+    assert "--native-mtp-depth" in sessions
+    assert "--native-mtp-sampling-policy" in sessions
+
+
+def test_serve_cli_exposes_image_lora_flags_and_startup_passes_them_through() -> None:
+    """vmlx serve must make image LoRA lower-stack support reachable."""
+
+    cli_source = (ROOT / "vmlx_engine" / "cli.py").read_text(encoding="utf-8")
+    serve_flags = _serve_cli_flags()
+
+    assert "--lora-paths" in serve_flags
+    assert "--lora-scales" in serve_flags
+    assert "server._image_lora_paths = _split_cli_values(getattr(args, \"lora_paths\", None))" in cli_source
+    assert "server._image_lora_scales = _parse_lora_scales(" in cli_source
+    assert "lora_paths=server._image_lora_paths" in cli_source
+    assert "lora_scales=server._image_lora_scales" in cli_source
+
+
+def test_command_preview_uses_runtime_numeric_sanitizers_for_advanced_modes() -> None:
+    """The visible CLI preview must not round/surface values runtime floors away."""
+
+    preview = (
+        ROOT / "panel" / "src" / "renderer" / "src" / "components" / "sessions" / "SessionSettings.tsx"
+    ).read_text(encoding="utf-8")
+    sessions = (ROOT / "panel" / "src" / "main" / "sessions.ts").read_text(encoding="utf-8")
+
+    preview_native = preview[
+        preview.index("// Native in-model MTP mirrors sessions.ts"):
+        preview.index("// Generation defaults", preview.index("// Native in-model MTP mirrors sessions.ts"))
+    ]
+    runtime_native = sessions[
+        sessions.index("// Native in-model MTP."):
+        sessions.index("// Generation defaults", sessions.index("// Native in-model MTP."))
+    ]
+    preview_advanced = preview[
+        preview.index("// Smelt mode"):
+        preview.index("// Generation defaults", preview.index("// Smelt mode"))
+    ]
+    runtime_advanced = sessions[
+        sessions.index("// Smelt mode"):
+        sessions.index("// Generation defaults", sessions.index("// Smelt mode"))
+    ]
+
+    assert "finitePositiveInteger(configuredDepth)" in runtime_native
+    assert "finitePositiveInteger(configuredDepth)" in preview_native
+    assert "Math.round(Number(configuredDepth" not in preview_native
+    for expression in (
+        "finitePositiveInteger((config as any).smeltExperts)",
+        "finitePositiveInteger((config as any).flashMoeSlotBank)",
+        "finitePositiveInteger((config as any).flashMoeIoSplit)",
+        "finitePositiveInteger(config.numDraftTokens)",
+    ):
+        assert expression in runtime_advanced
+        assert expression in preview_advanced
+
+
+def test_command_preview_uses_runtime_numeric_sanitizers_for_core_flags() -> None:
+    """Core launch knobs must not show CLI values runtime would omit or floor."""
+
+    preview = (
+        ROOT / "panel" / "src" / "renderer" / "src" / "components" / "sessions" / "SessionSettings.tsx"
+    ).read_text(encoding="utf-8")
+    sessions = (ROOT / "panel" / "src" / "main" / "sessions.ts").read_text(encoding="utf-8")
+
+    preview_body = preview[
+        preview.index("function buildCommandPreview("):
+        preview.index("return parts.join", preview.index("function buildCommandPreview("))
+    ]
+    runtime_start = sessions.index("buildArgs(config: ServerConfig): string[]")
+    runtime_body = sessions[
+        runtime_start:
+        sessions.index("findEnginePath()", runtime_start)
+    ]
+
+    for expression in (
+        "finitePositiveInteger(config.rateLimit)",
+        "finitePositiveInteger(config.maxNumSeqs)",
+        "finitePositiveInteger(config.prefillBatchSize)",
+        "finitePositiveInteger(config.prefillStepSize)",
+        "finitePositiveInteger(config.completionBatchSize)",
+        "finitePositiveInteger(config.prefixCacheSize)",
+        "finitePositiveInteger(config.prefixCacheMaxBytes)",
+        "finitePositiveInteger(config.cacheMemoryMb)",
+        "finitePositiveNumber(config.cacheMemoryPercent)",
+        "finitePositiveNumber(config.cacheTtlMinutes)",
+        "finitePositiveInteger(effectivePagedCacheBlockSize)",
+        "finitePositiveInteger(config.maxCacheBlocks)",
+        "finitePositiveInteger(config.kvCacheGroupSize)",
+        "finiteNonNegativeNumber(config.diskCacheMaxGb)",
+        "finiteNonNegativeNumber(config.blockDiskCacheMaxGb)",
+    ):
+        assert expression in runtime_body
+        assert expression in preview_body

@@ -1,0 +1,118 @@
+{
+  "results": [
+    {
+      "route": "metal_fused_dequant_wht_sign",
+      "shape": [
+        1,
+        8,
+        2048,
+        64
+      ],
+      "bits": 8,
+      "latency_ms_mean": 50.08947490423452,
+      "latency_ms_p50": 1.3290830102050677,
+      "latency_ms_p95": 491.52833300468046,
+      "cosine_vs_reference": 0.9999998807907104,
+      "max_abs_diff_vs_reference": 0.0,
+      "rel_mae_vs_reference": 0.0,
+      "fallback_used": false,
+      "status": "valid"
+    },
+    {
+      "route": "metal_fused_dequant_wht_sign",
+      "shape": [
+        1,
+        8,
+        2048,
+        64
+      ],
+      "bits": 3,
+      "latency_ms_mean": 1.3390331994742155,
+      "latency_ms_p50": 1.2572920095408335,
+      "latency_ms_p95": 2.6718749868450686,
+      "cosine_vs_reference": 1.0,
+      "max_abs_diff_vs_reference": 0.0,
+      "rel_mae_vs_reference": 0.0,
+      "fallback_used": false,
+      "status": "valid"
+    },
+    {
+      "route": "metal_fused_dequant_wht_sign",
+      "shape": [
+        1,
+        8,
+        1024,
+        64
+      ],
+      "bits": 8,
+      "latency_ms_mean": 0.5237876030150801,
+      "latency_ms_p50": 0.36941700091119856,
+      "latency_ms_p95": 0.9727919969009236,
+      "cosine_vs_reference": 1.0,
+      "max_abs_diff_vs_reference": 0.0,
+      "rel_mae_vs_reference": 0.0,
+      "fallback_used": false,
+      "status": "valid"
+    },
+    {
+      "route": "metal_fused_dequant_wht_sign",
+      "shape": [
+        1,
+        8,
+        1024,
+        64
+      ],
+      "bits": 3,
+      "latency_ms_mean": 0.4279957996914163,
+      "latency_ms_p50": 0.3438749990891665,
+      "latency_ms_p95": 0.993415989796631,
+      "cosine_vs_reference": 1.0,
+      "max_abs_diff_vs_reference": 0.0,
+      "rel_mae_vs_reference": 0.0,
+      "fallback_used": false,
+      "status": "valid"
+    },
+    {
+      "route": "metal_fused_dequant_wht_sign",
+      "shape": [
+        1,
+        4,
+        128,
+        64
+      ],
+      "bits": 8,
+      "latency_ms_mean": 0.3102832968579605,
+      "latency_ms_p50": 0.2739999908953905,
+      "latency_ms_p95": 0.6019579886924475,
+      "cosine_vs_reference": 1.0,
+      "max_abs_diff_vs_reference": 0.0,
+      "rel_mae_vs_reference": 0.0,
+      "fallback_used": false,
+      "status": "valid"
+    },
+    {
+      "route": "metal_fused_dequant_wht_sign",
+      "shape": [
+        1,
+        4,
+        128,
+        64
+      ],
+      "bits": 3,
+      "latency_ms_mean": 0.23052109900163487,
+      "latency_ms_p50": 0.21666700195055455,
+      "latency_ms_p95": 0.3698750078910962,
+      "cosine_vs_reference": 0.9999998807907104,
+      "max_abs_diff_vs_reference": 0.0,
+      "rel_mae_vs_reference": 0.0,
+      "fallback_used": false,
+      "status": "valid"
+    }
+  ],
+  "summary": {
+    "all_valid": true,
+    "avg_cosine_vs_reference": 0.9999999602635702,
+    "avg_max_abs_diff_vs_reference": 0.0
+  },
+  "generated_at": "2026-06-03T17:44:34.993007"
+}

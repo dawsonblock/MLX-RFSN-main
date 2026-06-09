@@ -1,0 +1,70 @@
+{
+  "configs": [
+    {
+      "config": "baseline_fp16",
+      "fp16_bytes": 4194304,
+      "compressed_bytes": 4194304,
+      "scale_bytes": 0,
+      "packed_code_bytes": 0,
+      "overhead_bytes": 0,
+      "compression_ratio": 1.0,
+      "waste_ratio": 0.0
+    },
+    {
+      "fp16_bytes": 4194304,
+      "compressed_bytes": 1878956,
+      "scale_bytes": 131072,
+      "packed_code_bytes": 1747628,
+      "overhead_bytes": 256,
+      "compression_ratio": 2.2322523784484574,
+      "waste_ratio": 0.00013624587270803573,
+      "config": "stable_k8_v5_gs64"
+    },
+    {
+      "fp16_bytes": 4194304,
+      "compressed_bytes": 2010028,
+      "scale_bytes": 262144,
+      "packed_code_bytes": 1747628,
+      "overhead_bytes": 256,
+      "compression_ratio": 2.08668933965099,
+      "waste_ratio": 0.00012736140989080748,
+      "config": "stable_k8_v5_gs32"
+    },
+    {
+      "fp16_bytes": 4194304,
+      "compressed_bytes": 1811000,
+      "scale_bytes": 181100,
+      "packed_code_bytes": 1629644,
+      "overhead_bytes": 256,
+      "compression_ratio": 2.3160154610712316,
+      "waste_ratio": 0.0001413583655438984,
+      "config": "adaptive"
+    },
+    {
+      "fp16_bytes": 4194304,
+      "compressed_bytes": 1407172,
+      "scale_bytes": 140717,
+      "packed_code_bytes": 1266199,
+      "overhead_bytes": 256,
+      "compression_ratio": 2.9806619233469682,
+      "waste_ratio": 0.00018192516621990773,
+      "config": "experimental_hybrid"
+    },
+    {
+      "fp16_bytes": 4194304,
+      "compressed_bytes": 1811000,
+      "scale_bytes": 181100,
+      "packed_code_bytes": 1629644,
+      "overhead_bytes": 256,
+      "compression_ratio": 2.3160154610712316,
+      "waste_ratio": 0.0001413583655438984,
+      "config": "turbo_polar"
+    }
+  ],
+  "summary": {
+    "best_compression_config": "experimental_hybrid",
+    "best_compression_ratio": 2.9806619233469682,
+    "best_efficiency_config": "baseline_fp16",
+    "best_efficiency_waste_ratio": 0.0
+  }
+}

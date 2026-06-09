@@ -1,0 +1,156 @@
+{
+  "metadata": {
+    "shape": [
+      1,
+      4,
+      256,
+      64
+    ],
+    "repeats": 2,
+    "configs": [
+      "baseline_fp16",
+      "stable_k8_v5_gs64",
+      "stable_k8_v5_gs32",
+      "adaptive",
+      "experimental_hybrid",
+      "turbo_polar"
+    ]
+  },
+  "results": [
+    {
+      "config": "baseline_fp16",
+      "family": "baseline",
+      "prefill_ms": 0.0272504985332489,
+      "quantize_ms": 0.0,
+      "pack_ms": 0.0,
+      "unpack_ms": 0.0,
+      "dequantize_ms": 0.0,
+      "decode_ms": 0.0,
+      "total_end_to_end_ms": 0.0272504985332489,
+      "tokens_per_second": 9394323.54559125,
+      "fp16_kv_bytes": 262144,
+      "compressed_kv_bytes": 262144,
+      "compression_ratio": 1.0,
+      "peak_memory_bytes": 0.0,
+      "active_memory_bytes": 0.0
+    },
+    {
+      "config": "stable_k8_v5_gs64",
+      "family": "stable",
+      "prefill_ms": 0.007520495273638517,
+      "quantize_ms": 95.89535820123274,
+      "pack_ms": 143.8430373018491,
+      "unpack_ms": 14.159607350302393,
+      "dequantize_ms": 18.205209450388793,
+      "decode_ms": 8.091204200172797,
+      "total_end_to_end_ms": 280.20193699921947,
+      "tokens_per_second": 913.6268033747143,
+      "fp16_kv_bytes": 262144,
+      "compressed_kv_bytes": 117424,
+      "compression_ratio": 2.232456737975201,
+      "peak_memory_bytes": 1417216.0,
+      "active_memory_bytes": 446472.0
+    },
+    {
+      "config": "stable_k8_v5_gs32",
+      "family": "stable",
+      "prefill_ms": 0.7627710001543164,
+      "quantize_ms": 115.42303339811042,
+      "pack_ms": 173.13455009716563,
+      "unpack_ms": 25.34022610016109,
+      "dequantize_ms": 32.580290700207115,
+      "decode_ms": 14.480129200092051,
+      "total_end_to_end_ms": 361.7210004958906,
+      "tokens_per_second": 707.7277781744616,
+      "fp16_kv_bytes": 262144,
+      "compressed_kv_bytes": 125616,
+      "compression_ratio": 2.0868679149152976,
+      "peak_memory_bytes": 0.0,
+      "active_memory_bytes": 204800.0
+    },
+    {
+      "config": "adaptive",
+      "family": "experimental",
+      "prefill_ms": 0.014728997484780848,
+      "quantize_ms": 345.66616649681237,
+      "pack_ms": 155.54977492356556,
+      "unpack_ms": 47.919766599079594,
+      "dequantize_ms": 53.90973742396454,
+      "decode_ms": 17.969912474654848,
+      "total_end_to_end_ms": 465.48031199199613,
+      "tokens_per_second": 549.9695548979564,
+      "fp16_kv_bytes": 262144,
+      "compressed_kv_bytes": 113208,
+      "compression_ratio": 2.3155960709490495,
+      "peak_memory_bytes": 0.0,
+      "active_memory_bytes": 330752.0
+    },
+    {
+      "config": "experimental_hybrid",
+      "family": "experimental",
+      "prefill_ms": 0.008416500349994749,
+      "quantize_ms": 286.5400419977959,
+      "pack_ms": 128.94301889900817,
+      "unpack_ms": 37.835549999726936,
+      "dequantize_ms": 42.5649937496928,
+      "decode_ms": 14.188331249897601,
+      "total_end_to_end_ms": 381.13733349746326,
+      "tokens_per_second": 671.6739020311792,
+      "fp16_kv_bytes": 262144,
+      "compressed_kv_bytes": 88132,
+      "compression_ratio": 2.974447419779422,
+      "peak_memory_bytes": 0.0,
+      "active_memory_bytes": 4462024.0
+    },
+    {
+      "config": "turbo_polar",
+      "family": "experimental",
+      "prefill_ms": 0.014375000318977982,
+      "quantize_ms": 47.81222900055582,
+      "pack_ms": 21.515503050250118,
+      "unpack_ms": 15.845416599768214,
+      "dequantize_ms": 17.82609367473924,
+      "decode_ms": 5.94203122491308,
+      "total_end_to_end_ms": 87.44014550029533,
+      "tokens_per_second": 2927.7169946970794,
+      "fp16_kv_bytes": 262144,
+      "compressed_kv_bytes": 113208,
+      "compression_ratio": 2.3155960709490495,
+      "peak_memory_bytes": 0.0,
+      "active_memory_bytes": 855066.0
+    }
+  ],
+  "conclusions": {
+    "baseline_fp16": {
+      "verdict": "reference",
+      "notes": "Uncompressed FP16 baseline."
+    },
+    "stable_k8_v5_gs64": {
+      "verdict": "rejected_speed",
+      "notes": "compresses 2.23x; synthetic overhead dominates total time. Not a runtime default."
+    },
+    "stable_k8_v5_gs32": {
+      "verdict": "rejected_speed",
+      "notes": "compresses 2.09x; synthetic overhead dominates total time. Not a runtime default."
+    },
+    "adaptive": {
+      "verdict": "rejected_speed",
+      "notes": "Best experimental quality candidate; compression overhead dominates. Not a default."
+    },
+    "experimental_hybrid": {
+      "verdict": "rejected_speed",
+      "notes": "Best synthetic compression candidate; overhead dominates. Not a default."
+    },
+    "turbo_polar": {
+      "verdict": "rejected_speed",
+      "notes": "Fastest compressed experimental path in this synthetic benchmark; still overhead-dominated. Study target, not default."
+    },
+    "ranking": {
+      "fastest_compressed": "turbo_polar",
+      "best_quality_compressed": "adaptive",
+      "best_stable_default": "stable_k8_v5_gs64",
+      "best_conservative_quality": "stable_k8_v5_gs32",
+      "caveat": "This benchmark uses a tiny synthetic KV shape [1,4,256,64] with 2 repeats. The FP16 baseline is unrealistically fast. The ratios reflect current implementation overhead, not theoretical limits. Do not conclude all compression is useless; conclude the current Python/MLX overhead dominates."
+    }
+  }
+}

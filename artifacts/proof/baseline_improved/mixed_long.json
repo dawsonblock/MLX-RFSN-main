@@ -1,0 +1,195 @@
+{
+  "release": "main27",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 512,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 3908.1958749993646,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000037252903,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "mixed_L0-1k8v4_restk6v4_gs64",
+          "k_bits": 6,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": -4.8973550860864634e-05,
+          "latency_ms": 5476.909666998836,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.99968187417835,
+          "logit_cosine_min": 0.9987057447433472,
+          "logit_max_abs_diff": 0.44209020491689444,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.984375,
+          "kl_divergence_mean": 5.726597813948686e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs64",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": 1.3219946481513034e-05,
+          "latency_ms": 5259.409416998096,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9997828705236316,
+          "logit_cosine_min": 0.9992324113845825,
+          "logit_max_abs_diff": 0.3678642655722797,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 2.3243424327468176e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 1024,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 3760.0006249995204,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999823048711,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "mixed_L0-1k8v4_restk6v4_gs64",
+          "k_bits": 6,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": -4.572749958242639e-06,
+          "latency_ms": 4715.928541998437,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9997393237426877,
+          "logit_cosine_min": 0.9991395473480225,
+          "logit_max_abs_diff": 0.40432127472013235,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.978125,
+          "kl_divergence_mean": 1.2615972856400148e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs64",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": 2.55045300718848e-05,
+          "latency_ms": 4841.157416001806,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9997687488794327,
+          "logit_cosine_min": 0.9990808963775635,
+          "logit_max_abs_diff": 0.4136227201670408,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.990625,
+          "kl_divergence_mean": 2.0273606251564047e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 2048,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 5344.5645829997375,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000027939677,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "mixed_L0-1k8v4_restk6v4_gs64",
+          "k_bits": 6,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": 1.210618756886106e-05,
+          "latency_ms": 46219.02074999889,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9997973330318928,
+          "logit_cosine_min": 0.9992899894714355,
+          "logit_max_abs_diff": 0.3431184170767665,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.9875,
+          "kl_divergence_mean": 1.0366503413461459e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs64",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": -1.3156882346265775e-05,
+          "latency_ms": 54253.98474999747,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9998105559498072,
+          "logit_cosine_min": 0.999372124671936,
+          "logit_max_abs_diff": 0.33813313813880086,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 1.395015766014751e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "k8_v4_gs64",
+    "best_memory_config_passing_all_contexts": "mixed_L0-1k8v4_restk6v4_gs64",
+    "recommended_default": "mixed_L0-1k8v4_restk6v4_gs64",
+    "compression_estimate_x": {
+      "baseline_fp16": 0.9696969696969697,
+      "mixed_L0-1k8v4_restk6v4_gs64": 2.8054794520547945,
+      "k8_v4_gs64": 2.4615384615384617
+    },
+    "rejected_configs": [],
+    "production_ready": false
+  }
+}

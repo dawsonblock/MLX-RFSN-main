@@ -1,0 +1,3 @@
+Evaluate RFSN runtime quality under strict Metal equivalence constraints.
+Explain why sparse safety gating should default to dense execution until empirical thresholds are met.
+Provide one concise recommendation for safe rollout.

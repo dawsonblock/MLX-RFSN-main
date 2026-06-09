@@ -1,0 +1,59 @@
+name: Cross-Platform Backend Tests
+
+on:
+  push:
+    branches: [main, feature/*]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-macos-arm:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lock Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.2.app
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[mlx,dev]"
+      - name: Test Metal backend + coverage
+        run: |
+          python -c "from rfsn_v10.kernels import backend; assert backend.name == 'metal'"
+          pytest tests/test_attention.py tests/test_drift.py tests/test_bitpack_fuzz.py tests/test_stress_32k.py tests/test_integration_7b_synthetic.py -v --cov=rfsn_v10 --cov-report=term-missing
+      - name: Benchmark regression check
+        run: |
+          python benchmarks/run_deterministic.py
+          python benchmarks/check_regression.py benchmarks/results/baseline.json benchmarks/results/latest.json
+
+  # NOTE: macos-x86 (Intel) job removed — Metal is Apple Silicon only.
+  # MLX does not support Intel Macs. This job was misleadingly claiming to
+  # validate Metal on a platform where it does not run.
+
+  test-ubuntu-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps (no MLX)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test NumPy backend
+        env:
+          RFSN_BACKEND: numpy
+        run: |
+          python -c "from rfsn_v10.kernels import backend; assert backend.name == 'numpy'"
+          python -c "
+          import numpy as np
+          from rfsn_v10.kernels import backend
+          packed, n = backend.pack_bits(np.array([1,2,3,4], dtype=np.uint32), bits=4)
+          codes = backend.unpack_bits(packed, n, bits=4)
+          assert np.array_equal(codes, [1,2,3,4])
+          print('NumPy backend OK')
+          "

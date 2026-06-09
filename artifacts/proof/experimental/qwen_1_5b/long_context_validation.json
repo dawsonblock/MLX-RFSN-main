@@ -1,0 +1,62 @@
+{
+  "release": "experimental",
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 512,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "status": "reference"
+        },
+        {
+          "name": "k8_v5_gs64",
+          "status": "pass"
+        },
+        {
+          "name": "k8_v5_gs32",
+          "status": "pass"
+        },
+        {
+          "name": "adaptive",
+          "status": "pass"
+        },
+        {
+          "name": "experimental_hybrid",
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "tokens": 1024,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "status": "reference"
+        },
+        {
+          "name": "k8_v5_gs64",
+          "status": "pass"
+        },
+        {
+          "name": "k8_v5_gs32",
+          "status": "pass"
+        },
+        {
+          "name": "adaptive",
+          "status": "pass"
+        },
+        {
+          "name": "experimental_hybrid",
+          "status": "pass"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "baseline_fp16",
+    "best_memory_config_passing_all_contexts": "adaptive",
+    "rejected_configs": [],
+    "production_ready": false
+  }
+}

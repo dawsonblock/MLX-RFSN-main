@@ -1,0 +1,197 @@
+============================================================
+RFSN v10 Bitpack Benchmarks
+============================================================
+{
+  "hardware": "arm64",
+  "platform": "macOS-26.2-arm64-arm-64bit",
+  "python_version": "3.11.9",
+  "timestamp": "2026-06-08T21:04:59.812318+00:00"
+}
+
+
+--- bits=3 ---
+  pack n=      1000: 5.552 ms, ratio=0.100, 0.2M codes/s
+  unpack n=      1000: 2.759 ms, 0.4M codes/s
+  pack n=     10000: 1.630 ms, ratio=0.100, 6.1M codes/s
+  unpack n=     10000: 0.378 ms, 26.5M codes/s
+  pack n=    100000: 2.156 ms, ratio=0.100, 46.4M codes/s
+  unpack n=    100000: 1.098 ms, 91.1M codes/s
+  pack n=   1000000: 2.652 ms, ratio=0.100, 377.0M codes/s
+  unpack n=   1000000: 0.948 ms, 1054.7M codes/s
+  pack n=  10000000: 9.171 ms, ratio=0.100, 1090.4M codes/s
+  unpack n=  10000000: 8.032 ms, 1245.0M codes/s
+
+--- bits=8 ---
+  pack n=      1000: 3.554 ms, ratio=0.250, 0.3M codes/s
+  unpack n=      1000: 1.214 ms, 0.8M codes/s
+  pack n=     10000: 1.660 ms, ratio=0.250, 6.0M codes/s
+  unpack n=     10000: 0.377 ms, 26.5M codes/s
+  pack n=    100000: 1.937 ms, ratio=0.250, 51.6M codes/s
+  unpack n=    100000: 0.881 ms, 113.6M codes/s
+  pack n=   1000000: 8.977 ms, ratio=0.250, 111.4M codes/s
+  unpack n=   1000000: 2.234 ms, 447.7M codes/s
+  pack n=  10000000: 5.307 ms, ratio=0.250, 1884.4M codes/s
+  unpack n=  10000000: 1.804 ms, 5542.9M codes/s
+
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.11.9",
+    "timestamp": "2026-06-08T21:04:59.812318+00:00"
+  },
+  "pack": [
+    {
+      "bits": 3,
+      "n_codes": 1000,
+      "pack_latency_ms": 5.552008401718922,
+      "throughput_codes_per_s": 180115.00121116466,
+      "original_bytes": 4000,
+      "packed_bytes": 400,
+      "compression_ratio": 0.1
+    },
+    {
+      "bits": 3,
+      "n_codes": 10000,
+      "pack_latency_ms": 1.6297752037644386,
+      "throughput_codes_per_s": 6135815.526522982,
+      "original_bytes": 40000,
+      "packed_bytes": 4000,
+      "compression_ratio": 0.1
+    },
+    {
+      "bits": 3,
+      "n_codes": 100000,
+      "pack_latency_ms": 2.155725104967132,
+      "throughput_codes_per_s": 46388103.8308568,
+      "original_bytes": 400000,
+      "packed_bytes": 40000,
+      "compression_ratio": 0.1
+    },
+    {
+      "bits": 3,
+      "n_codes": 1000000,
+      "pack_latency_ms": 2.652441695681773,
+      "throughput_codes_per_s": 377011114.56211066,
+      "original_bytes": 4000000,
+      "packed_bytes": 400000,
+      "compression_ratio": 0.1
+    },
+    {
+      "bits": 3,
+      "n_codes": 10000000,
+      "pack_latency_ms": 9.171079308725893,
+      "throughput_codes_per_s": 1090384202.706155,
+      "original_bytes": 40000000,
+      "packed_bytes": 4000000,
+      "compression_ratio": 0.1
+    },
+    {
+      "bits": 8,
+      "n_codes": 1000,
+      "pack_latency_ms": 3.554129204712808,
+      "throughput_codes_per_s": 281362.8718601425,
+      "original_bytes": 4000,
+      "packed_bytes": 1000,
+      "compression_ratio": 0.25
+    },
+    {
+      "bits": 8,
+      "n_codes": 10000,
+      "pack_latency_ms": 1.6603710944764316,
+      "throughput_codes_per_s": 6022749.994424181,
+      "original_bytes": 40000,
+      "packed_bytes": 10000,
+      "compression_ratio": 0.25
+    },
+    {
+      "bits": 8,
+      "n_codes": 100000,
+      "pack_latency_ms": 1.9374583062017336,
+      "throughput_codes_per_s": 51614013.9273726,
+      "original_bytes": 400000,
+      "packed_bytes": 100000,
+      "compression_ratio": 0.25
+    },
+    {
+      "bits": 8,
+      "n_codes": 1000000,
+      "pack_latency_ms": 8.976958398125134,
+      "throughput_codes_per_s": 111396305.4801338,
+      "original_bytes": 4000000,
+      "packed_bytes": 1000000,
+      "compression_ratio": 0.25
+    },
+    {
+      "bits": 8,
+      "n_codes": 10000000,
+      "pack_latency_ms": 5.306829189066775,
+      "throughput_codes_per_s": 1884364399.8571086,
+      "original_bytes": 40000000,
+      "packed_bytes": 10000000,
+      "compression_ratio": 0.25
+    }
+  ],
+  "unpack": [
+    {
+      "bits": 3,
+      "n_codes": 1000,
+      "unpack_latency_ms": 2.758566598640755,
+      "throughput_codes_per_s": 362507.10803673766
+    },
+    {
+      "bits": 3,
+      "n_codes": 10000,
+      "unpack_latency_ms": 0.37805009342264384,
+      "throughput_codes_per_s": 26451521.039092634
+    },
+    {
+      "bits": 3,
+      "n_codes": 100000,
+      "unpack_latency_ms": 1.0982374951709062,
+      "throughput_codes_per_s": 91054986.2299485
+    },
+    {
+      "bits": 3,
+      "n_codes": 1000000,
+      "unpack_latency_ms": 0.9481126064201817,
+      "throughput_codes_per_s": 1054727036.8819703
+    },
+    {
+      "bits": 3,
+      "n_codes": 10000000,
+      "unpack_latency_ms": 8.032404197729193,
+      "throughput_codes_per_s": 1244957269.8080928
+    },
+    {
+      "bits": 8,
+      "n_codes": 1000,
+      "unpack_latency_ms": 1.2135622033383697,
+      "throughput_codes_per_s": 824020.3899306648
+    },
+    {
+      "bits": 8,
+      "n_codes": 10000,
+      "unpack_latency_ms": 0.3772082010982558,
+      "throughput_codes_per_s": 26510558.282891586
+    },
+    {
+      "bits": 8,
+      "n_codes": 100000,
+      "unpack_latency_ms": 0.8806209953036159,
+      "throughput_codes_per_s": 113556229.67576706
+    },
+    {
+      "bits": 8,
+      "n_codes": 1000000,
+      "unpack_latency_ms": 2.2335792949888855,
+      "throughput_codes_per_s": 447711886.5864917
+    },
+    {
+      "bits": 8,
+      "n_codes": 10000000,
+      "unpack_latency_ms": 1.8041082978015766,
+      "throughput_codes_per_s": 5542904498.6853895
+    }
+  ]
+}

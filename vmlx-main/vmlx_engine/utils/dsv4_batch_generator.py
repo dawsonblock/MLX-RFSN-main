@@ -1,0 +1,866 @@
+# SPDX-License-Identifier: Apache-2.0
+"""DSV4-Flash custom batch generator.
+
+Bypasses ``mlx_lm.generate.BatchGenerator`` entirely for DSV4-Flash JANGTQ
+bundles because the mlx_lm code path triggers ``mx.eval`` /
+``mx.async_eval`` calls that traverse the tensor stream graph and hit
+``RuntimeError: There is no Stream(gpu, N) in current thread.`` on the
+llm-worker step executor (DSV4 model forward allocates internal Metal
+streams that don't survive the cross-thread context).
+
+This implementation mirrors the canonical ``jang_tools.dsv4.runtime.generate``
+path — same prompt encode → prefill → decode → parse loop, but exposes the BatchGenerator
+API surface (``insert`` / ``next`` / ``next_generated`` / ``remove`` /
+``extract_cache``) so the existing vmlx scheduler can drive it without
+caring which generator is underneath.
+
+Constraints:
+- Single-batch only (``max_num_seqs=1``). Multi-batch DSV4 isn't
+  supported — the compressor + indexer pool state can't be sliced
+  per-request without a full re-prefill.
+- Internally always pins ops to ``mx.stream(mx.default_device())`` so
+  there's no chance of cross-thread stream leakage.
+"""
+from __future__ import annotations
+import logging
+import os
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Optional, Sequence, Tuple
+
+import mlx.core as mx
+
+logger = logging.getLogger(__name__)
+
+# DSV4-Flash-specific token IDs (canonical, mirrors
+# jang_tools.dsv4.runtime.{THINK_OPEN_ID,THINK_CLOSE_ID,EOS_ID})
+THINK_OPEN_ID = 128821
+THINK_CLOSE_ID = 128822
+DSV4_EOS_ID = 1
+DSV4_USER_ID = 128803
+DSV4_ASSISTANT_ID = 128804
+DEFAULT_DSV4_PROMPT_SNAPSHOT_MIN_TOKENS = 256
+
+
+def dsv4_prompt_snapshot_min_tokens() -> int:
+    """Minimum DSV4 N-1 prompt-key length that donates a sync snapshot.
+
+    DSV4's composite prompt-boundary snapshot is correctness-safe for prefix/L2
+    store, but live timing showed it can cost seconds on tiny prompts. Short
+    prompts are cheap to re-prefill on the next request, so default to only
+    snapshotting block-sized-or-larger prefix keys. Operators can lower this
+    for diagnostics or cache experiments without changing sampling behavior.
+    """
+    raw = os.environ.get("DSV4_PROMPT_SNAPSHOT_MIN_TOKENS")
+    if raw is None:
+        raw = os.environ.get("VMLINUX_DSV4_PROMPT_SNAPSHOT_MIN_TOKENS")
+    if raw is None:
+        return DEFAULT_DSV4_PROMPT_SNAPSHOT_MIN_TOKENS
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid DSV4 prompt snapshot threshold %r; using default %d",
+            raw,
+            DEFAULT_DSV4_PROMPT_SNAPSHOT_MIN_TOKENS,
+        )
+        return DEFAULT_DSV4_PROMPT_SNAPSHOT_MIN_TOKENS
+
+
+@dataclass
+class _Request:
+    uid: int
+    prompt_tokens: List[int]
+    context_tokens: List[int]
+    cache: Optional[List[Any]]
+    out_tokens: List[int] = field(default_factory=list)
+    max_tokens: int = 1024
+    sampler: Optional[Callable] = None
+    logits_processors: Optional[List[Callable]] = None
+    state_machine: Any = None
+    matcher_state: Any = None
+    finish_reason: Optional[str] = None
+    prompt_processed: bool = False
+    # Clean prompt-boundary cache snapshot, captured immediately after
+    # prefill completes and BEFORE decode advances the live cache. Used
+    # by scheduler to populate prefix cache / L2 disk store with state
+    # that has no output-side contamination — solves the SWA wrap +
+    # CSA/HCA pool-drift problem without sacrificing cache hit rate.
+    prompt_snapshot: Optional[List[Any]] = None
+
+
+@dataclass
+class _Response:
+    """Mirror of mlx_lm.generate.BatchGenerator.Response (subset we use)."""
+    uid: int
+    token: int
+    logprobs: Any
+    finish_reason: Optional[str] = None
+    current_state: Any = None
+    match_sequence: Any = None
+    # `prompt_cache` is the LIVE cache used for decode (kept for back-compat
+    # with mlx_lm.BatchGenerator semantics that the scheduler expects).
+    # `prompt_cache_snapshot` is the clean prefill-time copy used for store.
+    prompt_cache: Any = None
+    prompt_cache_snapshot: Any = None
+
+
+class DSV4BatchGenerator:
+    """Drop-in replacement for ``mlx_lm.generate.BatchGenerator`` scoped to
+    DSV4-Flash. Single-request at a time. Idempotent stream pinning.
+
+    Public API mirrors the subset that vmlx scheduler uses:
+        insert(prompts, max_tokens, caches, samplers, logits_processors, state_machines)
+        next() -> (prompt_responses, generation_responses)
+        next_generated() -> generation_responses
+        remove(uids, return_prompt_caches=False) -> dict | None
+        extract_cache(uids) -> dict
+        stop_tokens (mutable set)
+    """
+
+    Response = _Response  # so callers that do `BatchGenerator.Response(...)` keep working
+
+    def __init__(
+        self,
+        model,
+        *,
+        max_tokens: int = 1024,
+        stop_tokens: Optional[Sequence[Sequence[int]]] = None,
+        sampler: Optional[Callable] = None,
+        logits_processors: Optional[List[Callable]] = None,
+        completion_batch_size: int = 1,
+        prefill_batch_size: int = 1,
+        prefill_step_size: int = 2048,
+        max_kv_size: Optional[int] = None,
+        stream=None,
+        capture_prompt_snapshot: bool = True,
+    ):
+        self.model = model
+        self.max_tokens = max_tokens
+        # Mark first request so we know to warm up MLX kernels before
+        # the user's prefill (DSV4 first forward triggers hash-routed
+        # layer JIT that exceeds the Metal command-buffer watchdog if
+        # done in one shot on a long prompt).
+        self._warmed_up = False
+        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.fallback_sampler = self.sampler
+        self.logits_processors = logits_processors or []
+        # stop_tokens is exposed as a mutable set the scheduler mutates.
+        self.stop_tokens = set()
+        if stop_tokens:
+            for seq in stop_tokens:
+                if isinstance(seq, int):
+                    self.stop_tokens.add(seq)
+                else:
+                    # Multi-token stop sequence — store as tuple
+                    self.stop_tokens.add(tuple(seq))
+        # DSV4 has learned role-boundary tokens. If a registry/config path
+        # forgets them, generation can continue into fake user/assistant turns.
+        self.stop_tokens.update({DSV4_USER_ID, DSV4_ASSISTANT_ID})
+        _log_stop_tokens = sorted(
+            self.stop_tokens,
+            key=lambda item: (isinstance(item, tuple), repr(item)),
+        )
+        logger.info(
+            f"DSV4Gen: stop_tokens at construction = {_log_stop_tokens} "
+            f"(DSV4_EOS_ID={DSV4_EOS_ID} always-checked separately)"
+        )
+        # DSV4 prefill defaults to bounded chunks.
+        #
+        # v1.5.6 (commit 00a78db4) established that chunking the DSV4
+        # prefill corrupts the compressor + indexer pool state mid-decode
+        # (broadcast_shapes mismatch on subsequent decode steps). v1.5.15
+        # silently re-introduced chunking at 512 with a comment claiming
+        # "current DeepseekV4Cache accumulates pool state correctly across
+        # calls" — this is unverified and contradicted by v1.5.6's
+        # empirical 14/14 probe matrix. The jang-tools DSV4 runtime is
+        # unchanged between 2.5.18 (v1.5.10 baseline) and 2.5.23 (current),
+        # so the chunking corruption v1.5.6 documented stayed latent until the
+        # materialized PoolQuantizedV4Cache path was repaired.
+        #
+        # v1.5.49+ live installed-app stress showed single-shot DSV4 prefill can
+        # transiently hit the 128GB machine limit on a ~10k-token prompt, while
+        # the 2048-token step path preserved native block/L2 cache hits and kept
+        # peak memory near the resident model size. Operators can still force
+        # legacy single-shot with DSV4_PREFILL_STEP_SIZE=0 for diagnostics.
+        try:
+            _dsv4_step_env = os.environ.get("DSV4_PREFILL_STEP_SIZE")
+            _dsv4_step = (
+                int(_dsv4_step_env)
+                if _dsv4_step_env is not None
+                else int(prefill_step_size or 2048)
+            )
+        except (TypeError, ValueError):
+            _dsv4_step = int(prefill_step_size or 2048)
+        if _dsv4_step <= 0:
+            # Single-shot — set step to a sentinel larger than any real
+            # prompt so the chunked loop runs exactly once.
+            self.prefill_step_size = 1 << 30
+        else:
+            self.prefill_step_size = _dsv4_step
+        self.prefill_batch_size = 1  # always 1 for DSV4
+        self.completion_batch_size = 1
+        self.max_kv_size = max_kv_size
+        self.capture_prompt_snapshot = bool(capture_prompt_snapshot)
+        self.prompt_snapshot_min_tokens = dsv4_prompt_snapshot_min_tokens()
+        self._uid_count = 0
+        self._requests: List[_Request] = []
+        # Pin a concrete MLX stream owned by this generator. Using the
+        # device object implicitly resolves Stream(gpu, 0), which can be
+        # absent in the scheduler worker thread on cache-hit replay.
+        self._device = mx.default_device()
+        self._stream = stream or mx.default_stream(self._device)
+
+    def _trace_timing(self, event: str, start: float, uid: Optional[int] = None, **fields: Any) -> None:
+        if os.environ.get("VMLINUX_DSV4_TRACE_TIMINGS", "").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+        try:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            extra = " ".join(f"{k}={v}" for k, v in fields.items())
+            logger.info(
+                "DSV4 timing: component=generator event=%s uid=%s elapsed_ms=%.3f %s",
+                event,
+                uid,
+                elapsed_ms,
+                extra,
+            )
+        except Exception:
+            pass
+
+    def _refresh_thread_stream(self):
+        """Bind the generator to this worker thread's default MLX stream."""
+        try:
+            self._stream = mx.default_stream(self._device)
+        except Exception:
+            pass
+
+    def _sync(self):
+        if not hasattr(mx, "synchronize"):
+            return
+        try:
+            mx.synchronize(self._stream)
+        except TypeError:
+            mx.synchronize()
+
+    def _sampled_token_id(self, sampled) -> int:
+        """Materialize a sampled token on this worker thread's stream."""
+        with mx.stream(self._stream):
+            try:
+                # Re-home the scalar onto the active worker stream before
+                # tolist()/item() forces synchronization. Cache-hit replay can
+                # otherwise leave the sampled scalar associated with a stale
+                # Stream(gpu, 0) object from an earlier request/thread.
+                sampled = sampled + mx.zeros_like(sampled)
+            except Exception:
+                pass
+            # Scalar materialization is the required sync point. Calling
+            # _sync() here first adds a second host/GPU barrier to every
+            # decode token on the DSV4 hot path.
+            return int(sampled.tolist()[0]) if hasattr(sampled, "tolist") else int(sampled.item())
+
+    # ---------- helpers ----------
+    def _make_new_cache(self):
+        if hasattr(self.model, "make_cache"):
+            return self.model.make_cache()
+        from mlx_lm.models.cache import KVCache
+        # 43 layers for DSV4-Flash (caller will get this right via model.make_cache)
+        return [KVCache() for _ in range(getattr(self.model, "n_layers", 43))]
+
+    @staticmethod
+    def _snapshot_dsv4_cache(cache_list: List[Any]) -> Optional[List[Any]]:
+        """Deep-copy a DSV4 cache list at the prompt boundary.
+
+        Captures a clean snapshot of `DeepseekV4Cache` (or any other cache
+        class in the list) IMMEDIATELY after prefill, before decode starts
+        advancing the live cache. This snapshot represents the prompt-only
+        state — no SWA wrap, no CSA/HCA pool drift from output tokens, no
+        cumulative contamination.
+
+        Used by scheduler to populate prefix cache + L2 disk store. The
+        guard at `_truncate_cache_to_prompt_length` is replaced by snapshot
+        consumption: when a request has a snapshot, scheduler stores that
+        directly (no rewind attempt). When no snapshot, the conservative
+        guard still fires.
+
+        Returns a NEW list of cache objects, deep-copied via numpy
+        roundtrip. Returns None if any layer fails to snapshot (caller
+        falls through to the conservative no-store path).
+        """
+        try:
+            import numpy as np
+            from jang_tools.dsv4.mlx_model import DeepseekV4Cache
+        except Exception:
+            return None
+
+        _force_realize = getattr(mx, "eval")
+        # Track per-snapshot copy failures so we can hard-fail the whole
+        # snapshot if any LEAF array fails to round-trip. Silent None
+        # leaves were a real bug: if any DSV4 cache
+        # leaf is bf16, np.array(bf16_mx_array) raises a buffer-format
+        # error and would have left a None in place of real state →
+        # corrupted snapshot replays as garbage on cache hit.
+        copy_errors: List[str] = []
+
+        def _arr_copy(a):
+            """Force-realize and deep-copy an mx.array via numpy.
+
+            Casts bf16 → fp32 before numpy roundtrip because direct
+            np.array() on a bfloat16 mlx array raises:
+                "Item size 2 for PEP 3118 buffer format string B does
+                 not match the dtype B item size 1"
+            Restores fp32 → original dtype on the way back so the
+            snapshot's per-leaf dtype matches the live cache.
+            """
+            if a is None:
+                return None
+            try:
+                _force_realize(a)
+                src_dtype = a.dtype
+                # bf16 / non-numpy-mappable dtypes need fp32 staging.
+                # np.array() on bf16 raises buffer-format error.
+                use_fp32_stage = (
+                    str(src_dtype).endswith("bfloat16")
+                    or str(src_dtype).endswith("float8")
+                )
+                if use_fp32_stage:
+                    a_fp32 = a.astype(mx.float32)
+                    np_arr = np.array(a_fp32, copy=True)
+                    return mx.array(np_arr, dtype=mx.float32).astype(src_dtype)
+                return mx.array(np.array(a, copy=True), dtype=src_dtype)
+            except Exception as e:
+                copy_errors.append(f"{type(a).__name__}/{getattr(a,'dtype','?')}: {e}")
+                return None
+
+        snapshots: List[Any] = []
+
+        def _is_dsv4_cache(obj) -> bool:
+            try:
+                return any(
+                    cls.__name__ in {"DeepseekV4Cache", "PoolQuantizedV4Cache"}
+                    for cls in type(obj).__mro__
+                )
+            except Exception:
+                return False
+
+        for layer_cache in cache_list:
+            try:
+                cls_name = type(layer_cache).__name__
+                if _is_dsv4_cache(layer_cache):
+                    # DSV4 composite: state = (local_kv, comp_state, idx_state)
+                    local = getattr(layer_cache, "local", None)
+                    sliding_window = int(getattr(local, "max_size", 128) or 128)
+                    compress_ratio = getattr(layer_cache, "compress_ratio", None)
+
+                    new_cache = DeepseekV4Cache(
+                        sliding_window=sliding_window,
+                        compress_ratio=compress_ratio,
+                    )
+
+                    # Read state tuple via @property (returns nested tuples
+                    # of mx.arrays). Deep-copy each leaf array.
+                    state = layer_cache.state
+                    if state is not None:
+                        snap_state = []
+                        for sub in state:
+                            if sub is None:
+                                snap_state.append(None)
+                            elif isinstance(sub, (tuple, list)):
+                                snap_state.append(tuple(_arr_copy(x) for x in sub))
+                            else:
+                                snap_state.append(_arr_copy(sub))
+                        new_cache.state = tuple(snap_state)
+                    try:
+                        new_cache.meta_state = layer_cache.meta_state
+                    except Exception:
+                        pass
+                    snapshots.append(new_cache)
+                elif hasattr(layer_cache, "keys") and hasattr(layer_cache, "values"):
+                    from mlx_lm.models.cache import KVCache
+                    nc = type(layer_cache)() if "Cache" in cls_name else KVCache()
+                    try:
+                        k = layer_cache.keys
+                        v = layer_cache.values
+                        if k is not None and v is not None:
+                            nc.keys = _arr_copy(k)
+                            nc.values = _arr_copy(v)
+                            try:
+                                nc.offset = int(getattr(layer_cache, "offset", 0) or 0)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    snapshots.append(nc)
+                else:
+                    snapshots.append(None)
+            except Exception as e:
+                logger.debug(f"DSV4 snapshot failed for layer: {e}")
+                return None
+        # Hard-fail the whole snapshot if ANY leaf copy reported an
+        # error. Silent None leaves would corrupt cache replays.
+        if copy_errors:
+            logger.warning(
+                f"DSV4 snapshot REJECTED: {len(copy_errors)} leaf copy "
+                f"errors (first 3): {copy_errors[:3]}"
+            )
+            return None
+        return snapshots
+
+    def _should_capture_logprobs(self, uid: int) -> bool:
+        try:
+            from .mamba_cache import _should_capture_generation_logprobs
+
+            return bool(_should_capture_generation_logprobs(self.model, [uid])[0])
+        except Exception:
+            return False
+
+    def _sample(
+        self,
+        logits,
+        sampler,
+        processors,
+        recent_tokens,
+        generated_tokens=None,
+        capture_logprobs: bool = False,
+    ):
+        """Apply logits processors then sample. logits: (1, vocab).
+
+        `recent_tokens`: full prompt+generated context (used by rep_penalty
+            processor — mlx_lm convention).
+        `generated_tokens`: GENERATED-ONLY context (used by the hard n-gram
+            dedup so the prompt cannot poison the dedup state). When None,
+            falls back to `recent_tokens` for backwards compat.
+        """
+        x = logits
+        for p in processors or []:
+            # processor signature: fn(token_context, logits) -> logits
+            try:
+                x = p(recent_tokens, x)
+            except TypeError:
+                x = p(x)
+        sample_fn = sampler or self.fallback_sampler
+        if (
+            not capture_logprobs
+            and getattr(sample_fn, "_vmlx_accepts_logits", False)
+        ):
+            sampled = sample_fn(x)
+            return sampled, None
+
+        # Convert log-probs via logsumexp normalization only when the sampler
+        # needs normalized probabilities or the request asked for logprobs.
+        # Default vMLX greedy samplers accept raw logits; materializing a
+        # full-vocab log-softmax every token is wasted DSV4 decode time.
+        logprobs = x - mx.logsumexp(x, axis=-1, keepdims=True)
+        sampled = sample_fn(logprobs)
+        return sampled, logprobs
+
+    @staticmethod
+    def _realize_last_logits(last_logits: Any) -> None:
+        mx.eval(last_logits)
+
+    def _prefill_last_logits(
+        self,
+        token_ids: List[int],
+        cache: List[Any],
+        *,
+        realize_before_clear: bool = True,
+    ):
+        """DSV4 prefill returning logits for the last prompt token.
+
+        Default behavior is bounded-step prefill. The production default uses
+        a 2048-token step after installed-app cache-hit validation showed it
+        preserves native block/L2 cache hits while avoiding the transient
+        memory spike seen with large single-shot prompts. Operators can still
+        force legacy single-shot with DSV4_PREFILL_STEP_SIZE=0 for diagnostics.
+        Each step runs against the same native composite cache and clears
+        transient MLX buffers between chunks.
+        """
+        if not token_ids:
+            return None
+        all_ids = mx.array(token_ids, dtype=mx.int32)[None, :]
+        last_logits = None
+        total = len(token_ids)
+        step = max(1, self.prefill_step_size)
+        for off in range(0, total, step):
+            chunk = all_ids[:, off:min(off + step, total)]
+            logits = self.model(chunk, cache=cache)
+            last_logits = logits[:, -1, :]
+            # Force the logits graph and cache side effects to materialize
+            # before clearing transient allocator buffers. A stream sync alone
+            # does not schedule lazy MLX work.
+            if realize_before_clear:
+                self._realize_last_logits(last_logits)
+            if hasattr(mx, "synchronize"):
+                self._sync()
+            else:
+                mx.eval(last_logits)
+            if hasattr(mx, "clear_cache"):
+                mx.clear_cache()
+        return last_logits
+
+    # ---------- BatchGenerator API ----------
+    def insert(
+        self,
+        prompts: List[List[int]],
+        max_tokens: Optional[List[int]] = None,
+        caches: Optional[List[List[Any]]] = None,
+        all_tokens: Optional[List[List[int]]] = None,
+        samplers: Optional[List[Callable]] = None,
+        logits_processors: Optional[List[List[Callable]]] = None,
+        state_machines: Optional[List[Any]] = None,
+    ):
+        # Auto-evict any already-finished requests so the scheduler can
+        # queue the next one. Without this, the scheduler keeps retrying
+        # inserts because the generator still claims slot 0 is taken.
+        self._requests = [r for r in self._requests if r.finish_reason is None]
+        if len(self._requests) + len(prompts) > 1:
+            raise NotImplementedError(
+                "DSV4BatchGenerator only supports max_num_seqs=1. "
+                "Restart with --max-num-seqs 1 (continuous batching off)."
+            )
+        uids = []
+        max_tokens = max_tokens or [self.max_tokens] * len(prompts)
+        caches = caches or [None] * len(prompts)
+        all_tokens = all_tokens or prompts
+        samplers = samplers or [None] * len(prompts)
+        logits_processors = logits_processors or [None] * len(prompts)
+        state_machines = state_machines or [None] * len(prompts)
+        for i, p in enumerate(prompts):
+            req = _Request(
+                uid=self._uid_count,
+                prompt_tokens=list(p),
+                context_tokens=list(all_tokens[i] or p),
+                cache=caches[i],
+                max_tokens=max_tokens[i],
+                sampler=samplers[i],
+                logits_processors=logits_processors[i] or self.logits_processors,
+                state_machine=state_machines[i],
+            )
+            if state_machines[i] is not None and hasattr(state_machines[i], "make_state"):
+                req.matcher_state = state_machines[i].make_state()
+            self._requests.append(req)
+            uids.append(self._uid_count)
+            self._uid_count += 1
+        return uids
+
+    def insert_segments(self, segments, *args, **kwargs):
+        # mlx_lm convention: segments[i] is list of token segments per request.
+        # Flatten by concatenation — DSV4 doesn't use multi-segment prefill.
+        flat = [sum(seg, []) for seg in segments]
+        return self.insert(flat, *args, **kwargs)
+
+    @staticmethod
+    def _processor_context(req: _Request) -> List[int]:
+        """Full token history for logits processors.
+
+        mlx-lm's repetition penalty is applied over the generated context, not
+        just a small recent window. DSV4 is especially sensitive here: limiting
+        the processor context to the last 32 output tokens allowed long-form
+        chat to re-enter earlier sentence/paragraph loops once the repeated
+        phrase fell outside that window.
+        """
+        return list(req.context_tokens) + list(req.out_tokens)
+
+    @staticmethod
+    def _prompt_starts_in_think(req: _Request) -> bool:
+        """Return True when DSV4's prompt leaves generation inside <think>.
+
+        Direct/instruct rail ends the assistant prefix with </think>, while the
+        thinking rail ends with <think>. This check is token-based so it follows
+        the canonical DSV4 encoder instead of string-rendering assumptions.
+        """
+        try:
+            last_open = len(req.prompt_tokens) - 1 - req.prompt_tokens[::-1].index(THINK_OPEN_ID)
+        except ValueError:
+            last_open = -1
+        try:
+            last_close = len(req.prompt_tokens) - 1 - req.prompt_tokens[::-1].index(THINK_CLOSE_ID)
+        except ValueError:
+            last_close = -1
+        return last_open > last_close
+
+    def _effective_max_tokens(self, req: _Request) -> int:
+        return req.max_tokens
+
+    def _update_finish_reason_after_token(self, req: _Request, token_id: int) -> None:
+        if token_id == DSV4_EOS_ID or token_id in self.stop_tokens:
+            req.finish_reason = "stop"
+        elif len(req.out_tokens) >= self._effective_max_tokens(req):
+            req.finish_reason = "length"
+        else:
+            req.finish_reason = None
+
+    def remove(self, uids, return_prompt_caches: bool = False):
+        out = {}
+        keep = []
+        for r in self._requests:
+            if r.uid in uids:
+                if return_prompt_caches:
+                    out[r.uid] = (r.cache, r.prompt_tokens + r.out_tokens)
+            else:
+                keep.append(r)
+        self._requests = keep
+        return out if return_prompt_caches else None
+
+    def extract_cache(self, uids):
+        out = {}
+        for r in self._requests:
+            if r.uid in uids:
+                out[r.uid] = (r.cache, r.prompt_tokens + r.out_tokens)
+        return out
+
+    def next(self) -> Tuple[List[_Response], List[_Response]]:
+        """Run one step. Returns (prompt_responses, generation_responses).
+
+        Prompt responses fire when a request transitions from 'queued
+        with no cache' to 'has its first decoded token'.
+
+        Generation responses fire on every subsequent decode step.
+        """
+        prompt_resps: List[_Response] = []
+        gen_resps: List[_Response] = []
+        self._refresh_thread_stream()
+
+        # On first call, warm up MLX kernels so the user's prefill
+        # doesn't have to JIT-compile every routed-expert / hash-router
+        # combo in one shot. We call model() with the smallest possible
+        # input (1 token) on a fresh cache, force-evaluate, then drop
+        # the warmup state. After this, the user's prefill paths use
+        # the precompiled kernels.
+        if not self._warmed_up:
+            with mx.stream(self._stream):
+                try:
+                    _warm_cache = self._make_new_cache()
+                    _warm_ids = mx.array([[0]], dtype=mx.int32)
+                    _ = self.model(_warm_ids, cache=_warm_cache)
+                    mx.eval(_)
+                    self._sync()
+                    logger.info("DSV4Gen: kernel warmup done")
+                except Exception as _wexc:
+                    logger.warning(f"DSV4Gen: warmup failed (continuing anyway): {_wexc}")
+            self._warmed_up = True
+
+        for r in list(self._requests):
+            with mx.stream(self._stream):
+                if r.cache is None:
+                    # Prefill — chunked through one DeepseekV4Cache instance.
+                    # This preserves SWA+CSA/HCA state while bounding transient
+                    # MLX allocations for long prompts.
+                    r.cache = self._make_new_cache()
+                    if not r.prompt_tokens:
+                        r.finish_reason = "stop"
+                        r.prompt_processed = True
+                        continue
+
+                    # TWO-PHASE PREFILL FOR N-1 SNAPSHOT.
+                    #
+                    # Scheduler stores prefix cache under N-1 token keys
+                    # so the last prompt token gets re-fed on cache hit
+                    # (avoids positional duplication). Our snapshot must
+                    # match that convention or hits drift positionally.
+                    #
+                    # Phase 1: prefill all but last token, snapshot the
+                    #          cache state at N-1.
+                    # Phase 2: prefill the last token to advance the
+                    #          live cache to N (used for first-token
+                    #          decode logits).
+                    should_capture_snapshot = (
+                        self.capture_prompt_snapshot
+                        and len(r.prompt_tokens) >= 2
+                        and len(r.prompt_tokens) - 1 >= self.prompt_snapshot_min_tokens
+                    )
+
+                    if should_capture_snapshot:
+                        head_tokens = r.prompt_tokens[:-1]
+                        last_token = r.prompt_tokens[-1:]
+                        # Phase 1
+                        _t_prefill_head = time.perf_counter()
+                        _ = self._prefill_last_logits(head_tokens, r.cache)
+                        self._trace_timing(
+                            "prefill_head",
+                            _t_prefill_head,
+                            r.uid,
+                            tokens=len(head_tokens),
+                        )
+                        try:
+                            _t_snapshot = time.perf_counter()
+                            r.prompt_snapshot = self._snapshot_dsv4_cache(r.cache)
+                            self._trace_timing(
+                                "prompt_snapshot",
+                                _t_snapshot,
+                                r.uid,
+                                layers=len(r.prompt_snapshot or []),
+                            )
+                            if r.prompt_snapshot is not None:
+                                logger.debug(
+                                    f"DSV4Gen: captured N-1 prompt-boundary "
+                                    f"snapshot ({len(r.prompt_snapshot)} layers, "
+                                    f"N-1={len(head_tokens)} tokens) "
+                                    f"for uid={r.uid}"
+                                )
+                        except Exception as _snap_err:
+                            logger.warning(
+                                f"DSV4Gen: snapshot capture failed: {_snap_err}"
+                            )
+                            r.prompt_snapshot = None
+                        # Phase 2 — feed the last token, get its logits
+                        _t_prefill_last = time.perf_counter()
+                        last_logits = self._prefill_last_logits(last_token, r.cache)
+                        self._trace_timing(
+                            "prefill_last",
+                            _t_prefill_last,
+                            r.uid,
+                            tokens=len(last_token),
+                        )
+                    else:
+                        if self.capture_prompt_snapshot and len(r.prompt_tokens) >= 2:
+                            _t_snapshot_skip = time.perf_counter()
+                            self._trace_timing(
+                                "prompt_snapshot_skipped",
+                                _t_snapshot_skip,
+                                r.uid,
+                                tokens=len(r.prompt_tokens) - 1,
+                                min_tokens=self.prompt_snapshot_min_tokens,
+                            )
+                            logger.debug(
+                                "DSV4Gen: skipped prompt-boundary snapshot for "
+                                "short prompt (N-1=%d < min_tokens=%d) uid=%s",
+                                len(r.prompt_tokens) - 1,
+                                self.prompt_snapshot_min_tokens,
+                                r.uid,
+                            )
+                        else:
+                            r.prompt_snapshot = None
+                        _t_prefill = time.perf_counter()
+                        last_logits = self._prefill_last_logits(r.prompt_tokens, r.cache)
+                        self._trace_timing(
+                            "prefill_full",
+                            _t_prefill,
+                            r.uid,
+                            tokens=len(r.prompt_tokens),
+                        )
+
+                    _t_sample = time.perf_counter()
+                    sampled, logprobs = self._sample(
+                        last_logits, r.sampler, r.logits_processors,
+                        self._processor_context(r),
+                        generated_tokens=list(r.out_tokens),
+                        capture_logprobs=self._should_capture_logprobs(r.uid),
+                    )
+                    tok_id = self._sampled_token_id(sampled)
+                    self._trace_timing(
+                        "sample_materialize",
+                        _t_sample,
+                        r.uid,
+                        capture_logprobs=logprobs is not None,
+                    )
+                    r.out_tokens.append(tok_id)
+                    r.prompt_processed = True
+                    self._update_finish_reason_after_token(r, tok_id)
+                    prompt_resps.append(_Response(
+                        uid=r.uid, token=tok_id, logprobs=logprobs,
+                        finish_reason=r.finish_reason,
+                        prompt_cache=r.cache,
+                        prompt_cache_snapshot=r.prompt_snapshot,
+                    ))
+                elif not r.prompt_processed:
+                    # Prefix-cache hit path. The scheduler passes the cached
+                    # prompt cache plus the remaining prompt tail to process
+                    # (for exact hits this is the final prompt token). DSV4's
+                    # custom generator cannot jump straight into decode with
+                    # an empty out_tokens list; it must first run that prompt
+                    # tail through the restored cache and sample the first
+                    # generated token from the resulting logits. This mirrors
+                    # mlx_lm BatchGenerator's cached-prefix kickoff behavior.
+                    if not r.prompt_tokens:
+                        r.finish_reason = "stop"
+                        r.prompt_processed = True
+                        continue
+                    _t_prefill_tail = time.perf_counter()
+                    last_logits = self._prefill_last_logits(
+                        r.prompt_tokens,
+                        r.cache,
+                        realize_before_clear=False,
+                    )
+                    self._trace_timing(
+                        "cache_hit_tail_prefill",
+                        _t_prefill_tail,
+                        r.uid,
+                        tokens=len(r.prompt_tokens),
+                    )
+                    _t_sample = time.perf_counter()
+                    sampled, logprobs = self._sample(
+                        last_logits, r.sampler, r.logits_processors,
+                        self._processor_context(r),
+                        generated_tokens=list(r.out_tokens),
+                        capture_logprobs=self._should_capture_logprobs(r.uid),
+                    )
+                    tok_id = self._sampled_token_id(sampled)
+                    self._trace_timing(
+                        "sample_materialize",
+                        _t_sample,
+                        r.uid,
+                        capture_logprobs=logprobs is not None,
+                    )
+                    r.out_tokens.append(tok_id)
+                    r.prompt_processed = True
+                    self._update_finish_reason_after_token(r, tok_id)
+                    prompt_resps.append(_Response(
+                        uid=r.uid, token=tok_id, logprobs=logprobs,
+                        finish_reason=r.finish_reason,
+                        prompt_cache=r.cache,
+                        prompt_cache_snapshot=r.prompt_snapshot,
+                    ))
+                else:
+                    # Decode
+                    if r.finish_reason is not None:
+                        # Already finished — just emit nothing. Caller
+                        # should remove() it.
+                        continue
+                    last_id = r.out_tokens[-1]
+                    ids = mx.array([[last_id]], dtype=mx.int32)
+                    _t_decode_model = time.perf_counter()
+                    logits = self.model(ids, cache=r.cache)
+                    last_logits = logits[:, -1, :]
+                    self._trace_timing(
+                        "decode_model",
+                        _t_decode_model,
+                        r.uid,
+                        output_tokens=len(r.out_tokens),
+                    )
+                    _t_sample = time.perf_counter()
+                    sampled, logprobs = self._sample(
+                        last_logits, r.sampler, r.logits_processors,
+                        self._processor_context(r),
+                        generated_tokens=list(r.out_tokens),
+                        capture_logprobs=self._should_capture_logprobs(r.uid),
+                    )
+                    tok_id = self._sampled_token_id(sampled)
+                    self._trace_timing(
+                        "sample_materialize",
+                        _t_sample,
+                        r.uid,
+                        capture_logprobs=logprobs is not None,
+                    )
+                    r.out_tokens.append(tok_id)
+                    self._update_finish_reason_after_token(r, tok_id)
+                    gen_resps.append(_Response(
+                        uid=r.uid, token=tok_id, logprobs=logprobs,
+                        finish_reason=r.finish_reason,
+                        prompt_cache=r.cache,
+                        prompt_cache_snapshot=r.prompt_snapshot,
+                    ))
+
+        return prompt_resps, gen_resps
+
+    def next_generated(self) -> List[_Response]:
+        while True:
+            prompt_resps, gen_resps = self.next()
+            if not gen_resps and prompt_resps:
+                continue
+            return gen_resps

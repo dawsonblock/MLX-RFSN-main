@@ -1,0 +1,129 @@
+{
+  "profile": "main12",
+  "release": "main22",
+  "release_purpose": "Clean Block-Aware KV Reconstruction Release",
+  "generated_at": "2026-06-02T07:26:04.849886+00:00",
+  "files": [
+    "kv_cache_runs.json",
+    "e2e_scenarios.json"
+  ],
+  "highlights": {
+    "best_kv": {
+      "shape": "(1, 8, 1024, 64)",
+      "k_bits": 8,
+      "v_bits": 8,
+      "use_incoherent": false,
+      "store_latency_ms": 0.8037910010898486,
+      "retrieve_latency_ms": 0.6100000027799979,
+      "original_bytes": 4194304,
+      "packed_bytes": 1114112,
+      "compression_ratio": 0.265625,
+      "key_cosine_sim": 0.9999824166297913,
+      "key_rel_mae": 0.00631355307996273,
+      "key_max_abs_error": 0.019597060978412628,
+      "value_cosine_sim": 0.9999824166297913,
+      "value_rel_mae": 0.006300057750195265,
+      "value_max_abs_error": 0.019924819469451904,
+      "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False"
+    },
+    "best_sparse": {
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "top_k_ratio": 0.75,
+      "reserved_sink_blocks": 1,
+      "reserved_recent_blocks": 2,
+      "use_compressed_on_miss": true,
+      "sparse_allowed_by_gate": true,
+      "cache_miss_total_latency_ms": 11.05666600051336,
+      "cache_hit_total_latency_ms": 7.373874992481433,
+      "cache_hit_execution_mode": "sparse_compacted",
+      "active_blocks": 24,
+      "kv_cache_hit": true,
+      "audit_cosine": 0.8836325407028198,
+      "quant_audit_cosine": 0.970818281173706,
+      "sparse_audit_cosine": 0.8836325407028198,
+      "sparse_audit_rel_mae": 0.543573796749115,
+      "effective_sparsity": 0.25,
+      "execution_mode": "sparse_compacted",
+      "latency_ms": 7.373874992481433,
+      "scenario": "sparse_topk_075_sink1_recent2"
+    },
+    "worst_sparse": {
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "top_k_ratio": 0.5,
+      "reserved_sink_blocks": 1,
+      "reserved_recent_blocks": 2,
+      "use_compressed_on_miss": true,
+      "sparse_allowed_by_gate": false,
+      "cache_miss_total_latency_ms": 8.960125007433817,
+      "cache_hit_total_latency_ms": 5.018458003178239,
+      "cache_hit_execution_mode": "dense_requested",
+      "active_blocks": 32,
+      "kv_cache_hit": true,
+      "audit_cosine": 1.0,
+      "quant_audit_cosine": 0.970818281173706,
+      "sparse_audit_cosine": null,
+      "sparse_audit_rel_mae": null,
+      "effective_sparsity": 0.0,
+      "execution_mode": "dense_requested",
+      "latency_ms": 5.018458003178239,
+      "scenario": "sparse_disabled_by_default"
+    },
+    "best_dense": {
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "top_k_ratio": 1.0,
+      "reserved_sink_blocks": 1,
+      "reserved_recent_blocks": 2,
+      "use_compressed_on_miss": true,
+      "sparse_allowed_by_gate": false,
+      "cache_miss_total_latency_ms": 9.679458002210595,
+      "cache_hit_total_latency_ms": 5.329917010385543,
+      "cache_hit_execution_mode": "dense_requested",
+      "active_blocks": 32,
+      "kv_cache_hit": true,
+      "audit_cosine": 1.0,
+      "quant_audit_cosine": 0.970818281173706,
+      "sparse_audit_cosine": null,
+      "sparse_audit_rel_mae": null,
+      "effective_sparsity": 0.0,
+      "execution_mode": "dense_requested",
+      "latency_ms": 5.329917010385543,
+      "scenario": "dense_baseline"
+    }
+  },
+  "absolute_quality": {
+    "sparse": {
+      "status": "warn",
+      "min": 0.4996378421783447,
+      "threshold": 0.9
+    },
+    "quant": {
+      "status": "pass",
+      "min": 0.9703969359397888,
+      "threshold": 0.95
+    },
+    "value": {
+      "status": "pass",
+      "min": 0.9699910283088684,
+      "threshold": 0.9
+    },
+    "warning_unsafe_for_llm_deployment": true,
+    "sparse_deployment_safe": false,
+    "sparse_default": "disabled",
+    "sparse_default_recommendation": "dense_default"
+  },
+  "kernel_benchmark": {
+    "status": "run"
+  },
+  "real_model_validation": {
+    "status": "run"
+  }
+}

@@ -1,0 +1,183 @@
+============================================================
+RFSN v10 KV Cache Benchmarks
+============================================================
+{
+  "hardware": "arm64",
+  "platform": "macOS-26.2-arm64-arm-64bit",
+  "python_version": "3.11.9",
+  "timestamp": "2026-06-08T21:04:59.329159+00:00"
+}
+
+  (1, 8, 1024, 64) k=8b v=3b incoherent=True: store=75.85ms retrieve=302.68ms ratio=0.191 k_cos=1.0000 v_cos=0.9701
+  (1, 8, 1024, 64) k=8b v=3b incoherent=False: store=49.86ms retrieve=52.29ms ratio=0.191 k_cos=1.0000 v_cos=0.9700
+  (1, 8, 1024, 64) k=8b v=8b incoherent=False: store=76.35ms retrieve=65.86ms ratio=0.266 k_cos=1.0000 v_cos=1.0000
+  (1, 8, 2048, 64) k=8b v=3b incoherent=True: store=188.23ms retrieve=486.58ms ratio=0.191 k_cos=1.0000 v_cos=0.9700
+  (1, 8, 2048, 64) k=8b v=3b incoherent=False: store=91.56ms retrieve=125.00ms ratio=0.191 k_cos=1.0000 v_cos=0.9700
+  (1, 8, 2048, 64) k=8b v=8b incoherent=False: store=112.63ms retrieve=114.55ms ratio=0.266 k_cos=1.0000 v_cos=1.0000
+  (1, 32, 4096, 128) k=8b v=3b incoherent=True: store=274.98ms retrieve=1012.70ms ratio=0.191 k_cos=1.0000 v_cos=0.9700
+  (1, 32, 4096, 128) k=8b v=3b incoherent=False: store=300.76ms retrieve=131.71ms ratio=0.191 k_cos=1.0000 v_cos=0.9700
+  (1, 32, 4096, 128) k=8b v=8b incoherent=False: store=264.13ms retrieve=157.55ms ratio=0.266 k_cos=1.0000 v_cos=1.0000
+
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.11.9",
+    "timestamp": "2026-06-08T21:04:59.329159+00:00"
+  },
+  "runs": [
+    {
+      "shape": "(1, 8, 1024, 64)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "use_incoherent": true,
+      "store_latency_ms": 75.85200000903569,
+      "retrieve_latency_ms": 302.6817499776371,
+      "original_bytes": 4194304,
+      "packed_bytes": 799552,
+      "compression_ratio": 0.1906280517578125,
+      "key_cosine_sim": 0.9999822974205017,
+      "key_rel_mae": 0.005859941244125366,
+      "key_max_abs_error": 0.032712191343307495,
+      "value_cosine_sim": 0.9700643420219421,
+      "value_rel_mae": 0.24806949496269226,
+      "value_max_abs_error": 1.3542907238006592
+    },
+    {
+      "shape": "(1, 8, 1024, 64)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "use_incoherent": false,
+      "store_latency_ms": 49.86358399037272,
+      "retrieve_latency_ms": 52.29258400504477,
+      "original_bytes": 4194304,
+      "packed_bytes": 799552,
+      "compression_ratio": 0.1906280517578125,
+      "key_cosine_sim": 0.9999824166297913,
+      "key_rel_mae": 0.00631355307996273,
+      "key_max_abs_error": 0.019597060978412628,
+      "value_cosine_sim": 0.9700178503990173,
+      "value_rel_mae": 0.267108291387558,
+      "value_max_abs_error": 0.7895931005477905
+    },
+    {
+      "shape": "(1, 8, 1024, 64)",
+      "k_bits": 8,
+      "v_bits": 8,
+      "use_incoherent": false,
+      "store_latency_ms": 76.34637498995289,
+      "retrieve_latency_ms": 65.86312499712221,
+      "original_bytes": 4194304,
+      "packed_bytes": 1114112,
+      "compression_ratio": 0.265625,
+      "key_cosine_sim": 0.9999824166297913,
+      "key_rel_mae": 0.00631355307996273,
+      "key_max_abs_error": 0.019597060978412628,
+      "value_cosine_sim": 0.9999824166297913,
+      "value_rel_mae": 0.006300057750195265,
+      "value_max_abs_error": 0.019924819469451904
+    },
+    {
+      "shape": "(1, 8, 2048, 64)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "use_incoherent": true,
+      "store_latency_ms": 188.23262499063276,
+      "retrieve_latency_ms": 486.5827079920564,
+      "original_bytes": 8388608,
+      "packed_bytes": 1599104,
+      "compression_ratio": 0.1906280517578125,
+      "key_cosine_sim": 0.9999824166297913,
+      "key_rel_mae": 0.005844393279403448,
+      "key_max_abs_error": 0.03766840696334839,
+      "value_cosine_sim": 0.9700079560279846,
+      "value_rel_mae": 0.248267263174057,
+      "value_max_abs_error": 1.540197491645813
+    },
+    {
+      "shape": "(1, 8, 2048, 64)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "use_incoherent": false,
+      "store_latency_ms": 91.55608300352469,
+      "retrieve_latency_ms": 124.99766700784676,
+      "original_bytes": 8388608,
+      "packed_bytes": 1599104,
+      "compression_ratio": 0.1906280517578125,
+      "key_cosine_sim": 0.9999822974205017,
+      "key_rel_mae": 0.0063169547356665134,
+      "key_max_abs_error": 0.020263373851776123,
+      "value_cosine_sim": 0.9700464606285095,
+      "value_rel_mae": 0.2669861912727356,
+      "value_max_abs_error": 0.8000398874282837
+    },
+    {
+      "shape": "(1, 8, 2048, 64)",
+      "k_bits": 8,
+      "v_bits": 8,
+      "use_incoherent": false,
+      "store_latency_ms": 112.62695799814537,
+      "retrieve_latency_ms": 114.54633399262093,
+      "original_bytes": 8388608,
+      "packed_bytes": 2228224,
+      "compression_ratio": 0.265625,
+      "key_cosine_sim": 0.9999822974205017,
+      "key_rel_mae": 0.0063169547356665134,
+      "key_max_abs_error": 0.020263373851776123,
+      "value_cosine_sim": 0.9999824166297913,
+      "value_rel_mae": 0.0062971399165689945,
+      "value_max_abs_error": 0.018954992294311523
+    },
+    {
+      "shape": "(1, 32, 4096, 128)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "use_incoherent": true,
+      "store_latency_ms": 274.97529101674445,
+      "retrieve_latency_ms": 1012.6992920122575,
+      "original_bytes": 134217728,
+      "packed_bytes": 25585408,
+      "compression_ratio": 0.1906261444091797,
+      "key_cosine_sim": 0.999982476234436,
+      "key_rel_mae": 0.005860436242073774,
+      "key_max_abs_error": 0.042821288108825684,
+      "value_cosine_sim": 0.9699910283088684,
+      "value_rel_mae": 0.24823878705501556,
+      "value_max_abs_error": 1.919440507888794
+    },
+    {
+      "shape": "(1, 32, 4096, 128)",
+      "k_bits": 8,
+      "v_bits": 3,
+      "use_incoherent": false,
+      "store_latency_ms": 300.76408400782384,
+      "retrieve_latency_ms": 131.7067079944536,
+      "original_bytes": 134217728,
+      "packed_bytes": 25585408,
+      "compression_ratio": 0.1906261444091797,
+      "key_cosine_sim": 0.999982476234436,
+      "key_rel_mae": 0.006306956522166729,
+      "key_max_abs_error": 0.02072286605834961,
+      "value_cosine_sim": 0.9700300097465515,
+      "value_rel_mae": 0.26702815294265747,
+      "value_max_abs_error": 0.8980423212051392
+    },
+    {
+      "shape": "(1, 32, 4096, 128)",
+      "k_bits": 8,
+      "v_bits": 8,
+      "use_incoherent": false,
+      "store_latency_ms": 264.13291701464914,
+      "retrieve_latency_ms": 157.5451249955222,
+      "original_bytes": 134217728,
+      "packed_bytes": 35651584,
+      "compression_ratio": 0.265625,
+      "key_cosine_sim": 0.999982476234436,
+      "key_rel_mae": 0.006306956522166729,
+      "key_max_abs_error": 0.02072286605834961,
+      "value_cosine_sim": 0.9999823570251465,
+      "value_rel_mae": 0.006302158813923597,
+      "value_max_abs_error": 0.021274298429489136
+    }
+  ]
+}

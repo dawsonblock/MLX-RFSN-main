@@ -1,0 +1,234 @@
+name: CI
+
+# Honest test matrix — only claims what the code actually supports.
+#
+#   linux-cpu-source  : compileall, editable install, no-placeholder guard,
+#                       runtime contract, config, health, experimental quarantine,
+#                       security, SDPA enforcement, healthcheck CLI
+#   linux-cpu-package : build wheel, install into clean env, verify imports
+#   security          : ClickHouse security, routing, tool-runner security
+#   docker            : docker build + run healthcheck (if docker is available)
+#   macos-arm-mlx     : Apple Silicon, Metal kernel, causal mask, drift,
+#                       bitpack fuzz, decode drift, prefill/decode split
+#
+# NOT included (not yet implemented):
+#   - CUDA runtime
+#   - macOS x86 Metal (Metal is ARM only)
+#   - Production HTTP inference service
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/*"
+      - "qjl-beta-repair*"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: linux-cpu-source
+  # Editable install, full non-MLX gate, source integrity checks
+  # ---------------------------------------------------------------------------
+  linux-cpu-source:
+    name: "Linux CPU (source)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (no MLX)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Compile check — no SyntaxErrors in any source file
+        run: python -m compileall -q rfsn_v10 tests
+
+      - name: Collection check — all tests discoverable without PYTHONPATH hack
+        run: pytest --collect-only -q
+
+      - name: Source integrity — no placeholder text in .py files
+        run: pytest tests/test_no_placeholder_source.py -q
+
+      - name: Runtime import contract — module collision regression
+        run: pytest tests/test_runtime_import_contract.py -q
+
+      - name: Config tests
+        run: pytest tests/test_config.py tests/test_config_strict.py -q
+
+      - name: Health tests
+        run: pytest tests/test_health.py -q
+
+      - name: Experimental flags quarantine
+        run: pytest tests/test_experimental_flags.py -q
+
+      - name: Quantization lazy import gate
+        run: pytest tests/test_quantization_lazy_imports.py -q
+
+      - name: Stable runtime SDPA enforcement
+        run: pytest tests/test_no_runtime_raw_sdpa.py -q
+
+      - name: Kernel validation (NumPy)
+        env:
+          RFSN_BACKEND: numpy
+        run: pytest tests/test_kernels_validation.py -q
+
+      - name: ClickHouse security tests
+        run: pytest tests/test_clickhouse_security.py -q
+
+      - name: healthcheck CLI (numpy backend)
+        env:
+          RFSN_BACKEND: numpy
+        run: python -m rfsn_v10 healthcheck
+
+      - name: validate-config CLI
+        env:
+          RFSN_BACKEND: numpy
+        run: python -m rfsn_v10 validate-config --config configs/default_runtime.yaml
+
+  # ---------------------------------------------------------------------------
+  # Job 2: linux-cpu-package
+  # Build wheel, install into clean environment, verify subpackage imports
+  # ---------------------------------------------------------------------------
+  linux-cpu-package:
+    name: "Linux CPU (package build)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build
+
+      - name: Compile check (must pass before build)
+        run: python -m compileall -q rfsn_v10 tests
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Install wheel into clean environment
+        run: python -m pip install --force-reinstall dist/*.whl
+
+      - name: Verify subpackage imports from installed wheel
+        run: |
+          python -c "import rfsn_v10; print('rfsn_v10:', rfsn_v10)"
+          python -c "import rfsn_v10.kernels; print('kernels OK')"
+          python -c "import rfsn_v10.quantization; print('quantization OK')"
+          python -c "import rfsn_v10.runtime; print('runtime OK')"
+          python -c "from rfsn_v10 import RFSNRuntime; print('RFSNRuntime:', RFSNRuntime)"
+          python -c "from rfsn_v10.runtime import RFSNRuntime; print('runtime.RFSNRuntime:', RFSNRuntime)"
+
+  # ---------------------------------------------------------------------------
+  # Job 3: security
+  # Isolated security test suite — ClickHouse, routing, tool-runner
+  # ---------------------------------------------------------------------------
+  security:
+    name: "Security tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Compile check
+        run: python -m compileall -q rfsn_v10 tests
+
+      - name: ClickHouse security tests
+        run: pytest tests/test_clickhouse_security.py -q
+
+      - name: ClickHouse routing tests
+        run: pytest tests/test_clickhouse_routing.py -q
+
+      - name: Tool runner security tests
+        run: pytest tests/test_tool_runner_security.py -q
+
+  # ---------------------------------------------------------------------------
+  # Job 4: docker
+  # Build Docker image and verify CLI healthcheck runs correctly
+  # Only runs on branches that modify Docker-related files to save minutes
+  # ---------------------------------------------------------------------------
+  docker:
+    name: "Docker healthcheck"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t rfsn-qjl .
+
+      - name: Run healthcheck (numpy backend, must exit 0)
+        run: |
+          docker run --rm -e RFSN_BACKEND=numpy rfsn-qjl
+
+      - name: Run explicit healthcheck subcommand
+        run: |
+          docker run --rm -e RFSN_BACKEND=numpy rfsn-qjl python -m rfsn_v10 healthcheck
+
+  # ---------------------------------------------------------------------------
+  # Job 5: macos-arm-mlx
+  # Apple Silicon — Metal kernels, causal mask, drift, bitpack, quality gates
+  # This is the primary runtime platform. No beta without this job passing.
+  # ---------------------------------------------------------------------------
+  macos-arm-mlx:
+    name: "macOS ARM (MLX)"
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lock Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.2.app
+
+      - name: Install dependencies (with MLX)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[mlx,dev]"
+
+      - name: Compile check
+        run: python -m compileall -q rfsn_v10 tests
+
+      - name: Source integrity guard
+        run: pytest tests/test_no_placeholder_source.py -q
+
+      - name: Runtime import contract
+        run: pytest tests/test_runtime_import_contract.py -q
+
+      - name: Causal attention mask tests
+        run: pytest tests/test_attention_causal_mask.py -q
+
+      - name: Drift tests
+        run: pytest tests/test_drift.py -q
+
+      - name: Bitpack fuzz tests
+        run: pytest tests/test_bitpack_fuzz.py -q
+
+      - name: Short-prompt decode drift quality gate
+        run: pytest tests/test_short_prompt_decode_drift.py -q
+
+      - name: Prefill/decode split quality gate
+        run: pytest tests/test_prefill_decode_split.py -q
+
+      - name: Short-prompt generation regression
+        run: pytest tests/test_short_prompt_generation_regression.py -q
+
+      - name: healthcheck CLI (MLX backend)
+        env:
+          RFSN_BACKEND: mlx
+        run: python -m rfsn_v10 healthcheck

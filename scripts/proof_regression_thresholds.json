@@ -1,0 +1,34 @@
+{
+  "kv": {
+    "latency_max_regression_pct": {
+      "store_latency_ms": 200.0,
+      "retrieve_latency_ms": 200.0
+    },
+    "quality_max_drop_abs": {
+      "key_cosine_sim": 0.008,
+      "value_cosine_sim": 0.02
+    },
+    "quality_max_rise_abs": {
+      "key_rel_mae": 0.02,
+      "value_rel_mae": 0.06,
+      "key_max_abs_error": 0.04,
+      "value_max_abs_error": 0.20
+    }
+  },
+  "e2e": {
+    "latency_max_regression_pct": {
+      "cache_miss_total_latency_ms": 30.0,
+      "cache_hit_total_latency_ms": 30.0
+    },
+    "quality_max_drop_abs": {
+      "quant_audit_cosine": 0.015,
+      "sparse_audit_cosine": 0.03,
+      "audit_cosine": 0.03
+    }
+  },
+  "absolute_quality_min": {
+    "absolute_sparse_audit_cosine_min": 0.9,
+    "absolute_quant_audit_cosine_min": 0.95,
+    "absolute_value_cosine_min": 0.9
+  }
+}

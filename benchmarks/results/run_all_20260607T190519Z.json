@@ -1,0 +1,46 @@
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.12.0",
+    "mlx_available": true,
+    "timestamp": "20260607T190519Z",
+    "fast_mode": true
+  },
+  "bitpack_numpy": {
+    "suite": "bitpack_numpy",
+    "status": "ok",
+    "data": {
+      "n=4096": {
+        "pack_ms": 0.02670849789865315
+      },
+      "n=65536": {
+        "pack_ms": 0.1204584987135604
+      },
+      "n=262144": {
+        "pack_ms": 0.3206249966751784
+      }
+    }
+  },
+  "attention_mlx": {
+    "suite": "attention_mlx",
+    "status": "ok",
+    "data": {
+      "t_k=256": {
+        "sparse_ms": 1.0001045011449605,
+        "dense_ms": 0.19720851560123265,
+        "speedup": 0.1971879092389448
+      },
+      "t_k=512": {
+        "sparse_ms": 1.271603992790915,
+        "dense_ms": 0.20383299852255732,
+        "speedup": 0.16029597239246227
+      },
+      "t_k=1024": {
+        "sparse_ms": 1.8599375034682453,
+        "dense_ms": 0.23349998809862882,
+        "speedup": 0.12554184625194068
+      }
+    }
+  }
+}

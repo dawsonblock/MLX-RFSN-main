@@ -1,0 +1,109 @@
+{
+  "description": "Comprehensive validation prompt suite for RFSN v10 production readiness",
+  "version": "1.0",
+  "prompts": [
+    {
+      "id": "reasoning_1",
+      "category": "reasoning",
+      "task": "Logical reasoning",
+      "prompt": "If all roses are flowers and some flowers fade quickly, can we conclude that some roses fade quickly? Explain your reasoning step by step.",
+      "expected_length_tokens": 80,
+      "complexity": "medium"
+    },
+    {
+      "id": "reasoning_2",
+      "category": "reasoning",
+      "task": "Mathematical reasoning",
+      "prompt": "A train travels at 60 mph for 2 hours, then at 80 mph for 3 hours. What is the average speed for the entire journey? Show your work.",
+      "expected_length_tokens": 60,
+      "complexity": "medium"
+    },
+    {
+      "id": "coding_1",
+      "category": "coding",
+      "task": "Python function",
+      "prompt": "Write a Python function that takes a list of integers and returns a new list with only the even numbers, sorted in ascending order.",
+      "expected_length_tokens": 50,
+      "complexity": "low"
+    },
+    {
+      "id": "coding_2",
+      "category": "coding",
+      "task": "Algorithm implementation",
+      "prompt": "Implement a binary search function in Python that returns the index of a target value in a sorted list, or -1 if not found.",
+      "expected_length_tokens": 80,
+      "complexity": "medium"
+    },
+    {
+      "id": "chat_1",
+      "category": "chat",
+      "task": "Conversational response",
+      "prompt": "What are the main differences between supervised and unsupervised machine learning? Provide a clear explanation with examples.",
+      "expected_length_tokens": 100,
+      "complexity": "medium"
+    },
+    {
+      "id": "chat_2",
+      "category": "chat",
+      "task": "Creative writing",
+      "prompt": "Write a short paragraph describing a sunset over the ocean. Use vivid imagery and sensory details.",
+      "expected_length_tokens": 70,
+      "complexity": "low"
+    },
+    {
+      "id": "factual_1",
+      "category": "factual",
+      "task": "Historical knowledge",
+      "prompt": "What were the key causes of the French Revolution? Summarize the main factors.",
+      "expected_length_tokens": 90,
+      "complexity": "medium"
+    },
+    {
+      "id": "factual_2",
+      "category": "factual",
+      "task": "Scientific explanation",
+      "prompt": "Explain the process of photosynthesis in plants, including the role of chlorophyll and the chemical equation.",
+      "expected_length_tokens": 85,
+      "complexity": "medium"
+    },
+    {
+      "id": "summarization_1",
+      "category": "summarization",
+      "task": "Text summarization",
+      "prompt": "Summarize the following text in 2-3 sentences: Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed. It focuses on developing computer programs that can access data and use it to learn for themselves. Deep learning is a subset of machine learning that uses neural networks with multiple layers to progressively extract higher-level features from raw input.",
+      "expected_length_tokens": 40,
+      "complexity": "low"
+    },
+    {
+      "id": "summarization_2",
+      "category": "summarization",
+      "task": "Technical summary",
+      "prompt": "Explain the concept of a RESTful API in simple terms for a non-technical audience.",
+      "expected_length_tokens": 60,
+      "complexity": "low"
+    },
+    {
+      "id": "long_context_1",
+      "category": "long_context",
+      "task": "Multi-step reasoning",
+      "prompt": "Alice has 3 times as many apples as Bob. Carol has 5 fewer apples than Alice. If Bob has 12 apples, how many apples does Carol have? Show all steps.",
+      "expected_length_tokens": 50,
+      "complexity": "low"
+    },
+    {
+      "id": "long_context_2",
+      "category": "long_context",
+      "task": "Complex instruction following",
+      "prompt": "Write a function that processes a list of customer orders. Each order is a dictionary with 'customer_id', 'items' (list of product names), and 'total'. The function should: 1) Group orders by customer_id, 2) Calculate total spend per customer, 3) Return a sorted list of customers by total spend descending.",
+      "expected_length_tokens": 120,
+      "complexity": "high"
+    }
+  ],
+  "usage_notes": [
+    "Each prompt is designed to test different aspects of model capability",
+    "Prompts range from 40-120 expected output tokens",
+    "Complexity levels: low (simple), medium (moderate), high (complex)",
+    "Categories cover reasoning, coding, chat, factual, summarization, and long-context tasks",
+    "Use these prompts to validate KV compression quality across diverse workloads"
+  ]
+}

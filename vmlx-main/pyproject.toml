@@ -1,0 +1,232 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vmlx"
+version = "1.5.56"
+description = "MLX inference server for Apple Silicon — Text, Image, Video & Audio generation"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11,<3.15"
+authors = [
+    {name = "Jinho Jang", email = "eric@jangq.ai"}
+]
+keywords = ["llm", "mlx", "apple-silicon", "vllm", "inference", "transformers"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "mlx>=0.29.0",
+    "mlx-lm>=0.31.3",  # 0.31.3 is the release-bundle floor for current JANG
+                       # families: ArraysCache.lengths/advance, SequenceStateMachine,
+                       # LRUPromptCache, native Gemma 4 text MoE, and the baseline
+                       # model registry that vMLX patches with bailing_hybrid for
+                       # Ling. NOTE: mlx-audio 0.4.1 hard-pins 0.31.1; audio support
+                       # is opt-in via [audio] extra and not in the main bundle.
+    # MiniCPM-V-4.6 model class added in mlx-vlm 0.5.0; Gemma 4 remains covered.
+    # Keep the floor Darwin-specific so optional Linux image-extra resolution
+    # does not inherit mlx-vlm's macOS MLX wheel floor.
+    "mlx-vlm>=0.5.0; sys_platform == 'darwin'",
+    "mlx-vlm>=0.4.3; sys_platform != 'darwin'",
+    "transformers>=4.40.0",
+    "tokenizers>=0.19.0",
+    # Kimi K2.6 tokenizer remote code imports tiktoken during chat-template
+    # rendering; this is needed for core text/tool/reasoning paths, not only
+    # optional audio extras.
+    "tiktoken>=0.5.0",
+    "huggingface-hub>=0.23.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "tqdm>=4.66.0",
+    "pyyaml>=6.0",
+    "requests>=2.28.0",
+    "tabulate>=0.9.0",
+    # Video processing for VLM (headless — no GUI deps, smaller install)
+    "opencv-python-headless>=4.8.0",
+    # Resource monitoring
+    "psutil>=5.9.0",
+    # Server
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    # MCP (Model Context Protocol) support
+    "mcp>=1.0.0",
+    # JSON Schema validation for structured output
+    "jsonschema>=4.0.0",
+    # Note: mlx-audio moved to optional [audio] deps due to mlx-lm version conflict
+    "mlx-embeddings>=0.0.5",
+    # JANG / MXTQ / JANGTQ runtime — REQUIRED, not optional. Every modern JANG
+    # bundle (MiniMax-M2.7-JANGTQ-CRACK, Kimi K2.6, DSV4-Flash, Nemotron-Omni,
+    # Mistral-Medium-3.5-JANGTQ, Laguna-XS.2-JANGTQ, etc.) needs jang_tools at
+    # load time to dequant tq_packed weights. Without it the engine prints
+    # 60+ ERROR lines per shard and the bundle loads with garbage weights.
+    # User report 2026-04-30 with MiniMax-M2.7-JANGTQ-CRACK forced the
+    # promotion from optional [mxtq] to a hard dependency. The PyPI package
+    # is named `jang` (not `jang-tools` — that's the local repo dir name);
+    # `import jang_tools` works because that's the package import name.
+    "jang>=2.5.29",
+    # PyTorch — REQUIRED for Nemotron-3-Nano-Omni multimodal dispatch.
+    # `jang_tools.nemotron_omni_chat._import_torch()` lazy-imports torch on
+    # the FIRST image / audio / video request to an Omni bundle; without
+    # it the request 500s with `ModuleNotFoundError: No module named
+    # 'torch'` and the user gets a generic Internal Server Error. Live
+    # audit 2026-04-30 (release-audit.py E1) caught this regression vs
+    # 1.4.3. Wheel install grows ~700 MB but it's the only way to keep
+    # the Omni multimodal path working out of the box.
+    "torch>=2.3.0",
+    "torchvision>=0.18.0",
+    # soundfile — REQUIRED for Stage-2 native MLX Omni audio. Audio
+    # ingestion in `jang_tools.nemotron_omni.model._load_audio` lazy-
+    # imports it on the first audio request; without it Stage-2 audio
+    # 500s with `ModuleNotFoundError: 'soundfile'`. Live audit
+    # 2026-04-30 with --omni-backend stage2 reproduced the gap. Stage-1
+    # uses torchaudio so isn't affected, but every user who flips to
+    # Stage-2 hits it. Promote to hard dep so the JANGQ-AI banner
+    # speed claims (84 tok/s decode, 15-21x faster encoders) are
+    # reachable on a plain `pip install vmlx`. ~3 MB via cffi.
+    "soundfile>=0.12.0",
+    # timm — REQUIRED for Nemotron-3-Nano-Omni media dispatch. The Stage-1
+    # PyTorch bridge loads the RADIO/ViT vision backbone through transformers
+    # remote code, which raises before generation if timm is missing. Live
+    # Nemotron image row on 2026-05-08 reproduced the failure from `uv run`
+    # even though the bundled Python script already installed timm.
+    "timm>=1.0.20",
+    # einops — REQUIRED by the same Nemotron-Omni remote vision modules.
+    # Without it the first image/video request fails after timm is present.
+    "einops>=0.8.0",
+    # librosa — REQUIRED during Nemotron-Omni session construction because the
+    # Parakeet audio feature extractor is initialized with the multimodal
+    # wrapper even when the first request is image-only.
+    "librosa>=0.10.0",
+]
+
+[project.optional-dependencies]
+ui = [
+    "gradio>=4.0.0",
+    "pytz>=2024.1",
+]
+# mxtq extra retained as a no-op alias for backward compat with anyone
+# pinning `vmlx[mxtq]` in their requirements; the real install is now a
+# hard dependency above so plain `pip install vmlx` works for all bundles.
+mxtq = [
+    "jang>=2.5.29",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "twine>=6.2.0",
+]
+vllm = [
+    # vllm pins torch<=2.6.0 which conflicts with mflux (torch>=2.8.0) when both installed
+    "vllm>=0.4.0; python_version < '3.13'",
+]
+vision = [
+    "torch>=2.3.0",
+    "torchvision>=0.18.0",
+]
+# Audio dependencies for TTS/STT (mlx-audio)
+audio = [
+    "mlx-audio>=0.2.9",
+    "sounddevice>=0.4.0",
+    "soundfile>=0.12.0",
+    "scipy>=1.10.0",
+    "numba>=0.57.0",
+    "tiktoken>=0.5.0",
+    "misaki[zh,ja]>=0.5.0",  # Chinese (zh) and Japanese (ja) support
+    "spacy>=3.7.0",
+    "num2words>=0.5.0",
+    "loguru>=0.7.0",
+    "phonemizer>=3.2.0",
+    # Additional multilingual dependencies
+    "ordered_set>=4.1.0",    # Required for Chinese TTS
+    "cn2an>=0.5.0",          # Chinese number conversion
+    "fugashi>=1.3.0",        # Japanese tokenizer
+    "unidic-lite>=1.0.0",    # Japanese dictionary for fugashi
+    "jieba>=0.42.0",         # Chinese word segmentation
+]
+# JANG / MXTQ runtime + conversion. The PyPI distribution name is
+# `jang` (NOT `jang-tools` — that name doesn't exist on PyPI; the
+# import name is `jang_tools` only because the wheel ships its
+# package directory as `jang_tools/`). Provides both the runtime
+# dequant codec and the conversion CLI; covers DSV4-Flash,
+# MiniMax-M2.7-JANG_*, NemotronH-Omni-*, Laguna-XS.2-JANGTQ,
+# Mistral-Medium-3.5-JANGTQ, Qwen 3.5/3.6-JANGTQ, MXTQ shards, and
+# any other JANG-stamped bundle. Mirrors `mxtq` extra above
+# (intentionally same pin) so `pip install vmlx[jang]` is a
+# friendly alias. Pin tracks the hard dep above — bump in lockstep.
+jang = [
+    "jang>=2.5.29",
+]
+# Image generation dependencies (Flux, Z-Image-Turbo via mflux)
+image = [
+    "mflux>=0.16.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/jjang-ai/vmlx"
+Documentation = "https://github.com/jjang-ai/vmlx#readme"
+Repository = "https://github.com/jjang-ai/vmlx"
+Downloads = "https://github.com/jjang-ai/mlxstudio/releases"
+Issues = "https://github.com/jjang-ai/vmlx/issues"
+
+[project.entry-points."vllm.platform_plugins"]
+mlx = "vmlx_engine.plugin:mlx_platform_plugin"
+
+[project.scripts]
+vmlx = "vmlx_engine.cli:main"
+vmlx-serve = "vmlx_engine.cli:main"
+vmlx-engine = "vmlx_engine.cli:main"
+vmlx-engine-chat = "vmlx_engine.gradio_app:main"
+vmlx-engine-bench = "vmlx_engine.benchmark:main"
+vmlx-worker = "vmlx_engine.distributed.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vmlx_engine*"]
+
+[tool.setuptools.package-data]
+vmlx_engine = [
+    "chat_templates/*.jinja",
+    "config/*.yaml",
+    "metal/*.metal",
+    "vendor/transformers_modules/nvidia/C_hyphen_RADIOv2_hyphen_H/*.py",
+    "vendor/transformers_modules/nvidia/C_hyphen_RADIOv2_hyphen_H/*/*.py",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.black]
+line-length = 88
+target-version = ["py311", "py312", "py313"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501", "B905"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"

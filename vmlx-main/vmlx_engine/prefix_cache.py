@@ -1,0 +1,3825 @@
+# SPDX-License-Identifier: Apache-2.0
+# Base prefix cache from waybarrios/vllm-mlx. Block-aware prefix cache,
+# MLA H=1 head validation, QuantizedKVCache support, hybrid SSM cumulative
+# state handling, and gen_prompt_len stripping added by Jinho Jang
+# (eric@jangq.ai) for vMLX (github.com/jjang-ai/vmlx).
+"""
+Prefix Cache Manager for vmlx-engine.
+
+Wraps mlx-lm's LRUPromptCache to provide prefix caching functionality,
+allowing reuse of computed KV cache for common prompt prefixes.
+
+This module provides two implementations:
+- PrefixCacheManager: Original trie-based LRU cache (for backward compatibility)
+- BlockAwarePrefixCache: Block-based cache with PagedCacheManager integration
+"""
+
+import copy
+import hashlib
+import importlib.metadata
+import logging
+import os
+import time
+from collections import OrderedDict, deque
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
+from .paged_cache import BlockTable, PagedCacheManager, compute_block_hash
+
+logger = logging.getLogger(__name__)
+
+# Bump this when the token->cache-state contract changes for paged prefix
+# caches or their block-level L2 disk namespace. 2026-05-03 changed paged
+# stores to index truncated N-1 prompt cache state under N-1 prompt-token
+# keys so the last prompt token is always re-fed on cache hit. Older block
+# disk entries were indexed under full-N keys and can replay unrelated text
+# after restart, so every family must use a fresh namespace, not just DSV4.
+# 2026-05-05 v3 bump: scheduler.py:1964 DSV4 SWA+CSA+HCA truncation guard
+# now refuses to store post-generation DeepseekV4Cache when current_len >
+# target_len. Old block-disk entries (v2) were stored without the guard
+# and contain post-generation rotated/cumulative state that decodes
+# garbage on hit. This bump invalidates ALL families' L2 disk caches,
+# forcing a clean rebuild on next run. DSV4 specifically also gets a new
+# v7 schema tag below to invalidate v6 entries that were stored before
+# the guard landed.
+# 2026-05-25 v4 bump: Gemma4/mixed-SWA block records now preserve
+# RotatingKVCache tags and meta_state through paged/L2 reconstruction.
+# Older v3 records can restore sliding-window layers as plain KVCache,
+# causing slow and semantically wrong cache-hit decode.
+# 2026-05-25 v5 bump: mixed-SWA same-process cache hits keep resident
+# rotating/full-attention block data so immediate repeats cannot hit
+# partially written or stale disk-only blocks with crossed layer shapes.
+# 2026-06-06 v6 bump: MiMo V2 asymmetric full/SWA KV uses
+# num_key_value_heads=4 for full layers and swa_num_key_value_heads=8 for
+# rotating SWA layers. Older VLM extraction sliced all layers to the primary
+# count before storage, so old L2 blocks can restore invalid 4-head rotating
+# caches. Miss them cleanly.
+PAGED_CACHE_SCHEMA_VERSION = "paged_n1_keys_v6"
+
+
+def runtime_cache_fingerprint() -> str:
+    """Fingerprint runtime packages that define cache tensor semantics.
+
+    Disk L2 is intentionally reusable across same-version process restarts.
+    It must not, however, silently cross an app/runtime update when a cache
+    schema string was not bumped. Keep this compact string inside cache
+    namespaces and model keys so old blocks miss cleanly after package drift.
+    """
+    parts: List[str] = []
+    try:
+        from . import __version__ as engine_version
+    except Exception:
+        engine_version = "unknown"
+    parts.append(f"vmlx_engine={engine_version}")
+    for package in ("jang", "mlx", "mlx-lm", "mlx-vlm"):
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            version = "missing"
+        except Exception:
+            version = "unknown"
+        parts.append(f"{package}={version}")
+    return "runtime_cache=" + ",".join(parts)
+
+
+def compute_model_cache_key(
+    model: Any,
+    model_path: Optional[str] = None,
+    smelt_enabled: bool = False,
+    smelt_pct: Optional[float] = None,
+    tq_enabled: bool = False,
+    kv_quant_bits: int = 0,
+) -> str:
+    """
+    Compute a stable, content-derived cache key for a loaded model.
+
+    Replaces the legacy `id(model)` key (F6 / Concern #6) which:
+    - Changes on JIT reload (cache becomes orphaned, never reachable)
+    - Doesn't survive across processes for L2 disk cache lookups
+    - Allows trie pollution if a session swaps models in-process
+
+    Mixes in loader fingerprint (A4 Concern #1) so two sessions on the SAME
+    model with DIFFERENT loader configs (smelt %, TQ, JANG quant bits) NEVER
+    share trie entries — divergent K/V tensors otherwise produce silent
+    corruption on cross-session fetch.
+
+    Components:
+    - Architecture id: model class + num_hidden_layers + key arch fields
+    - Path + mtime: catches in-place edits to config.json / jang_config.json
+    - Loader flags: smelt mode, smelt %, TQ enabled, KV quant bits
+
+    Returns the first 32 hex chars of SHA-256 (16 bytes — collision-safe for
+    realistic per-process model counts; trie key compares are O(1) hash).
+
+    Falls back to id(model) string if any component is unavailable, so this
+    is strictly additive over the previous behaviour.
+    """
+    parts: List[str] = []
+
+    # 1. Architecture identity (cheap and safe even if path is unknown)
+    try:
+        parts.append(type(model).__module__ + "." + type(model).__name__)
+        for attr in ("args", "config"):
+            cfg = getattr(model, attr, None)
+            if cfg is None:
+                continue
+            for f in (
+                "model_type",
+                "num_hidden_layers",
+                "num_attention_heads",
+                "num_key_value_heads",
+                "hidden_size",
+                "vocab_size",
+                "kv_lora_rank",
+            ):
+                v = getattr(cfg, f, None)
+                if v is not None and not callable(v):
+                    parts.append(f"{f}={v}")
+            break
+    except Exception:
+        pass
+
+    # 2. Path + mtime — catches edited config.json / jang_config.json
+    if model_path:
+        parts.append(f"path={model_path}")
+        try:
+            for fname in ("config.json", "jang_config.json"):
+                p = os.path.join(model_path, fname)
+                if os.path.exists(p):
+                    parts.append(f"{fname}_mtime={int(os.path.getmtime(p))}")
+        except Exception:
+            pass
+
+    # 3. Loader fingerprint — A4 Concern #1
+    parts.append(f"paged_cache_schema={PAGED_CACHE_SCHEMA_VERSION}")
+    parts.append(runtime_cache_fingerprint())
+    parts.append(f"smelt={1 if smelt_enabled else 0}")
+    if smelt_enabled and smelt_pct is not None:
+        parts.append(f"smelt_pct={float(smelt_pct):.4f}")
+    parts.append(f"tq={1 if tq_enabled else 0}")
+    parts.append(f"kvq={int(kv_quant_bits or 0)}")
+
+    # DSV4 cache correctness depends on runtime cache shape. Keep these in
+    # the model key so L1/L2 prefix cache entries never cross between SWA-only
+    # and tri-mode SWA+CSA/HCA, or between different DSV4 composite-cache
+    # schema versions.
+    if any(p == "model_type=deepseek_v4" for p in parts):
+        parts.append(f"dsv4_long_ctx={os.environ.get('DSV4_LONG_CTX', '0')}")
+        parts.append(f"dsv4_pool_quant={os.environ.get('DSV4_POOL_QUANT', '')}")
+        # v5: DSV4 runtime uses PR #1195 flat-pool CSA/HCA masks plus
+        # chunked prefill. Bump the schema so old blocks captured by the
+        # pre-v5 L*topk expansion path can never replay into the fixed
+        # runtime.
+        #
+        # v4: paged/block L2 stores DSV4 cache data under N-1 prompt-token
+        # keys so the last prompt token is always re-fed on prefix hits. This
+        # intentionally invalidates older v2 disk blocks that were keyed by
+        # the full prompt despite holding truncated cache state.
+        parts.append("dsv4_cache_schema=deepseek_v4_v7")
+
+    if not parts:
+        # Defensive: fall back to identity
+        return f"id_{id(model):x}"
+
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
+    return digest
+
+
+def is_hybrid_ssm_cache(prompt_cache: Optional[List[Any]]) -> bool:
+    """
+    Detect if a cache list contains any cumulative SSM layer (MambaCache /
+    ArraysCache / BatchMambaCache). Used to short-circuit `mode=longer` trim
+    paths (F2): cumulative SSM state cannot be rewound by `cache.trim(N)`,
+    so a longer-prefix match must downgrade to a miss for hybrid models.
+
+    Inline structural detection — no model_inspector dependency. Walks layer
+    objects looking for either:
+    - Class name in the cumulative cache set, OR
+    - `.cache` attribute that is a list (MambaCache/ArraysCache shape)
+      AND no positional `.keys/.values` attributes
+    """
+    if not prompt_cache:
+        return False
+    cumulative_cls = {"MambaCache", "BatchMambaCache", "ArraysCache"}
+    for layer in prompt_cache:
+        cls = type(layer).__name__
+        if cls in cumulative_cls:
+            return True
+        if isinstance(layer, dict) and layer.get("class_name", "") in cumulative_cls:
+            return True
+        # Structural fallback for nested CacheList wrappers
+        sub = getattr(layer, "caches", None)
+        if isinstance(sub, (list, tuple)):
+            for s in sub:
+                if type(s).__name__ in cumulative_cls:
+                    return True
+    return False
+
+
+@dataclass
+class CacheEntry:
+    """Entry in the prefix cache."""
+
+    prompt_cache: List[Any]  # The cached KV state
+    count: int  # Reference count for sharing
+    cache_type: str = "assistant"  # "system" | "user" | "assistant" — eviction priority
+    nbytes: int = 0  # Estimated memory footprint, computed at store time
+
+
+# Type priority for LRU eviction. Lower-priority types are evicted first.
+# Order: assistant (least sticky) → user → system (pinned, evicted last).
+# This mirrors mlx-lm 0.31.2 LRUPromptCache.CacheOrder so cross-session
+# system prompts stay cached across users.
+_CACHE_TYPE_PRIORITY: Tuple[str, ...] = ("assistant", "user", "system")
+
+
+@dataclass
+class PrefixCacheStats:
+    """Statistics for prefix cache performance."""
+
+    hits: int = 0
+    misses: int = 0
+    tokens_saved: int = 0
+    total_queries: int = 0
+    evictions: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        """Calculate cache hit rate."""
+        if self.total_queries == 0:
+            return 0.0
+        return self.hits / self.total_queries
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert stats to dictionary."""
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": self.hit_rate,
+            "tokens_saved": self.tokens_saved,
+            "total_queries": self.total_queries,
+            "evictions": self.evictions,
+        }
+
+
+class PrefixCacheManager:
+    """
+    Manages prefix caching for vmlx-engine using a trie-based LRU cache.
+
+    This implementation is inspired by mlx-lm's LRUPromptCache but adapted
+    for vmlx-engine's batching architecture.
+
+    The cache stores KV states keyed by token sequences, allowing:
+    - Exact match: Full prompt found in cache
+    - Shorter match: Partial prefix found, process remaining tokens
+    - Longer match: Cached prefix longer than request, trim excess
+
+    Example:
+        cache_manager = PrefixCacheManager(model, max_entries=100)
+
+        # Check for cached prefix
+        cache, remaining_tokens = cache_manager.fetch_cache(tokens)
+        if cache:
+            # Use cached KV, only process remaining_tokens
+            pass
+
+        # After generation, store cache for reuse
+        cache_manager.store_cache(full_tokens, prompt_cache)
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        max_entries: int = 100,
+        max_bytes: Optional[int] = None,
+        model_path: Optional[str] = None,
+        smelt_enabled: bool = False,
+        smelt_pct: Optional[float] = None,
+        tq_enabled: bool = False,
+        kv_quant_bits: int = 0,
+    ):
+        """
+        Initialize the prefix cache manager.
+
+        Args:
+            model: The MLX model (used for cache key identification)
+            max_entries: Maximum number of cached entries before LRU eviction
+            max_bytes: Optional global byte budget. When set, eviction also
+                triggers when total cached bytes exceed this. None = unlimited.
+            model_path, smelt_enabled, smelt_pct, tq_enabled, kv_quant_bits:
+                Loader fingerprint inputs (F6 + A4 Concern #1). Two sessions
+                with divergent loader configs get different model keys and
+                never share trie entries — prevents silent K/V corruption.
+        """
+        self.model = model
+        # Content-derived stable key (replaces fragile id(model) — F6).
+        # Survives JIT reload, prevents cross-config trie pollution, and
+        # mixes loader fingerprint so smelt/TQ/JANG variants don't collide.
+        self.model_key = compute_model_cache_key(
+            model,
+            model_path=model_path,
+            smelt_enabled=smelt_enabled,
+            smelt_pct=smelt_pct,
+            tq_enabled=tq_enabled,
+            kv_quant_bits=kv_quant_bits,
+        )
+        self.max_size = max_entries
+        self.max_bytes: Optional[int] = max_bytes
+
+        # Trie-based cache: nested dicts with token keys
+        # Structure: {model_key: {token1: {token2: {..., "cache": CacheEntry}}}}
+        self._cache: Dict[Any, Dict] = {}
+
+        # Per-cache-type LRU tracking. Each type has its own OrderedDict;
+        # eviction pops from the lowest-priority non-empty type first
+        # (assistant → user → system). System entries are evicted last so
+        # shared system prompts persist across users/sessions.
+        # Key shape: (model_key, tuple(tokens)) → True (presence)
+        self._lru_by_type: Dict[str, "OrderedDict[Tuple[Any, tuple], bool]"] = {
+            t: OrderedDict() for t in _CACHE_TYPE_PRIORITY
+        }
+
+        # Per-type byte counters and total
+        self._n_bytes: int = 0
+        self._n_bytes_by_type: Dict[str, int] = {t: 0 for t in _CACHE_TYPE_PRIORITY}
+
+        # Statistics
+        self.stats = PrefixCacheStats()
+
+    def _search(
+        self, tokens: List[int]
+    ) -> Tuple[Optional[List[int]], Optional[List[int]], Optional[List[int]], int]:
+        """
+        Search for cached prefix matching tokens.
+
+        Returns:
+            Tuple of (exact, shorter, longer, common_prefix_len)
+            - exact: Tokens if exact match found
+            - shorter: Tokens of shorter cached prefix
+            - longer: Tokens of longer cached prefix
+            - common_prefix_len: Length of common prefix with longer match
+        """
+        if self.model_key not in self._cache:
+            return None, None, None, 0
+
+        current = self._cache[self.model_key]
+        path = []
+
+        # Traverse trie following token sequence
+        for i, tok in enumerate(tokens):
+            if tok not in current:
+                # No match for this token
+                # Check if we have a shorter prefix with cache
+                if "cache" in current:
+                    return None, list(path), None, 0
+                return None, None, None, 0
+
+            path.append(tok)
+            current = current[tok]
+
+        # Reached end of tokens
+        if "cache" in current:
+            # Exact match
+            return list(tokens), None, None, 0
+
+        # Check for longer cached prefix
+        # BFS to find shortest extension with cache
+        from collections import deque
+        queue = deque([(current, list(path))])
+        while queue:
+            node, node_path = queue.popleft()
+            if "cache" in node:
+                return None, None, node_path, len(tokens)
+            for tok, child in node.items():
+                if tok != "cache":
+                    queue.append((child, node_path + [tok]))
+
+        return None, None, None, 0
+
+    def fetch_cache(self, tokens: List[int]) -> Tuple[Optional[List[Any]], List[int]]:
+        """
+        Find cached prefix for the given tokens.
+
+        Args:
+            tokens: Input token sequence
+
+        Returns:
+            Tuple of (cache, remaining_tokens)
+            - cache: Cached KV state if found, None otherwise
+            - remaining_tokens: Tokens that still need processing
+        """
+        self.stats.total_queries += 1
+        tokens_tuple = tuple(tokens)
+
+        exact, shorter, longer, common_len = self._search(tokens)
+
+        if exact:
+            # Exact match - return full cache
+            cache_entry = self._get_cache_entry(exact)
+            if cache_entry:
+                self.stats.hits += 1
+                self.stats.tokens_saved += len(tokens)
+                self._touch_lru(tokens_tuple)
+                # Return reference directly — MLX arrays are immutable,
+                # so sharing the cache is safe (no mutation possible).
+                return cache_entry.prompt_cache, []
+
+        if shorter:
+            # Shorter prefix cached - return cache and remaining tokens
+            cache_entry = self._get_cache_entry(shorter)
+            if cache_entry:
+                self.stats.hits += 1
+                self.stats.tokens_saved += len(shorter)
+                self._touch_lru(tuple(shorter))
+                remaining = tokens[len(shorter) :]
+                # Return reference directly — MLX arrays are immutable,
+                # so sharing the cache is safe (no mutation possible).
+                return cache_entry.prompt_cache, remaining
+
+        if longer:
+            # Longer prefix cached - trim to match and return
+            cache_entry = self._get_cache_entry(longer)
+            if cache_entry:
+                # Check if cache supports trimming
+                prompt_cache = cache_entry.prompt_cache
+                # F2 (R-003): hybrid SSM models cannot be trimmed — cumulative
+                # SSM state at position L can't be rewound to L-k without
+                # re-running the model. The auto-switch at scheduler.py:322 saves
+                # the default-config user, but explicit `--no-memory-aware-cache`
+                # users on hybrid models would otherwise hit silent corruption.
+                # Downgrade to miss instead.
+                if is_hybrid_ssm_cache(prompt_cache):
+                    logger.debug(
+                        "PrefixCacheManager: hybrid SSM longer-match downgraded "
+                        "to miss (R-003 — cumulative state cannot be rewound)"
+                    )
+                elif self._can_trim_cache(prompt_cache):
+                    trim_amount = len(longer) - len(tokens)
+                    # Deep copy IS needed here: _trim_cache mutates the cache
+                    # objects' offset/keys/values refs via .trim(), which would
+                    # corrupt the stored entry. (Unlike the read-only fetch paths
+                    # above where sharing is safe.)
+                    trimmed_cache = self._trim_cache(
+                        copy.deepcopy(prompt_cache), trim_amount
+                    )
+                    self.stats.hits += 1
+                    self.stats.tokens_saved += len(tokens)
+                    return trimmed_cache, []
+
+        # No cache hit
+        self.stats.misses += 1
+        return None, tokens
+
+    def store_cache(
+        self,
+        tokens: List[int],
+        prompt_cache: List[Any],
+        cache_type: str = "assistant",
+    ) -> None:
+        """
+        Store computed cache for future reuse.
+
+        Args:
+            tokens: Token sequence that was processed
+            prompt_cache: The computed KV cache to store
+            cache_type: One of "system", "user", or "assistant". Controls
+                LRU eviction priority — system entries are pinned and evicted
+                last so shared system prompts persist across users/sessions.
+                Defaults to "assistant" for backward compatibility.
+        """
+        if not tokens:
+            return
+        if cache_type not in self._lru_by_type:
+            cache_type = "assistant"
+
+        tokens_tuple = tuple(tokens)
+
+        # Build trie path
+        if self.model_key not in self._cache:
+            self._cache[self.model_key] = {}
+
+        current = self._cache[self.model_key]
+        for tok in tokens:
+            if tok not in current:
+                current[tok] = {}
+            current = current[tok]
+
+        # Estimate bytes for this entry. Reuse memory_cache helper to support
+        # KVCache, QuantizedKVCache, MambaCache, ArraysCache, CacheList, and
+        # extracted-state dicts.
+        try:
+            from .memory_cache import estimate_kv_cache_memory  # local import: optional
+            entry_nbytes = estimate_kv_cache_memory(prompt_cache)
+        except Exception:
+            entry_nbytes = 0
+
+        key = (self.model_key, tokens_tuple)
+
+        # Replace existing entry: drop old byte counters before re-tracking
+        if "cache" in current:
+            old: CacheEntry = current["cache"]
+            self._n_bytes -= old.nbytes
+            self._n_bytes_by_type[old.cache_type] = max(
+                0, self._n_bytes_by_type[old.cache_type] - old.nbytes
+            )
+            self._remove_from_all_lru(key)
+            current["cache"] = CacheEntry(
+                prompt_cache=prompt_cache,
+                count=old.count + 1,
+                cache_type=cache_type,
+                nbytes=entry_nbytes,
+            )
+        else:
+            current["cache"] = CacheEntry(
+                prompt_cache=prompt_cache,
+                count=1,
+                cache_type=cache_type,
+                nbytes=entry_nbytes,
+            )
+
+        # Track bytes
+        self._n_bytes += entry_nbytes
+        self._n_bytes_by_type[cache_type] += entry_nbytes
+
+        # Push to type-specific LRU (most recently used at the end)
+        type_lru = self._lru_by_type[cache_type]
+        type_lru[key] = True
+        type_lru.move_to_end(key)
+
+        # Evict if over entry count
+        while self._total_lru_size() > self.max_size:
+            if not self._evict_lru():
+                break
+
+        # Evict if over byte budget
+        if self.max_bytes is not None:
+            while self._n_bytes > self.max_bytes:
+                if not self._evict_lru():
+                    break
+
+    def trim_to(self, n_bytes: int) -> int:
+        """
+        Evict entries until total cached bytes <= n_bytes.
+
+        Used by the scheduler to reserve room for in-flight requests when
+        operating with a global byte budget. Returns the number of entries
+        evicted. n_bytes <= 0 clears the cache.
+        """
+        evicted = 0
+        if n_bytes <= 0:
+            count = self._total_lru_size()
+            self.clear()
+            return count
+        while self._n_bytes > n_bytes:
+            if not self._evict_lru():
+                break
+            evicted += 1
+        return evicted
+
+    def _total_lru_size(self) -> int:
+        return sum(len(d) for d in self._lru_by_type.values())
+
+    def _remove_from_all_lru(self, key: Tuple[Any, tuple]) -> None:
+        for d in self._lru_by_type.values():
+            if key in d:
+                del d[key]
+
+    def _get_cache_entry(self, tokens: List[int]) -> Optional[CacheEntry]:
+        """Get cache entry for given tokens."""
+        if self.model_key not in self._cache:
+            return None
+
+        current = self._cache[self.model_key]
+        for tok in tokens:
+            if tok not in current:
+                return None
+            current = current[tok]
+
+        return current.get("cache")
+
+    def _touch_lru(self, tokens_tuple: tuple) -> None:
+        """Move entry to end of its type's LRU (most recently used). O(1)."""
+        key = (self.model_key, tokens_tuple)
+        # Find the type that owns this key (entries live in exactly one bucket)
+        for t in _CACHE_TYPE_PRIORITY:
+            d = self._lru_by_type[t]
+            if key in d:
+                d.move_to_end(key)
+                return
+        # New entry — default to assistant bucket. Real type assigned at store.
+        self._lru_by_type["assistant"][key] = True
+
+    def _evict_lru(self) -> bool:
+        """Evict the least recently used entry from the lowest-priority
+        non-empty bucket. Returns True if an entry was evicted, False if all
+        buckets were empty. Eviction order: assistant → user → system.
+        """
+        for t in _CACHE_TYPE_PRIORITY:
+            d = self._lru_by_type[t]
+            if d:
+                (model_key, tokens_tuple), _ = d.popitem(last=False)
+                # Untrack bytes BEFORE deleting the entry (lookup needs it)
+                entry = self._get_cache_entry(list(tokens_tuple))
+                if entry is not None:
+                    self._n_bytes -= entry.nbytes
+                    self._n_bytes_by_type[entry.cache_type] = max(
+                        0, self._n_bytes_by_type[entry.cache_type] - entry.nbytes
+                    )
+                self._delete_cache(model_key, list(tokens_tuple))
+                self.stats.evictions += 1
+                return True
+        return False
+
+    def _delete_cache(self, model_key: Any, tokens: List[int]) -> None:
+        """Delete cache entry and clean up empty trie branches."""
+        if model_key not in self._cache:
+            return
+
+        # Navigate to entry
+        path = [(self._cache[model_key], None)]
+        current = self._cache[model_key]
+
+        for tok in tokens:
+            if tok not in current:
+                return
+            path.append((current[tok], tok))
+            current = current[tok]
+
+        # Delete cache entry
+        if "cache" in current:
+            del current["cache"]
+
+        # Clean up empty branches (bottom-up)
+        for i in range(len(path) - 1, 0, -1):
+            node, tok = path[i]
+            parent, _ = path[i - 1]
+            if not node:  # Empty dict
+                del parent[tok]
+
+    def _can_trim_cache(self, prompt_cache: List[Any]) -> bool:
+        """Check if cache can be trimmed."""
+        if not prompt_cache:
+            return False
+        # Check if first cache layer has is_trimmable method
+        first_cache = prompt_cache[0]
+        if hasattr(first_cache, "is_trimmable"):
+            return first_cache.is_trimmable()
+        return hasattr(first_cache, "trim")
+
+    def _trim_cache(self, prompt_cache: List[Any], num_tokens: int) -> List[Any]:
+        """Trim cache by removing num_tokens from the end."""
+        for cache in prompt_cache:
+            if hasattr(cache, "trim"):
+                cache.trim(num_tokens)
+        return prompt_cache
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics including per-type byte usage."""
+        d = self.stats.to_dict()
+        d["nbytes"] = self._n_bytes
+        d["nbytes_by_type"] = dict(self._n_bytes_by_type)
+        d["entries_by_type"] = {
+            t: len(self._lru_by_type[t]) for t in _CACHE_TYPE_PRIORITY
+        }
+        d["max_bytes"] = self.max_bytes
+        return d
+
+    def reset_stats(self) -> None:
+        """Reset statistics."""
+        self.stats = PrefixCacheStats()
+
+    def clear(self) -> None:
+        """Clear all cached entries."""
+        self._cache.clear()
+        for d in self._lru_by_type.values():
+            d.clear()
+        self._n_bytes = 0
+        for t in self._n_bytes_by_type:
+            self._n_bytes_by_type[t] = 0
+        self.reset_stats()
+
+    def __len__(self) -> int:
+        """Return number of cached entries."""
+        return self._total_lru_size()
+
+
+# =============================================================================
+# Block-Aware Prefix Cache (uses PagedCacheManager)
+# =============================================================================
+
+
+
+def _is_dsv4_cache_class(class_name: str) -> bool:
+    return (class_name or "") in {"DeepseekV4Cache", "PoolQuantizedV4Cache"}
+
+
+def _cache_data_has_dsv4(cache_data) -> bool:
+    """Return True when extracted cache states include DSV4 composite layers."""
+    try:
+        for layer_state in cache_data or []:
+            if not isinstance(layer_state, dict):
+                continue
+            if _is_dsv4_cache_class(layer_state.get("class_name", "")):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _to_numpy_tree(obj):
+    """Convert nested MLX-array state to numpy, preserving tuple/list shape."""
+    import numpy as np
+
+    if obj is None:
+        return None
+    if hasattr(obj, "__array__"):
+        return np.array(obj)
+    if isinstance(obj, tuple):
+        return tuple(_to_numpy_tree(x) for x in obj)
+    if isinstance(obj, list):
+        return [_to_numpy_tree(x) for x in obj]
+    return obj
+
+
+def _copy_mlx_tree(obj):
+    """Materialize independent MLX-array copies in a nested cache state tree."""
+    if obj is None or not HAS_MLX:
+        return obj
+    if hasattr(obj, "shape") and hasattr(obj, "dtype"):
+        copied = obj * 1
+        mx.eval(copied)
+        return copied
+    if isinstance(obj, tuple):
+        return tuple(_copy_mlx_tree(x) for x in obj)
+    if isinstance(obj, list):
+        return [_copy_mlx_tree(x) for x in obj]
+    return obj
+
+
+def _is_zaya_cca_cache_list_state(layer_state: Dict[str, Any]) -> bool:
+    """Return True for ZAYA's CacheList(KVCache, ArraysCache) CCA layer."""
+    if layer_state.get("class_name") != "CacheList":
+        return False
+    subs = layer_state.get("sub_caches")
+    if not isinstance(subs, (list, tuple)) or len(subs) < 2:
+        return False
+    first = subs[0] if isinstance(subs[0], dict) else {}
+    second = subs[1] if isinstance(subs[1], dict) else {}
+    first_cls = str(first.get("class_name", ""))
+    second_cls = str(second.get("class_name", ""))
+    if first_cls not in {"KVCache", "QuantizedKVCache"}:
+        return False
+    if second_cls != "ArraysCache":
+        return False
+    second_state = second.get("state")
+    return isinstance(second_state, (list, tuple)) and len(second_state) >= 2
+
+
+def _cache_data_has_zaya_cca(cache_data) -> bool:
+    """Return True when extracted cache states include typed ZAYA CCA layers."""
+    try:
+        for layer_state in cache_data or []:
+            if isinstance(layer_state, dict) and _is_zaya_cca_cache_list_state(
+                layer_state
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _cache_data_has_rotating_kv(cache_data) -> bool:
+    """Return True when extracted cache states include rotating-window KV."""
+    try:
+        for layer_state in cache_data or []:
+            if not isinstance(layer_state, dict):
+                continue
+            if "Rotating" in str(layer_state.get("class_name", "")):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _dsv4_cache_meta(layer_state: Dict[str, Any]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    cr = layer_state.get("compress_ratio")
+    sw = layer_state.get("sliding_window")
+    if cr is not None:
+        try:
+            meta["compress_ratio"] = int(cr)
+        except Exception:
+            meta["compress_ratio"] = cr
+    if sw is not None:
+        try:
+            meta["sliding_window"] = int(sw)
+        except Exception:
+            meta["sliding_window"] = sw
+    if "pool_quant" in layer_state:
+        meta["pool_quant"] = layer_state.get("pool_quant")
+    if "local_quant_meta" in layer_state:
+        try:
+            meta["local_quant_meta"] = [
+                str(x) for x in layer_state.get("local_quant_meta") or []
+            ]
+        except Exception:
+            meta["local_quant_meta"] = layer_state.get("local_quant_meta")
+    return meta
+
+
+def _positional_layer_slice_bounds(
+    layer_state, class_name, start_idx, end_idx, seq_len, existing_tokens=0,
+):
+    """Map global token positions to a layer-local KV slice range."""
+    layer_offset = 0
+    if seq_len > 0 and "Rotating" in str(class_name):
+        meta = layer_state.get("meta_state", ()) if isinstance(layer_state, dict) else ()
+        if meta and len(meta) >= 3:
+            try:
+                absolute_offset = int(meta[2])
+            except (TypeError, ValueError):
+                absolute_offset = 0
+            if absolute_offset > seq_len:
+                layer_offset = absolute_offset - seq_len
+    elif seq_len > 0 and existing_tokens > seq_len:
+        layer_offset = existing_tokens
+
+    local_start = start_idx - layer_offset
+    local_end = end_idx - layer_offset
+    actual_end = min(local_end, seq_len)
+    slice_start = max(local_start, 0)
+    return slice_start, actual_end
+
+
+def _numpy_block_slice(
+    cache_data, np_sources, start_idx, end_idx, is_last_block, existing_tokens=0,
+):
+    """Create per-block cache_data using numpy slicing (no MLX/Metal ops).
+
+    Args:
+        cache_data: Full layer-state dicts from _extract_cache_states.
+        np_sources: dict mapping layer_idx → (np_keys, np_values).
+        start_idx, end_idx: Token range for this block.
+        is_last_block: Whether this is the last block in the sequence.
+
+    Returns:
+        List of tuples per layer in the same format as _extract_block_tensor_slice
+        but with numpy arrays instead of MLX arrays.
+    """
+    import numpy as np
+
+    block_slices = []
+    for idx, layer_state in enumerate(cache_data):
+        if "state" not in layer_state:
+            continue
+        cls = layer_state.get("class_name", "")
+
+        if _is_dsv4_cache_class(cls):
+            state = layer_state.get("state")
+            if is_last_block and state is not None:
+                block_slices.append((
+                    "deepseek_v4",
+                    _to_numpy_tree(state),
+                    layer_state.get("meta_state", ""),
+                    cls,
+                    _dsv4_cache_meta(layer_state),
+                ))
+            else:
+                block_slices.append((
+                    "deepseek_v4_pending",
+                    cls,
+                    _dsv4_cache_meta(layer_state),
+                ))
+            continue
+
+        if cls == "ZayaNoStateCache" or layer_state.get("no_state"):
+            block_slices.append(("no_state", cls or "ZayaNoStateCache"))
+            continue
+
+        if _is_zaya_cca_cache_list_state(layer_state):
+            zsrc = np_sources.get(idx) if isinstance(np_sources, dict) else None
+            if not isinstance(zsrc, dict) or zsrc.get("type") != "zaya_cca":
+                block_slices.append(("skip",))
+                continue
+
+            np_k, np_v, orig_dtype = zsrc["kv"]
+            ndim = np_k.ndim
+            seq_dim = 2 if ndim == 4 else (1 if ndim == 3 else -1)
+            if seq_dim < 0:
+                block_slices.append(("skip",))
+                continue
+            seq_len = np_k.shape[seq_dim]
+            actual_end = min(end_idx, seq_len)
+            if start_idx >= actual_end:
+                kv_entry = ("skip",)
+            elif ndim == 4:
+                ks = mx.array(np_k[:, :, start_idx:actual_end, :])
+                vs = mx.array(np_v[:, :, start_idx:actual_end, :])
+                if ks.dtype != orig_dtype:
+                    ks = ks.astype(orig_dtype)
+                    vs = vs.astype(orig_dtype)
+                kv_entry = ("kv", ks, vs)
+            else:
+                ks = mx.array(np_k[:, start_idx:actual_end, :])
+                vs = mx.array(np_v[:, start_idx:actual_end, :])
+                if ks.dtype != orig_dtype:
+                    ks = ks.astype(orig_dtype)
+                    vs = vs.astype(orig_dtype)
+                kv_entry = ("kv", ks, vs)
+
+            cca_state = zsrc.get("cca_state") if is_last_block else None
+            if cca_state is not None:
+                def _to_mx_tree(x):
+                    if x is None:
+                        return None
+                    if isinstance(x, tuple):
+                        return tuple(_to_mx_tree(v) for v in x)
+                    if isinstance(x, list):
+                        return [_to_mx_tree(v) for v in x]
+                    return mx.array(x)
+
+                cca_state = _to_mx_tree(cca_state)
+            block_slices.append((
+                "zaya_cca",
+                kv_entry,
+                cca_state,
+                zsrc.get("cca_meta", ""),
+                zsrc.get("cache_meta", {}),
+            ))
+            continue
+
+        # CacheList (MoE): not yet supported in numpy path
+        if cls == "CacheList":
+            block_slices.append(("skip",))
+            continue
+
+        if idx in np_sources:
+            np_k, np_v, *_ = np_sources[idx]
+            ndim = np_k.ndim
+            if ndim == 4:
+                seq_len = np_k.shape[2]
+            elif ndim == 3:
+                seq_len = np_k.shape[1]
+            else:
+                block_slices.append(("skip",))
+                continue
+            slice_start, actual_end = _positional_layer_slice_bounds(
+                layer_state, cls, start_idx, end_idx, seq_len, existing_tokens,
+            )
+            if actual_end <= 0 or slice_start >= actual_end:
+                block_slices.append(("skip",))
+                continue
+            if ndim == 4:
+                ks = np_k[:, :, slice_start:actual_end, :]
+                vs = np_v[:, :, slice_start:actual_end, :]
+            else:
+                ks = np_k[:, slice_start:actual_end, :]
+                vs = np_v[:, slice_start:actual_end, :]
+            if "Rotating" in cls:
+                meta = layer_state.get("meta_state", ())
+                max_size = seq_len
+                keep = 0
+                offset = None
+                idx_state = None
+                if meta and len(meta) >= 2:
+                    try:
+                        keep = int(meta[0])
+                        max_size = int(meta[1])
+                        if len(meta) >= 3:
+                            offset = int(meta[2])
+                        if len(meta) >= 4:
+                            idx_state = int(meta[3])
+                    except (ValueError, TypeError):
+                        max_size = seq_len
+                        keep = 0
+                        offset = None
+                        idx_state = None
+                block_slices.append((
+                    "rotating_kv",
+                    mx.array(ks),
+                    mx.array(vs),
+                    max_size,
+                    keep,
+                    offset,
+                    idx_state,
+                ))
+            else:
+                block_slices.append(("kv", ks, vs))
+        else:
+            # Cumulative / non-positional layer
+            state = layer_state.get("state")
+            if is_last_block and state is not None:
+                meta = layer_state.get("meta_state", "")
+                # Convert cumulative state to numpy
+                if isinstance(state, (list, tuple)):
+                    np_state = []
+                    for s in state:
+                        if hasattr(s, '__array__'):
+                            np_state.append(np.array(s))
+                        else:
+                            np_state.append(s)
+                    block_slices.append(("cumulative", np_state, meta, cls))
+                else:
+                    block_slices.append(("skip",))
+            else:
+                block_slices.append(("skip",))
+
+    return block_slices if block_slices else None
+
+
+def _block_needs_cumulative_update(cache_data) -> bool:
+    """Check if a block's cache_data is missing cumulative SSM state.
+
+    Returns True if the block has "skip" entries (SSM layers stored as
+    non-last) but no "cumulative" entries. This indicates the block was
+    originally stored at a non-last position and needs cumulative state
+    before it can be used as the last block in a sequence.
+
+    Checks both top-level entries and sub-slices inside CacheList entries
+    (for MoE hybrid models where SSM sub-caches are nested).
+
+    Used by store_cache() to detect when block reuse would lose SSM state
+    for hybrid models (KVCache + MambaCache/ArraysCache).
+    """
+    if not cache_data:
+        return False
+    has_skip = False
+    has_cumulative = False
+    for entry in cache_data:
+        if not isinstance(entry, (tuple, list)) or len(entry) == 0:
+            continue
+        tag = entry[0]
+        if tag == "skip":
+            has_skip = True
+        elif tag == "deepseek_v4_pending":
+            has_skip = True
+        elif tag in ("cumulative", "deepseek_v4"):
+            has_cumulative = True
+        elif tag == "zaya_cca":
+            # Non-terminal ZAYA blocks carry KV pages only. The exact CCA
+            # conv_state/prev_hs payload lives on the terminal prompt block.
+            # Reusing a non-terminal block as the final block would restore
+            # standard KV without the path-dependent CCA state.
+            if len(entry) > 2 and entry[2] is not None:
+                has_cumulative = True
+            else:
+                has_skip = True
+        elif tag == "cache_list" and len(entry) > 1:
+            # Recurse into CacheList sub-slices for MoE hybrid models
+            for sub in entry[1]:
+                if isinstance(sub, (tuple, list)) and len(sub) > 0:
+                    if sub[0] == "skip":
+                        has_skip = True
+                    elif sub[0] == "deepseek_v4_pending":
+                        has_skip = True
+                    elif sub[0] in ("cumulative", "deepseek_v4"):
+                        has_cumulative = True
+    return has_skip and not has_cumulative
+
+
+@dataclass
+class BlockCacheEntry:
+    """Entry mapping a token sequence to cache blocks."""
+
+    block_table: BlockTable
+    cache_data: Optional[List[Any]]  # Legacy full-cache reference, if needed
+    last_access: float
+    cache_type: str = "assistant"  # "system" | "user" | "assistant" — segment ownership
+
+
+class BlockAwarePrefixCache:
+    """
+    Prefix cache that uses PagedCacheManager for block-based storage.
+
+    Features:
+    - Block-level prefix sharing (64 tokens per block)
+    - Copy-on-Write for efficient forking
+    - Hash-based deduplication across requests
+    - Reference counting for memory efficiency
+
+    This is the recommended cache for production use when memory
+    efficiency for concurrent requests is important.
+
+    Example:
+        paged_manager = PagedCacheManager(block_size=64, max_blocks=1000)
+        cache = BlockAwarePrefixCache(model, paged_manager)
+
+        # Check for cached prefix
+        block_table, remaining_tokens = cache.fetch_cache(request_id, tokens)
+
+        # After generation, store cache
+        cache.store_cache(request_id, tokens, kv_cache_data)
+
+        # Clean up when request completes
+        cache.release_cache(request_id)
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        paged_cache_manager: PagedCacheManager,
+        model_path: Optional[str] = None,
+        smelt_enabled: bool = False,
+        smelt_pct: Optional[float] = None,
+        tq_enabled: bool = False,
+        kv_quant_bits: int = 0,
+    ):
+        """
+        Initialize block-aware prefix cache.
+
+        Args:
+            model: The MLX model (used for identification)
+            paged_cache_manager: The PagedCacheManager instance for block management
+            model_path, smelt_enabled, smelt_pct, tq_enabled, kv_quant_bits:
+                Loader fingerprint inputs (F6 + A4 Concern #1). Mixed into
+                paged-cache content hash so divergent loader configs never
+                collide on shared blocks.
+        """
+        self.model = model
+        # Content-derived stable key (replaces id(model)). Includes loader
+        # fingerprint so two sessions with different smelt/TQ/JANG settings
+        # never share blocks (would otherwise corrupt K/V routing).
+        self.model_key = compute_model_cache_key(
+            model,
+            model_path=model_path,
+            smelt_enabled=smelt_enabled,
+            smelt_pct=smelt_pct,
+            tq_enabled=tq_enabled,
+            kv_quant_bits=kv_quant_bits,
+        )
+        self.paged_cache = paged_cache_manager
+        self.block_size = paged_cache_manager.block_size
+
+        # Hash table for quick prefix lookup
+        # Maps hash(tokens[:block_size*n]) -> (tokens, block_ids)
+        self._prefix_index: Dict[str, Tuple[List[int], List[int]]] = {}
+
+        # Request to block table mapping
+        self._request_tables: Dict[str, BlockCacheEntry] = {}
+
+        # Per-cache-type LRU buckets for block eviction priority. Tracks
+        # request_id sets per type so we can prefer evicting assistant entries
+        # (and the blocks they uniquely reference) before user/system. The
+        # paged_cache itself uses ref-count eviction; this layer adds a
+        # priority signal so the higher-level scheduler can call
+        # `release_low_priority(n)` when under block pressure.
+        self._entries_by_type: Dict[str, "OrderedDict[str, bool]"] = {
+            t: OrderedDict() for t in _CACHE_TYPE_PRIORITY
+        }
+
+        # Statistics
+        self._hits = 0
+        self._misses = 0
+        self._tokens_saved = 0
+
+        # Lazy-cached expected KV head count for validation
+        self._n_kv_heads: Optional[int] = None
+        # Lazy-cached set of ALL valid KV head counts (for mixed-head models
+        # like Gemma 4 where sliding_attention layers use num_key_value_heads
+        # and full_attention layers use num_global_key_value_heads).
+        self._allowed_n_kv_heads: Optional[set] = None
+
+        # Expected layer count is derived from the model's
+        # cache contract. Hybrid models such as Nemotron-H have no-cache MoE
+        # blocks (52 transformer blocks, 29 Mamba/attention cache entries), so
+        # validating against raw num_hidden_layers rejects legitimate L2 blocks.
+        # Used by reconstruct_cache to hard-reject blocks whose layer count
+        # diverges (canonical "wrong-model L2 entry" signal).
+        self._expected_num_layers: Optional[int] = None
+        if model is not None and hasattr(model, "make_cache"):
+            try:
+                _cache = model.make_cache() or []
+                if len(_cache) > 0:
+                    self._expected_num_layers = len(_cache)
+            except Exception:
+                self._expected_num_layers = None
+        for _attr in ("args", "config"):
+            if self._expected_num_layers is not None:
+                break
+            _cfg = getattr(model, _attr, None)
+            if _cfg is not None:
+                _ln = getattr(_cfg, "num_hidden_layers", 0)
+                if _ln:
+                    self._expected_num_layers = int(_ln)
+                    break
+
+    def _get_n_kv_heads(self) -> int:
+        """Get expected KV head count from model config (cached).
+
+        Only returns num_key_value_heads or num_kv_heads — never falls back
+        to num_attention_heads, which is wrong for GQA models (e.g. 32 attn
+        heads but 8 KV heads). Returns 0 if unknown (skips validation).
+
+        For MLA models (kv_lora_rank > 0): returns 1 because MLA stores
+        compressed latents with H=1, not per-head KV. The config's
+        num_key_value_heads is the pre-compression head count (32), but
+        the actual cache tensor has shape (B, 1, T, kv_lora_rank).
+
+        Original MLA prefix cache integration by Jinho Jang (eric@jangq.ai).
+        This fix required tracing through the full paged cache block hash →
+        store → reconstruct → validate pipeline to find the head count
+        mismatch that caused 100% cache misses for all MLA models.
+        """
+        if self._n_kv_heads is not None:
+            return self._n_kv_heads
+        n_kv = 0
+        try:
+            # Check model, language_model (VLM wrapper), and model.model (nested)
+            candidates = [self.model]
+            lm = getattr(self.model, 'language_model', None)
+            if lm is not None:
+                candidates.append(lm)
+            mm = getattr(self.model, 'model', None)
+            if mm is not None and mm is not self.model:
+                candidates.append(mm)
+            # TWO-PASS scan: MLA detection MUST come first. Most MLA models
+            # store compressed latent cache with H=1, but Ling/Bailing stores
+            # full expanded KV heads in MLAAttention.update_and_fetch().
+            # Do not slice those blocks down to one head.
+            for model_obj in candidates:
+                for attr in ('args', 'config', 'text_config'):
+                    cfg = getattr(model_obj, attr, None)
+                    if cfg is None:
+                        continue
+                    model_type = str(getattr(cfg, 'model_type', '') or '').lower()
+                    if not model_type:
+                        tc = getattr(cfg, 'text_config', None)
+                        if tc is not None:
+                            model_type = str(
+                                getattr(tc, 'model_type', '') or ''
+                            ).lower()
+                    kv_lora_rank = getattr(cfg, 'kv_lora_rank', 0)
+                    if not kv_lora_rank:
+                        tc = getattr(cfg, 'text_config', None)
+                        if tc is not None:
+                            kv_lora_rank = getattr(tc, 'kv_lora_rank', 0)
+                    if kv_lora_rank and kv_lora_rank > 0:
+                        if model_type in ('bailing_hybrid', 'bailing_moe_v2_5'):
+                            n_kv = int(getattr(cfg, 'num_attention_heads', 0) or 0)
+                            if not n_kv:
+                                tc = getattr(cfg, 'text_config', None)
+                                if tc is not None:
+                                    n_kv = int(
+                                        getattr(tc, 'num_attention_heads', 0) or 0
+                                    )
+                        else:
+                            n_kv = 1  # MLA compressed latent, single "head"
+                        break
+                if n_kv:
+                    break
+            # Pass 2: if no MLA found, get num_key_value_heads.
+            # Gemma 4 VLM stores num_key_value_heads inside
+            # model.config.text_config (not directly on model.config),
+            # so we also check cfg.text_config as a nested fallback.
+            if not n_kv:
+                for model_obj in candidates:
+                    for attr in ('args', 'config', 'text_config'):
+                        cfg = getattr(model_obj, attr, None)
+                        if cfg is None:
+                            continue
+                        n_kv = (
+                            getattr(cfg, 'num_key_value_heads', 0)
+                            or getattr(cfg, 'num_kv_heads', 0)
+                        )
+                        if not n_kv:
+                            # Nested text_config (VLM wrappers like Gemma 4
+                            # whose ModelConfig wraps TextConfig)
+                            tc = getattr(cfg, 'text_config', None)
+                            if tc is not None:
+                                n_kv = (
+                                    getattr(tc, 'num_key_value_heads', 0)
+                                    or getattr(tc, 'num_kv_heads', 0)
+                                )
+                        if n_kv:
+                            break
+                    if n_kv:
+                        break
+        except Exception:
+            pass
+        if not isinstance(n_kv, int):
+            n_kv = 0
+        self._n_kv_heads = n_kv
+        return n_kv
+
+    def _get_allowed_n_kv_heads(self) -> set:
+        """Get the set of valid KV head counts across ALL layers.
+
+        For uniform-head models (Llama, Qwen, etc.), returns {num_key_value_heads}.
+        For mixed-head models (Gemma 4 with interleaved sliding_attention +
+        full_attention, where sliding uses num_key_value_heads=16 and full uses
+        num_global_key_value_heads=4), returns {4, 16}.
+
+        Used to validate reconstructed paged-cache KV shapes without forcing
+        false-positive cache misses on layers that legally have a different
+        head count than the primary num_key_value_heads.
+
+        Returns the empty set if no valid counts could be determined (in which
+        case head-count validation is skipped — better than forcing false misses).
+        """
+        if self._allowed_n_kv_heads is not None:
+            return self._allowed_n_kv_heads
+
+        allowed: set = set()
+        primary = self._get_n_kv_heads()
+        if primary > 0:
+            allowed.add(primary)
+
+        # Scan model config tree for mixed-head architectures.
+        # Gemma 4: num_global_key_value_heads on full_attention layers.
+        # Future-proof for other mixed-head variants by walking the same
+        # config candidates _get_n_kv_heads uses.
+        try:
+            candidates = [self.model]
+            lm = getattr(self.model, 'language_model', None)
+            if lm is not None:
+                candidates.append(lm)
+            mm = getattr(self.model, 'model', None)
+            if mm is not None and mm is not self.model:
+                candidates.append(mm)
+            for model_obj in candidates:
+                for attr in ('args', 'config', 'text_config'):
+                    cfg = getattr(model_obj, attr, None)
+                    if cfg is None:
+                        continue
+                    # Mixed full/SWA KV heads. Gemma 4 exposes global KV
+                    # heads for full-attention layers; MiMo V2 exposes
+                    # swa_num_key_value_heads for rotating SWA layers.
+                    for field in (
+                        'num_global_key_value_heads',
+                        'global_num_key_value_heads',
+                        'swa_num_key_value_heads',
+                        'num_swa_key_value_heads',
+                        'sliding_num_key_value_heads',
+                        'local_num_key_value_heads',
+                    ):
+                        val = getattr(cfg, field, None)
+                        if val is None:
+                            tc = getattr(cfg, 'text_config', None)
+                            if tc is not None:
+                                val = getattr(tc, field, None)
+                        if isinstance(val, int) and val > 0:
+                            allowed.add(val)
+        except Exception:
+            pass
+
+        self._allowed_n_kv_heads = allowed
+        return allowed
+
+    def fetch_cache(
+        self,
+        request_id: str,
+        tokens: List[int],
+        cache_extra_keys: Optional[Any] = None,
+    ) -> Tuple[Optional[BlockTable], List[int]]:
+        """
+        Find cached prefix blocks for the given tokens.
+
+        Args:
+            request_id: Unique request identifier
+            tokens: Input token sequence
+
+        Returns:
+            Tuple of (block_table, remaining_tokens)
+            - block_table: BlockTable if prefix found, None otherwise
+            - remaining_tokens: Tokens that need processing
+
+        Ref ownership:
+            get_computed_blocks() increments request refs through touch();
+            fallback prefix-index matches call increment_ref explicitly.
+        """
+        if not tokens:
+            return None, tokens
+
+        # Primary path: chain-hash lookup. This includes the parent block hash
+        # and therefore the full prefix context. Do not use the legacy
+        # find_shared_prefix() block-content hash here: it keys only on the
+        # current block's token bytes and can replay a repeated 64-token chunk
+        # under the wrong history/position, corrupting decoded text.
+        cached_blocks, num_cached = self.paged_cache.get_computed_blocks(
+            tokens,
+            extra_keys=cache_extra_keys,
+        )
+        # MLLM/DSV4 paths store blocks with N-1 tokens (truncated for re-feed).
+        # Always try the N-1 key as well, not only on total miss. After process
+        # restart the in-memory partial-size index is empty, so the full-N lookup
+        # can restore the full 64-token blocks but miss the terminal partial
+        # block (e.g. full prompt remaining=41 while stored N-1 terminal=40).
+        # For DSV4 that terminal partial carries the only deepseek_v4 composite
+        # CSA/HCA state; accepting the shorter hit yields "2 layers, expected
+        # 43" or a forced full prefill. Prefer whichever lookup restores more
+        # cached tokens, and release request refs from the loser.
+        if len(tokens) > 1:
+            alt_blocks, alt_num_cached = self.paged_cache.get_computed_blocks(
+                tokens[:-1],
+                extra_keys=cache_extra_keys,
+            )
+            if alt_num_cached > num_cached:
+                if cached_blocks:
+                    try:
+                        self.paged_cache.release_request_refs(
+                            BlockTable(
+                                request_id=request_id,
+                                block_ids=[b.block_id for b in cached_blocks],
+                                num_tokens=num_cached,
+                            )
+                        )
+                    except Exception:
+                        pass
+                cached_blocks, num_cached = alt_blocks, alt_num_cached
+            elif alt_blocks:
+                try:
+                    self.paged_cache.release_request_refs(
+                        BlockTable(
+                            request_id=request_id,
+                            block_ids=[b.block_id for b in alt_blocks],
+                            num_tokens=alt_num_cached,
+                        )
+                    )
+                except Exception:
+                    pass
+
+        # get_computed_blocks() is intentionally block-chain-first. For prompts
+        # that extend a previously cached terminal partial block by more than
+        # one block, it can stop at the last full block and never consider the
+        # longer exact partial prefix. The prefix index stores those terminal
+        # partial boundaries, so compare before accepting the shorter hit.
+        best_match = self._find_best_prefix_match(
+            tokens,
+            cache_extra_keys=cache_extra_keys,
+        )
+        if cached_blocks and best_match and len(best_match[0]) > num_cached:
+            try:
+                self.paged_cache.release_request_refs(
+                    BlockTable(
+                        request_id=request_id,
+                        block_ids=[b.block_id for b in cached_blocks],
+                        num_tokens=num_cached,
+                    )
+                )
+            except Exception:
+                pass
+            logger.info(
+                "Prefix index exact-partial match for %s extends paged hit "
+                "from %d to %d tokens",
+                request_id,
+                num_cached,
+                len(best_match[0]),
+            )
+            cached_blocks = []
+            num_cached = 0
+        if cached_blocks:
+            _disk_store = getattr(self.paged_cache, "_disk_store", None)
+            if self._dsv4_l2_chain_missing_terminal_state(cached_blocks, _disk_store):
+                _reject_table = BlockTable(
+                    request_id=request_id,
+                    block_ids=[cb.block_id for cb in cached_blocks],
+                    num_tokens=sum(getattr(cb, "token_count", 0) for cb in cached_blocks),
+                )
+                self.paged_cache.release_request_refs(_reject_table)
+                logger.warning(
+                    "Ignoring DSV4 paged prefix hit for %s: restored blocks "
+                    "contain DeepseekV4Cache pending markers but no terminal "
+                    "deepseek_v4 composite state. A non-terminal DSV4 block "
+                    "only carries SWA/local fragments; CSA/HCA pool state "
+                    "lives in the terminal block, so using this prefix would "
+                    "reconstruct an incomplete cache.",
+                    request_id,
+                )
+                self._misses += 1
+                return None, tokens
+
+            if self._zaya_l2_chain_missing_terminal_state(cached_blocks, _disk_store):
+                _reject_table = BlockTable(
+                    request_id=request_id,
+                    block_ids=[cb.block_id for cb in cached_blocks],
+                    num_tokens=sum(getattr(cb, "token_count", 0) for cb in cached_blocks),
+                )
+                self.paged_cache.release_request_refs(_reject_table)
+                logger.warning(
+                    "Ignoring ZAYA paged prefix hit for %s: restored blocks "
+                    "contain typed zaya_cca KV pages but no terminal CCA "
+                    "conv_state/prev_hs payload. ZAYA CCA state is "
+                    "path-dependent, so this prefix must re-prefill cleanly.",
+                    request_id,
+                )
+                self._misses += 1
+                return None, tokens
+
+            # get_computed_blocks() holds request refs for each returned
+            # block via touch(); the prefix-index path below uses
+            # increment_ref directly because it starts from block IDs.
+            block_table = self.paged_cache.create_block_table(request_id)
+            for cb in cached_blocks:
+                block_table.block_ids.append(cb.block_id)
+                block_table.num_tokens += cb.token_count
+
+            remaining = tokens[block_table.num_tokens:]
+            self._hits += 1
+            self._tokens_saved += block_table.num_tokens
+            logger.info(
+                f"Paged cache hit for {request_id}: "
+                f"{len(cached_blocks)} blocks, {block_table.num_tokens} tokens"
+            )
+            return block_table, remaining
+
+        # Try prefix index for longer matches
+        if best_match:
+            matched_tokens, matched_block_ids = best_match
+            matched_blocks = [
+                self.paged_cache.allocated_blocks.get(block_id)
+                for block_id in matched_block_ids
+            ]
+            matched_blocks = [b for b in matched_blocks if b is not None]
+            _disk_store = getattr(self.paged_cache, "_disk_store", None)
+            if self._dsv4_l2_chain_missing_terminal_state(matched_blocks, _disk_store):
+                logger.warning(
+                    "Ignoring DSV4 prefix-index hit for %s: matched blocks "
+                    "contain DeepseekV4Cache pending markers but no terminal "
+                    "deepseek_v4 composite state.",
+                    request_id,
+                )
+                self._misses += 1
+                return None, tokens
+            if self._zaya_l2_chain_missing_terminal_state(matched_blocks, _disk_store):
+                logger.warning(
+                    "Ignoring ZAYA prefix-index hit for %s: matched blocks "
+                    "contain zaya_cca KV pages but no terminal CCA state.",
+                    request_id,
+                )
+                self._misses += 1
+                return None, tokens
+
+            # Fork the matched blocks
+            block_table = self.paged_cache.create_block_table(request_id)
+            for block_id in matched_block_ids:
+                self.paged_cache.increment_ref(block_id)
+                block = self.paged_cache.allocated_blocks.get(block_id)
+                if block:
+                    block_table.block_ids.append(block_id)
+                    block_table.num_tokens += block.token_count
+
+            remaining = tokens[len(matched_tokens) :]
+            self._hits += 1
+            self._tokens_saved += len(matched_tokens)
+
+            logger.debug(
+                f"Prefix index hit for {request_id}: "
+                f"{len(matched_tokens)} tokens matched"
+            )
+
+            return block_table, remaining
+
+        # No cache hit
+        self._misses += 1
+        logger.debug(f"Cache miss for {request_id}")
+        return None, tokens
+
+    @staticmethod
+    def _iter_terminal_check_entries(block: Any, disk_store: Optional[Any] = None):
+        cache_data = getattr(block, "cache_data", None)
+        if cache_data is None and disk_store is not None:
+            block_hash = getattr(block, "block_hash", None)
+            if block_hash is not None:
+                try:
+                    cache_data = disk_store.read_block(block_hash)
+                except Exception:
+                    cache_data = None
+        for entry in cache_data or []:
+            yield entry
+
+    @staticmethod
+    def _dsv4_l2_chain_missing_terminal_state(
+        cached_blocks: List[Any],
+        disk_store: Optional[Any] = None,
+    ) -> bool:
+        """True when an L2 hit restored only non-terminal DSV4 blocks.
+
+        DSV4 block L2 intentionally writes cheap ``deepseek_v4_pending``
+        markers for non-terminal blocks and stores the full SWA+CSA/HCA
+        composite state only on the terminal block. A chain hit that stops
+        before that terminal block is not a usable prefix cache: rebuilding it
+        yields a few SWA layers and misses every DeepseekV4Cache layer.
+        Treat it as a miss so the scheduler does a full prefill instead of
+        running with incomplete compressor/indexer pool state.
+        """
+        saw_pending = False
+        saw_terminal = False
+        for block in cached_blocks or []:
+            for entry in BlockAwarePrefixCache._iter_terminal_check_entries(
+                block,
+                disk_store,
+            ):
+                if not isinstance(entry, (tuple, list)) or not entry:
+                    continue
+                tag = entry[0]
+                if tag == "deepseek_v4_pending":
+                    saw_pending = True
+                elif tag == "deepseek_v4":
+                    saw_terminal = True
+        return saw_pending and not saw_terminal
+
+    @staticmethod
+    def _zaya_l2_chain_missing_terminal_state(
+        cached_blocks: List[Any],
+        disk_store: Optional[Any] = None,
+    ) -> bool:
+        """True when a ZAYA hit has KV pages but lacks terminal CCA state."""
+        saw_zaya = False
+        saw_terminal = False
+        for block in cached_blocks or []:
+            for entry in BlockAwarePrefixCache._iter_terminal_check_entries(
+                block,
+                disk_store,
+            ):
+                if not isinstance(entry, (tuple, list)) or not entry:
+                    continue
+                if entry[0] != "zaya_cca":
+                    continue
+                saw_zaya = True
+                if len(entry) > 2 and entry[2] is not None:
+                    saw_terminal = True
+        return saw_zaya and not saw_terminal
+
+    def store_cache(
+        self,
+        request_id: str,
+        tokens: List[int],
+        cache_data: List[Any],
+        cache_type: str = "assistant",
+        cache_extra_keys: Optional[Any] = None,
+    ) -> Optional[BlockTable]:
+        """
+        Store computed cache for future reuse.
+
+        This method stores actual tensor data (not references) when cache_data
+        contains extracted states from mlx-lm's KVCache.state property.
+
+        Args:
+            request_id: Unique request identifier
+            tokens: Token sequence that was processed
+            cache_data: The computed KV cache to store. Can be:
+                - List of KVCache objects (legacy, stores references)
+                - List of dicts with 'state': (keys, values) tensors (new, stores slices)
+            cache_type: One of "system" | "user" | "assistant". Tagged on the
+                BlockCacheEntry for stats / future eviction prioritization.
+                Block-level eviction itself is governed by paged-cache reference
+                counts; this tag does not change current eviction order.
+
+        Returns:
+            BlockTable for the stored cache, or None on failure
+        """
+        if not tokens:
+            return None
+
+        # Check if cache_data contains extracted tensor states
+        is_tensor_data = (
+            cache_data
+            and isinstance(cache_data, list)
+            and len(cache_data) > 0
+            and isinstance(cache_data[0], dict)
+            and "state" in cache_data[0]
+        )
+        has_dsv4_cache_data = _cache_data_has_dsv4(cache_data) if is_tensor_data else False
+        has_zaya_cca_cache_data = (
+            _cache_data_has_zaya_cca(cache_data) if is_tensor_data else False
+        )
+        has_rotating_kv_cache_data = (
+            _cache_data_has_rotating_kv(cache_data) if is_tensor_data else False
+        )
+
+        # Get or create block table
+        block_table = self.paged_cache.get_block_table(request_id)
+        if not block_table:
+            block_table = self.paged_cache.create_block_table(request_id)
+
+        # Determine tokens we need to cache (not already in block_table)
+        existing_tokens = block_table.num_tokens
+        new_tokens = tokens[existing_tokens:]
+
+        if not new_tokens:
+            # All tokens already cached
+            return block_table
+
+        # Allocate blocks for new tokens
+        num_new_blocks = (len(new_tokens) + self.block_size - 1) // self.block_size
+
+        # For disk write-through, compute chain hashes over the full token sequence.
+        # Reconstruct parent_hash from existing blocks (if any).
+        from .paged_cache import compute_block_hash as _compute_chain_hash
+        parent_hash = None
+        if existing_tokens > 0:
+            # Recompute chain hash up to where the existing blocks end
+            num_existing_full = existing_tokens // self.block_size
+            for eb_idx in range(num_existing_full):
+                eb_start = eb_idx * self.block_size
+                eb_end = eb_start + self.block_size
+                parent_hash = _compute_chain_hash(
+                    parent_hash,
+                    tokens[eb_start:eb_end],
+                    extra_keys=cache_extra_keys,
+                )
+
+        disk_store = self.paged_cache._disk_store  # May be None
+        # Frugal mode: when block disk store is on, disk is authoritative for
+        # block KV data. The in-RAM `block.cache_data` MLX copy is then a
+        # ~26 GB duplicate (sized like the live KV cache) that
+        # `_promote_from_disk` re-creates lazily on L1 miss anyway. Skip the
+        # in-RAM mirror to keep total cache footprint at ~1× live-KV instead
+        # of ~3× during _store. Default ON whenever disk store is present;
+        # users can re-enable RAM-only via `VMLX_PAGED_FRUGAL=0`.
+        import os as _os
+        _frugal_env = _os.environ.get("VMLX_PAGED_FRUGAL", "").strip()
+        if _frugal_env == "":
+            _paged_frugal = disk_store is not None  # auto: on when disk has it
+        else:
+            _paged_frugal = _frugal_env not in ("0", "false", "False", "no")
+        logger.info(
+            f"Block disk write-through: disk_store={'present' if disk_store else 'None'}, "
+            f"is_tensor_data={is_tensor_data}, new_tokens={len(new_tokens)}, "
+            f"num_new_blocks={num_new_blocks}, frugal={_paged_frugal}"
+        )
+
+        # Pre-convert source KV arrays to numpy for safe slicing.
+        # MLX has a Metal command buffer bug: any evaluation of lazy slices
+        # whose source was previously evaluated triggers fatal Metal
+        # assertions ("addCompletedHandler after commit") or kernel panics
+        # ("completeMemory() prepare count underflow").  By converting the
+        # full evaluated source arrays to numpy here (just a CPU memcpy on
+        # unified memory), both _extract_block_tensor_slice (for block
+        # cache_data) and _numpy_block_slice (for disk writes) can do all
+        # per-block slicing in numpy space — zero Metal operations.
+        np_sources: dict = {}  # layer_idx → (np_keys, np_values)
+        if is_tensor_data and HAS_MLX:
+            import numpy as np
+            # Synchronize all Metal streams before converting arrays to numpy.
+            # mlx_lm's BatchGenerator.next() does NOT synchronize after
+            # inference — in-place KV/SSM cache updates (keys[...] = new_k)
+            # create lazy side-effect operations that may still be pending on
+            # the Metal command queue.  Without this sync, np.array() on cache
+            # arrays (especially cumulative SSM state in _numpy_block_slice)
+            # triggers "addCompletedHandler after commit" or segfault.
+            # MLLMBatchGenerator.next() already syncs its dedicated _stream,
+            # but the stock BatchGenerator and the default stream are not
+            # covered — a bare mx.synchronize() handles both.
+            mx.synchronize()
+            for idx, layer_state in enumerate(cache_data):
+                cls = layer_state.get("class_name", "")
+                if _is_zaya_cca_cache_list_state(layer_state):
+                    try:
+                        subs = layer_state["sub_caches"]
+                        kv_state = subs[0].get("state")
+                        keys, values = kv_state
+                        if isinstance(keys, (tuple, list)):
+                            # Keep generic quantized CacheList on the MLX
+                            # path for now. ZAYA runtime TQ-KV needs its own
+                            # typed partial codec before disk writes use it.
+                            continue
+                        k_np, v_np = keys, values
+                        if hasattr(k_np, "dtype") and "bfloat16" in str(k_np.dtype):
+                            k_np = k_np.astype(mx.float32)
+                            v_np = v_np.astype(mx.float32)
+                        cca_state = subs[1].get("state")
+                        cca_np = _to_numpy_tree(cca_state)
+                        np_sources[idx] = {
+                            "type": "zaya_cca",
+                            "kv": (np.array(k_np), np.array(v_np), keys.dtype),
+                            "cca_state": cca_np,
+                            "cca_meta": subs[1].get("meta_state", ""),
+                            "cache_meta": {
+                                "schema": "zaya_cca_v1",
+                                "cca_class_name": subs[1].get(
+                                    "class_name", "ArraysCache"
+                                ),
+                            },
+                        }
+                    except Exception as _npe:
+                        logger.debug(f"np_sources skip ZAYA layer {idx}: {_npe}")
+                    continue
+                state = layer_state.get("state")
+                if state is None:
+                    continue
+                if self._is_positional_cache(state, cls):
+                    try:
+                        keys, values = state
+                        if isinstance(keys, (tuple, list)):
+                            # Quantized KV (QuantizedKVCache / TurboQuantKVCache).
+                            # state = ((w_packed, scales, biases), (w_packed, scales, biases))
+                            # Dequantize to float16 for the numpy extraction path so the
+                            # block disk cache can serialize per-block slices. Without
+                            # this, np_sources stays empty for quantized layers and the
+                            # block disk write-through silently drops everything.
+                            #
+                            # Trade-off: disk cache entries are ~4x larger for q8 (vs.
+                            # storing packed bytes), but storage works.
+                            if len(keys) < 2 or len(values) < 2:
+                                logger.debug(
+                                    f"np_sources skip layer {idx}: quantized state "
+                                    f"arity keys={len(keys)} values={len(values)}"
+                                )
+                                continue
+                            meta = layer_state.get("meta_state", ())
+                            # meta_state typically ends with (group_size, bits)
+                            g_size, q_bits = 64, 8
+                            if isinstance(meta, (tuple, list)) and len(meta) >= 2:
+                                try:
+                                    g_size = int(meta[-2])
+                                    q_bits = int(meta[-1])
+                                except (ValueError, TypeError):
+                                    pass
+                            k_w, k_s = keys[0], keys[1]
+                            k_b = keys[2] if len(keys) >= 3 else mx.zeros_like(k_s)
+                            v_w, v_s = values[0], values[1]
+                            v_b = values[2] if len(values) >= 3 else mx.zeros_like(v_s)
+                            k_dq = mx.dequantize(
+                                k_w, k_s, k_b, group_size=g_size, bits=q_bits,
+                            )
+                            v_dq = mx.dequantize(
+                                v_w, v_s, v_b, group_size=g_size, bits=q_bits,
+                            )
+                            if 'bfloat16' in str(k_dq.dtype):
+                                # Use float32 (not float16) for the numpy round-trip.
+                                # fp16 has only 5 exponent bits vs bf16's 8 — casting
+                                # down silently clips/loses precision for many
+                                # attention KV values. On Gemma 4 JANG this caused
+                                # "step-by-step" word loops on the 3rd multi-turn
+                                # request because the cached KV drift pushed the
+                                # sampler into a degenerate rep_pen-proof basin.
+                                k_dq = k_dq.astype(mx.float32)
+                                v_dq = v_dq.astype(mx.float32)
+                            mx.eval(k_dq, v_dq)
+                            np_sources[idx] = (np.array(k_dq), np.array(v_dq), k_dq.dtype)
+                            continue
+                        if hasattr(keys, 'shape'):
+                            k_np, v_np = keys, values
+                            # numpy doesn't support bfloat16 — cast through fp32
+                            # (NOT fp16, which silently clips). See the Gemma 4
+                            # multi-turn word-loop note above.
+                            if hasattr(k_np, 'dtype') and 'bfloat16' in str(k_np.dtype):
+                                k_np = k_np.astype(mx.float32)
+                                v_np = v_np.astype(mx.float32)
+                            np_sources[idx] = (np.array(k_np), np.array(v_np), keys.dtype)
+                    except Exception as _npe:
+                        logger.debug(f"np_sources skip layer {idx}: {_npe}")
+
+        if disk_store is not None:
+            logger.info(
+                f"Block disk: np_sources has {len(np_sources)} positional layers "
+                f"(out of {len(cache_data)} total)"
+            )
+
+        pending_disk_writes: list = []
+
+        for i in range(num_new_blocks):
+            start_idx = i * self.block_size
+            end_idx = min(start_idx + self.block_size, len(new_tokens))
+            block_tokens = new_tokens[start_idx:end_idx]
+
+            # Token range in the original sequence (accounting for existing tokens)
+            global_start = existing_tokens + start_idx
+            global_end = existing_tokens + end_idx
+
+            # Compute chain hash for this block
+            block_chain_hash = _compute_chain_hash(
+                parent_hash,
+                block_tokens,
+                extra_keys=cache_extra_keys,
+            )
+
+            # Check if this block already exists via chain hash (deduplication)
+            # IMPORTANT: lookup + ref bump must be atomic under _lock to prevent
+            # the block from being freed between get_block and increment_ref.
+            is_last = (i == num_new_blocks - 1)
+            reused = False
+            with self.paged_cache._lock:
+                existing_block = self.paged_cache.cached_block_hash_to_block.get_block(
+                    block_chain_hash
+                )
+                if existing_block:
+                    # If this is the last block in the new sequence and the
+                    # existing block was stored as non-last (SSM layers tagged
+                    # "skip" without cumulative state), skip reuse so we can
+                    # allocate a new block with proper cumulative SSM state.
+                    # Without this, hybrid SSM models get "Reconstructed 10
+                    # layers but expected 40" because cumulative entries are
+                    # never stored.
+                    if (
+                        is_last
+                        and is_tensor_data
+                        and (
+                            _block_needs_cumulative_update(existing_block.cache_data)
+                            or (
+                                (has_dsv4_cache_data or has_zaya_cca_cache_data)
+                                and existing_block.cache_data is None
+                            )
+                        )
+                    ):
+                        pass  # Fall through to new block allocation
+                    else:
+                        existing_block.ref_count += 1
+                        existing_block.touch()
+                        if existing_block.ref_count == 2:
+                            self.paged_cache.stats.shared_blocks += 1
+                        reused = True
+            if reused:
+                block_table.block_ids.append(existing_block.block_id)
+                block_table.num_tokens += len(block_tokens)
+                parent_hash = block_chain_hash
+                if disk_store is not None:
+                    logger.debug(
+                        f"Block disk: block {existing_block.block_id} reused from L1 "
+                        f"(skip disk write)"
+                    )
+                continue
+
+            # Also check legacy hash for non-tensor blocks stored before chain hashing.
+            #
+            # Tensor KV state must NEVER use this content-only fallback.
+            # Repeated 64-token chunks have identical text but different hidden
+            # state because real KV values depend on the full prefix. DSV4 made
+            # this obvious through CSA/HCA state, but the same invariant applies
+            # to ordinary attention, RoPE, hybrid SSM companions, and TQ-KV.
+            # Chain hashes above already cover the safe exact-prefix case.
+            existing_block = None
+            if not is_tensor_data:
+                # find_cached_block already holds _lock internally, but we need
+                # to do the ref bump under the same lock to avoid the same race.
+                with self.paged_cache._lock:
+                    hash_value = self.paged_cache.compute_block_hash(block_tokens)
+                    if hash_value in self.paged_cache.hash_to_block:
+                        bid = self.paged_cache.hash_to_block[hash_value]
+                        if bid in self.paged_cache.allocated_blocks:
+                            existing_block = self.paged_cache.allocated_blocks[bid]
+                            # Same cumulative state check as chain hash path:
+                            # skip reuse if last block needs cumulative SSM state
+                            if is_last and is_tensor_data and _block_needs_cumulative_update(
+                                existing_block.cache_data
+                            ):
+                                existing_block = None  # Fall through to allocation
+                            else:
+                                existing_block.ref_count += 1
+                                existing_block.touch()
+                                if existing_block.ref_count == 2:
+                                    self.paged_cache.stats.shared_blocks += 1
+                                self.paged_cache.stats.cache_hits += 1
+                                # Set chain hash on the existing block if it doesn't have one
+                                if existing_block.block_hash is None:
+                                    existing_block.block_hash = block_chain_hash
+                                    self.paged_cache.cached_block_hash_to_block.insert(
+                                        block_chain_hash, existing_block
+                                    )
+                    if existing_block is None:
+                        self.paged_cache.stats.cache_misses += 1
+            else:
+                with self.paged_cache._lock:
+                    self.paged_cache.stats.cache_misses += 1
+            if existing_block:
+                block_table.block_ids.append(existing_block.block_id)
+                block_table.num_tokens += len(block_tokens)
+                parent_hash = block_chain_hash
+                continue
+
+            # Allocate new block
+            block = self.paged_cache.allocate_block()
+            if not block:
+                # First free low-priority entries (assistant -> user -> system)
+                # so their request refs drop and blocks can enter the free LRU queue.
+                self.release_low_priority(1)
+
+                # Then run block-level LRU eviction under memory pressure.
+                if not self.paged_cache.handle_memory_pressure(1):
+                    if block_table.num_tokens > 0:
+                        logger.warning(
+                            "Paged cache capacity reached for %s; stored partial "
+                            "prefix %s/%s tokens (%s blocks). Increase Max Cache "
+                            "Blocks or lower Block Size to cache more of this prompt.",
+                            request_id,
+                            block_table.num_tokens,
+                            len(tokens),
+                            len(block_table.block_ids),
+                        )
+                    else:
+                        logger.warning(
+                            "Paged cache capacity reached for %s before any prefix "
+                            "blocks fit. Increase Max Cache Blocks or lower Block "
+                            "Size to enable prefix reuse for this prompt.",
+                            request_id,
+                        )
+                    break
+                block = self.paged_cache.allocate_block()
+                if not block:
+                    if block_table.num_tokens > 0:
+                        logger.warning(
+                            "Paged cache allocation stopped for %s; stored partial "
+                            "prefix %s/%s tokens (%s blocks).",
+                            request_id,
+                            block_table.num_tokens,
+                            len(tokens),
+                            len(block_table.block_ids),
+                        )
+                    break
+
+            # Store block data
+            block.token_count = len(block_tokens)
+            block_table.block_ids.append(block.block_id)
+            block_table.num_tokens += len(block_tokens)
+
+            # Set chain hash on the block (for L1 dedup and L2 disk addressing)
+            block.block_hash = block_chain_hash
+
+            # Extract and store actual tensor slices for this block
+            if is_tensor_data and HAS_MLX:
+                # is_last already computed above (for cumulative state checks)
+                block_kv_data = self._extract_block_tensor_slice(
+                    cache_data,
+                    global_start,
+                    global_end,
+                    is_last_block=is_last,
+                    np_sources=np_sources if np_sources else None,
+                    existing_tokens=existing_tokens,
+                )
+                if block_kv_data:
+                    # DSV4, ZAYA CCA, and mixed-SWA rotating KV are not normal
+                    # per-block KV payloads.
+                    # DSV4 terminal blocks carry SWA+CSA/HCA composite state;
+                    # ZAYA terminal blocks carry CCA conv_state + prev_hs.
+                    # Mixed-SWA carries per-layer rotating-window metadata.
+                    # If frugal mode drops those in-RAM records, an immediate
+                    # same-process repeat can hit the block table before the
+                    # async L2 write is readable and reconstruct as None. Keep
+                    # native path-dependent records resident; L2 still gets the
+                    # write-through copy for restart restore.
+                    keep_in_ram = (
+                        has_dsv4_cache_data
+                        or has_zaya_cca_cache_data
+                        or has_rotating_kv_cache_data
+                    )
+                    if _paged_frugal and not keep_in_ram:
+                        # Disk has it — skip the in-RAM duplicate. L1 lookup
+                        # will fall through to L2 disk + _promote_from_disk
+                        # which lazily re-creates cache_data on hit.
+                        # Keep token_count/block_hash set above so disk
+                        # promotion can verify the block.
+                        logger.debug(
+                            f"Frugal: skipped in-RAM mirror for block "
+                            f"{block.block_id} (tokens [{global_start}:{global_end}], "
+                            f"disk-only)"
+                        )
+                    else:
+                        block.cache_data = block_kv_data
+                        block.cache_data_from_disk = False
+                        logger.debug(
+                            f"Stored tensor slice for block {block.block_id}: "
+                            f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
+                            f"{' (includes cumulative states)' if is_last else ''}"
+                        )
+
+                    # Defer disk write using numpy slices (no MLX ops)
+                    if disk_store is not None:
+                        np_block = _numpy_block_slice(
+                            cache_data, np_sources or {},
+                            global_start, global_end, is_last, existing_tokens,
+                        )
+                        if np_block:
+                            # Count non-skip entries. DSV4 intentionally logs
+                            # only two plain KV layers plus native composite
+                            # markers/state for the remaining layers; showing
+                            # those tags keeps support logs from looking like
+                            # the CSA/HCA cache was dropped.
+                            _tag_counts = {}
+                            for _entry in np_block:
+                                if not isinstance(_entry, (tuple, list)) or not _entry:
+                                    continue
+                                _tag = _entry[0]
+                                if _tag == "skip":
+                                    continue
+                                _tag_counts[_tag] = _tag_counts.get(_tag, 0) + 1
+                            _kv_count = _tag_counts.get("kv", 0)
+                            _extra_tags = ", ".join(
+                                f"{_tag}={_count}"
+                                for _tag, _count in sorted(_tag_counts.items())
+                                if _tag != "kv"
+                            )
+                            _layer_summary = f"{_kv_count} kv layers"
+                            if _extra_tags:
+                                _layer_summary += f", {_extra_tags}"
+                            logger.info(
+                                f"Block disk: queuing write for block {block.block_id} "
+                                f"({_layer_summary}, {len(block_tokens)} tokens)"
+                            )
+                            pending_disk_writes.append(
+                                (block_chain_hash, np_block, len(block_tokens))
+                            )
+                        else:
+                            logger.warning(
+                                f"Block disk: _numpy_block_slice returned empty "
+                                f"for block {block.block_id} "
+                                f"(global [{global_start}:{global_end}], is_last={is_last})"
+                            )
+
+            # Register in hash caches under lock (both chain hash and legacy)
+            with self.paged_cache._lock:
+                self.paged_cache.cached_block_hash_to_block.insert(
+                    block_chain_hash, block
+                )
+            self.paged_cache.register_block_hash(block, block_tokens)
+
+            parent_hash = block_chain_hash
+
+        # Free the full-cache numpy mirror immediately. np_sources duplicates
+        # the entire live KV cache (~26 GB on a MiniMax-M2 17K-prefill: 62
+        # layers × 48 heads × 64 head_dim × 17000 tokens × 2 bytes × 2 (k+v))
+        # and was previously held until function exit. The block-extraction
+        # loop above is finished, so dropping this here cuts peak resident
+        # RAM during _store by exactly the live-KV size. Pending disk writes
+        # below already have their own per-block numpy slices captured.
+        if np_sources:
+            np_sources.clear()
+        np_sources = None
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+
+        # Write deferred disk blocks (all numpy — no MLX/Metal ops).
+        if pending_disk_writes and disk_store is not None:
+            logger.info(
+                f"Block disk: writing {len(pending_disk_writes)} blocks to SSD"
+            )
+            for block_hash, block_data, tok_count in pending_disk_writes:
+                try:
+                    disk_store.write_block_async(block_hash, block_data, tok_count)
+                except Exception as _wbe:
+                    logger.warning(
+                        f"Block disk: write_block_async failed: {_wbe}"
+                    )
+
+        # Update prefix index
+        self._update_prefix_index(
+            tokens,
+            block_table.block_ids,
+            cache_extra_keys=cache_extra_keys,
+        )
+
+        # Store entry for request (for legacy compatibility)
+        norm_type = cache_type if cache_type in ("system", "user", "assistant") else "assistant"
+        # Tensor-backed paged cache uses block.cache_data as the authoritative
+        # in-memory payload and block-disk L2 as the durable spill tier. Keeping
+        # the original full cache_data object here pins a second full KV copy
+        # after the request has finished, which can push large native
+        # RotatingKVCache models over the Metal working-set guard. Non-tensor
+        # callers keep the legacy reference for get_cache_for_generation().
+        entry_cache_data = None if is_tensor_data else cache_data
+        self._request_tables[request_id] = BlockCacheEntry(
+            block_table=block_table,
+            cache_data=entry_cache_data,
+            last_access=time.time(),
+            cache_type=norm_type,
+        )
+        if is_tensor_data:
+            cache_data = None
+            try:
+                import gc as _gc
+                _gc.collect()
+            except Exception:
+                pass
+            if HAS_MLX:
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
+
+        # Track in per-type bucket for priority-aware eviction (F1 backport).
+        # Drop old entry from any other bucket (request may have been re-stored
+        # with a different role on a follow-up turn).
+        for _t, _d in self._entries_by_type.items():
+            if request_id in _d and _t != norm_type:
+                del _d[request_id]
+        self._entries_by_type[norm_type][request_id] = True
+        self._entries_by_type[norm_type].move_to_end(request_id)
+
+        blocks_with_data = sum(
+            1
+            for bid in block_table.block_ids
+            if self.paged_cache.allocated_blocks.get(bid)
+            and self.paged_cache.allocated_blocks[bid].cache_data is not None
+        )
+
+        logger.debug(
+            f"Stored cache for {request_id}: "
+            f"{len(block_table.block_ids)} blocks ({blocks_with_data} with tensor data), "
+            f"{block_table.num_tokens} tokens"
+        )
+
+        return block_table
+
+    @staticmethod
+    def _is_positional_cache(state_tuple, class_name: str = "") -> bool:
+        """
+        Determine if a cache layer's state is position-indexed or cumulative.
+
+        Positional (sliceable by token position):
+            KVCache, RotatingKVCache, QuantizedKVCache
+        Cumulative (represents all processed tokens):
+            MambaCache, ArraysCache
+
+        Args:
+            state_tuple: Cache state (keys, values) or arrays list
+            class_name: Cache class name for disambiguation
+        """
+        if not state_tuple:
+            return False
+
+        # Class name is most reliable
+        if class_name:
+            positional = {"KVCache", "BatchKVCache", "RotatingKVCache",
+                          "BatchRotatingKVCache", "QuantizedKVCache",
+                          "TurboQuantKVCache"}
+            cumulative = {"MambaCache", "BatchMambaCache", "ArraysCache"}
+            if any(cls in class_name for cls in positional):
+                return True
+            if any(cls in class_name for cls in cumulative):
+                return False
+
+        # Structure-based fallback
+        if isinstance(state_tuple, (tuple, list)) and len(state_tuple) == 2:
+            first = state_tuple[0]
+            if hasattr(first, "shape") and len(first.shape) in (3, 4):
+                return True
+            # QuantizedKVCache: state is ((data, scales, zeros), (data, scales, zeros))
+            # first element is a tuple of arrays, not an array itself
+            if isinstance(first, tuple) and len(first) >= 2:
+                if hasattr(first[0], "shape") and len(first[0].shape) in (3, 4):
+                    return True
+        return False
+
+    def _extract_block_tensor_slice(
+        self,
+        cache_data: List[Dict[str, Any]],
+        start_idx: int,
+        end_idx: int,
+        is_last_block: bool = False,
+        np_sources: Optional[dict] = None,
+        existing_tokens: int = 0,
+    ) -> Optional[List[Tuple]]:
+        """
+        Extract tensor slices for a single block from cache data.
+
+        Handles both positional caches (KVCache - attention layers) and
+        cumulative caches (MambaCache - SSM/hybrid layers).
+
+        For KVCache layers: slices the KV tensors by token position.
+        For MambaCache layers: stores the full cumulative state (only in
+        the last block, since it represents all processed tokens).
+
+        IMPORTANT — Metal safety:
+        When np_sources is provided, positional (KV) layers are sliced in
+        numpy space and wrapped with mx.array() to produce materialized MLX
+        arrays with their own Metal buffers.  This avoids creating lazy MLX
+        slices of already-evaluated parent arrays, which is fundamentally
+        unsafe: evaluating such slices (whether via mx.eval or np.array)
+        corrupts Metal command buffer state, causing either
+        "addCompletedHandler after commit" assertions or IOGPUFamily
+        "completeMemory() prepare count underflow" kernel panics.
+
+        Args:
+            cache_data: List of layer states from _extract_cache_states
+            start_idx: Start token index in the sequence
+            end_idx: End token index in the sequence
+            is_last_block: Whether this is the last block in the sequence
+            np_sources: Optional dict of layer_idx → (np_keys, np_values)
+                        pre-converted numpy arrays from the parent KV cache.
+                        When present, slicing is done in numpy space.
+
+        Returns:
+            List of tuples per layer. Each tuple is either:
+            - ("kv", keys_slice, values_slice) for positional layers
+            - ("cumulative", state_list) for cumulative/SSM layers
+            - ("skip",) for cumulative layers in non-last blocks
+        """
+        if not HAS_MLX or not cache_data:
+            return None
+
+        block_slices = []
+        for layer_idx, layer_state in enumerate(cache_data):
+            if "state" not in layer_state:
+                continue
+
+            class_name = layer_state.get("class_name", "")
+
+            if _is_dsv4_cache_class(class_name):
+                state = layer_state["state"]
+                if is_last_block and state is not None:
+                    meta = layer_state.get("meta_state", "")
+                    block_slices.append((
+                        "deepseek_v4",
+                        state,
+                        meta,
+                        class_name,
+                        _dsv4_cache_meta(layer_state),
+                    ))
+                else:
+                    block_slices.append((
+                        "deepseek_v4_pending",
+                        class_name,
+                        _dsv4_cache_meta(layer_state),
+                    ))
+                continue
+
+            if class_name == "ZayaNoStateCache" or layer_state.get("no_state"):
+                block_slices.append(("no_state", class_name or "ZayaNoStateCache"))
+                continue
+
+            if _is_zaya_cca_cache_list_state(layer_state):
+                subs = layer_state["sub_caches"]
+                kv_sub = subs[0]
+                state_sub = subs[1]
+                kv_entry = ("skip",)
+                try:
+                    keys, values = kv_sub.get("state")
+                    if isinstance(keys, (tuple, list)):
+                        first_k = keys[0]
+                        seq_len = first_k.shape[-2]
+                        actual_end = min(end_idx, seq_len)
+                        if start_idx < actual_end:
+                            keys_slice = tuple(
+                                t[..., start_idx:actual_end, :] for t in keys
+                            )
+                            values_slice = tuple(
+                                t[..., start_idx:actual_end, :] for t in values
+                            )
+                            kv_entry = (
+                                "quantized_kv",
+                                keys_slice,
+                                values_slice,
+                                kv_sub.get("meta_state", ()),
+                            )
+                    else:
+                        ndim = len(keys.shape)
+                        seq_dim = 2 if ndim == 4 else (1 if ndim == 3 else -1)
+                        if seq_dim >= 0:
+                            seq_len = keys.shape[seq_dim]
+                            actual_end = min(end_idx, seq_len)
+                            if start_idx < actual_end:
+                                if ndim == 4:
+                                    ks = keys[:, :, start_idx:actual_end, :]
+                                    vs = values[:, :, start_idx:actual_end, :]
+                                else:
+                                    ks = keys[:, start_idx:actual_end, :]
+                                    vs = values[:, start_idx:actual_end, :]
+                                kv_entry = ("kv", ks, vs)
+                except Exception:
+                    kv_entry = ("skip",)
+
+                cca_state = (
+                    _copy_mlx_tree(state_sub.get("state"))
+                    if is_last_block
+                    else None
+                )
+                block_slices.append((
+                    "zaya_cca",
+                    kv_entry,
+                    cca_state,
+                    state_sub.get("meta_state", ""),
+                    {
+                        "schema": "zaya_cca_v1",
+                        "cca_class_name": state_sub.get("class_name", "ArraysCache"),
+                    },
+                ))
+                continue
+
+            # CacheList (MoE models): extract slices from each sub-cache
+            if class_name == "CacheList" and "sub_caches" in layer_state:
+                sub_slices = []
+                for sub in layer_state["sub_caches"]:
+                    sub_state = sub.get("state")
+                    sub_cls = sub.get("class_name", "")
+                    if sub_state is None:
+                        sub_slices.append(("skip",))
+                        continue
+                    if self._is_positional_cache(sub_state, sub_cls):
+                        try:
+                            keys, values = sub_state
+                            if isinstance(keys, (tuple, list)):
+                                first_k = keys[0]
+                                seq_len = first_k.shape[-2]
+                                actual_end = min(end_idx, seq_len)
+                                if start_idx >= actual_end:
+                                    sub_slices.append(("skip",))
+                                    continue
+                                keys_slice = tuple(t[..., start_idx:actual_end, :] for t in keys)
+                                values_slice = tuple(t[..., start_idx:actual_end, :] for t in values)
+                                meta = sub.get("meta_state", ())
+                                sub_slices.append(("quantized_kv", keys_slice, values_slice, meta))
+                            else:
+                                ndim = len(keys.shape)
+                                seq_dim = 2 if ndim == 4 else (1 if ndim == 3 else -1)
+                                if seq_dim < 0:
+                                    sub_slices.append(("skip",))
+                                    continue
+                                seq_len = keys.shape[seq_dim]
+                                actual_end = min(end_idx, seq_len)
+                                if start_idx >= actual_end:
+                                    sub_slices.append(("skip",))
+                                    continue
+                                if ndim == 4:
+                                    ks = keys[:, :, start_idx:actual_end, :]
+                                    vs = values[:, :, start_idx:actual_end, :]
+                                else:
+                                    ks = keys[:, start_idx:actual_end, :]
+                                    vs = values[:, start_idx:actual_end, :]
+                                sub_slices.append(("kv", ks, vs))
+                        except Exception:
+                            sub_slices.append(("skip",))
+                    else:
+                        if is_last_block:
+                            meta = sub.get("meta_state", "")
+                            sub_slices.append((
+                                "cumulative",
+                                _copy_mlx_tree(sub_state),
+                                meta,
+                                sub_cls,
+                            ))
+                        else:
+                            sub_slices.append(("skip",))
+                block_slices.append(("cache_list", sub_slices))
+                continue
+
+            state = layer_state["state"]
+
+            # Detect if this is a positional (KVCache) or cumulative (MambaCache) layer
+            if self._is_positional_cache(state, class_name):
+                try:
+                    keys, values = state
+
+                    # QuantizedKVCache: keys/values are tuples or lists of (data, scales, zeros)
+                    if isinstance(keys, (tuple, list)):
+                        # Use first component to detect shape
+                        first_k = keys[0]
+                        seq_len = first_k.shape[-2]  # seq axis is always -2
+                        actual_end = min(end_idx, seq_len)
+                        if start_idx >= actual_end:
+                            block_slices.append(("skip",))
+                            continue
+
+                        keys_slice = tuple(
+                            t[..., start_idx:actual_end, :] for t in keys
+                        )
+                        values_slice = tuple(
+                            t[..., start_idx:actual_end, :] for t in values
+                        )
+                        meta = layer_state.get("meta_state", ())
+                        block_slices.append(("quantized_kv", keys_slice, values_slice, meta))
+                        continue
+
+                    ndim = len(keys.shape)
+
+                    # Handle both 3D (n_kv_heads, seq, dim) and
+                    # 4D (batch, n_kv_heads, seq, dim) tensors
+                    if ndim == 4:
+                        seq_dim = 2
+                    elif ndim == 3:
+                        seq_dim = 1
+                    else:
+                        block_slices.append(("skip",))
+                        continue
+
+                    seq_len = keys.shape[seq_dim]
+                    slice_start, actual_end = _positional_layer_slice_bounds(
+                        layer_state,
+                        class_name,
+                        start_idx,
+                        end_idx,
+                        seq_len,
+                        existing_tokens,
+                    )
+                    if actual_end <= 0 or slice_start >= actual_end:
+                        block_slices.append(("skip",))
+                        continue
+
+                    # When numpy sources are available, slice in numpy space
+                    # and wrap with mx.array() to get materialized MLX arrays.
+                    # This avoids creating lazy MLX slices of evaluated parent
+                    # arrays, which corrupts Metal command buffer state.
+                    if np_sources is not None and layer_idx in np_sources:
+                        np_k, np_v, orig_dtype = np_sources[layer_idx]
+                        if ndim == 4:
+                            ks = mx.array(np_k[:, :, slice_start:actual_end, :])
+                            vs = mx.array(np_v[:, :, slice_start:actual_end, :])
+                        else:
+                            ks = mx.array(np_k[:, slice_start:actual_end, :])
+                            vs = mx.array(np_v[:, slice_start:actual_end, :])
+                        # Restore original dtype (e.g. bfloat16 → float16 → bfloat16)
+                        if ks.dtype != orig_dtype:
+                            ks = ks.astype(orig_dtype)
+                            vs = vs.astype(orig_dtype)
+                    elif ndim == 4:
+                        ks = keys[:, :, slice_start:actual_end, :]
+                        vs = values[:, :, slice_start:actual_end, :]
+                    else:  # ndim == 3
+                        ks = keys[:, slice_start:actual_end, :]
+                        vs = values[:, slice_start:actual_end, :]
+
+                    # Use rotating_kv tag for RotatingKVCache to preserve params
+                    if "Rotating" in class_name:
+                        # Extract max_size/keep from meta_state tuple
+                        # RotatingKVCache.meta_state returns
+                        # (keep, max_size, offset, _idx).
+                        meta = layer_state.get("meta_state", ())
+                        offset = None
+                        idx_state = None
+                        if meta and len(meta) >= 2:
+                            try:
+                                keep = int(meta[0])
+                                max_size = int(meta[1])
+                                if len(meta) >= 3:
+                                    offset = int(meta[2])
+                                if len(meta) >= 4:
+                                    idx_state = int(meta[3])
+                            except (ValueError, TypeError):
+                                max_size = seq_len
+                                keep = 0
+                                offset = None
+                                idx_state = None
+                        else:
+                            max_size = layer_state.get("max_size", seq_len)
+                            keep = layer_state.get("keep", 0)
+                        block_slices.append((
+                            "rotating_kv",
+                            ks,
+                            vs,
+                            max_size,
+                            keep,
+                            offset,
+                            idx_state,
+                        ))
+                    else:
+                        block_slices.append(("kv", ks, vs))
+                except Exception as e:
+                    logger.warning(
+                        f"Layer {layer_idx} ({class_name}): "
+                        f"failed to slice positional cache: {e}"
+                    )
+                    block_slices.append(("skip",))
+            else:
+                # Cumulative cache (MambaCache, ArraysCache, etc.)
+                # State is not position-indexed — it represents ALL tokens processed
+                # Only store in the last block (it encompasses all prior tokens)
+                if is_last_block and state is not None:
+                    meta = layer_state.get("meta_state", "")
+                    block_slices.append((
+                        "cumulative",
+                        _copy_mlx_tree(state),
+                        meta,
+                        class_name,
+                    ))
+                else:
+                    block_slices.append(("skip",))
+
+        if block_slices:
+            tag_counts: dict = {}
+            for bs in block_slices:
+                t = bs[0] if isinstance(bs, (tuple, list)) else "?"
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+            tag_str = ", ".join(f"{k}={v}" for k, v in tag_counts.items())
+            logger.debug(
+                f"Block tensor slice: {len(block_slices)}/{len(cache_data)} layers "
+                f"({tag_str}), tokens [{start_idx}:{end_idx}], is_last={is_last_block}"
+            )
+        return block_slices if block_slices else None
+
+    def get_cache_for_generation(
+        self,
+        request_id: str,
+    ) -> Tuple[Optional[List[Any]], bool]:
+        """
+        Get cache data for generation, applying COW if needed.
+
+        Args:
+            request_id: Request identifier
+
+        Returns:
+            Tuple of (cache_data, was_copied)
+        """
+        entry = self._request_tables.get(request_id)
+        if not entry:
+            return None, False
+
+        # Get blocks with COW
+        blocks, was_copied = self.paged_cache.get_blocks_for_generation(
+            entry.block_table
+        )
+        if entry.cache_data is None:
+            cache_data = self.reconstruct_cache(entry.block_table)
+            entry.last_access = time.time()
+            return cache_data, was_copied
+
+        if was_copied:
+            # Deep copy cache data for modified blocks
+            cache_data = copy.deepcopy(entry.cache_data)
+        else:
+            cache_data = entry.cache_data
+
+        entry.last_access = time.time()
+        return cache_data, was_copied
+
+    def release_cache(self, request_id: str) -> None:
+        """
+        Release cache blocks for a completed request.
+
+        Args:
+            request_id: Request identifier
+        """
+        entry = self._request_tables.pop(request_id, None)
+        if entry:
+            # Drop from per-type LRU bucket so eviction priority stays accurate
+            for _d in self._entries_by_type.values():
+                if request_id in _d:
+                    del _d[request_id]
+            self.paged_cache.delete_block_table(request_id)
+            logger.debug(f"Released cache for {request_id}")
+
+    def detach_request(self, request_id: str) -> None:
+        """Drop the per-request block_table entry WITHOUT freeing blocks.
+
+        Used by the SSM-companion-miss fast path: the request will do a
+        full prefill and the in-memory block_table is no longer useful for
+        it, but the underlying KV blocks must stay cache-resident so that
+        future cross-session requests with the same prompt prefix can hit
+        them. Mirrors PagedCacheManager.detach_request semantics.
+
+        Without this, scheduler.py:2381 was calling release_cache which
+        free_block()s every block — turning the SSM-companion miss into
+        a cache poisoning event that defeats cross-session reuse.
+        """
+        entry = self._request_tables.pop(request_id, None)
+        if entry:
+            for _d in self._entries_by_type.values():
+                if request_id in _d:
+                    del _d[request_id]
+            self.paged_cache.detach_request(request_id)
+            logger.debug(f"Detached request {request_id} (blocks kept cached)")
+
+    def trim_block_table(
+        self, request_id: str, target_tokens: int
+    ) -> Optional["BlockTable"]:
+        """Shrink a live block_table down to ``target_tokens`` by releasing
+        trailing blocks, keeping only the block-aligned prefix.
+
+        Used by the vmlx#91 SSM resume path: when the exact SSM companion
+        cache misses but a shorter checkpoint is a valid prefix, we trim
+        the KV cache to match the checkpoint so KV + SSM stay aligned, and
+        the scheduler prefills only the tail delta.
+
+        Args:
+            request_id: Request whose block_table to trim (must be held in
+                the paged cache — look up via get_block_table).
+            target_tokens: Desired cached-token count. The actual result is
+                block-aligned (floor to nearest multiple of block_size), so
+                it may be slightly less than requested.
+
+        Returns:
+            Trimmed BlockTable if trim succeeded and >0 blocks retained,
+            None if target_tokens == 0 (caller should release entirely) or
+            if the request has no active block_table.
+
+        Safety:
+            * Trailing blocks have their ref_count decremented via
+              ``paged_cache.decrement_ref`` so they rejoin the free pool
+              for future reuse. No ref-count leak.
+            * Block IDs retained are exactly the prefix, preserving
+              content-hash chain integrity for future sibling requests.
+        """
+        block_table = self.paged_cache.get_block_table(request_id)
+        if block_table is None or not block_table.block_ids:
+            return None
+        if target_tokens <= 0:
+            return None
+
+        # Block-align (floor): never exceed target_tokens.
+        block_size = self.block_size
+        kept_blocks_count = target_tokens // block_size
+        if kept_blocks_count <= 0:
+            return None
+        kept_blocks_count = min(kept_blocks_count, len(block_table.block_ids))
+        if kept_blocks_count == len(block_table.block_ids):
+            # Nothing to trim — already at or below target.
+            return block_table
+
+        # Release the trailing block refs so they return to the free pool.
+        to_release = block_table.block_ids[kept_blocks_count:]
+        for block_id in to_release:
+            self.paged_cache.decrement_ref(block_id)
+
+        # Truncate the block_table in-place.
+        block_table.block_ids = block_table.block_ids[:kept_blocks_count]
+        block_table.num_tokens = kept_blocks_count * block_size
+
+        logger.debug(
+            f"vmlx#91: trimmed block_table for {request_id} to "
+            f"{kept_blocks_count} blocks ({block_table.num_tokens} tokens); "
+            f"released {len(to_release)} trailing blocks"
+        )
+        return block_table
+
+    @staticmethod
+    def _block_has_terminal_state(block: Any, tag: str) -> bool:
+        """Return True if a block carries a terminal path-dependent payload."""
+        for entry in getattr(block, "cache_data", None) or []:
+            if not isinstance(entry, (tuple, list)) or not entry:
+                continue
+            if entry[0] != tag:
+                continue
+            if tag == "zaya_cca":
+                return len(entry) > 2 and entry[2] is not None
+            return True
+        return False
+
+    def trim_block_table_to_terminal_state(
+        self,
+        request_id: str,
+        target_tokens: int,
+        tag: str,
+    ) -> Optional["BlockTable"]:
+        """Shrink a block table only to a native terminal-state checkpoint.
+
+        Path-dependent cache families cannot use plain block-aligned KV
+        trimming: a non-terminal DSV4/ZAYA block carries only partial state.
+        This helper scans the request's prefix blocks and keeps the longest
+        prefix at or below ``target_tokens`` whose last block contains the
+        family-specific terminal payload (for example ``deepseek_v4``).
+        """
+        block_table = self.paged_cache.get_block_table(request_id)
+        if block_table is None or not block_table.block_ids or target_tokens <= 0:
+            return None
+
+        best_index: Optional[int] = None
+        best_tokens = 0
+        running_tokens = 0
+        for idx, block_id in enumerate(block_table.block_ids):
+            block = self.paged_cache.allocated_blocks.get(block_id)
+            if block is None:
+                return None
+            running_tokens += int(getattr(block, "token_count", 0) or 0)
+            if running_tokens > target_tokens:
+                break
+            if self._block_has_terminal_state(block, tag):
+                best_index = idx
+                best_tokens = running_tokens
+
+        if best_index is None or best_tokens <= 0:
+            return None
+
+        kept_count = best_index + 1
+        if kept_count == len(block_table.block_ids):
+            block_table.num_tokens = best_tokens
+            return block_table
+
+        to_release = block_table.block_ids[kept_count:]
+        for block_id in to_release:
+            self.paged_cache.decrement_ref(block_id)
+
+        block_table.block_ids = block_table.block_ids[:kept_count]
+        block_table.num_tokens = best_tokens
+        logger.debug(
+            "Trimmed path-dependent block_table for %s to terminal %s "
+            "checkpoint: %d blocks, %d tokens; released %d trailing blocks",
+            request_id,
+            tag,
+            kept_count,
+            best_tokens,
+            len(to_release),
+        )
+        return block_table
+
+    def release_low_priority(self, n_entries: int = 1) -> int:
+        """
+        Release up to n_entries from the lowest-priority non-empty bucket
+        (assistant → user → system). Used by the scheduler when under block
+        pressure to evict ephemeral assistant entries before pinned system
+        prompts. Returns the number of entries actually released.
+
+        Block-level reclamation still happens through paged_cache ref counts
+        — this just biases WHICH request_table entries get released first.
+        """
+        released = 0
+        for t in _CACHE_TYPE_PRIORITY:
+            d = self._entries_by_type[t]
+            while d and released < n_entries:
+                rid, _ = d.popitem(last=False)
+                if rid in self._request_tables:
+                    self.release_cache(rid)
+                    released += 1
+            if released >= n_entries:
+                break
+        return released
+
+    def fork_cache(
+        self,
+        source_request_id: str,
+        new_request_id: str,
+    ) -> Optional[BlockTable]:
+        """
+        Fork cache from one request to another (COW).
+
+        Args:
+            source_request_id: Source request ID
+            new_request_id: New request ID
+
+        Returns:
+            Forked BlockTable, or None if source not found
+        """
+        source_entry = self._request_tables.get(source_request_id)
+        if not source_entry:
+            return None
+
+        # Fork block table (increments ref counts)
+        forked_table = self.paged_cache.fork_block_table(
+            source_entry.block_table,
+            new_request_id,
+        )
+
+        # Create new entry with reference to same cache data
+        self._request_tables[new_request_id] = BlockCacheEntry(
+            block_table=forked_table,
+            cache_data=source_entry.cache_data,  # Shared reference
+            last_access=time.time(),
+        )
+
+        logger.debug(f"Forked cache: {source_request_id} -> {new_request_id}")
+
+        return forked_table
+
+    def reconstruct_cache(
+        self,
+        block_table: BlockTable,
+    ) -> Optional[List[Any]]:
+        """
+        Reconstruct cache objects from stored block data.
+
+        Handles both positional caches (KVCache - attention layers) and
+        cumulative caches (MambaCache - SSM/hybrid layers):
+        - KVCache: concatenates tensor slices from all blocks along seq axis
+        - MambaCache: restores full cumulative state from the last block
+
+        Uses mlx_lm's cache classes and from_state() for proper reconstruction.
+
+        Args:
+            block_table: BlockTable containing block IDs to reconstruct from
+
+        Returns:
+            List of reconstructed cache objects (one per layer),
+            or None if reconstruction fails
+        """
+        if not block_table or not block_table.block_ids:
+            return None
+
+        if not HAS_MLX:
+            logger.warning("Cannot reconstruct cache: MLX not available")
+            return None
+
+        disk_backed_block_ids: set[int] = set()
+        l2_readable_block_ids: set[int] = set()
+        try:
+            # Collect cache data from all blocks
+            all_block_data = []
+            for block_id in block_table.block_ids:
+                block = self.paged_cache.allocated_blocks.get(block_id)
+                if not block:
+                    logger.warning(f"Block {block_id} not found in allocated blocks")
+                    return None
+
+                if block.cache_data is None:
+                    # Frugal mode (or post-eviction): in-RAM mirror skipped,
+                    # but the block was written to L2 disk during _store. Pull
+                    # it back lazily so the in-session reconstruct path still
+                    # succeeds. Without this, every prefix-cache hit on a
+                    # frugal-stored prompt would silently fall through to a
+                    # full prefill, defeating the cache.
+                    _disk = getattr(self.paged_cache, "_disk_store", None)
+                    if _disk is not None and block.block_hash is not None:
+                        try:
+                            _disk_data = _disk.read_block(block.block_hash)
+                        except Exception as _re:
+                            logger.warning(
+                                f"Block {block_id} disk read failed: {_re}"
+                            )
+                            _disk_data = None
+                        if _disk_data is not None:
+                            block.cache_data = _disk_data
+                            block.cache_data_from_disk = True
+                            logger.debug(
+                                f"Block {block_id} rehydrated from L2 disk "
+                                f"(hash={block.block_hash.hex()[:12] if hasattr(block.block_hash, 'hex') else block.block_hash})"
+                            )
+                    if block.cache_data is None:
+                        logger.debug(f"Block {block_id} has no tensor data stored")
+                        return None
+
+                if getattr(block, "cache_data_from_disk", False):
+                    disk_backed_block_ids.add(block_id)
+                elif block.block_hash is not None:
+                    disk_store = getattr(self.paged_cache, "_disk_store", None)
+                    if disk_store is not None:
+                        try:
+                            has_block = getattr(disk_store, "has_block", None)
+                            if callable(has_block):
+                                if has_block(block.block_hash):
+                                    l2_readable_block_ids.add(block_id)
+                            elif disk_store.read_block(block.block_hash) is not None:
+                                l2_readable_block_ids.add(block_id)
+                        except Exception:
+                            pass
+                all_block_data.append(block.cache_data)
+
+            if not all_block_data:
+                return None
+
+            # Get number of layers from first block
+            num_layers = len(all_block_data[0])
+            if num_layers == 0:
+                return None
+
+            # Validate every block before
+            # reconstructing tensors. A single corrupt block whose
+            # entries carry nonsense shapes used to cascade through
+            # ``mx.concatenate(...)`` then ``cache.state = state`` then
+            # blow up on the next forward pass with a 555 GB
+            # ``[metal::malloc]`` request. Validate up-front; on any
+            # failure, force cache miss and let the scheduler re-prefill.
+            try:
+                from .cache_record_validator import reject_or_warn as _reject_or_warn
+            except Exception:
+                _reject_or_warn = None
+            if _reject_or_warn is not None:
+                _expected_layers = getattr(self, "_expected_num_layers", None)
+                if _expected_layers is None:
+                    _expected_layers = num_layers  # at least guard layer-count drift across blocks
+                for _bi, _block_data in enumerate(all_block_data):
+                    if not _reject_or_warn(
+                        _block_data,
+                        expected_num_layers=_expected_layers,
+                        source=f"reconstruct[block={_bi}]",
+                    ):
+                        return None
+
+            # Import cache classes
+            try:
+                from mlx_lm.models.cache import KVCache, RotatingKVCache
+            except ImportError:
+                from mlx_lm.models.cache import KVCache
+                RotatingKVCache = None
+            try:
+                from mlx_lm.models.cache import MambaCache
+                has_mamba = True
+            except ImportError:
+                has_mamba = False
+            has_rotating = RotatingKVCache is not None
+
+            # Reconstruct each layer
+            reconstructed_caches = []
+            reconstructed_indices: set = set()  # tracks which layer_idx values were rebuilt
+            kv_count = 0
+            cumulative_count = 0
+
+            for layer_idx in range(num_layers):
+                # Collect this layer's data from all blocks
+                layer_entries = []
+                for block_data in all_block_data:
+                    if layer_idx < len(block_data):
+                        layer_entries.append(block_data[layer_idx])
+
+                if not layer_entries:
+                    continue
+
+                # Check the type tag from _extract_block_tensor_slice
+                # Collect entries by type, find best cumulative entry
+                best_cumulative = None
+                best_dsv4 = None
+                kv_slices_keys = []
+                kv_slices_values = []
+                rotating_kv_slices_keys = []
+                rotating_kv_slices_values = []
+                rotating_params = None  # (max_size, keep, offset, _idx)
+                quantized_kv_slices_keys = []  # list of tuples of (data, scales, zeros)
+                quantized_kv_slices_values = []
+                quantized_meta = None
+
+                cache_list_entries = []  # sub-slice lists from CacheList blocks
+                zaya_cca_entries = []
+
+                for entry in layer_entries:
+                    if not isinstance(entry, (tuple, list)):
+                        continue
+                    tag = entry[0]
+                    if tag == "kv":
+                        kv_slices_keys.append(entry[1])
+                        kv_slices_values.append(entry[2])
+                    elif tag == "quantized_kv":
+                        quantized_kv_slices_keys.append(entry[1])  # tuple of 3
+                        quantized_kv_slices_values.append(entry[2])  # tuple of 3
+                        if len(entry) > 3 and quantized_meta is None:
+                            quantized_meta = entry[3]
+                    elif tag == "rotating_kv":
+                        rotating_kv_slices_keys.append(entry[1])
+                        rotating_kv_slices_values.append(entry[2])
+                        if len(entry) > 3 and rotating_params is None:
+                            rotating_params = (
+                                entry[3],
+                                entry[4] if len(entry) > 4 else 0,
+                                entry[5] if len(entry) > 5 else None,
+                                entry[6] if len(entry) > 6 else None,
+                            )
+                    elif tag == "cumulative":
+                        best_cumulative = entry  # Last cumulative entry wins
+                    elif tag == "deepseek_v4":
+                        best_dsv4 = entry  # Last DSV4 composite state wins
+                    elif tag == "deepseek_v4_pending":
+                        pass
+                    elif tag == "no_state":
+                        best_cumulative = entry
+                    elif tag == "zaya_cca":
+                        zaya_cca_entries.append(entry)
+                    elif tag == "cache_list":
+                        cache_list_entries.append(entry[1])  # list of sub-slices
+                    # "skip" entries are ignored
+
+                if zaya_cca_entries:
+                    sub_kv_keys = []
+                    sub_kv_vals = []
+                    sub_qkv_keys = []
+                    sub_qkv_vals = []
+                    sub_qkv_meta = None
+                    terminal_cca_state = None
+                    terminal_cca_meta = ""
+                    terminal_cache_meta = {}
+                    for zentry in zaya_cca_entries:
+                        if len(zentry) < 2:
+                            continue
+                        kv_entry = zentry[1]
+                        if isinstance(kv_entry, (tuple, list)) and kv_entry:
+                            if kv_entry[0] == "kv":
+                                sub_kv_keys.append(kv_entry[1])
+                                sub_kv_vals.append(kv_entry[2])
+                            elif kv_entry[0] == "quantized_kv":
+                                sub_qkv_keys.append(kv_entry[1])
+                                sub_qkv_vals.append(kv_entry[2])
+                                if len(kv_entry) > 3 and sub_qkv_meta is None:
+                                    sub_qkv_meta = kv_entry[3]
+                        if len(zentry) > 2 and zentry[2] is not None:
+                            terminal_cca_state = _copy_mlx_tree(zentry[2])
+                            terminal_cca_meta = zentry[3] if len(zentry) > 3 else ""
+                            terminal_cache_meta = (
+                                zentry[4]
+                                if len(zentry) > 4 and isinstance(zentry[4], dict)
+                                else {}
+                            )
+
+                    if terminal_cca_state is None:
+                        logger.warning(
+                            "Cannot reconstruct ZAYA CCA layer %s: typed "
+                            "prefix chain has KV pages but no terminal "
+                            "conv_state/prev_hs payload",
+                            layer_idx,
+                        )
+                        return None
+
+                    try:
+                        from mlx_lm.models.cache import CacheList as CLCache
+                    except ImportError:
+                        logger.warning("Cannot reconstruct ZAYA CCA CacheList: import failed")
+                        return None
+
+                    if sub_qkv_keys:
+                        n_comp = len(sub_qkv_keys[0])
+                        ck = tuple(
+                            mx.concatenate([s[c] for s in sub_qkv_keys], axis=-2)
+                            for c in range(n_comp)
+                        )
+                        cv = tuple(
+                            mx.concatenate([s[c] for s in sub_qkv_vals], axis=-2)
+                            for c in range(n_comp)
+                        )
+                        mx.eval(*ck, *cv)
+                        try:
+                            from mlx_lm.models.cache import QuantizedKVCache as QKVCache
+                            g_size, q_bits = 64, 8
+                            if sub_qkv_meta and len(sub_qkv_meta) >= 3:
+                                try:
+                                    _, g_size, q_bits = map(int, sub_qkv_meta[:3])
+                                except (ValueError, TypeError):
+                                    pass
+                            kv_cache = QKVCache(group_size=g_size, bits=q_bits)
+                            kv_cache.keys = ck
+                            kv_cache.values = cv
+                            kv_cache.offset = ck[0].shape[-2]
+                        except ImportError:
+                            logger.warning("Cannot reconstruct ZAYA quantized KV sub-cache")
+                            return None
+                    elif sub_kv_keys:
+                        ndim = len(sub_kv_keys[0].shape)
+                        seq_axis = 1 if ndim == 3 else 2
+                        ck = mx.concatenate(sub_kv_keys, axis=seq_axis)
+                        cv = mx.concatenate(sub_kv_vals, axis=seq_axis)
+                        mx.eval(ck, cv)
+                        if ndim == 4:
+                            allowed_kv = self._get_allowed_n_kv_heads()
+                            if allowed_kv and ck.shape[1] not in allowed_kv:
+                                logger.warning(
+                                    f"ZAYA CCA layer {layer_idx} KV head mismatch: "
+                                    f"got {ck.shape[1]}, expected one of "
+                                    f"{sorted(allowed_kv)}"
+                                )
+                                return None
+                        kv_cache = KVCache()
+                        offset = ck.shape[seq_axis]
+                        step = int(getattr(kv_cache, "step", 0) or 0)
+                        if step > 0 and offset > 0 and offset % step:
+                            padded_len = ((offset + step - 1) // step) * step
+                            pad = padded_len - offset
+                            if pad > 0:
+                                pad_shape = list(ck.shape)
+                                pad_shape[seq_axis] = pad
+                                ck = mx.concatenate(
+                                    [ck, mx.zeros(tuple(pad_shape), ck.dtype)],
+                                    axis=seq_axis,
+                                )
+                                cv = mx.concatenate(
+                                    [cv, mx.zeros(tuple(pad_shape), cv.dtype)],
+                                    axis=seq_axis,
+                                )
+                                mx.eval(ck, cv)
+                        kv_cache.keys = ck
+                        kv_cache.values = cv
+                        kv_cache.offset = offset
+                    else:
+                        logger.warning(
+                            "Cannot reconstruct ZAYA CCA layer %s: no standard KV pages",
+                            layer_idx,
+                        )
+                        return None
+
+                    try:
+                        from mlx_lm.models.cache import ArraysCache
+                        cca_cache = ArraysCache.from_state(terminal_cca_state, None)
+                    except Exception:
+                        try:
+                            from vmlx_engine.utils.mamba_cache import ArraysCache
+                            cca_cache = ArraysCache.from_state(terminal_cca_state, None)
+                        except Exception as e:
+                            logger.warning(
+                                f"Cannot reconstruct ZAYA CCA ArraysCache layer "
+                                f"{layer_idx}: {e}"
+                            )
+                            return None
+                    try:
+                        cca_cache.meta_state = terminal_cca_meta
+                    except Exception:
+                        pass
+                    cl = CLCache.__new__(CLCache)
+                    cl.caches = (kv_cache, cca_cache)
+                    reconstructed_caches.append(cl)
+                    reconstructed_indices.add(layer_idx)
+                    cumulative_count += 1
+
+                elif quantized_kv_slices_keys:
+                    # QuantizedKVCache: concatenate each component of the tuple
+                    # Each entry is a tuple of 3 arrays (data, scales, zeros)
+                    num_components = len(quantized_kv_slices_keys[0])
+                    concat_keys = tuple(
+                        mx.concatenate([s[i] for s in quantized_kv_slices_keys], axis=-2)
+                        for i in range(num_components)
+                    )
+                    concat_values = tuple(
+                        mx.concatenate([s[i] for s in quantized_kv_slices_values], axis=-2)
+                        for i in range(num_components)
+                    )
+                    # Materialize concatenated quantized tensors
+                    mx.eval(*concat_keys, *concat_values)
+                    # Force independent copies for single-block case (same aliasing issue)
+                    if len(quantized_kv_slices_keys) == 1:
+                        concat_keys = tuple(k * 1 for k in concat_keys)
+                        concat_values = tuple(v * 1 for v in concat_values)
+                        mx.eval(*concat_keys, *concat_values)
+
+                    # Validate head count for quantized cache too.
+                    # Uses the full allowed set (Gemma 4 mixed-head support).
+                    first_k = concat_keys[0]
+                    if len(first_k.shape) == 4:
+                        allowed_kv = self._get_allowed_n_kv_heads()
+                        if allowed_kv and first_k.shape[1] not in allowed_kv:
+                            logger.warning(
+                                f"Quantized head count mismatch in layer {layer_idx}: "
+                                f"got {first_k.shape[1]}, expected one of "
+                                f"{sorted(allowed_kv)} — forcing cache miss"
+                            )
+                            return None
+
+                    try:
+                        from mlx_lm.models.cache import QuantizedKVCache as QKVCache
+                        # Parse meta_state for group_size and bits
+                        g_size, q_bits = 64, 8
+                        if quantized_meta and len(quantized_meta) >= 3:
+                            try:
+                                _, g_size, q_bits = map(int, quantized_meta[:3])
+                            except (ValueError, TypeError):
+                                logger.warning(
+                                    f"Layer {layer_idx}: failed to parse quantized meta "
+                                    f"{quantized_meta!r}, using defaults "
+                                    f"g_size={g_size} bits={q_bits} — "
+                                    f"dequantize may produce wrong values"
+                                )
+                        elif quantized_kv_slices_keys:
+                            # Have quantized data but no valid metadata —
+                            # this is a corruption risk (wrong dequantize params)
+                            logger.warning(
+                                f"Layer {layer_idx}: quantized cache block has no "
+                                f"metadata (meta={quantized_meta!r}), "
+                                f"using defaults g_size={g_size} bits={q_bits} — "
+                                f"possible stale disk cache"
+                            )
+                        cache = QKVCache(group_size=g_size, bits=q_bits)
+                        cache.keys = concat_keys
+                        cache.values = concat_values
+                        cache.offset = concat_keys[0].shape[-2]
+                        reconstructed_caches.append(cache)
+                        reconstructed_indices.add(layer_idx)
+                        kv_count += 1
+                    except ImportError:
+                        logger.warning("Cannot reconstruct QuantizedKVCache: import failed")
+                        return None
+
+                elif kv_slices_keys:
+                    # Standard KVCache: concatenate slices
+                    # Detect dimensionality: 3D (heads, seq, dim) vs 4D (batch, heads, seq, dim)
+                    ndim = len(kv_slices_keys[0].shape)
+                    seq_axis = 1 if ndim == 3 else 2
+                    concat_keys = mx.concatenate(kv_slices_keys, axis=seq_axis)
+                    concat_values = mx.concatenate(kv_slices_values, axis=seq_axis)
+                    # Materialize lazy concatenation to avoid accumulating a massive
+                    # Metal command buffer that can trigger GPU timeout (SIGTERM)
+                    mx.eval(concat_keys, concat_values)
+                    # CRITICAL: Force independent copies of the reconstructed arrays.
+                    # mx.concatenate([single_array]) can return the same object,
+                    # creating aliasing between block.cache_data and the live KVCache.
+                    # During generation, the model's forward pass builds a lazy graph
+                    # referencing these arrays. On subsequent reuse of the same block,
+                    # MLX may reuse/invalidate the underlying buffer, producing garbage.
+                    # mx.contiguous() on an already-contiguous, already-evaluated array
+                    # is a no-op, so we use slice-and-eval to guarantee a fresh buffer.
+                    if len(kv_slices_keys) == 1:
+                        concat_keys = concat_keys * 1  # Force new buffer allocation
+                        concat_values = concat_values * 1
+                        mx.eval(concat_keys, concat_values)
+
+                    # Validate head count against model config.
+                    # Catches stale blocks with inflated H from BatchKVCache.merge().
+                    #
+                    # Mixed-head support: Gemma 4 and similar architectures have
+                    # DIFFERENT KV head counts per layer (sliding_attention layers
+                    # use num_key_value_heads=16; full_attention layers use
+                    # num_global_key_value_heads=4). Checking against a single
+                    # primary count falsely forces cache miss on every
+                    # global-attention layer. Use the full allowed set instead.
+                    allowed_kv = self._get_allowed_n_kv_heads()
+                    if allowed_kv:
+                        # 4D: (batch, heads, seq, dim), 3D: (heads, seq, dim)
+                        head_axis = 1 if ndim == 4 else 0
+                        actual_h = concat_keys.shape[head_axis]
+                        if actual_h not in allowed_kv:
+                            logger.warning(
+                                f"Head count mismatch in layer {layer_idx}: "
+                                f"got {actual_h}, expected one of {sorted(allowed_kv)} "
+                                f"— forcing cache miss"
+                            )
+                            return None
+
+                    cache = KVCache()
+                    cache.keys = concat_keys
+                    cache.values = concat_values
+                    cache.offset = concat_keys.shape[seq_axis]
+                    reconstructed_caches.append(cache)
+                    reconstructed_indices.add(layer_idx)
+                    kv_count += 1
+
+                elif rotating_kv_slices_keys:
+                    # RotatingKVCache: concatenate + restore window params
+                    ndim = len(rotating_kv_slices_keys[0].shape)
+                    seq_axis = 1 if ndim == 3 else 2
+                    concat_keys = mx.concatenate(rotating_kv_slices_keys, axis=seq_axis)
+                    concat_values = mx.concatenate(rotating_kv_slices_values, axis=seq_axis)
+                    mx.eval(concat_keys, concat_values)
+
+                    if has_rotating and rotating_params:
+                        max_size, keep, original_offset, original_idx = rotating_params
+                        cache = RotatingKVCache(max_size=max_size, keep=keep)
+                    else:
+                        # Fallback to standard KVCache
+                        cache = KVCache()
+                    cache.keys = concat_keys
+                    cache.values = concat_values
+                    restored_len = concat_keys.shape[seq_axis]
+                    target_tokens = int(getattr(block_table, "num_tokens", 0) or 0)
+                    if has_rotating and rotating_params:
+                        if original_offset is not None and int(original_offset) == target_tokens:
+                            cache.offset = int(original_offset)
+                            if original_idx is not None:
+                                cache._idx = int(original_idx)
+                            else:
+                                cache._idx = restored_len
+                        else:
+                            cache.offset = max(restored_len, target_tokens)
+                            cache._idx = restored_len
+                    else:
+                        cache.offset = restored_len
+                    reconstructed_caches.append(cache)
+                    reconstructed_indices.add(layer_idx)
+                    kv_count += 1
+
+                elif best_dsv4 is not None:
+                    _, state, meta, class_name, cache_meta = best_dsv4
+                    try:
+                        from jang_tools.dsv4.mlx_model import DeepseekV4Cache
+
+                        if not isinstance(cache_meta, dict):
+                            cache_meta = {}
+                        sliding_window = int(cache_meta.get("sliding_window") or 128)
+                        compress_ratio = cache_meta.get("compress_ratio")
+                        if compress_ratio is not None:
+                            compress_ratio = int(compress_ratio)
+                        cache = DeepseekV4Cache(
+                            sliding_window=sliding_window,
+                            compress_ratio=compress_ratio,
+                        )
+                        local_quant_meta = cache_meta.get("local_quant_meta")
+                        if local_quant_meta:
+                            # DSV4 q4/q8 storage keeps CSA/HCA pool buffers
+                            # native but stores local SWA KV as QuantizedKVCache.
+                            # Rebuild that composite explicitly; assigning this
+                            # state through DeepseekV4Cache.state would feed a
+                            # quantized tuple into RotatingKVCache.state.
+                            from mlx_lm.models.cache import QuantizedKVCache
+
+                            local_state, compressor_state, indexer_state = state
+                            qlocal = QuantizedKVCache()
+                            qlocal.state = local_state
+                            qlocal.meta_state = tuple(local_quant_meta)
+                            cache.local = qlocal  # type: ignore[attr-defined]
+                            cache.compressor_state = dict(
+                                zip(
+                                    ("buffer_kv", "buffer_gate", "pooled"),
+                                    compressor_state,
+                                )
+                            )
+                            cache.indexer_state = dict(
+                                zip(
+                                    ("buffer_kv", "buffer_gate", "pooled"),
+                                    indexer_state,
+                                )
+                            )
+                            cache._vmlx_dsv4_local_meta_state = tuple(meta or ())
+                            cache._vmlx_dsv4_local_quant_meta = tuple(local_quant_meta)
+                            cache._vmlx_dsv4_sliding_window = sliding_window
+                            try:
+                                cache._vmlx_dsv4_keep = int(meta[0]) if meta else 0
+                            except Exception:
+                                cache._vmlx_dsv4_keep = 0
+                        else:
+                            cache.state = state
+                            try:
+                                cache.meta_state = meta
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.warning(
+                            f"Cannot reconstruct layer {layer_idx} "
+                            f"({class_name}) as DeepseekV4Cache: {e}"
+                        )
+                        return None
+
+                    reconstructed_caches.append(cache)
+                    reconstructed_indices.add(layer_idx)
+                    cumulative_count += 1
+
+                elif best_cumulative is not None:
+                    if best_cumulative[0] == "no_state":
+                        class_name = (
+                            best_cumulative[1]
+                            if len(best_cumulative) > 1
+                            else "ZayaNoStateCache"
+                        )
+                        if class_name == "ZayaNoStateCache":
+                            try:
+                                from vmlx_engine.models.zaya import ZayaNoStateCache
+
+                                cache = ZayaNoStateCache()
+                            except Exception as e:
+                                logger.warning(
+                                    f"Cannot reconstruct ZayaNoStateCache layer "
+                                    f"{layer_idx}: {e}"
+                                )
+                                return None
+                            reconstructed_caches.append(cache)
+                            reconstructed_indices.add(layer_idx)
+                            continue
+                        logger.warning(
+                            f"Cannot reconstruct no_state layer {layer_idx}: "
+                            f"unknown class {class_name}"
+                        )
+                        return None
+
+                    # Cumulative cache (MambaCache/ArraysCache): restore full state
+                    _, state, meta, class_name = best_cumulative
+                    state = _copy_mlx_tree(state)
+
+                    # Try class-specific restoration.
+                    # ArraysCache.from_state() rejects meta_state (it has no offset),
+                    # so try with state-only first, then fall back to state+meta.
+                    cache = None
+                    try:
+                        import mlx_lm.models.cache as cache_mod
+                        cache_cls = getattr(cache_mod, class_name, None)
+                        if cache_cls is None and class_name == "ArraysCache":
+                            try:
+                                from vmlx_engine.utils.mamba_cache import ArraysCache
+                                cache_cls = ArraysCache
+                            except Exception:
+                                pass
+                        
+                        if cache_cls and hasattr(cache_cls, "from_state"):
+                            try:
+                                cache = cache_cls.from_state(state, meta)
+                            except (ValueError, TypeError):
+                                # Some cache types (ArraysCache) reject meta_state.
+                                # Try state-only reconstruction.
+                                cache = cache_cls.from_state(state, None)
+                        elif has_mamba and "Mamba" in class_name:
+                            cache = MambaCache.from_state(state, meta)
+                        elif has_mamba:
+                            cache = MambaCache.from_state(state, meta)
+                        else:
+                            cache = KVCache.from_state(state, meta)
+                    except Exception:
+                        try:
+                            if has_mamba:
+                                cache = MambaCache.from_state(state, meta)
+                        except Exception:
+                            pass
+                    if cache is None:
+                        logger.warning(
+                            f"Cannot reconstruct layer {layer_idx} "
+                            f"({class_name}): no suitable cache class"
+                        )
+                        return None
+
+                    reconstructed_caches.append(cache)
+                    reconstructed_indices.add(layer_idx)
+                    cumulative_count += 1
+
+                elif cache_list_entries:
+                    # CacheList (MoE models): reconstruct each sub-cache
+                    # then wrap in CacheList
+                    try:
+                        from mlx_lm.models.cache import CacheList as CLCache
+                    except ImportError:
+                        logger.warning("Cannot reconstruct CacheList: import failed")
+                        return None
+
+                    # Determine number of sub-caches from first entry
+                    num_subs = len(cache_list_entries[0])
+                    sub_caches_rebuilt = []
+                    for sub_idx in range(num_subs):
+                        # Collect this sub-cache's slices across all blocks
+                        sub_kv_keys = []
+                        sub_kv_vals = []
+                        sub_qkv_keys = []  # quantized KV
+                        sub_qkv_vals = []
+                        sub_qkv_meta = None
+                        sub_cumulative = None
+                        for block_entry in cache_list_entries:
+                            if sub_idx >= len(block_entry):
+                                continue
+                            sub = block_entry[sub_idx]
+                            if not isinstance(sub, (tuple, list)):
+                                continue
+                            st = sub[0]
+                            if st == "kv":
+                                sub_kv_keys.append(sub[1])
+                                sub_kv_vals.append(sub[2])
+                            elif st == "quantized_kv":
+                                sub_qkv_keys.append(sub[1])
+                                sub_qkv_vals.append(sub[2])
+                                if len(sub) > 3 and sub_qkv_meta is None:
+                                    sub_qkv_meta = sub[3]
+                            elif st == "cumulative":
+                                sub_cumulative = sub
+
+                        if sub_qkv_keys:
+                            # Quantized sub-cache: concatenate each component
+                            n_comp = len(sub_qkv_keys[0])
+                            ck = tuple(
+                                mx.concatenate([s[c] for s in sub_qkv_keys], axis=-2)
+                                for c in range(n_comp)
+                            )
+                            cv = tuple(
+                                mx.concatenate([s[c] for s in sub_qkv_vals], axis=-2)
+                                for c in range(n_comp)
+                            )
+                            mx.eval(*ck, *cv)
+                            try:
+                                from mlx_lm.models.cache import QuantizedKVCache as QKVCache
+                                g_size, q_bits = 64, 8
+                                if sub_qkv_meta and len(sub_qkv_meta) >= 3:
+                                    try:
+                                        _, g_size, q_bits = map(int, sub_qkv_meta[:3])
+                                    except (ValueError, TypeError):
+                                        pass
+                                sc = QKVCache(group_size=g_size, bits=q_bits)
+                                sc.keys = ck
+                                sc.values = cv
+                                sc.offset = ck[0].shape[-2]
+                                sub_caches_rebuilt.append(sc)
+                            except ImportError:
+                                logger.warning(f"CacheList sub {sub_idx}: QuantizedKVCache import failed")
+                                return None
+                        elif sub_kv_keys:
+                            ndim = len(sub_kv_keys[0].shape)
+                            seq_axis = 1 if ndim == 3 else 2
+                            ck = mx.concatenate(sub_kv_keys, axis=seq_axis)
+                            cv = mx.concatenate(sub_kv_vals, axis=seq_axis)
+                            mx.eval(ck, cv)
+
+                            # Validate head count in sub-cache (mixed-head aware)
+                            if ndim == 4:
+                                allowed_kv = self._get_allowed_n_kv_heads()
+                                if allowed_kv and ck.shape[1] not in allowed_kv:
+                                    logger.warning(
+                                        f"CacheList sub {sub_idx} head mismatch: "
+                                        f"got {ck.shape[1]}, expected one of "
+                                        f"{sorted(allowed_kv)}"
+                                    )
+                                    return None
+
+                            sc = KVCache()
+                            offset = ck.shape[seq_axis]
+                            step = int(getattr(sc, "step", 0) or 0)
+                            if step > 0 and offset > 0 and offset % step:
+                                padded_len = ((offset + step - 1) // step) * step
+                                pad = padded_len - offset
+                                if pad > 0:
+                                    pad_shape = list(ck.shape)
+                                    pad_shape[seq_axis] = pad
+                                    k_pad = mx.zeros(tuple(pad_shape), ck.dtype)
+                                    v_pad = mx.zeros(tuple(pad_shape), cv.dtype)
+                                    ck = mx.concatenate([ck, k_pad], axis=seq_axis)
+                                    cv = mx.concatenate([cv, v_pad], axis=seq_axis)
+                                    mx.eval(ck, cv)
+                            sc.keys = ck
+                            sc.values = cv
+                            sc.offset = offset
+                            sub_caches_rebuilt.append(sc)
+                        elif sub_cumulative is not None:
+                            _, sstate, smeta, scls = sub_cumulative
+                            sstate = _copy_mlx_tree(sstate)
+                            try:
+                                import mlx_lm.models.cache as cache_mod
+                                scls_obj = getattr(cache_mod, scls, None)
+                                if scls_obj and hasattr(scls_obj, "from_state"):
+                                    sc = scls_obj.from_state(sstate, smeta)
+                                elif has_mamba:
+                                    sc = MambaCache.from_state(sstate, smeta)
+                                else:
+                                    sc = KVCache.from_state(sstate, smeta)
+                            except Exception:
+                                logger.warning(f"CacheList sub {sub_idx}: reconstruction failed")
+                                return None
+                            sub_caches_rebuilt.append(sc)
+                        else:
+                            # Skip-only sub-cache — can't reconstruct
+                            return None
+
+                    cl = CLCache.__new__(CLCache)
+                    cl.caches = tuple(sub_caches_rebuilt)
+                    reconstructed_caches.append(cl)
+                    reconstructed_indices.add(layer_idx)
+                    kv_count += 1
+
+            if not reconstructed_caches:
+                return None
+
+            if len(reconstructed_caches) != num_layers:
+                # Count how many layers were missed and why
+                missed_skip_only = 0
+                missed_other = 0
+                for li in range(num_layers):
+                    if li in reconstructed_indices:
+                        continue  # successfully rebuilt — not a miss
+                    layer_entries = []
+                    for bd in all_block_data:
+                        if li < len(bd):
+                            layer_entries.append(bd[li])
+                    tags = [e[0] if isinstance(e, (tuple, list)) else "?" for e in layer_entries]
+                    if all(t == "skip" for t in tags):
+                        missed_skip_only += 1
+                    else:
+                        missed_other += 1
+
+                if missed_other == 0 and missed_skip_only > 0 and reconstructed_caches:
+                    # All missing layers are cumulative/SSM with only "skip" entries
+                    # (non-last blocks don't store cumulative state).
+                    # Return partial reconstruction — the caller's _fix_hybrid_cache
+                    # will expand it by inserting fresh SSM caches at missing positions.
+                    logger.info(
+                        f"Partial hybrid reconstruction: {len(reconstructed_caches)}/{num_layers} layers "
+                        f"({missed_skip_only} cumulative layers deferred to _fix_hybrid_cache)"
+                    )
+                else:
+                    logger.warning(
+                        f"Reconstructed {len(reconstructed_caches)} layers "
+                        f"but expected {num_layers} "
+                        f"(skip_only={missed_skip_only}, other={missed_other})"
+                    )
+                    return None
+
+            logger.debug(
+                f"Reconstructed cache: {len(reconstructed_caches)} layers "
+                f"({kv_count} KV + {cumulative_count} cumulative), "
+                f"{block_table.num_tokens} tokens from {len(block_table.block_ids)} blocks"
+            )
+
+            return reconstructed_caches
+
+        except Exception as e:
+            logger.warning(f"Failed to reconstruct cache: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+        finally:
+            for block_id in disk_backed_block_ids | l2_readable_block_ids:
+                block = self.paged_cache.allocated_blocks.get(block_id)
+                if block is not None:
+                    block.cache_data = None
+                    block.cache_data_from_disk = False
+
+    def _find_best_prefix_match(
+        self,
+        tokens: List[int],
+        cache_extra_keys: Optional[Any] = None,
+    ) -> Optional[Tuple[List[int], List[int]]]:
+        """Find best matching prefix in the index."""
+        best_match = None
+        best_len = 0
+        extra_marker = self._prefix_index_extra_marker(cache_extra_keys)
+
+        # Try progressively longer prefixes
+        for num_blocks in range(1, len(tokens) // self.block_size + 1):
+            prefix_len = num_blocks * self.block_size
+            if prefix_len > len(tokens):
+                break
+
+            prefix_tokens = tokens[:prefix_len]
+            prefix_hash = self._prefix_index_hash(
+                prefix_tokens,
+                cache_extra_keys=cache_extra_keys,
+            )
+
+            if prefix_hash in self._prefix_index:
+                entry = self._prefix_index[prefix_hash]
+                cached_tokens, block_ids = entry[:2]
+                cached_extra = entry[2] if len(entry) > 2 else None
+                if cached_extra != extra_marker:
+                    continue
+                if cached_tokens == prefix_tokens and len(cached_tokens) > best_len:
+                    # Validate that all referenced blocks still exist
+                    valid = all(
+                        bid in self.paged_cache.allocated_blocks
+                        for bid in block_ids
+                    )
+                    if valid:
+                        best_match = (cached_tokens, block_ids)
+                        best_len = len(cached_tokens)
+                    else:
+                        # Stale entry — remove it
+                        del self._prefix_index[prefix_hash]
+
+        # _update_prefix_index() also records the terminal partial prefix for a
+        # cached request. A later request can have that exact partial prefix
+        # plus a long tail, so the block-aligned loop above will never probe
+        # its hash. Scan indexed entries by exact token-prefix equality and
+        # live block IDs only; this preserves chain-hash safety and avoids the
+        # legacy content-only block hash path.
+        for prefix_hash, entry in list(self._prefix_index.items()):
+            cached_tokens, block_ids = entry[:2]
+            cached_extra = entry[2] if len(entry) > 2 else None
+            if cached_extra != extra_marker:
+                continue
+            cached_len = len(cached_tokens)
+            if cached_len <= best_len or cached_len > len(tokens):
+                continue
+            if tokens[:cached_len] != cached_tokens:
+                continue
+
+            valid = all(
+                bid in self.paged_cache.allocated_blocks
+                for bid in block_ids
+            )
+            if valid:
+                best_match = (cached_tokens, block_ids)
+                best_len = cached_len
+            else:
+                del self._prefix_index[prefix_hash]
+
+        return best_match
+
+    @staticmethod
+    def _prefix_index_extra_marker(cache_extra_keys: Optional[Any]) -> Optional[str]:
+        if cache_extra_keys is None:
+            return None
+        try:
+            import json
+
+            return json.dumps(cache_extra_keys, sort_keys=True, default=str)
+        except Exception:
+            return repr(cache_extra_keys)
+
+    def _prefix_index_hash(
+        self,
+        tokens: List[int],
+        cache_extra_keys: Optional[Any] = None,
+    ) -> str:
+        if cache_extra_keys is None:
+            return self.paged_cache.compute_block_hash(tokens)
+        return compute_block_hash(
+            None,
+            tokens,
+            extra_keys=cache_extra_keys,
+        ).hex()
+
+    def _update_prefix_index(
+        self,
+        tokens: List[int],
+        block_ids: List[int],
+        cache_extra_keys: Optional[Any] = None,
+    ) -> None:
+        """Update prefix index with new token sequence."""
+        extra_marker = self._prefix_index_extra_marker(cache_extra_keys)
+        # Index block-aligned prefixes
+        for i in range(1, len(block_ids) + 1):
+            prefix_len = min(i * self.block_size, len(tokens))
+            prefix_tokens = tokens[:prefix_len]
+            prefix_hash = self._prefix_index_hash(
+                prefix_tokens,
+                cache_extra_keys=cache_extra_keys,
+            )
+            self._prefix_index[prefix_hash] = (
+                prefix_tokens,
+                block_ids[:i],
+                extra_marker,
+            )
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        paged_stats = self.paged_cache.get_memory_usage()
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": (
+                self._hits / (self._hits + self._misses)
+                if (self._hits + self._misses) > 0
+                else 0
+            ),
+            "tokens_saved": self._tokens_saved,
+            "active_requests": len(self._request_tables),
+            "entries_by_type": {
+                t: len(self._entries_by_type[t]) for t in _CACHE_TYPE_PRIORITY
+            },
+            **paged_stats,
+        }
+
+    def reset_stats(self) -> None:
+        """Reset statistics."""
+        self._hits = 0
+        self._misses = 0
+        self._tokens_saved = 0
+        self.paged_cache.reset_stats()
+
+    def clear(self) -> None:
+        """Clear all cached data."""
+        self._request_tables.clear()
+        self._prefix_index.clear()
+        for d in self._entries_by_type.values():
+            d.clear()
+        self.paged_cache.clear()
+        self._n_kv_heads = None  # Reset cached head count (may change on model switch)
+        self.reset_stats()
+
+    def __len__(self) -> int:
+        """Return number of active request entries."""
+        return len(self._request_tables)

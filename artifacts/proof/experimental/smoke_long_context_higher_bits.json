@@ -1,0 +1,88 @@
+{
+  "release": "experimental",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 256,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 400.9981249982957,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999776482582,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 16,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": 0.06485773951499141,
+          "latency_ms": 410.65262500160316,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.8976818211376667,
+          "logit_cosine_min": 0.7973721027374268,
+          "logit_max_abs_diff": 8.195958584547043,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.5750000000000001,
+          "kl_divergence_mean": 0.05478397236583987,
+          "token_positions_evaluated": 16,
+          "status": "fail",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 512,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 454.7216249993653,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999962747097,
+          "logit_cosine_min": 0.9999999403953552,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 16,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": 0.019568380204873392,
+          "latency_ms": 452.7042909994634,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.9414764232933521,
+          "logit_cosine_min": 0.8315778970718384,
+          "logit_max_abs_diff": 5.593432739377022,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.6625,
+          "kl_divergence_mean": 0.015445511222708319,
+          "token_positions_evaluated": 16,
+          "status": "fail",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "",
+    "best_memory_config_passing_all_contexts": "",
+    "rejected_configs": [
+      "experimental_hybrid"
+    ],
+    "production_ready": false
+  }
+}

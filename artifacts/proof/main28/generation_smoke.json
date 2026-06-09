@@ -1,0 +1,47 @@
+{
+  "release": "main28",
+  "analysis": "generation_smoke",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "context_tokens": 128,
+  "decode_steps": 64,
+  "baseline_text": " is the question. All that glitters is not gold. The early bird catches the worm. The quick brown fox jumps over the lazy dog. A journey of a thousand miles begins with a single step. To be or not to ",
+  "configs": [
+    {
+      "name": "baseline_fp16",
+      "token_match_rate": 1.0,
+      "normalised_edit_distance": 0.0,
+      "repetition_rate_4gram": 0.19672131147540983,
+      "had_nan_logits": false,
+      "latency_ms": 1437.803790999169,
+      "status": "pass"
+    },
+    {
+      "name": "k8_v4_gs64",
+      "token_match_rate": 1.0,
+      "normalised_edit_distance": 0.0,
+      "repetition_rate_4gram": 0.19672131147540983,
+      "had_nan_logits": false,
+      "latency_ms": 1015.0615830007155,
+      "status": "pass"
+    },
+    {
+      "name": "k8_v5_gs64",
+      "token_match_rate": 1.0,
+      "normalised_edit_distance": 0.0,
+      "repetition_rate_4gram": 0.19672131147540983,
+      "had_nan_logits": false,
+      "latency_ms": 1042.4611670005106,
+      "status": "pass"
+    },
+    {
+      "name": "k8_v5_gs32",
+      "token_match_rate": 1.0,
+      "normalised_edit_distance": 0.0,
+      "repetition_rate_4gram": 0.19672131147540983,
+      "had_nan_logits": false,
+      "latency_ms": 1041.4658749996306,
+      "status": "pass"
+    }
+  ],
+  "all_pass": true
+}

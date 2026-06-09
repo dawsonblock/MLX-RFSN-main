@@ -1,0 +1,23 @@
+version: '3.8'
+
+# Development override for docker-compose.yml.
+# Exposes ClickHouse ports for local inspection and development.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# WARNING: Do NOT use this override in production. Port exposure creates
+# attack surface.
+
+services:
+  rfsn:
+    environment:
+      # Dev override: allow empty/default password locally
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-dev_only_not_for_production}
+
+  clickhouse:
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-dev_only_not_for_production}

@@ -1,0 +1,72 @@
+{
+  "release": "main27",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 256,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 453.3925420000742,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999776482582,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 16,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs64",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": 0.00014083457881497452,
+          "latency_ms": 791.1751669998921,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9996879361569881,
+          "logit_cosine_min": 0.9990541934967041,
+          "logit_max_abs_diff": 0.4814501628279686,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.9875,
+          "kl_divergence_mean": 1.4448964741120562e-05,
+          "token_positions_evaluated": 16,
+          "status": "pass",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs128",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 128,
+          "avg_nll_delta": -0.0011902738033313653,
+          "latency_ms": 467.26625000155764,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9976136349141598,
+          "logit_cosine_min": 0.9941152334213257,
+          "logit_max_abs_diff": 1.3927115425467491,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.95,
+          "kl_divergence_mean": 0.0003268113330250344,
+          "token_positions_evaluated": 16,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "k8_v4_gs64",
+    "best_memory_config_passing_all_contexts": "k8_v4_gs64",
+    "recommended_default": "k8_v4_gs64",
+    "rejected_configs": [],
+    "production_ready": false
+  }
+}

@@ -1,0 +1,86 @@
+============================================================
+RFSN v10 Attention Benchmarks
+============================================================
+{
+  "hardware": "arm64",
+  "platform": "macOS-26.2-arm64-arm-64bit",
+  "python_version": "3.11.9",
+  "timestamp": "2026-06-08T21:05:05.048445+00:00"
+}
+
+  top_k=1.0: sparse=0.732ms dense=1.306ms speedup=1.78x cosine=1.0000 blocks=32
+  top_k=0.75: sparse=46.887ms dense=1.065ms speedup=0.02x cosine=0.8756 blocks=24
+  top_k=0.5: sparse=20.840ms dense=1.430ms speedup=0.07x cosine=0.7523 blocks=16
+  top_k=0.25: sparse=10.838ms dense=0.503ms speedup=0.05x cosine=0.5417 blocks=8
+  top_k=0.125: sparse=7.264ms dense=0.424ms speedup=0.06x cosine=0.3576 blocks=4
+
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.11.9",
+    "timestamp": "2026-06-08T21:05:05.048445+00:00"
+  },
+  "runs": [
+    {
+      "top_k_ratio": 1.0,
+      "block_size": 64,
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "dense_latency_ms": 1.3055085961241275,
+      "sparse_latency_ms": 0.7324708043597639,
+      "speedup": 1.78233533453288,
+      "avg_active_blocks": 32.0,
+      "avg_cosine_vs_dense": 1.0000001192092896,
+      "execution_mode": "dense_requested"
+    },
+    {
+      "top_k_ratio": 0.75,
+      "block_size": 64,
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "dense_latency_ms": 1.0652168013621122,
+      "sparse_latency_ms": 46.88708330213558,
+      "speedup": 0.022718768717131837,
+      "avg_active_blocks": 24.0,
+      "avg_cosine_vs_dense": 0.8756334781646729,
+      "execution_mode": "sparse_compacted"
+    },
+    {
+      "top_k_ratio": 0.5,
+      "block_size": 64,
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "dense_latency_ms": 1.4296874986030161,
+      "sparse_latency_ms": 20.84047069947701,
+      "speedup": 0.06860149750067276,
+      "avg_active_blocks": 16.0,
+      "avg_cosine_vs_dense": 0.7523223161697388,
+      "execution_mode": "sparse_compacted"
+    },
+    {
+      "top_k_ratio": 0.25,
+      "block_size": 64,
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "dense_latency_ms": 0.5032166984165087,
+      "sparse_latency_ms": 10.83833740267437,
+      "speedup": 0.04642932580160677,
+      "avg_active_blocks": 8.0,
+      "avg_cosine_vs_dense": 0.5417296886444092,
+      "execution_mode": "sparse_compacted"
+    },
+    {
+      "top_k_ratio": 0.125,
+      "block_size": 64,
+      "shape_q": "(1, 8, 1, 64)",
+      "shape_kv": "(1, 8, 2048, 64)",
+      "dense_latency_ms": 0.42415849457029253,
+      "sparse_latency_ms": 7.264195897732861,
+      "speedup": 0.05839028855247026,
+      "avg_active_blocks": 4.0,
+      "avg_cosine_vs_dense": 0.35756099224090576,
+      "execution_mode": "sparse_compacted"
+    }
+  ]
+}

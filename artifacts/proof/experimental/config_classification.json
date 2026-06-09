@@ -1,0 +1,68 @@
+{
+  "release": "experimental",
+  "stable_default": "k8_v5_gs64",
+  "promoted_to_default": false,
+  "teacher_forced_baseline_valid": true,
+  "promotion_blocked_by": [
+    "qjl_failed"
+  ],
+  "experimental_status": "research_only",
+  "classifications": {
+    "baseline_fp16": "reference",
+    "stable_k8_v5_gs64": "stable_default_step_trace_pass_bulk_benchmark_discrepancy",
+    "stable_k8_v5_gs32": "quality_candidate_step_trace_pass_bulk_benchmark_discrepancy",
+    "experimental_hybrid": "rejected_teacher_forced_step_trace_degraded",
+    "turbo_polar": "rejected_generation_divergence_and_step_trace_degraded",
+    "adaptive": "rejected_generation_divergence_and_step_trace_degraded",
+    "turbo_k8r8v6": "needs_throughput_data"
+  },
+  "notes": [
+    "baseline_fp16: reference \u2014 FP16 baseline",
+    "stable_k8_v5_gs64: stable_default_step_trace_pass_bulk_benchmark_discrepancy \u2014 passes per-step teacher-forced trace (cosine >= 0.995); bulk real-generation benchmark reports lower cosine (~0.955) \u2014 discrepancy under investigation",
+    "stable_k8_v5_gs32: quality_candidate_step_trace_pass_bulk_benchmark_discrepancy \u2014 passes per-step teacher-forced trace (cosine >= 0.995); bulk real-generation benchmark reports lower cosine \u2014 discrepancy under investigation",
+    "experimental_hybrid: rejected_teacher_forced_step_trace_degraded \u2014 teacher-forced step trace shows degradation (28/128 pass at 128 tokens, 0/128 at 512)",
+    "turbo_polar: rejected_generation_divergence_and_step_trace_degraded \u2014 free-running divergence and teacher-forced step trace degraded",
+    "adaptive: rejected_generation_divergence_and_step_trace_degraded \u2014 free-running divergence and teacher-forced step trace degraded",
+    "turbo_k8r8v6: needs_throughput_data \u2014 missing throughput benchmark"
+  ],
+  "evidence": {
+    "has_0_5b_validation": true,
+    "has_throughput": true,
+    "has_real_generation_throughput": true,
+    "has_decode_diagnostics": true,
+    "has_1_5b_validation": true,
+    "has_layer_policy": true,
+    "has_sensitivity": true
+  },
+  "promotion_rules": [
+    "stable_default: locked default runtime",
+    "stable_default_under_teacher_forced_drift: locked default runtime, teacher-forced drift unresolved",
+    "stable_default_decode_update_issue: locked default runtime, decode-update degraded",
+    "quality_candidate: better quality, acceptable throughput",
+    "quality_candidate_under_teacher_forced_drift: proven at 0.5B, teacher-forced drift unresolved",
+    "quality_candidate_decode_update_issue: proven at 0.5B, decode-update degraded",
+    "stable_baseline: proven stable config",
+    "stable_baseline_under_teacher_forced_drift: proven at 0.5B, teacher-forced drift unresolved",
+    "stable_baseline_decode_update_issue: proven at 0.5B, decode-update degraded",
+    "stable_needs_data: missing context validation",
+    "rejected_quality: fails 512/1024/2048",
+    "rejected_memory: missing compressed bytes or raw uint32 fallback",
+    "rejected_speed: missing throughput or regression",
+    "needs_throughput_data: missing throughput benchmark",
+    "needs_valid_teacher_forced_baseline: baseline_fp16 identity failed",
+    "rejected_generation_quality: teacher-forced real-generation failed",
+    "rejected_generation_divergence: free-running divergence observed at short/medium prompts",
+    "stable_default_step_trace_pass_bulk_benchmark_discrepancy: passes per-step teacher-forced trace; bulk benchmark discrepancy under investigation",
+    "quality_candidate_step_trace_pass_bulk_benchmark_discrepancy: passes per-step teacher-forced trace; bulk benchmark discrepancy under investigation",
+    "rejected_teacher_forced_step_trace_degraded: teacher-forced step trace shows degradation",
+    "rejected_generation_divergence_and_step_trace_degraded: free-running divergence and teacher-forced step trace degraded",
+    "free_running_match_but_teacher_forced_failed: free-running exact match but teacher-forced logits fail",
+    "generation_divergence_observed: teacher-forced passes but free-running diverges",
+    "experimental_pending_1_5b: awaiting 1.5B validation",
+    "rejected_1_5b: fails 1.5B validation",
+    "experimental_only: passes all gates but no clear win",
+    "speed_candidate: fastest compressed path",
+    "memory_candidate: better memory, comparable quality",
+    "disabled: QJL or hard-blocked config"
+  ]
+}

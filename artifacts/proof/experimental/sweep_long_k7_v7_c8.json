@@ -1,0 +1,51 @@
+{
+  "release": "experimental",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 256,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 402.906167000765,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999776482582,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 16,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": 0.005359217278964934,
+          "latency_ms": 417.84512500089477,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.9972929321229458,
+          "logit_cosine_min": 0.9879957437515259,
+          "logit_max_abs_diff": 1.218104526400566,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.8875,
+          "kl_divergence_mean": 0.002317706969876099,
+          "token_positions_evaluated": 16,
+          "status": "fail",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "",
+    "best_memory_config_passing_all_contexts": "",
+    "rejected_configs": [
+      "experimental_hybrid"
+    ],
+    "production_ready": false
+  }
+}

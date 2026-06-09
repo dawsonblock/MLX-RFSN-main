@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.12.0",
+    "backend": "metal",
+    "timestamp": "2026-06-07T05:59:33.897970+00:00"
+  },
+  "attention_Tk=256": {
+    "sparse_ms": 1.801228994736448,
+    "dense_ms": 0.3798335019382648,
+    "speedup": 0.21087463229173772
+  },
+  "attention_Tk=512": {
+    "sparse_ms": 3.5744789929594845,
+    "dense_ms": 0.37872899702051654,
+    "speedup": 0.10595362226676522
+  },
+  "attention_Tk=1024": {
+    "sparse_ms": 5.186312002479099,
+    "dense_ms": 0.8371040021302179,
+    "speedup": 0.16140641012921617
+  },
+  "quant_decode_nkeys=1024": {
+    "decode_ms": 0.9131039987551048
+  },
+  "quant_decode_nkeys=4096": {
+    "decode_ms": 1.4868955040583387
+  },
+  "quant_decode_nkeys=16384": {
+    "decode_ms": 4.617811995558441
+  }
+}

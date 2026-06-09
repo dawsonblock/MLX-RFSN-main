@@ -1,0 +1,13 @@
+{
+  "default": {
+    "mode": "k8_v5_gs64"
+  },
+  "layers": {
+    "0": {
+      "mode": "k8_v5_gs32"
+    },
+    "1": {
+      "mode": "k8_v5_gs32"
+    }
+  }
+}

@@ -1,0 +1,133 @@
+name: Production Model Validation
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Model to validate (mistral-7b, llama-3-8b, phi-3-mini, custom)'
+        required: false
+        default: 'mistral-7b'
+      custom_repo_id:
+        description: 'Custom Hugging Face repo ID (if model=custom)'
+        required: false
+        default: ''
+
+env:
+  MODEL_DIR: models
+
+jobs:
+  production-validation:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lock Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.2.app
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,real_model]"
+          python -m pip install huggingface_hub
+
+      - name: Determine model
+        id: model
+        run: |
+          if [ "${{ github.event.inputs.model }}" != "" ]; then
+            MODEL="${{ github.event.inputs.model }}"
+          else
+            MODEL="mistral-7b"
+          fi
+          echo "model=$MODEL" >> $GITHUB_OUTPUT
+          echo "Selected model: $MODEL"
+
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: models/
+          key: model-${{ steps.model.outputs.model }}-${{ hashFiles('tools/model_download.py') }}
+
+      - name: Download model
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ "${{ steps.model.outputs.model }}" == "custom" ]; then
+            REPO_ID="${{ github.event.inputs.custom_repo_id }}"
+            if [ -z "$REPO_ID" ]; then
+              echo "ERROR: custom_repo_id required when model=custom"
+              exit 1
+            fi
+            python tools/model_download.py custom \
+              --repo-id "$REPO_ID" \
+              --output-dir "$MODEL_DIR" \
+              --token "$HF_TOKEN"
+          else
+            python tools/model_download.py "${{ steps.model.outputs.model }}" \
+              --output-dir "$MODEL_DIR" \
+              --token "$HF_TOKEN"
+          fi
+
+      - name: Run production validation
+        run: |
+          MODEL_PATH=$(find "$MODEL_DIR" -name "config.json" -exec dirname {} \; | head -1)
+          echo "Using model at: $MODEL_PATH"
+          python benchmarks/validate_production_model.py \
+            --model-path "$MODEL_PATH" \
+            --prompt-suite prompts/validation_suite.json \
+            --out artifacts/proof/main12/production_validation.json
+
+      - name: Check regression against baseline
+        run: |
+          python scripts/check_production_regression.py \
+            --results artifacts/proof/main12/production_validation.json \
+            --baseline benchmarks/production_baseline.json \
+            --strict
+
+      - name: Upload validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-validation-results
+          path: artifacts/proof/main12/production_validation.json
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('artifacts/proof/main12/production_validation.json', 'utf8'));
+            
+            const body = `## Production Validation Results
+            
+            **Model:** ${results.model}
+            **Device:** ${results.device}
+            **Prompts Tested:** ${results.prompts_successful}/${results.prompts_tested}
+            
+            ### Overall Quality
+            - Dense Cosine: ${results.overall_dense_cosine.toFixed(4)}
+            - Sparse Cosine: ${results.overall_sparse_cosine.toFixed(4)}
+            
+            ### Category Results
+            ${Object.entries(results.category_statistics).map(([cat, stats]) => 
+              `- **${cat}**: Dense=${stats.avg_dense_cosine.toFixed(4)}, Sparse=${stats.avg_sparse_cosine.toFixed(4)}`
+            ).join('\n')}
+            
+            Generated at: ${results.generated_at}`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });

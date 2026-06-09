@@ -1,0 +1,50 @@
+rfsn_v11 — Alembic Migration Environment
+=========================================
+
+This directory contains the Alembic migration environment for the rfsn_v11
+telemetry schema.  The ``telemetry_events`` table stores every field of the
+``TelemetryEvent`` dataclass (``rfsn_v11/telemetry.py``).
+
+Quick start
+-----------
+
+1. Install dependencies::
+
+       pip install alembic sqlalchemy
+
+2. Set the database URL (optional — defaults to SQLite)::
+
+       export RFSN_DB_URL=postgresql://user:pass@localhost/rfsn_v11
+
+3. Apply all pending migrations::
+
+       alembic -c rfsn_v11/alembic.ini upgrade head
+
+4. Generate a new migration after schema changes::
+
+       alembic -c rfsn_v11/alembic.ini revision --autogenerate -m "describe change"
+
+5. Show current revision::
+
+       alembic -c rfsn_v11/alembic.ini current
+
+Directory layout
+----------------
+
+alembic/
+    env.py          — Migration environment (reads RFSN_DB_URL).
+    README          — This file.
+    versions/
+        0001_create_telemetry_events.py
+                    — Initial migration: creates ``telemetry_events`` table.
+
+Configuration
+-------------
+
+``alembic.ini`` (one level above this directory) controls:
+
+- ``script_location``  — points here (``rfsn_v11/alembic``).
+- ``sqlalchemy.url``   — default SQLite URL; override with ``RFSN_DB_URL``.
+
+The ``env.py`` always prefers ``RFSN_DB_URL`` over the ini value, so CI and
+production environments never need to edit the ini file.

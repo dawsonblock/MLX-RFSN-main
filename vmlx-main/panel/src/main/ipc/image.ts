@@ -1,0 +1,863 @@
+// MLX Studio Image System — mlx.studio — Jinho Jang
+import { ipcMain } from 'electron'
+import { v4 as uuidv4 } from 'uuid'
+import { join, resolve } from 'path'
+import { homedir } from 'os'
+import { mkdirSync, writeFileSync, existsSync, unlinkSync, readdirSync, rmdirSync, readFileSync } from 'fs'
+import { sessionManager } from '../sessions'
+import { db } from '../database'
+import { getImageModel, resolveImageModelFromDirectoryName, resolveImageModelRepo } from '../../shared/imageModels'
+import {
+  beginImageGeneration,
+  classifyImageGenerationError,
+  clearImageGenerationAfterLocalAbort,
+  clearImageGenerationSessionHistory,
+  finishImageGeneration,
+  getActiveImageGenerationController,
+  getImageGenerationStatus,
+  markImageGenerationAbort,
+} from './imageGenerationState'
+import type { ServerConfig } from '../server'
+import type { ImageSession, ImageGeneration } from '../database'
+
+let handlersRegistered = false
+
+// Track the current image server session ID (only one at a time)
+let activeImageSessionId: string | null = null
+
+// Serialize startServer calls to prevent race conditions when the user
+// rapidly switches models (e.g., clicks model A then immediately model B).
+// Without this lock, both calls can read the same activeImageSessionId,
+// double-stop the same session, and both create new servers — leaving an
+// orphaned server process that nobody tracks.
+let startServerChain: Promise<any> = Promise.resolve()
+
+function findDownloadedImageModelPath(modelName: string, quantize: number): { localPath: string; modelId: string; repoId?: string } | null {
+  const modelDef = resolveImageModelFromDirectoryName(modelName) || getImageModel(modelName)
+  const modelId = modelDef?.id || modelName
+  const repoId = resolveImageModelRepo(modelId, quantize)
+  const repoName = repoId?.split('/').pop()
+  if (!repoName) return null
+
+  for (const base of [join(homedir(), '.mlxstudio', 'models', 'image'), join(homedir(), '.mlxstudio', 'models', 'xcreates')]) {
+    const candidate = join(base, repoName)
+    if (existsSync(candidate)) {
+      return { localPath: candidate, modelId, repoId: repoId || undefined }
+    }
+  }
+  return null
+}
+
+/** Build fetch headers for image server requests, including auth if API key is configured. */
+function getImageFetchHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (activeImageSessionId) {
+    try {
+      const session = db.getSession(activeImageSessionId)
+      if (session?.config) {
+        const cfg = JSON.parse(session.config)
+        if (cfg.apiKey) {
+          headers['Authorization'] = `Bearer ${cfg.apiKey}`
+        }
+      }
+    } catch { /* ignore parse errors */ }
+  }
+  return headers
+}
+
+function isExpectedImageServerDisconnectError(error: unknown): boolean {
+  const err = error as NodeJS.ErrnoException | undefined
+  const code = String(err?.code || '')
+  const message = String(err?.message || error || '')
+  const cause = (err as any)?.cause
+  const wrappedDisconnects = [
+    cause,
+    (err as any)?.reason,
+    (err as any)?.error,
+    (err as any)?.detail,
+  ].filter(Boolean)
+  const nestedErrors = Array.isArray((err as any)?.errors) ? (err as any).errors : []
+  return (
+    code === 'EPIPE' ||
+    code === 'ECONNRESET' ||
+    code === 'ERR_STREAM_DESTROYED' ||
+    code === 'ERR_STREAM_WRITE_AFTER_END' ||
+    /EPIPE|write EPIPE|broken pipe|socket hang up|connection reset|premature close|stream.*destroyed|write after end/i.test(message) ||
+    wrappedDisconnects.some((nested) => isExpectedImageServerDisconnectError(nested)) ||
+    nestedErrors.some((nested) => isExpectedImageServerDisconnectError(nested))
+  )
+}
+
+function imageServerRequestWritable(req: any): boolean {
+  return (
+    !req.closed &&
+    !req.destroyed &&
+    !req.writableEnded &&
+    !req.writableDestroyed &&
+    !req.socket?.destroyed
+  )
+}
+
+function writeImageServerRequestBody(req: any, bodyStr: string): boolean {
+  if (!imageServerRequestWritable(req)) return false
+  try {
+    req.write(bodyStr)
+    return true
+  } catch (error) {
+    if (isExpectedImageServerDisconnectError(error)) return false
+    throw error
+  }
+}
+
+function endImageServerRequest(req: any): boolean {
+  if (!imageServerRequestWritable(req)) return false
+  try {
+    req.end()
+    return true
+  } catch (error) {
+    if (isExpectedImageServerDisconnectError(error)) return false
+    throw error
+  }
+}
+
+function writeAndEndImageServerRequest(req: any, bodyStr: string): boolean {
+  return writeImageServerRequestBody(req, bodyStr) && endImageServerRequest(req)
+}
+
+function imageServerDisconnectedError(): Error {
+  const error = new Error('Image server connection lost before request completed.') as NodeJS.ErrnoException
+  error.code = 'EPIPE'
+  return error
+}
+
+function requestImageServerCancel(): void {
+  if (!activeImageSessionId) return
+  const session = db.getSession(activeImageSessionId)
+  const port = session?.port
+  if (!port) return
+  try {
+    const http = require('http')
+    const bodyStr = '{}'
+    const headers = { ...getImageFetchHeaders(), 'Content-Length': Buffer.byteLength(bodyStr) }
+    const req = http.request(`http://127.0.0.1:${port}/v1/images/cancel`, {
+      method: 'POST',
+      headers,
+      agent: false,
+      timeout: 5000,
+    }, (res: any) => {
+      res.resume()
+    })
+    req.on('error', () => {})
+    req.on('timeout', () => req.destroy())
+    writeAndEndImageServerRequest(req, bodyStr)
+  } catch {
+    // Best-effort cancel; local abort still clears the UI immediately.
+  }
+}
+
+export function registerImageHandlers(): void {
+  if (handlersRegistered) return
+  handlersRegistered = true
+
+  // ─── Image Session CRUD ──────────────────────────────────────────────
+
+  ipcMain.handle('image:createSession', async (_, modelName: string, sessionType?: 'generate' | 'edit') => {
+    try {
+      const now = Date.now()
+      const session: ImageSession = {
+        id: uuidv4(),
+        modelName,
+        sessionType: sessionType || 'generate',
+        createdAt: now,
+        updatedAt: now
+      }
+      db.createImageSession(session)
+      return { success: true, session }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('image:getSessions', async () => {
+    try {
+      return db.getImageSessions()
+    } catch (error) {
+      console.error('[IMAGE] Failed to get sessions:', error)
+      return []
+    }
+  })
+
+  ipcMain.handle('image:getSession', async (_, id: string) => {
+    try {
+      return db.getImageSession(id) || null
+    } catch (error) {
+      return null
+    }
+  })
+
+  ipcMain.handle('image:deleteSession', async (_, id: string) => {
+    try {
+      // Clean up generated image files
+      const outputDir = join(homedir(), '.mlxstudio', 'generated', id)
+      if (existsSync(outputDir)) {
+        try {
+          const files = readdirSync(outputDir)
+          for (const f of files) unlinkSync(join(outputDir, f))
+          rmdirSync(outputDir)
+        } catch (e) {
+          console.error('[IMAGE] Failed to clean up image files:', e)
+        }
+      }
+      db.deleteImageSession(id)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('image:getGenerations', async (_, sessionId: string) => {
+    try {
+      return db.getImageGenerations(sessionId)
+    } catch (error) {
+      console.error('[IMAGE] Failed to get generations:', error)
+      return []
+    }
+  })
+
+  // ms#61: delete a single image generation from the gallery.
+  // The gallery can grow to unmanageable size without pruning (reporter's
+  // words); we expose per-row delete so users don't need to purge the
+  // whole session to clean up.
+  // Unlinks the image file (output) and, if present, the source image —
+  // BUT only if the source path is under ~/.mlxstudio (don't rm user's
+  // home-folder pictures that were only referenced, never copied).
+  ipcMain.handle('image:deleteGeneration', async (_, generationId: string) => {
+    try {
+      const gen = db.getImageGeneration(generationId)
+      if (!gen) return { success: false, error: 'generation not found' }
+      const mlxstudioRoot = resolve(join(homedir(), '.mlxstudio'))
+      const tryUnlink = (p?: string | null): void => {
+        if (!p) return
+        // Only unlink paths inside ~/.mlxstudio (defensive — never rm a
+        // file the user originally chose from their Pictures / Desktop).
+        try {
+          const abs = resolve(p)
+          if (!abs.startsWith(mlxstudioRoot + '/') && abs !== mlxstudioRoot) return
+          if (existsSync(abs)) unlinkSync(abs)
+        } catch (e) {
+          console.error('[IMAGE] Failed to unlink', p, e)
+        }
+      }
+      tryUnlink(gen.imagePath)
+      tryUnlink(gen.sourceImagePath)
+      db.deleteImageGeneration(generationId)
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  // ─── Image Generation ────────────────────────────────────────────────
+
+  ipcMain.handle('image:generate', async (_, params: {
+    sessionId: string
+    prompt: string
+    negativePrompt?: string
+    model: string
+    width: number
+    height: number
+    steps: number
+    guidance: number
+    seed?: number
+    count: number
+    quantize?: number
+    serverPort: number
+    imageBase64?: string    // Source image for img2img (optional)
+    strength?: number       // img2img strength (0-1, optional)
+  }) => {
+    let generationController: AbortController | null = null
+    try {
+      const { sessionId, prompt, negativePrompt, model, width, height, steps, guidance, seed, count, serverPort } = params
+      const baseUrl = `http://127.0.0.1:${serverPort}`
+
+      // Touch session to reset idle timer — prevents sleep during image generation
+      if (activeImageSessionId) sessionManager.touchSession(activeImageSessionId)
+
+      // Ensure output directory exists
+      const outputDir = join(homedir(), '.mlxstudio', 'generated', sessionId)
+      mkdirSync(outputDir, { recursive: true })
+
+      const startTime = Date.now()
+
+      // Call the image generation endpoint
+      const body: Record<string, any> = {
+        prompt,
+        model,
+        size: `${width}x${height}`,
+        steps,
+        guidance,
+        n: count,
+        response_format: 'b64_json'
+      }
+      if (negativePrompt) body.negative_prompt = negativePrompt
+      if (seed != null) body.seed = seed
+      if (params.quantize != null) body.quantize = params.quantize
+      // img2img: pass source image + strength to generation endpoint
+      if (params.imageBase64 && params.strength != null) {
+        const cleanB64 = params.imageBase64.replace(/^data:image\/[\w+.-]+;base64,/, '')
+        body.image = cleanB64
+        body.strength = params.strength
+      }
+
+      const controller = beginImageGeneration(sessionId)
+      generationController = controller
+      // 30-minute timeout — use Node.js http.request instead of Electron fetch
+      // (Chromium's net stack has its own ~5 min socket timeout that ignores keepalive)
+      const timeoutId = setTimeout(() => {
+        markImageGenerationAbort(controller, 'timeout')
+        requestImageServerCancel()
+        controller.abort()
+      }, 30 * 60 * 1000)
+      // Periodically touch session during long image generations (Qwen edits can take 10+ min)
+      // to prevent idle timer from triggering sleep mid-generation
+      const touchInterval = setInterval(() => {
+        if (activeImageSessionId) sessionManager.touchSession(activeImageSessionId)
+      }, 60_000) // Every 60 seconds
+      let resp: any
+      try {
+        resp = await new Promise<any>((resolve, reject) => {
+          const http = require('http')
+          const bodyStr = JSON.stringify(body)
+          const headers = { ...getImageFetchHeaders(), 'Content-Length': Buffer.byteLength(bodyStr) }
+          const req = http.request(`${baseUrl}/v1/images/generations`, {
+            method: 'POST',
+            headers,
+            agent: false,
+            timeout: 30 * 60 * 1000,
+          }, (res: any) => {
+            let data = ''
+            res.on('data', (chunk: any) => { data += chunk })
+            res.on('end', () => {
+              resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, statusText: res.statusMessage, data })
+            })
+          })
+          req.on('error', reject)
+          controller.signal.addEventListener('abort', () => {
+            req.destroy()
+            reject(new Error('ImageGenerationAborted'))
+          })
+          try {
+            if (!writeAndEndImageServerRequest(req, bodyStr)) {
+              reject(imageServerDisconnectedError())
+            }
+          } catch (error) {
+            reject(error)
+          }
+        })
+      } finally {
+        clearTimeout(timeoutId)
+        clearInterval(touchInterval)
+      }
+
+      if (!resp.ok) {
+        return { success: false, error: `Server returned ${resp.status}: ${resp.data?.slice(0, 500) || resp.statusText}` }
+      }
+
+      const result = JSON.parse(resp.data) as { data: Array<{ b64_json: string; revised_prompt?: string; seed?: number }> }
+      const elapsed = (Date.now() - startTime) / 1000
+
+      // If img2img, save source image to disk for gallery display
+      let sourceImagePath: string | undefined
+      if (params.imageBase64 && params.strength != null) {
+        const srcId = uuidv4()
+        sourceImagePath = join(outputDir, `src_${srcId}.png`)
+        const rawB64 = params.imageBase64.replace(/^data:image\/[\w+.-]+;base64,/, '')
+        writeFileSync(sourceImagePath, Buffer.from(rawB64, 'base64'))
+      }
+
+      // Save each image to disk and database
+      const generations: ImageGeneration[] = []
+      for (const item of result.data) {
+        const genId = uuidv4()
+        const imagePath = join(outputDir, `${genId}.png`)
+
+        // Decode base64 and save as PNG
+        const buffer = Buffer.from(item.b64_json, 'base64')
+        writeFileSync(imagePath, buffer)
+
+        // Use the actual seed from the server response (engine resolves random seeds)
+        // so the user can reproduce the same image by entering the seed later
+        const gen: ImageGeneration = {
+          id: genId,
+          sessionId,
+          prompt,
+          negativePrompt: negativePrompt || undefined,
+          modelName: model,
+          width,
+          height,
+          steps,
+          guidance,
+          seed: item.seed ?? seed,
+          strength: params.strength,
+          elapsedSeconds: elapsed,
+          imagePath,
+          sourceImagePath,
+          createdAt: Date.now()
+        }
+        db.addImageGeneration(gen)
+        generations.push(gen)
+      }
+
+      finishImageGeneration(generationController)
+      return { success: true, generations }
+    } catch (error) {
+      console.error('[IMAGE] Generation failed:', error)
+      const errorMessage = classifyImageGenerationError(error, generationController)
+      finishImageGeneration(generationController)
+      return {
+        success: false,
+        error: errorMessage
+      }
+    }
+  })
+
+  // ─── Image Editing ──────────────────────────────────────────────────
+
+  ipcMain.handle('image:edit', async (_, params: {
+    sessionId: string
+    prompt: string
+    negativePrompt?: string
+    model: string
+    imageBase64: string       // Base64-encoded source image
+    maskBase64?: string       // Base64-encoded mask (for inpainting)
+    width: number
+    height: number
+    steps: number
+    guidance: number
+    strength: number
+    seed?: number
+    serverPort: number
+  }) => {
+    let generationController: AbortController | null = null
+    try {
+      const { sessionId, prompt, model, imageBase64, maskBase64, width, height, steps, guidance, strength, seed, serverPort } = params
+      const baseUrl = `http://127.0.0.1:${serverPort}`
+
+      // Touch session to reset idle timer
+      if (activeImageSessionId) sessionManager.touchSession(activeImageSessionId)
+
+      // Ensure output directory exists
+      const outputDir = join(homedir(), '.mlxstudio', 'generated', sessionId)
+      mkdirSync(outputDir, { recursive: true })
+
+      const startTime = Date.now()
+
+      // Call the image editing endpoint
+      // Strip data URL prefix if present (FileReader adds it)
+      const cleanImageB64 = imageBase64.replace(/^data:image\/[\w+.-]+;base64,/, '')
+      const body: Record<string, any> = {
+        prompt,
+        model,
+        image: cleanImageB64,
+        size: `${width}x${height}`,
+        steps,
+        guidance,
+        strength,
+        n: 1,
+        response_format: 'b64_json'
+      }
+      if (params.negativePrompt) body.negative_prompt = params.negativePrompt
+      if (seed != null) body.seed = seed
+      if (maskBase64) {
+        body.mask = maskBase64.replace(/^data:image\/[\w+.-]+;base64,/, '')
+      }
+
+      const controller = beginImageGeneration(sessionId)
+      generationController = controller
+      // 30-minute timeout for image edits (Qwen full precision can take 10+ minutes)
+      // Use Node.js http.request instead of Electron fetch — Chromium's net stack
+      // has its own socket timeout (~5 min) that ignores keepalive, causing
+      // "fetch failed" errors on long image edits.
+      const timeoutId = setTimeout(() => {
+        markImageGenerationAbort(controller, 'timeout')
+        requestImageServerCancel()
+        controller.abort()
+      }, 30 * 60 * 1000)
+      // Periodically touch session during long image edits (Qwen can take 10+ min)
+      const touchInterval = setInterval(() => {
+        if (activeImageSessionId) sessionManager.touchSession(activeImageSessionId)
+      }, 60_000)
+      let resp: any
+      try {
+        resp = await new Promise<any>((resolve, reject) => {
+          const http = require('http')
+          const bodyStr = JSON.stringify(body)
+          const headers = { ...getImageFetchHeaders(), 'Content-Length': Buffer.byteLength(bodyStr) }
+          const req = http.request(`${baseUrl}/v1/images/edits`, {
+            method: 'POST',
+            headers,
+            agent: false,
+            timeout: 30 * 60 * 1000,
+          }, (res: any) => {
+            let data = ''
+            res.on('data', (chunk: any) => { data += chunk })
+            res.on('end', () => {
+              resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, statusText: res.statusMessage, data })
+            })
+          })
+          req.on('error', reject)
+          controller.signal.addEventListener('abort', () => {
+            req.destroy()
+            reject(new Error('ImageGenerationAborted'))
+          })
+          try {
+            if (!writeAndEndImageServerRequest(req, bodyStr)) {
+              reject(imageServerDisconnectedError())
+            }
+          } catch (error) {
+            reject(error)
+          }
+        })
+      } finally {
+        clearTimeout(timeoutId)
+        clearInterval(touchInterval)
+      }
+
+      if (!resp.ok) {
+        return { success: false, error: `Server returned ${resp.status}: ${resp.data?.slice(0, 500) || resp.statusText}` }
+      }
+
+      const result = JSON.parse(resp.data) as { data: Array<{ b64_json: string; revised_prompt?: string; seed?: number }> }
+      const elapsed = (Date.now() - startTime) / 1000
+
+      // Save source image to disk for gallery display
+      const srcGenId = uuidv4()
+      const sourceImagePath = join(outputDir, `src_${srcGenId}.png`)
+      const rawB64 = imageBase64.replace(/^data:image\/[\w+.-]+;base64,/, '')
+      const srcBuffer = Buffer.from(rawB64, 'base64')
+      writeFileSync(sourceImagePath, srcBuffer)
+
+      // Save edited image to disk and database
+      const generations: ImageGeneration[] = []
+      for (const item of result.data) {
+        const genId = uuidv4()
+        const imagePath = join(outputDir, `${genId}.png`)
+
+        const buffer = Buffer.from(item.b64_json, 'base64')
+        writeFileSync(imagePath, buffer)
+
+        // Use the actual seed from the server response (engine resolves random seeds)
+        const gen: ImageGeneration = {
+          id: genId,
+          sessionId,
+          prompt,
+          negativePrompt: params.negativePrompt || undefined,
+          modelName: model,
+          width,
+          height,
+          steps,
+          guidance,
+          seed: item.seed ?? seed,
+          strength,
+          elapsedSeconds: elapsed,
+          imagePath,
+          sourceImagePath,
+          createdAt: Date.now()
+        }
+        db.addImageGeneration(gen)
+        generations.push(gen)
+      }
+
+      finishImageGeneration(generationController)
+      return { success: true, generations }
+    } catch (error) {
+      console.error('[IMAGE] Edit failed:', error)
+      const errorMessage = classifyImageGenerationError(error, generationController)
+      finishImageGeneration(generationController)
+      return {
+        success: false,
+        error: errorMessage
+      }
+    }
+  })
+
+  // ─── Generation Status (persists across tab switches) ─────────────
+
+  ipcMain.handle('image:isGenerating', async () => {
+    return getImageGenerationStatus()
+  })
+
+  // ─── Server Lifecycle ────────────────────────────────────────────────
+
+  ipcMain.handle('image:startServer', async (_, modelName: string, quantize?: number, imageMode?: 'generate' | 'edit', serverSettings?: { host?: string; port?: number; apiKey?: string; logLevel?: string; mfluxClass?: string }) => {
+    // Serialize concurrent startServer calls to prevent race conditions.
+    // Each call chains onto the previous one so only one stop+create+start
+    // sequence runs at a time.
+    const result = startServerChain = startServerChain
+      .catch(() => {})  // Don't let a previous failure block the next call
+      .then(async () => {
+        try {
+          // Stop any existing image server first
+          if (activeImageSessionId) {
+            const controller = getActiveImageGenerationController()
+            if (controller) {
+              markImageGenerationAbort(controller, "cancel")
+              requestImageServerCancel()
+              controller.abort()
+            }
+            clearImageGenerationAfterLocalAbort(controller)
+            clearImageGenerationSessionHistory()
+            try {
+              await sessionManager.stopSession(activeImageSessionId)
+            } catch (e) {
+              console.error('[IMAGE] Failed to stop previous image server:', e)
+            }
+            activeImageSessionId = null
+          }
+
+          // Look up model path from DB — no directory scanning needed.
+          let modelPath = modelName
+          const storedPath = db.getImageModelPath(modelName, quantize || 0)
+          if (storedPath && existsSync(storedPath.localPath)) {
+            modelPath = storedPath.localPath
+            console.log(`[IMAGE] Using stored model path: ${modelPath}`)
+          } else {
+            // Clean up stale DB entry (file was deleted from disk)
+            if (storedPath) {
+              console.log(`[IMAGE] Stale DB entry for ${modelName} (quantize=${quantize}): path no longer exists, removing.`)
+              db.deleteImageModelPath(modelName, quantize || 0)
+            }
+            const discovered = findDownloadedImageModelPath(modelName, quantize || 0)
+            if (discovered) {
+              modelPath = discovered.localPath
+              db.setImageModelPath(discovered.modelId, quantize || 0, discovered.localPath, discovered.repoId)
+              console.log(`[IMAGE] Registered existing downloaded image model: ${discovered.modelId} q=${quantize || 0} → ${modelPath}`)
+            } else {
+              console.log(`[IMAGE] No local model found for ${modelName} (quantize=${quantize}). User must download first.`)
+              return { success: false, error: `Model "${modelName}" not downloaded. Use the Download button first.` }
+            }
+          }
+
+          // Create a session config for image serving
+          // imageMode, imageQuantize, and servedModelName are stored in config fields
+          // and passed as CLI flags by buildArgs() — NOT via additionalArgs (avoids duplication)
+          const mode = imageMode || 'generate'
+
+          // Look up model definition.
+          // mlxstudio#82: use fuzzy resolver (directory basenames like
+          // "FLUX.2-klein-9B" or "FLUX.1-dev-mflux-8bit" need more than
+          // exact-id match). Fuzzy resolver rule #1 is exact-id so this
+          // is a strict superset of getImageModel().
+          const modelDef = resolveImageModelFromDirectoryName(modelName) || getImageModel(modelName)
+          const mfluxName = modelDef?.mfluxName || modelName
+          const mfluxClass = serverSettings?.mfluxClass || modelDef?.mfluxClass || ''
+          if (modelDef && modelDef.id !== modelName) {
+            console.log(`[IMAGE] mlxstudio#82: resolved '${modelName}' -> modelDef id=${modelDef.id}, mfluxClass=${modelDef.mfluxClass}, mfluxName=${modelDef.mfluxName}`)
+          }
+
+          const config: Partial<ServerConfig> = {
+            host: serverSettings?.host || '127.0.0.1',
+            port: serverSettings?.port || 0,  // 0 = auto-assign
+            apiKey: serverSettings?.apiKey || '',
+            logLevel: (serverSettings?.logLevel || 'INFO') as 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR',
+            timeout: 1800,  // 30 minutes — image edits can take 10+ minutes for large models
+            modelType: 'image',
+            imageMode: mode,
+            imageQuantize: quantize || 0,
+            // Pass mflux canonical name so engine uses the correct class (not directory name)
+            servedModelName: mfluxName,
+            // Explicit mflux class — buildArgs passes --mflux-class flag
+            mfluxClass: mfluxClass || undefined,
+          }
+
+          const session = await sessionManager.createSession(modelPath, config)
+
+          // Start the session
+          await sessionManager.startSession(session.id)
+          activeImageSessionId = session.id
+
+          return { success: true, sessionId: session.id, port: session.port }
+        } catch (error) {
+          console.error('[IMAGE] Failed to start server:', error)
+          return { success: false, error: (error as Error).message }
+        }
+      })
+    return result
+  })
+
+  ipcMain.handle('image:stopServer', async () => {
+    try {
+      if (activeImageSessionId) {
+        // Cancel any in-flight generation before stopping
+        const controller = getActiveImageGenerationController()
+        if (controller) {
+          markImageGenerationAbort(controller, "cancel")
+          requestImageServerCancel()
+          controller.abort()
+        }
+        clearImageGenerationAfterLocalAbort(controller)
+        clearImageGenerationSessionHistory()
+        await sessionManager.stopSession(activeImageSessionId)
+        activeImageSessionId = null
+      }
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('image:cancelGeneration', async () => {
+    const controller = getActiveImageGenerationController()
+    if (controller) {
+      markImageGenerationAbort(controller, "cancel")
+      requestImageServerCancel()
+      controller.abort()
+      clearImageGenerationAfterLocalAbort(controller)
+      clearImageGenerationSessionHistory()
+      return { success: true }
+    }
+    return { success: false, error: 'No active generation' }
+  })
+
+  ipcMain.handle('image:getRunningServer', async () => {
+    try {
+      const buildResult = (s: any) => {
+        const cfg = (() => { try { return JSON.parse(s.config || '{}') } catch { return {} } })()
+        // Read imageMode from config — always set explicitly by startServer, no name guessing
+        const imageMode: 'generate' | 'edit' = cfg.imageMode || 'generate'
+        // Read quantize from config
+        const quantize = cfg.imageQuantize ?? 0
+        // mlxstudio#82: display the directory basename exactly as on disk.
+        // Prior flip prefers cfg.servedModelName (canonical mflux form like
+        // "flux2-klein-9b") which stripped dots and diverged from the
+        // session list / config form — Mark reported seeing "FLUX2" here
+        // and "FLUX.2" elsewhere. `servedModelName` is an API routing key,
+        // not a display label. Use it only when modelPath is missing.
+        const pathBase = s.modelPath?.includes('/') ? s.modelPath.split('/').pop()! : s.modelPath
+        const modelName = pathBase
+          || (s.modelName?.includes('/') ? s.modelName.split('/').pop()! : s.modelName)
+          || cfg.servedModelName
+          || ''
+        return {
+          sessionId: s.id,
+          modelName,
+          displayModelName: modelName,
+          canonicalModelId: cfg.servedModelName || undefined,
+          modelPath: s.modelPath,
+          host: s.host,
+          port: s.port,
+          status: s.status,
+          quantize,
+          imageMode,
+        }
+      }
+
+      // First check the tracked active image session
+      if (activeImageSessionId) {
+        const session = sessionManager.getSession(activeImageSessionId)
+        if (session && (session.status === 'running' || session.status === 'loading')) {
+          return buildResult(session)
+        }
+        activeImageSessionId = null
+      }
+
+      // Also scan all sessions for any image model (e.g., started from Server tab)
+      const allSessions = db.getSessions()
+      for (const s of allSessions) {
+        if (s.status !== 'running' && s.status !== 'loading') continue
+        try {
+          const cfg = JSON.parse(s.config || '{}')
+          if (cfg.modelType === 'image') {
+            activeImageSessionId = s.id  // Adopt it
+            return buildResult(s)
+          }
+        } catch {}
+      }
+
+      return null
+    } catch (error) {
+      return null
+    }
+  })
+
+  // List ALL running image sessions (gen + edit) so the Image tab can show a selector
+  ipcMain.handle('image:getRunningServers', async () => {
+    try {
+      const results: any[] = []
+      const allSessions = db.getSessions()
+      for (const s of allSessions) {
+        if (s.status !== 'running' && s.status !== 'loading') continue
+        try {
+          const cfg = JSON.parse(s.config || '{}')
+          if (cfg.modelType === 'image') {
+            // Prefer servedModelName from config (canonical mflux name, no path guessing)
+            const modelName = cfg.servedModelName
+              || (s.modelName?.includes('/') ? s.modelName.split('/').pop()! : s.modelName)
+              || ''
+            results.push({
+              sessionId: s.id,
+              modelName,
+              modelPath: s.modelPath,
+              host: s.host,
+              port: s.port,
+              status: s.status,
+              quantize: cfg.imageQuantize ?? 0,
+              imageMode: cfg.imageMode || 'generate',
+            })
+          }
+        } catch {}
+      }
+      return results
+    } catch {
+      return []
+    }
+  })
+
+  // ─── Image file reading ──────────────────────────────────────────────
+
+  ipcMain.handle('image:readFile', async (_, imagePath: string) => {
+    try {
+      // Restrict to ~/.mlxstudio/ for security (prevent arbitrary file reads)
+      const allowedDir = resolve(homedir(), '.mlxstudio')
+      const resolved = resolve(imagePath)
+      if (!resolved.startsWith(allowedDir)) {
+        console.warn('[IMAGE] Blocked readFile outside ~/.mlxstudio/:', resolved)
+        return null
+      }
+      if (!existsSync(resolved)) return null
+      const data = readFileSync(resolved)
+      return `data:image/png;base64,${data.toString('base64')}`
+    } catch (error) {
+      console.error('[IMAGE] Failed to read image file:', error)
+      return null
+    }
+  })
+
+  // ─── Save image to user-chosen location ──────────────────────────────
+
+  ipcMain.handle('image:saveFile', async (_, imagePath: string) => {
+    try {
+      // Restrict source to ~/.mlxstudio/ for security (prevent arbitrary file reads)
+      const allowedDir = resolve(homedir(), '.mlxstudio')
+      const resolved = resolve(imagePath)
+      if (!resolved.startsWith(allowedDir)) {
+        console.warn('[IMAGE] Blocked saveFile outside ~/.mlxstudio/:', resolved)
+        return { success: false, error: 'Source path not allowed' }
+      }
+      const { dialog } = require('electron')
+      const { copyFileSync } = require('fs')
+      const fileName = resolved.split('/').pop() || 'image.png'
+      const result = await dialog.showSaveDialog({
+        defaultPath: fileName,
+        filters: [{ name: 'PNG Image', extensions: ['png'] }]
+      })
+      if (!result.canceled && result.filePath) {
+        copyFileSync(resolved, result.filePath)
+        return { success: true, path: result.filePath }
+      }
+      return { success: false }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+}

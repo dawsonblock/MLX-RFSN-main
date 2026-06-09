@@ -1,0 +1,79 @@
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.11.9",
+    "mlx_available": true,
+    "timestamp": "20260607T215547Z",
+    "fast_mode": false
+  },
+  "bitpack_numpy": {
+    "suite": "bitpack_numpy",
+    "status": "ok",
+    "data": {
+      "n=4096": {
+        "pack_ms": 0.026020992663688958
+      },
+      "n=65536": {
+        "pack_ms": 0.0974580179899931
+      },
+      "n=262144": {
+        "pack_ms": 0.4089170106453821
+      }
+    }
+  },
+  "attention_mlx": {
+    "suite": "attention_mlx",
+    "status": "ok",
+    "data": {
+      "t_k=256": {
+        "sparse_ms": 6.51079200906679,
+        "dense_ms": 1.4875835040584207,
+        "speedup": 0.22847965377896323
+      },
+      "t_k=512": {
+        "sparse_ms": 15.487291995668784,
+        "dense_ms": 2.288583491463214,
+        "speedup": 0.14777170160562902
+      },
+      "t_k=1024": {
+        "sparse_ms": 13.830479510943405,
+        "dense_ms": 1.4674584963358939,
+        "speedup": 0.10610322622399052
+      }
+    }
+  },
+  "quant_decode_mlx": {
+    "suite": "quant_decode_mlx",
+    "status": "ok",
+    "data": {
+      "n_keys=1024": {
+        "decode_ms": 1.747854010318406
+      },
+      "n_keys=4096": {
+        "decode_ms": 2.9046459967503324
+      },
+      "n_keys=16384": {
+        "decode_ms": 4.56354150082916
+      }
+    }
+  },
+  "kv_roundtrip_mlx": {
+    "suite": "kv_roundtrip_mlx",
+    "status": "ok",
+    "data": {
+      "seq=128_gs=32": {
+        "cosine_K": 0.999986,
+        "roundtrip_ms": 102.992
+      },
+      "seq=512_gs=32": {
+        "cosine_K": 0.999986,
+        "roundtrip_ms": 161.179
+      },
+      "seq=512_gs=64": {
+        "cosine_K": 0.999982,
+        "roundtrip_ms": 110.631
+      }
+    }
+  }
+}

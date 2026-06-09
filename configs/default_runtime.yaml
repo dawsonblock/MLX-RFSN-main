@@ -1,0 +1,11 @@
+runtime:
+  default_quant_mode: "k8_v5_gs32"
+  allow_experimental: false
+  qjl_enabled: false
+  sparse_decode_enabled: false
+  audit_enabled: true
+
+experimental:
+  enable_qjl: false
+  enable_polar: false
+  enable_adaptive: false

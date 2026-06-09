@@ -1,0 +1,24 @@
+{
+  "feature_dim": 64,
+  "proj_dim": 64,
+  "num_queries": 32,
+  "num_keys": 128,
+  "batch_size": 2,
+  "num_heads": 4,
+  "base_mode": "hybrid",
+  "base_score_mae": 0.0823969691991806,
+  "qjl_score_mae": 0.10513991117477417,
+  "base_score_rmse": 0.10420498996973038,
+  "qjl_score_rmse": 0.13377822935581207,
+  "base_topk_overlap": 1.0,
+  "qjl_topk_overlap": 0.8,
+  "base_softmax_kl": 0.005612309090793133,
+  "qjl_softmax_kl": 0.009274144656956196,
+  "qjl_improves_mae": false,
+  "qjl_improves_kl": false,
+  "qjl_preserves_topk": false,
+  "passes_all": false,
+  "notes": [
+    "Pass condition: qjl_mae < base_mae AND qjl_kl < base_kl AND qjl_topk >= base_topk"
+  ]
+}

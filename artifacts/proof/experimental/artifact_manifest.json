@@ -1,0 +1,60 @@
+{
+  "release": "experimental",
+  "stable_default": "k8_v5_gs64",
+  "qjl_status": "failed_disabled",
+  "promoted_to_default": false,
+  "real_generation_teacher_forced_status": "bulk_average_methodology_under_investigation",
+  "promotion_blockers": [
+    "stable_teacher_forced_drift_unexplained",
+    "experimental_decode_update_failure",
+    "real_gen_benchmark_methodology_discrepancy",
+    "qjl_failed"
+  ],
+  "experimental_modes": "research_only",
+  "decode_update_diagnosis": "stable_configs_pass_decode_update_experimental_fail",
+  "teacher_forced_step_trace_finding": "stable_configs_pass_all_128_teacher_forced_steps_cosine_gte_0995",
+  "real_gen_discrepancy_note": "benchmark_real_generation_throughput.py reports cosine~0.955 for stable configs. teacher_forced_step_trace.json shows cosine>=0.995 for all 128 forced steps on same prompt. Discrepancy under investigation — likely a comparison methodology difference in the bulk benchmark.",
+  "artifacts": {
+    "comparison": "comparison_summary.json",
+    "memory": "memory_accounting.json",
+    "throughput": "throughput.json",
+    "real_generation_throughput": {
+      "path": "real_generation_throughput.json",
+      "status": "executed",
+      "methodology_note": "Bulk average over 128 decode steps. Teacher-forced comparison methodology differs from teacher_forced_step_trace.json — under investigation."
+    },
+    "teacher_forced_step_trace": {
+      "path": "teacher_forced_step_trace.json",
+      "status": "executed",
+      "rows": 1536,
+      "configs": 6,
+      "prompt_lengths": [128, 512],
+      "steps_per_run": 128,
+      "prompt_source": "text_foxdog",
+      "purpose": "per-step teacher-forced quality trace with distribution-shift diagnostics",
+      "key_finding": "k8_v5_gs64 and k8_v5_gs32 pass all 128/128 steps (cosine>=0.995). Experimental configs degrade from step 0."
+    },
+    "decode_update_trace": {
+      "path": "decode_update_trace.json",
+      "status": "executed",
+      "rows": 70,
+      "purpose": "step-level decode cache/update diagnostics (free-running greedy)"
+    },
+    "decode_append_kv_diff": {
+      "path": "decode_append_kv_diff.json",
+      "status": "executed",
+      "rows": 10,
+      "purpose": "old-cache preservation and new-token K/V append diagnostics"
+    },
+    "prefill_decode_split": {
+      "path": "prefill_decode_split.json",
+      "status": "executed",
+      "methodology_note": "free_running_greedy — each mode uses its own greedy token sequence, not teacher-forced. Reconciliation fields added: continuation_mode, token_sequence_source."
+    },
+    "kv_roundtrip_by_context": "kv_roundtrip_by_context.json",
+    "short_prompt_drift_trace": "short_prompt_drift_trace.json",
+    "qjl": "qjl_attention_score.json",
+    "layer_policy": "layer_policy.json",
+    "qwen_1_5b": "qwen_1_5b/"
+  }
+}

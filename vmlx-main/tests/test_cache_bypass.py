@@ -1,0 +1,1100 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Strict cache-bypass enforcement suite.
+
+These tests enforce two guarantees that must hold for every model family
+regardless of whether it's JANG, VL, or hybrid SSM:
+
+1. **Cache bypass is absolute.** When a request carries `cache_salt` or
+   `skip_prefix_cache=True`, no prefix cache layer may return stored state
+   and no prefix cache layer may store new state. This applies to the paged
+   cache, memory-aware cache, legacy prefix cache, disk L2, block disk store,
+   AND the SSM companion cache for hybrid models.
+
+2. **Multi-turn context is preserved WITHOUT bypass.** A follow-up request
+   within the same session must correctly consult the cache (`_bypass = False`
+   code path). The bypass gates must not accidentally disable the happy path.
+
+These tests are source-level: they assert that specific gating expressions
+appear in the right files at the right sites. They run in <1s because they
+don't load any model weights, and they catch regressions BEFORE a release.
+A future refactor that accidentally drops a bypass gate will fail these
+tests immediately.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from vmlx_engine.api.models import ChatCompletionRequest, CompletionRequest
+from vmlx_engine.request import Request, SamplingParams
+
+
+# ---------------------------------------------------------------------------
+# API model layer: cache_salt / skip_prefix_cache field acceptance
+# ---------------------------------------------------------------------------
+
+
+class TestAPIModelFields:
+    """The OpenAI-compatible request models must accept the new fields."""
+
+    def test_chat_request_accepts_cache_salt_string(self):
+        r = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            cache_salt="benchmark-run-42",
+        )
+        assert r.cache_salt == "benchmark-run-42"
+        assert r.skip_prefix_cache is None
+
+    def test_chat_request_accepts_skip_prefix_cache_bool(self):
+        r = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            skip_prefix_cache=True,
+        )
+        assert r.skip_prefix_cache is True
+        assert r.cache_salt is None
+
+    def test_chat_request_default_values_do_not_bypass(self):
+        r = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert r.cache_salt is None
+        assert r.skip_prefix_cache is None
+
+    def test_completion_request_accepts_cache_salt(self):
+        r = CompletionRequest(model="test", prompt="hi", cache_salt="run-1")
+        assert r.cache_salt == "run-1"
+
+    def test_completion_request_accepts_skip_prefix_cache(self):
+        r = CompletionRequest(model="test", prompt="hi", skip_prefix_cache=True)
+        assert r.skip_prefix_cache is True
+
+
+# ---------------------------------------------------------------------------
+# Server helper: _compute_bypass_prefix_cache
+# ---------------------------------------------------------------------------
+
+
+class TestComputeBypassFlag:
+    """The helper that decides whether a request bypasses cache must
+    return True ONLY when the request explicitly asked for it."""
+
+    def test_none_request_returns_false(self):
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+        assert _compute_bypass_prefix_cache(None) is False
+
+    def test_no_bypass_fields_returns_false(self):
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+
+        class R:
+            cache_salt = None
+            skip_prefix_cache = None
+
+        assert _compute_bypass_prefix_cache(R()) is False
+
+    def test_empty_cache_salt_returns_false(self):
+        """Empty-string salt must not trigger bypass — it's semantically
+        the same as no salt at all. Otherwise clients that default-construct
+        the field to '' would accidentally opt into bypass mode."""
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+
+        class R:
+            cache_salt = ""
+            skip_prefix_cache = None
+
+        assert _compute_bypass_prefix_cache(R()) is False
+
+    def test_non_empty_cache_salt_returns_true(self):
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+
+        class R:
+            cache_salt = "abc-123"
+            skip_prefix_cache = None
+
+        assert _compute_bypass_prefix_cache(R()) is True
+
+    def test_explicit_skip_prefix_cache_returns_true(self):
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+
+        class R:
+            cache_salt = None
+            skip_prefix_cache = True
+
+        assert _compute_bypass_prefix_cache(R()) is True
+
+    def test_skip_prefix_cache_false_returns_false(self):
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+
+        class R:
+            cache_salt = None
+            skip_prefix_cache = False
+
+        assert _compute_bypass_prefix_cache(R()) is False
+
+    def test_dsv4_model_does_not_implicitly_bypass(self):
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+
+        class R:
+            model = "/Volumes/EricsLLMDrive/jangq-ai/DeepSeek-V4-Flash-JANGTQ2"
+            cache_salt = None
+            skip_prefix_cache = None
+
+        assert _compute_bypass_prefix_cache(R()) is False
+
+    def test_cache_salt_and_skip_both_set_returns_true(self):
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+
+        class R:
+            cache_salt = "x"
+            skip_prefix_cache = True
+
+        assert _compute_bypass_prefix_cache(R()) is True
+
+
+# ---------------------------------------------------------------------------
+# Request object: _bypass_prefix_cache attribute
+# ---------------------------------------------------------------------------
+
+
+class TestRequestBypassAttribute:
+    """The Request class must carry the bypass flag through the scheduler
+    pipeline. Default must be False so normal requests use cache normally."""
+
+    def _make_request(self) -> Request:
+        return Request(
+            request_id="test-req",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+
+    def test_default_bypass_is_false(self):
+        req = self._make_request()
+        assert req._bypass_prefix_cache is False
+
+    def test_set_bypass_to_true(self):
+        req = self._make_request()
+        req._bypass_prefix_cache = True
+        assert req._bypass_prefix_cache is True
+
+    def test_bypass_survives_attribute_access_with_default(self):
+        """getattr with a `False` default must return the real value, not
+        the default — otherwise scheduler-level `getattr(request,
+        '_bypass_prefix_cache', False)` would always evaluate to False."""
+        req = self._make_request()
+        req._bypass_prefix_cache = True
+        assert getattr(req, "_bypass_prefix_cache", False) is True
+
+
+# ---------------------------------------------------------------------------
+# Source-level gating assertions: scheduler + mllm_scheduler + mllm_batch_generator
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerBypassGating:
+    """Source-level assertions that every cache path in scheduler.py,
+    mllm_scheduler.py, and mllm_batch_generator.py gates on
+    `_bypass_prefix_cache` either directly (at fetch sites) or via
+    `_skip_cache_store` (at store sites).
+
+    These run without any model weights. They catch a future refactor
+    that accidentally drops a gate — which is the exact class of bug
+    we've already seen once and must prevent from recurring.
+    """
+
+    def _read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_scheduler_schedule_has_bypass_gate(self):
+        src = self._read("vmlx_engine/scheduler.py")
+        # The main _schedule_request path must declare the bypass variable
+        assert "_bypass = bool(getattr(request, \"_bypass_prefix_cache\"" in src, (
+            "scheduler.py lost the _bypass variable declaration"
+        )
+        # block_aware_cache fetch must be gated
+        assert (
+            "self.block_aware_cache is not None and not _bypass" in src
+        ), "scheduler.py block_aware_cache fetch is no longer gated on _bypass"
+        # memory_aware_cache fetch must be gated
+        assert (
+            "self.memory_aware_cache is not None and not _bypass" in src
+        ), "scheduler.py memory_aware_cache fetch is no longer gated on _bypass"
+        # legacy prefix_cache fetch must be gated
+        assert (
+            "self.prefix_cache is not None and not _bypass" in src
+        ), "scheduler.py legacy prefix_cache fetch is no longer gated on _bypass"
+        # disk L2 fallback must be gated
+        assert (
+            "self.disk_cache is not None" in src
+            and "and not _bypass" in src[src.index("# L2: Disk cache fallback"): src.index("disk_cache = self.disk_cache.fetch", src.index("# L2: Disk cache fallback"))]
+        ), "scheduler.py disk L2 fetch is no longer gated on _bypass"
+
+    def test_scheduler_store_path_honors_bypass(self):
+        src = self._read("vmlx_engine/scheduler.py")
+        # _skip_cache_store must get forced to True when bypass is set
+        assert 'getattr(request, "_bypass_prefix_cache", False):' in src, (
+            "scheduler.py store path no longer reads _bypass_prefix_cache"
+        )
+        # And the line immediately after must set _skip_cache_store = True
+        idx = src.index('getattr(request, "_bypass_prefix_cache", False):')
+        # Search forward within a small window for the assignment
+        window = src[idx : idx + 200]
+        assert "_skip_cache_store = True" in window, (
+            "scheduler.py bypass check no longer forces _skip_cache_store = True"
+        )
+
+    def test_scheduler_finish_path_skips_cache_extraction_when_bypassed(self):
+        src = self._read("vmlx_engine/scheduler.py")
+        idx = src.index("# Extract cache for future reuse")
+        window = src[idx : src.index("self.total_completion_tokens", idx)]
+        assert 'not getattr(request, "_bypass_prefix_cache", False)' in window, (
+            "scheduler.py still extracts prompt-boundary cache for bypassed "
+            "requests; cache_salt/skip_prefix_cache must avoid both lookup "
+            "and store-side extraction work/logs"
+        )
+
+    def test_mllm_scheduler_store_path_honors_bypass(self):
+        src = self._read("vmlx_engine/mllm_scheduler.py")
+        cleanup_idx = src.index("def _cleanup_finished(")
+        src = src[cleanup_idx:]
+        assert (
+            "getattr(request, '_bypass_prefix_cache', False):" in src
+        ), "mllm_scheduler.py store path no longer checks _bypass_prefix_cache"
+        idx = src.index("getattr(request, '_bypass_prefix_cache', False):")
+        window = src[idx : idx + 200]
+        assert "_skip_cache_store = True" in window, (
+            "mllm_scheduler.py bypass check no longer forces _skip_cache_store = True"
+        )
+
+    def test_mllm_scheduler_add_request_reads_bypass(self):
+        src = self._read("vmlx_engine/mllm_scheduler.py")
+        assert 'kwargs.get("bypass_prefix_cache", False)' in src, (
+            "mllm_scheduler.add_request no longer reads bypass_prefix_cache from kwargs"
+        )
+        assert "request._bypass_prefix_cache = True" in src, (
+            "mllm_scheduler.add_request no longer attaches _bypass_prefix_cache to request"
+        )
+
+    def test_mllm_scheduler_threads_bypass_to_batch_request(self):
+        """The scheduler must copy bypass from MLLMRequest to MLLMBatchRequest.
+
+        The batch generator owns prefix-cache fetch and vision pixel-cache
+        fetch, so setting the flag only on the scheduler request is not enough.
+        """
+        src = self._read("vmlx_engine/mllm_scheduler.py")
+        idx = src.index("batch_req = MLLMBatchRequest(")
+        window = src[idx : src.index("batch_requests.append(batch_req)", idx)]
+        assert "getattr(request, '_bypass_prefix_cache', False)" in window, (
+            "mllm_scheduler lost the MLLMRequest -> MLLMBatchRequest "
+            "bypass propagation check"
+        )
+        assert "batch_req._bypass_prefix_cache = True" in window, (
+            "mllm_scheduler no longer copies _bypass_prefix_cache to "
+            "MLLMBatchRequest before prefix-cache fetch"
+        )
+
+    def test_mllm_batch_generator_gates_all_three_fetch_paths(self):
+        src = self._read("vmlx_engine/mllm_batch_generator.py")
+        # Must have the bypass variable
+        assert "_mllm_bypass" in src, (
+            "mllm_batch_generator.py lost the _mllm_bypass variable"
+        )
+        # Must check _bypass_prefix_cache on the request
+        assert "_bypass_prefix_cache" in src, (
+            "mllm_batch_generator.py no longer reads _bypass_prefix_cache"
+        )
+        # Must gate at least 3 fetch paths (paged, memory-aware, disk L2)
+        assert src.count("not _mllm_bypass") >= 3, (
+            "mllm_batch_generator.py must gate paged + memory-aware + disk-L2 "
+            f"fetches — found only {src.count('not _mllm_bypass')} gates"
+        )
+
+    def test_mllm_batch_generator_bypass_skips_ssm_capture_work(self):
+        src = self._read("vmlx_engine/mllm_batch_generator.py")
+        clean_idx = src.index("def _clean_ssm_boundary_for(")
+        clean_window = src[clean_idx : src.index("def _ssm_capture_boundaries_for(", clean_idx)]
+        assert 'getattr(request, "_bypass_prefix_cache", False)' in clean_window, (
+            "cache_salt/skip_prefix_cache must skip inline SSM boundary "
+            "splitting; bypassed benchmark/API requests should not pay hidden "
+            "companion-cache capture work"
+        )
+
+        store_idx = src.index("# Capture SSM state at prompt boundary for hybrid models.")
+        store_window = src[store_idx : store_idx + 900]
+        assert "not getattr(req, '_bypass_prefix_cache', False)" in store_window, (
+            "cache_salt/skip_prefix_cache must skip MLLM SSM companion "
+            "store/rederive work, not only lookup"
+        )
+        capture_idx = src.index("def _ssm_capture_boundaries_for(")
+        capture_window = src[capture_idx : src.index("def _ssm_block_aligned_boundary(", capture_idx)]
+        assert 'os.environ.get("VMLX_DISABLE_SSM_INLINE_CAPTURE")' in capture_window, (
+            "MLLM SSM inline capture killswitch must use the canonical VMLX_* "
+            "env var; a VMLINUX typo leaves the documented bypass ineffective"
+        )
+
+    def test_mllm_batch_generator_gates_vision_pixel_cache_on_bypass(self):
+        src = self._read("vmlx_engine/mllm_batch_generator.py")
+        idx = src.index("media_cache_sources = all_images + video_cache_sources")
+        window = src[idx : src.index("# Cache miss - process images", idx)]
+        assert "_mllm_bypass" in window, (
+            "mllm_batch_generator._preprocess_request no longer computes "
+            "the bypass flag before consulting the vision pixel cache"
+        )
+        assert "not _mllm_bypass" in window, (
+            "vision pixel-cache fetch must be gated by not _mllm_bypass"
+        )
+        store_idx = src.index("# Store in pixel cache for future reuse")
+        store_window = src[store_idx : store_idx + 400]
+        assert "not _mllm_bypass" in store_window, (
+            "vision pixel-cache store must be gated by not _mllm_bypass"
+        )
+
+    def test_engine_core_add_request_accepts_bypass(self):
+        src = self._read("vmlx_engine/engine_core.py")
+        assert "bypass_prefix_cache: bool = False" in src, (
+            "engine_core.add_request no longer accepts bypass_prefix_cache parameter"
+        )
+        assert "request._bypass_prefix_cache = True" in src, (
+            "engine_core.add_request no longer sets _bypass_prefix_cache on Request"
+        )
+
+    def test_batched_engine_threads_bypass_to_engine(self):
+        src = self._read("vmlx_engine/engine/batched.py")
+        # Must pop from kwargs at top of generate() and stream_generate()
+        pop_count = src.count('kwargs.pop("_bypass_prefix_cache"')
+        assert pop_count >= 2, (
+            f"batched.py must pop _bypass_prefix_cache in at least 2 methods "
+            f"(generate + stream_generate) — found {pop_count}"
+        )
+        # Must forward as bypass_prefix_cache=bypass_prefix_cache to both
+        # LLM and MLLM paths in both generate and stream_generate
+        fwd_count = src.count("bypass_prefix_cache=bypass_prefix_cache")
+        assert fwd_count >= 4, (
+            f"batched.py must forward bypass to LLM + MLLM paths in both "
+            f"generate() and stream_generate() — found only {fwd_count} forwards"
+        )
+
+    def test_simple_engine_eats_bypass_kwarg(self):
+        """SimpleEngine has no prefix cache but must still pop the kwarg so
+        it doesn't leak into mlx_lm.generate which would reject unknown kwargs."""
+        src = self._read("vmlx_engine/engine/simple.py")
+        pop_count = src.count('kwargs.pop("_bypass_prefix_cache"')
+        assert pop_count >= 4, (
+            f"SimpleEngine must pop _bypass_prefix_cache in all 4 methods "
+            f"(generate, stream_generate, chat, stream_chat) — found {pop_count}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Server: gateway forwarding of cache_salt → chat_kwargs
+# ---------------------------------------------------------------------------
+
+
+class TestServerForwarding:
+    """Each API gateway handler in server.py must forward the bypass flag
+    into the kwargs it passes to engine.chat/stream_chat/generate."""
+
+    def _read_server(self):
+        with open("vmlx_engine/server.py") as f:
+            return f.read()
+
+    def test_helper_exists(self):
+        src = self._read_server()
+        assert "def _compute_bypass_prefix_cache(" in src, (
+            "server.py lost the _compute_bypass_prefix_cache helper"
+        )
+
+    def test_all_gateway_forward_sites_set_bypass_kwarg(self):
+        """Every `_resolve_repetition_penalty(...)` forward site must be
+        paired with a `_compute_bypass_prefix_cache(...)` check that sets
+        `_bypass_prefix_cache` in the same kwargs dict. This ensures
+        Anthropic, Ollama, OpenAI chat, Responses API, and both streaming
+        and non-streaming completions all honor the flag."""
+        src = self._read_server()
+        call_count = src.count("_compute_bypass_prefix_cache(")
+        # 6 forward sites + 1 helper definition = 7 total
+        assert call_count >= 7, (
+            f"Expected at least 7 _compute_bypass_prefix_cache references "
+            f"(definition + 6 forward sites) — found {call_count}"
+        )
+        assert '_msg_kwargs["_bypass_prefix_cache"] = True' in src, (
+            "Anthropic forward site lost the _bypass_prefix_cache assignment"
+        )
+        chat_kwargs_assigns = src.count('chat_kwargs["_bypass_prefix_cache"] = True')
+        assert chat_kwargs_assigns >= 3, (
+            f"Need at least 3 chat_kwargs assignments (ollama + openai + "
+            f"responses) — found {chat_kwargs_assigns}"
+        )
+        gen_kwargs_assigns = src.count('gen_kwargs["_bypass_prefix_cache"] = True')
+        assert gen_kwargs_assigns >= 2, (
+            f"Need at least 2 gen_kwargs assignments (completions non-stream "
+            f"+ streaming) — found {gen_kwargs_assigns}"
+        )
+
+    def test_responses_output_text_survives_tool_history_conversion(self):
+        """Panel follow-ups use Responses items to preserve tool history.
+
+        A previous regression dropped `output_text` items in
+        _responses_input_to_messages, so after a tool round the next prompt
+        lost the assistant's final text and models tried to restart tool use
+        in the wrong format.
+        """
+        from vmlx_engine.server import _responses_input_to_messages
+
+        messages = _responses_input_to_messages(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "list_directory",
+                    "arguments": json.dumps({"path": "."}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "README.md",
+                },
+                {"type": "output_text", "text": "The directory contains README.md."},
+                {"type": "message", "role": "user", "content": "continue"},
+            ],
+            instructions="system",
+        )
+
+        assert messages[0] == {"role": "system", "content": "system"}
+        assert messages[1]["role"] == "user"
+        assert "tool-call history" in messages[1]["content"]
+        assert messages[2]["role"] == "assistant"
+        assert messages[2]["tool_calls"][0]["id"] == "call_1"
+        assert messages[3] == {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "README.md",
+        }
+        assert messages[4] == {
+            "role": "assistant",
+            "content": "The directory contains README.md.",
+        }
+
+    def test_tool_parser_is_disabled_when_request_has_no_tools(self):
+        """CLI auto parser flags must not create tool calls by themselves.
+
+        A Responses follow-up can include prior function_call/function_call_output
+        items as history, then ask for plain text with no tools in the current
+        request. If the server still runs the Qwen/Mistral/etc. parser solely
+        because it was launched with --tool-call-parser auto, normal text can be
+        returned as a function_call-only response with no visible output_text.
+        """
+        from vmlx_engine import server
+
+        assert (
+            server._suppress_tool_parsing_when_no_tools(
+                [], "auto", "Responses API"
+            )
+            is True
+        )
+        assert (
+            server._suppress_tool_parsing_when_no_tools(
+                [], None, "Chat Completions"
+            )
+            is True
+        )
+        assert (
+            server._suppress_tool_parsing_when_no_tools(
+                [{"type": "function"}], "auto", "Responses API"
+            )
+            is False
+        )
+
+        with pytest.raises(Exception) as exc:
+            server._suppress_tool_parsing_when_no_tools(
+                [], "required", "Responses API"
+            )
+        assert getattr(exc.value, "status_code", None) == 400
+
+    def test_streaming_tool_detection_requires_request_tools(self):
+        """Streaming paths should not buffer tool-call markers unless tools
+        were actually passed into the request/template."""
+        src = self._read_server()
+        assert "_stream_tools_available = bool(kwargs.get(\"tools\")) or _request_has_tools" in src
+        assert "tool_call_active = _stream_tools_available and not _suppress_tools" in src
+        assert "(_enable_auto_tool_choice or _tool_call_parser is not None or _request_has_tools" not in src
+
+    def test_explicit_cli_repetition_penalty_wins_over_dsv4_bundle_default(self, tmp_path, monkeypatch):
+        """DSV4 bundles carry calibrated sampling defaults.
+
+        The engine must not secretly rewrite explicit server defaults. The
+        panel suppresses stale historical UI values before launch; once a
+        caller explicitly sets a CLI/session default, request > CLI > bundle
+        ordering must remain honest.
+        """
+        from vmlx_engine import server
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v4"}), encoding="utf-8"
+        )
+        (tmp_path / "jang_config.json").write_text(
+            json.dumps(
+                {
+                    "chat": {
+                        "sampling_defaults": {
+                            "repetition_penalty_thinking": 1.0,
+                            "repetition_penalty_chat": 1.05,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(server, "_model_path", str(tmp_path))
+        monkeypatch.setattr(server, "_default_repetition_penalty", 1.10)
+        server._jang_sampling_defaults_cache.clear()
+
+        assert server._resolve_repetition_penalty(None, str(tmp_path)) == 1.10
+
+    def test_dsv4_paged_block_disk_cache_is_not_force_disabled(self):
+        """DSV4 paged cache must use the dedicated composite-state path.
+
+        Regression guard for the old emergency workaround that force-disabled
+        paged cache + block disk L2. Production should keep those layers on
+        and serialize DeepseekV4Cache as a first-class block type.
+        """
+        with open("vmlx_engine/scheduler.py") as f:
+            sched = f.read()
+        with open("vmlx_engine/prefix_cache.py") as f:
+            prefix = f.read()
+        with open("vmlx_engine/block_disk_store.py") as f:
+            disk = f.read()
+        assert "force-disabling paged cache" not in sched
+        assert '"deepseek_v4"' in prefix
+        assert '"deepseek_v4"' in disk
+        assert "dsv4_cache_schema=deepseek_v4_v7" in sched
+
+    def test_paged_l2_schema_invalidates_old_block_namespaces_for_all_families(self):
+        """Global paged-cache contract changes must move every family to a
+        fresh L2 namespace, not only DSV4.
+
+        The N-1 cache-key fix changed how block disk entries are keyed. If a
+        non-DSV4 family (Laguna/Qwen/Gemma/etc.) reuses the old block-cache
+        directory, first request after restart can restore stale blocks and
+        emit unrelated text before the prompt suffix is processed.
+        """
+        with open("vmlx_engine/prefix_cache.py") as f:
+            prefix = f.read()
+        with open("vmlx_engine/scheduler.py") as f:
+            sched = f.read()
+        with open("vmlx_engine/mllm_scheduler.py") as f:
+            mllm = f.read()
+
+        assert "PAGED_CACHE_SCHEMA_VERSION" in prefix
+        assert "paged_cache_schema={PAGED_CACHE_SCHEMA_VERSION}" in sched
+        assert "paged_cache_schema={PAGED_CACHE_SCHEMA_VERSION}" in mllm
+        assert "prefix_cache_schema={PAGED_CACHE_SCHEMA_VERSION}" in sched
+        assert "prefix_cache_schema={PAGED_CACHE_SCHEMA_VERSION}" in mllm
+
+    def test_l2_namespaces_include_runtime_cache_fingerprint(self, monkeypatch):
+        """App/runtime updates must invalidate L2 without killing same-version restore."""
+        from types import SimpleNamespace
+
+        from vmlx_engine import prefix_cache
+        from vmlx_engine.prefix_cache import compute_model_cache_key
+
+        model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3"))
+        monkeypatch.setattr(prefix_cache, "runtime_cache_fingerprint", lambda: "runtime=a")
+        key_a = compute_model_cache_key(model, model_path="/models/qwen")
+
+        monkeypatch.setattr(prefix_cache, "runtime_cache_fingerprint", lambda: "runtime=b")
+        key_b = compute_model_cache_key(model, model_path="/models/qwen")
+
+        assert key_a != key_b
+
+        with open("vmlx_engine/scheduler.py") as f:
+            sched = f.read()
+        with open("vmlx_engine/mllm_scheduler.py") as f:
+            mllm = f.read()
+
+        assert "runtime_cache_fingerprint()" in sched
+        assert "runtime_cache_fingerprint()" in mllm
+
+    def test_block_disk_record_rejects_runtime_fingerprint_drift(
+        self, monkeypatch, tmp_path
+    ):
+        """Explicit L2 dirs still reject records from a different runtime build."""
+        import hashlib
+        import time
+
+        mx = pytest.importorskip("mlx.core")
+        from vmlx_engine import prefix_cache
+        from vmlx_engine.block_disk_store import BlockDiskStore
+
+        block_hash = hashlib.sha256(b"runtime-fingerprint").digest()
+        cache_data = [
+            (
+                "kv",
+                mx.array([[1.0, 2.0], [3.0, 4.0]]),
+                mx.array([[5.0, 6.0], [7.0, 8.0]]),
+            )
+        ]
+
+        monkeypatch.setattr(
+            prefix_cache,
+            "runtime_cache_fingerprint",
+            lambda: "runtime=a",
+        )
+        store1 = BlockDiskStore(str(tmp_path), max_size_gb=0.1, expected_num_layers=1)
+        try:
+            store1.write_block_async(block_hash, cache_data, token_count=2)
+            for _ in range(20):
+                if store1.get_stats()["blocks_on_disk"] >= 1:
+                    break
+                time.sleep(0.1)
+            assert store1.get_stats()["blocks_on_disk"] == 1
+            assert store1.read_block(block_hash) is not None
+        finally:
+            store1.shutdown()
+
+        monkeypatch.setattr(
+            prefix_cache,
+            "runtime_cache_fingerprint",
+            lambda: "runtime=b",
+        )
+        store2 = BlockDiskStore(str(tmp_path), max_size_gb=0.1, expected_num_layers=1)
+        try:
+            assert store2.read_block(block_hash) is None
+        finally:
+            store2.shutdown()
+
+    def test_block_disk_round_trip_preserves_trailing_skip_cache_slots(self):
+        """Hybrid L2 blocks must not drop trailing no-state/skip cache slots."""
+        mx = pytest.importorskip("mlx.core")
+        from vmlx_engine.block_disk_store import _deserialize_block, _serialize_block
+
+        cache_data = [
+            (
+                "kv",
+                mx.array([[1.0, 2.0], [3.0, 4.0]]),
+                mx.array([[5.0, 6.0], [7.0, 8.0]]),
+            ),
+            ("skip",),
+            ("skip",),
+        ]
+
+        tensors, dtype, num_layers = _serialize_block(cache_data)
+        assert num_layers == 3
+
+        restored = _deserialize_block(dict(tensors), dtype)
+
+        assert len(restored) == 3
+        assert restored[0][0] == "kv"
+        assert restored[1] == ("skip",)
+        assert restored[2] == ("skip",)
+
+    def test_ssm_companion_record_rejects_runtime_fingerprint_drift(
+        self, monkeypatch, tmp_path
+    ):
+        """Hybrid SSM companion L2 also rejects explicit-dir runtime drift."""
+        mx = pytest.importorskip("mlx.core")
+        from vmlx_engine import prefix_cache
+        from vmlx_engine.utils.ssm_companion_disk_store import SSMCompanionDiskStore
+
+        class FakeArraysCache:
+            def __init__(self):
+                self.cache = [mx.array([1.0, 2.0, 3.0])]
+                self.lengths = None
+
+        monkeypatch.setattr(
+            prefix_cache,
+            "runtime_cache_fingerprint",
+            lambda: "runtime=a",
+        )
+        disk1 = SSMCompanionDiskStore(directory=tmp_path, budget_bytes=32 * 1024 * 1024)
+        assert disk1.store(
+            "ssm-runtime-fingerprint",
+            [FakeArraysCache()],
+            is_complete=True,
+            token_ids=[1, 2, 3],
+            num_tokens=3,
+        )
+        assert disk1.fetch("ssm-runtime-fingerprint") is not None
+
+        monkeypatch.setattr(
+            prefix_cache,
+            "runtime_cache_fingerprint",
+            lambda: "runtime=b",
+        )
+        disk2 = SSMCompanionDiskStore(directory=tmp_path, budget_bytes=32 * 1024 * 1024)
+        assert disk2.fetch("ssm-runtime-fingerprint") is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn coherence: the happy path without bypass must still work
+# ---------------------------------------------------------------------------
+
+
+class TestHappyPathStillUsesCache:
+    """Negative-space test: bypass gates must not leak into the non-bypass
+    happy path. Source-level check that the gating is conditional, not
+    unconditional."""
+
+    def _read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_scheduler_still_does_fetch_when_not_bypassed(self):
+        """The gate is `and not _bypass` — without this modifier the fetch
+        would always be skipped. Check that the old unconditional form
+        isn't present (regression guard)."""
+        src = self._read("vmlx_engine/scheduler.py")
+        # These patterns would indicate a broken gate that always bypasses
+        forbidden = [
+            "if self.block_aware_cache is not None:\n            # Use paged",
+            "if False:  # bypass",
+        ]
+        for pattern in forbidden:
+            assert pattern not in src, (
+                f"scheduler.py contains broken gate pattern: {pattern!r} — "
+                f"the happy (non-bypass) path would be dead"
+            )
+
+    def test_default_request_does_not_bypass(self):
+        """Construct a fresh Request with no bypass → scheduler's
+        `getattr(req, '_bypass_prefix_cache', False)` returns False → fetch
+        paths run as normal."""
+        from vmlx_engine.request import Request, SamplingParams
+        req = Request(
+            request_id="happy-path",
+            prompt="normal request",
+            sampling_params=SamplingParams(),
+        )
+        assert getattr(req, "_bypass_prefix_cache", False) is False
+
+    def test_chat_request_without_cache_salt_does_not_bypass(self):
+        """Building a ChatCompletionRequest without cache_salt or
+        skip_prefix_cache must not accidentally trigger bypass."""
+        from vmlx_engine.server import _compute_bypass_prefix_cache
+        r = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.7,
+            top_p=0.9,
+            max_tokens=100,
+        )
+        assert _compute_bypass_prefix_cache(r) is False
+
+
+# ---------------------------------------------------------------------------
+# Mixed-attention RotatingKVCache support (Gemma 4 sliding + full pattern)
+# ---------------------------------------------------------------------------
+
+
+class TestMixedAttentionRotatingCacheSupport:
+    """Gemma 4 and similar models with interleaved sliding-window + full
+    attention layers need RotatingKVCache metadata preserved across
+    truncation/reconstruction. The old implementation blanket-bypassed the
+    cache; production should exercise the real cache path instead.
+    """
+
+    def _read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def test_llm_scheduler_has_mixed_attention_helper(self):
+        src = self._read("vmlx_engine/scheduler.py")
+        assert "def _model_has_mixed_attention(" in src, (
+            "scheduler.py lost the _model_has_mixed_attention helper"
+        )
+        assert "_mixed_attention_cache_model" in src, (
+            "scheduler.py should keep mixed-attention detection for diagnostics"
+        )
+        assert "_force_bypass_prefix_cache" not in src, (
+            "scheduler.py reintroduced the mixed-attention prefix-cache bypass"
+        )
+
+    def test_mllm_scheduler_has_mixed_attention_helper(self):
+        src = self._read("vmlx_engine/mllm_scheduler.py")
+        assert "def _model_has_mixed_attention(" in src, (
+            "mllm_scheduler.py lost the _model_has_mixed_attention helper"
+        )
+        assert "_mixed_attention_cache_model" in src, (
+            "mllm_scheduler.py should keep mixed-attention detection for diagnostics"
+        )
+        assert "_force_bypass_prefix_cache" not in src, (
+            "mllm_scheduler.py reintroduced the mixed-attention prefix-cache bypass"
+        )
+
+    def test_mixed_attention_helper_detects_gemma4_layer_types(self):
+        """Feed the helper a mock model whose args.layer_types look like
+        Gemma 4 (25 sliding + 5 full) and assert it returns True."""
+        from vmlx_engine.scheduler import Scheduler
+
+        class _Args:
+            layer_types = (["sliding_attention"] * 25) + (["full_attention"] * 5)
+
+        class _Model:
+            args = _Args()
+
+        assert Scheduler._model_has_mixed_attention(_Model()) is True
+
+    def test_mixed_attention_helper_ignores_uniform_models(self):
+        """Uniform-attention models (Llama, Qwen) must return False so
+        they keep the full prefix-cache behaviour."""
+        from vmlx_engine.scheduler import Scheduler
+
+        class _Args:
+            layer_types = ["full_attention"] * 32
+
+        class _Model:
+            args = _Args()
+
+        assert Scheduler._model_has_mixed_attention(_Model()) is False
+
+    def test_mixed_attention_helper_handles_text_config(self):
+        """VLM wrappers store the attention layout under text_config."""
+        from vmlx_engine.scheduler import Scheduler
+
+        class _TextCfg:
+            layer_types = (["sliding_attention"] * 2) + (["full_attention"] * 1)
+
+        class _Cfg:
+            text_config = _TextCfg()
+
+        class _Model:
+            config = _Cfg()
+
+        assert Scheduler._model_has_mixed_attention(_Model()) is True
+
+    def test_mixed_attention_helpers_normalize_layer_type_case(self):
+        """Sidecar/config writers must not silently drop Gemma-style SWA
+        detection just because layer_types are cased differently."""
+        from vmlx_engine.mllm_scheduler import MLLMScheduler
+        from vmlx_engine.scheduler import Scheduler
+
+        class _Args:
+            layer_types = ["SLIDING_ATTENTION", "FULL_ATTENTION"]
+
+        class _Model:
+            args = _Args()
+
+        assert Scheduler._model_has_mixed_attention(_Model()) is True
+        assert MLLMScheduler._model_has_mixed_attention(object(), _Model()) is True
+
+    def test_mixed_attention_helper_detects_mimo_v2_asymmetric_swa_subtype(self):
+        """MiMo V2 declares full+SWA KV through cache_subtype, not layer_types."""
+        from vmlx_engine.mllm_scheduler import MLLMScheduler
+        from vmlx_engine.scheduler import Scheduler
+
+        class _Cfg:
+            model_type = "mimo_v2"
+            cache_subtype = "mimo_v2_asymmetric_swa"
+
+        class _Model:
+            config = _Cfg()
+
+        assert Scheduler._model_has_mixed_attention(_Model()) is True
+        assert MLLMScheduler._model_has_mixed_attention(object(), _Model()) is True
+
+
+# ---------------------------------------------------------------------------
+# RotatingKVCache meta_state truncation: keep + max_size must NOT be lost
+# ---------------------------------------------------------------------------
+
+
+class TestRotatingKVCacheMetaStateTruncation:
+    """Gemma 4 uses RotatingKVCache for sliding layers with
+    meta_state = (keep, max_size, offset, _idx). The scheduler's
+    gen_prompt_len truncation path previously assumed slot 0 was ``offset``
+    and silently overwrote ``keep`` with the truncated sequence length —
+    this is the bug that prompted the RotatingKVCache investigation.
+    The helper below must preserve keep + max_size and only touch
+    offset/_idx.
+    """
+
+    def test_rotating_kv_cache_preserves_keep_and_max_size(self):
+        from vmlx_engine.scheduler import _rebuild_meta_state_after_truncation
+        meta = _rebuild_meta_state_after_truncation(
+            "RotatingKVCache",
+            (str(0), str(1024), str(150), str(150)),
+            safe_len=93,
+        )
+        assert meta == ("0", "1024", "93", "93"), (
+            f"RotatingKVCache meta_state slot 0 (keep) must stay at 0, "
+            f"slot 1 (max_size) must stay at 1024; got {meta}"
+        )
+
+    def test_rotating_kv_cache_wrapped_refuses_store(self):
+        """A circular buffer that has wrapped (offset > max_size) cannot
+        be truncated by a head-aligned slice — refuse to store rather
+        than corrupt."""
+        from vmlx_engine.scheduler import _rebuild_meta_state_after_truncation
+        meta = _rebuild_meta_state_after_truncation(
+            "RotatingKVCache",
+            (str(0), str(1024), str(2000), str(800)),
+            safe_len=93,
+        )
+        assert meta is None
+
+    def test_standard_kv_cache_meta_state_unchanged(self):
+        from vmlx_engine.scheduler import _rebuild_meta_state_after_truncation
+        meta = _rebuild_meta_state_after_truncation(
+            "KVCache",
+            (str(150),),
+            safe_len=93,
+        )
+        assert meta == ("93",)
+
+    def test_quantized_kv_cache_preserves_group_size_and_bits(self):
+        from vmlx_engine.scheduler import _rebuild_meta_state_after_truncation
+        meta = _rebuild_meta_state_after_truncation(
+            "QuantizedKVCache",
+            (str(150), str(64), str(8)),
+            safe_len=93,
+        )
+        assert meta == ("93", "64", "8"), (
+            f"QuantizedKVCache must preserve (group_size, bits); got {meta}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# DeepseekV32Attention MLA absorb fp32-SDPA fix (GLM-5.1, DeepSeek-V3.2-Exp)
+# ---------------------------------------------------------------------------
+
+
+class TestDeepseekV32AbsorbFp32Patch:
+    """The bundled mlx_lm/models/deepseek_v32.py must keep the L==1 absorb-
+    branch SDPA inputs cast to fp32, otherwise GLM-5.1 / glm_moe_dsa decode
+    drifts ~7.0 in logit magnitude per token vs the prefill path and
+    produces repetition loops ('1.1.1.1...', 'precedence precedence...').
+
+    Source-level guard: a future mlx_lm bump that overwrites the bundled
+    file will revert this patch silently. These tests fail immediately when
+    that happens, so the regression is caught before a release ships.
+    """
+
+    def _read(self, path: str) -> str:
+        file_path = Path(path)
+        if not file_path.exists():
+            pytest.skip(f"bundled Python file not present in source worktree: {path}")
+        with open(file_path) as f:
+            return f.read()
+
+    def test_bundled_deepseek_v32_has_fp32_absorb_fix(self):
+        src = self._read(
+            "panel/bundled-python/python/lib/python3.12/site-packages/mlx_lm/models/deepseek_v32.py"
+        )
+        # The fp32 cast lines must be present in the L==1 branch.
+        assert "q_sdpa = q_nope.astype(mx.float32)" in src, (
+            "deepseek_v32.py lost the q_nope→fp32 cast on the L==1 branch — "
+            "GLM-5.1 / DeepSeek-V3.2 will repetition-loop on decode"
+        )
+        assert "k_sdpa = k.astype(mx.float32)" in src
+        assert "v_sdpa = v.astype(mx.float32)" in src
+        assert "mask_sdpa = pe_scores.astype(mx.float32)" in src
+        # The else branch must alias the variables (no fp32 on prefill path).
+        assert "q_sdpa, k_sdpa, v_sdpa, mask_sdpa = q_nope, k, v, pe_scores" in src
+        # Output must be cast back to bf16 before unembed_out.
+        assert "output = output.astype(kv_latent.dtype)" in src, (
+            "deepseek_v32.py lost the output→bf16 cast-back before unembed_out"
+        )
+        # SDPA must use the _sdpa variables, not the originals.
+        assert "q_sdpa, k_sdpa, v_sdpa, cache=cache, scale=self.scale, mask=mask_sdpa" in src
+
+    def test_only_l_eq_1_branch_is_touched_not_prefill(self):
+        """Negative-space guard: the prefill (L != 1) branch must be
+        unchanged so we don't accidentally slow down every other MLA model
+        (Mistral 4, Qwen3.5 MLA variants, DeepSeek V3 / V2)."""
+        src = self._read(
+            "panel/bundled-python/python/lib/python3.12/site-packages/mlx_lm/models/deepseek_v32.py"
+        )
+        # Prefill branch still uses the original logic
+        assert "k = self.embed_q(kv_latent, transpose=False)" in src
+        assert "v = self.unembed_out(kv_latent)" in src
+
+    def test_bundled_deepseek_v32_module_imports(self):
+        """Smoke test: the patched module must still be valid Python."""
+        import subprocess
+        import sys
+
+        bundled_python = (
+            "panel/bundled-python/python/bin/python3"
+        )
+        if not Path(bundled_python).exists():
+            pytest.skip("bundled Python is not present in this source worktree")
+        code = """
+import inspect
+import mlx_lm.models.deepseek_v32 as mod
+assert hasattr(mod, "DeepseekV32Attention"), "module schema regressed"
+assert hasattr(mod, "Model"), "module schema regressed"
+src = inspect.getsource(mod.DeepseekV32Attention.__call__)
+assert "q_sdpa" in src, "bundled deepseek_v32 import loaded unpatched source"
+"""
+        result = subprocess.run(
+            [bundled_python, "-B", "-s", "-c", code],
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+
+    def test_bundled_mistral4_has_fp32_absorb_fix(self):
+        """Mistral 4's MLA absorb decode path needs the same fp32-SDPA cast
+        as deepseek_v32 — same bug, same shape (kv_lora_rank contraction at
+        bf16). Without it, JANG_2L (2-bit) profiles produce 'stern bard bard'
+        word loops on the very first decode.
+        """
+        src = self._read(
+            "panel/bundled-python/python/lib/python3.12/site-packages/mlx_lm/models/mistral4.py"
+        )
+        assert "q_sdpa = q_nope.astype(mx.float32)" in src, (
+            "mistral4.py lost the q_nope→fp32 cast on the L==1 branch — "
+            "JANG 2L Mistral 4 119B will repetition-loop on decode"
+        )
+        assert "k_sdpa = k.astype(mx.float32)" in src
+        assert "v_sdpa = v.astype(mx.float32)" in src
+        assert "mask_sdpa = pe_scores.astype(mx.float32)" in src
+        assert "q_sdpa, k_sdpa, v_sdpa, mask_sdpa = q_nope, k, v, pe_scores" in src
+        assert "output = output.astype(kv_latent.dtype)" in src
+        assert "q_sdpa, k_sdpa, v_sdpa, cache=cache, scale=self.scale, mask=mask_sdpa" in src
+
+
+# ---------------------------------------------------------------------------
+# Mistral-Small-4-119B JANG model_type promotion (mistral3 wrapper hides MLA)
+# ---------------------------------------------------------------------------
+
+
+class TestMistral4ModelTypePromotion:
+    """Mistral-Small-4-119B's HF config.json has top-level model_type=mistral3
+    (the VLM wrapper) but text_config.model_type=mistral4 (MLA inner). Loading
+    via the VLM wrapper used the standard q_proj/k_proj/v_proj attention from
+    mlx_vlm/models/mistral3/language.py, which has nowhere to land the JANG
+    MLA weights → modules kept random init → 'armanarmanarman' / 'Bub Bub'
+    token soup. Earlier was tracked as a JANG quality issue, but it's a
+    loader regression. Promotion + LM-strip + re-quantize landed 2026-04-11.
+    """
+
+    def _read(self, path: str) -> str:
+        with open(path) as f:
+            return f.read()
+
+    def test_v2_llm_loader_has_mistral4_promotion(self):
+        src = self._read("vmlx_engine/utils/jang_loader.py")
+        assert 'Mistral 4 model_type promotion' in src
+        assert 'top mistral3 + text_config' in src
+        assert "_flat = dict(_tc_for_model_type)" in src
+        assert "_flat.setdefault(\"model_type\", \"mistral4\")" in src
+
+    def test_v2_llm_loader_has_lm_strip(self):
+        src = self._read("vmlx_engine/utils/jang_loader.py")
+        assert "_needs_mistral4_lm_strip" in src
+        assert "Mistral 4 LM-prefix strip" in src
+
+    def test_v2_llm_loader_has_post_promo_requantize(self):
+        src = self._read("vmlx_engine/utils/jang_loader.py")
+        assert "Re-quantized" in src
+        assert "_renamed_quant_paths" in src
+        assert "_post_promo_predicate" in src
+        # The predicate must also pre-register embed_q / unembed_out paths
+        # since mlx_lm/mistral4.py:sanitize splits kv_b_proj into them.
+        assert ".embed_q" in src
+        assert ".unembed_out" in src

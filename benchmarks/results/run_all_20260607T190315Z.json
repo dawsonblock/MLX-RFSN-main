@@ -1,0 +1,37 @@
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.12.0",
+    "mlx_available": true,
+    "timestamp": "20260607T190315Z",
+    "fast_mode": true
+  },
+  "bitpack_numpy": {
+    "suite": "bitpack_numpy",
+    "status": "failed",
+    "error": "No module named 'rfsn_v10.kernels.numpy_backend'",
+    "traceback": "Traceback (most recent call last):\n  File \"/Users/dawsonblock/rfsn_v10_corrected_full/benchmarks/run_all.py\", line 200, in suite_bitpack_numpy\n    from rfsn_v10.kernels.numpy_backend import NumpyBackend\nModuleNotFoundError: No module named 'rfsn_v10.kernels.numpy_backend'\n"
+  },
+  "attention_mlx": {
+    "suite": "attention_mlx",
+    "status": "ok",
+    "data": {
+      "t_k=256": {
+        "sparse_ms": 1.4600624999729916,
+        "dense_ms": 0.501458504004404,
+        "speedup": 0.3434500262924909
+      },
+      "t_k=512": {
+        "sparse_ms": 1.6130209987750277,
+        "dense_ms": 0.22297950636129826,
+        "speedup": 0.138237199968652
+      },
+      "t_k=1024": {
+        "sparse_ms": 2.227166507509537,
+        "dense_ms": 0.2522705035516992,
+        "speedup": 0.11326970960684625
+      }
+    }
+  }
+}

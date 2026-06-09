@@ -1,0 +1,86 @@
+{
+  "description": "Quality regression baseline for production validation",
+  "version": "1.0",
+  "baseline_date": "2026-06-02",
+  "thresholds": {
+    "overall_dense_cosine": {
+      "minimum": 0.95,
+      "target": 0.98,
+      "description": "Minimum acceptable cosine similarity for dense compressed KV"
+    },
+    "overall_sparse_cosine": {
+      "minimum": 0.90,
+      "target": 0.95,
+      "description": "Minimum acceptable cosine similarity for sparse compressed KV"
+    },
+    "category_dense_cosine": {
+      "minimum": 0.93,
+      "target": 0.97,
+      "description": "Minimum acceptable cosine similarity per category (dense)"
+    },
+    "category_sparse_cosine": {
+      "minimum": 0.88,
+      "target": 0.93,
+      "description": "Minimum acceptable cosine similarity per category (sparse)"
+    },
+    "perplexity_delta": {
+      "maximum_dense": 0.5,
+      "maximum_sparse": 1.0,
+      "description": "Maximum acceptable perplexity increase vs baseline"
+    },
+    "top1_match_rate": {
+      "minimum_dense": 0.95,
+      "minimum_sparse": 0.90,
+      "description": "Minimum top-1 token match rate vs baseline"
+    }
+  },
+  "category_expectations": {
+    "reasoning": {
+      "notes": "Reasoning tasks require high quality to maintain logical coherence",
+      "priority": "high"
+    },
+    "coding": {
+      "notes": "Coding tasks are sensitive to small quality degradation",
+      "priority": "high"
+    },
+    "chat": {
+      "notes": "Chat tasks can tolerate moderate quality loss",
+      "priority": "medium"
+    },
+    "factual": {
+      "notes": "Factual tasks require high accuracy",
+      "priority": "high"
+    },
+    "summarization": {
+      "notes": "Summarization tasks are moderately quality-sensitive",
+      "priority": "medium"
+    },
+    "long_context": {
+      "notes": "Long-context tasks test compression over extended sequences",
+      "priority": "high"
+    }
+  },
+  "regression_policy": {
+    "strict_mode": false,
+    "description": "When strict_mode is true, any threshold breach fails the validation. When false, warnings are issued but validation passes.",
+    "action_on_failure": "warn_and_continue",
+    "options": ["fail_immediately", "warn_and_continue", "log_only"]
+  },
+  "model_specific_baselines": {
+    "mistral-7b": {
+      "expected_dense_cosine": 0.98,
+      "expected_sparse_cosine": 0.92,
+      "notes": "Mistral 7B has strong baseline performance"
+    },
+    "llama-3-8b": {
+      "expected_dense_cosine": 0.99,
+      "expected_sparse_cosine": 0.94,
+      "notes": "Llama 3 8B has excellent baseline performance"
+    },
+    "phi-3-mini": {
+      "expected_dense_cosine": 0.97,
+      "expected_sparse_cosine": 0.91,
+      "notes": "Phi-3 Mini is smaller but capable"
+    }
+  }
+}

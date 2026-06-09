@@ -1,0 +1,14 @@
+{
+  "release": "main28",
+  "title": "Proof Consistency + Long-Context + Throughput Honesty Release",
+  "status": "alpha",
+  "purpose": "Make the release identity, proof summary, validation artifacts, throughput reporting, and long-context claims internally consistent.",
+  "not_claimed": [
+    "production readiness",
+    "end-to-end speedup",
+    "sparse decode safety",
+    "polar quantization",
+    "true arbitrary token-level partial dequantization",
+    "larger-model generalization"
+  ]
+}

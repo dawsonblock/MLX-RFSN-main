@@ -1,0 +1,4022 @@
+# SPDX-License-Identifier: Apache-2.0
+# Base architecture from waybarrios/vllm-mlx. MLLM VLM scheduling, MLA detection,
+# hybrid SSM cache handling, and vision cache added by Jinho Jang (eric@jangq.ai)
+# for vMLX (github.com/jjang-ai/vmlx).
+"""
+MLLM Scheduler -- Multimodal Language Model continuous batching on Apple Metal.
+
+This is the central orchestrator for all multimodal inference in vmlx-engine.
+It manages request lifecycle, cache infrastructure, and Metal GPU memory for
+Vision Language Models (VLMs) like Qwen3-VL, Qwen3.5-VL, LLaVA, InternVL, etc.
+
+REQUEST LIFECYCLE
+-----------------
+::
+
+    add_request()       _schedule()          step()          _cleanup_finished()
+    ------------> WAITING ----------> RUNNING ------> FINISHED ----------------->
+                  (deque)            (dict)    (tokens)    (cache store + cleanup)
+
+1. Requests arrive via add_request() -> waiting deque (FCFS ordering)
+2. _schedule() moves requests from waiting -> running (via MLLMBatchGenerator)
+3. step() generates one token per step for ALL running requests simultaneously
+4. _process_batch_responses() extracts tokens, detokenizes, checks stop
+5. _cleanup_finished() stores cache, frees memory, removes request state
+6. Async streaming: output_queues deliver RequestOutput per token
+
+CACHE ARCHITECTURE (3-Tier Exclusive Selection)
+-----------------------------------------------
+The scheduler selects ONE in-memory cache mode at init time, with optional
+disk L2 backing. This matches the LLM scheduler's cache design exactly.
+
+**Tier 1 -- In-Memory (mutually exclusive):**
+
+- **PAGED CACHE** (default, recommended):
+  PagedCacheManager + BlockAwarePrefixCache.
+  Fixed-size blocks (default 64 tokens), O(1) block-level matching.
+  Supports BlockDiskStore L2 for persistence.
+  Required for hybrid models (auto-switches from memory-aware).
+  Config: ``use_paged_cache=True, paged_cache_block_size=64``
+
+- **MEMORY-AWARE CACHE** (good for large models):
+  MemoryAwarePrefixCache.
+  Auto-sizes to fraction of available RAM with TTL-based expiration
+  and LRU eviction. Monitors memory pressure via ``mx.metal.device_info()``.
+  Config: ``use_paged_cache=False, use_memory_aware_cache=True``
+
+- **LEGACY PREFIX CACHE** (simple, entry-count based):
+  PrefixCacheManager.
+  Fixed max_entries, no memory awareness. Trie-based token prefix matching.
+  Config: ``use_paged_cache=False, use_memory_aware_cache=False``
+
+**Tier 2 -- Disk (optional, additive to any Tier 1):**
+
+- **DISK CACHE L2** (non-paged paths):
+  DiskCacheManager -- serializes KV cache to ``~/.cache/vmlx-engine/``.
+  Config: ``enable_disk_cache=True``
+
+- **BLOCK DISK STORE** (paged path only):
+  BlockDiskStore -- persists paged blocks to disk.
+  Config: ``enable_block_disk_cache=True``
+
+**Cross-Cutting: KV Cache Quantization:**
+
+Storage-boundary quantization for 2-4x memory savings.
+Full-precision KVCache during generation -> quantize on store ->
+dequantize on fetch. Never modifies model.make_cache().
+Config: ``kv_cache_quantization="q4"|"q8", kv_cache_group_size=64``
+
+HYBRID MODEL SUPPORT (SSM + Attention)
+---------------------------------------
+Models like Qwen3.5-VL have mixed layers: some use KVCache (attention),
+others use MambaCache/ArraysCache (SSM/linear attention). This creates a
+cache asymmetry problem:
+
+- KVCache layers CAN be prefix-cached (position-independent)
+- SSM layers CANNOT -- their state is cumulative and path-dependent
+
+The scheduler handles this via:
+
+1. ``_is_hybrid_model()`` -- detects non-KVCache layers at init
+2. Auto-switches to paged cache (memory-aware can't truncate SSM state)
+3. ``HybridSSMStateCache`` (companion cache in MLLMBatchGenerator):
+   After prefill, captures SSM layer states keyed by prompt tokens.
+   On paged cache HIT + SSM companion HIT -> full skip (KV + SSM).
+   On paged cache HIT + SSM MISS -> forced full prefill.
+4. ``_fix_hybrid_cache()`` -- expands reconstructed KV-only cache back to
+   full layer count by inserting fresh ArraysCache at SSM positions
+5. ``ensure_mamba_support()`` -- patches mlx-lm's BatchGenerator for
+   MambaCache batching (merge, extract, filter)
+
+METAL GPU MEMORY MANAGEMENT
+----------------------------
+- Metal allocator cache limit: 25% of max working set (floor 512MB).
+  Prevents Metal from hoarding freed memory in its allocator free-list,
+  leaving more memory available for prefix cache and OS.
+- Periodic GC: ``clear_mlx_memory_cache()`` every 60s during sustained traffic
+  (via ``_last_metal_gc_time`` timer in ``step()``)
+- Idle GC: ``clear_mlx_memory_cache()`` when all requests finish
+  (in ``_cleanup_finished`` when ``self.running`` is empty)
+- Wired limit: set to ``max_recommended_working_set_size`` at init
+- ``mx.async_eval()`` in prefill loop for GPU/CPU overlap
+
+CACHE STORE FLOW (in _cleanup_finished)
+-----------------------------------------
+When a request finishes, its KV cache is stored for future reuse::
+
+    request._extracted_cache (set by _process_batch_responses)
+         |
+         +-- Paged: block_aware_cache.store_cache(tokens, states)
+         |     +-- Optional: disk L2 store + quantization
+         |
+         +-- Memory-aware: memory_aware_cache.store(tokens, cache)
+         |     +-- Optional: disk L2 store + quantization
+         |
+         +-- Legacy: prefix_cache.store_cache(tokens, cache)
+               +-- Optional: disk L2 store + quantization
+
+Each path uses ``_truncate_hybrid_cache()`` to trim generation tokens,
+``_quantize_cache_for_storage()`` if ``kv_cache_bits > 0``, and always
+sets ``_extracted_cache = None`` in a finally block to free tensor refs.
+
+CACHE FETCH FLOW (in MLLMBatchGenerator._process_prompts)
+----------------------------------------------------------
+Before prefill, each request checks for cached KV state::
+
+    1. Paged cache -> block_aware_cache.fetch_cache(request_id, tokens)
+       +-- Pure attention model: skip cached prefix tokens
+       +-- Hybrid + SSM companion HIT: full skip (KV + SSM)
+       +-- Hybrid + SSM MISS: no skip (full prefill needed)
+    2. Memory-aware/Legacy -> cache_obj.fetch(tokens)
+       +-- Same image-token and hybrid guards
+    3. Disk L2 fallback -> disk_cache.fetch(tokens)
+       +-- Only for non-hybrid models
+
+KEY CLASSES
+-----------
+- ``MLLMSchedulerConfig`` -- All cache + scheduling settings (dataclass)
+- ``MLLMRequest`` -- Per-request state (prompt, media, tokens, status)
+- ``MLLMSchedulerOutput`` -- Output from one step() call
+- ``MLLMScheduler`` -- Main scheduler class
+"""
+
+import asyncio
+import hashlib
+import logging
+import os
+import time
+import uuid
+import threading
+
+import mlx.core as mx
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+
+
+from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+
+from .mllm_batch_generator import (
+    MLLMBatchGenerator,
+    MLLMBatchRequest,
+    MLLMBatchResponse,
+    _mllm_media_cache_extra_keys,
+    _model_uses_zaya_cache_contract,
+)
+from .errors import PromptTooLongError
+from .mlx_memory import clear_mlx_memory_cache
+from .request import RequestOutput, RequestStatus, SamplingParams
+from .utils.head_dim_detection import (
+    choose_supported_kv_group_size,
+    detect_cache_head_dims,
+)
+from .utils.hybrid_tq_cache import is_turboquant_make_cache
+from .utils.ssm_companion_disk_store import SSMCompanionDiskStore
+from .utils.memory_limits import (
+    get_effective_metal_working_set_bytes,
+    get_metal_ws_guard_threshold,
+)
+from .prefix_cache import runtime_cache_fingerprint
+
+logger = logging.getLogger(__name__)
+
+
+def _mllm_scheduler_trace_enabled() -> bool:
+    return os.environ.get("VMLINUX_MLLM_SCHEDULER_TRACE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@dataclass
+class MLLMSchedulerConfig:
+    """Configuration for MLLM scheduler.
+
+    All fields mirror the LLM SchedulerConfig for full cache parity.
+    The 3-tier cache selection is mutually exclusive:
+
+    - ``use_paged_cache=True`` -> PagedCacheManager + BlockAwarePrefixCache
+    - ``use_memory_aware_cache=True`` (and paged off) -> MemoryAwarePrefixCache
+    - Both off -> PrefixCacheManager (legacy entry-count based)
+
+    Disk L2 caches are additive on top of any tier.
+    KV cache quantization applies at the storage boundary (not during generation).
+    """
+
+    # Maximum concurrent MLLM requests in the batch
+    max_num_seqs: int = 1
+    # Prefill batch size (all queued requests are prefilled together)
+    prefill_batch_size: int = 512
+    # Completion batch size
+    completion_batch_size: int = 512
+    # Prefill step size for chunked prefill
+    prefill_step_size: int = 2048
+    # Enable vision embedding cache
+    enable_vision_cache: bool = True
+    # Maximum cache entries
+    vision_cache_size: int = 16
+    # Default max tokens
+    default_max_tokens: int = 256
+    # Default video FPS for frame extraction
+    default_video_fps: float = 2.0
+    # Maximum video frames
+    max_video_frames: int = 128
+
+    # Prefix/Paged cache settings
+    enable_prefix_cache: bool = True
+    use_paged_cache: bool = True
+    paged_cache_block_size: int = 64
+    max_cache_blocks: int = 1000
+
+    # KV cache quantization for prefix cache storage
+    kv_cache_quantization: str = "none"  # "none", "q4", "q8"
+    kv_cache_group_size: int = 64
+    kv_cache_quantization_explicit: bool = False
+
+    # Memory-aware cache settings (L1, recommended for large models)
+    use_memory_aware_cache: bool = True  # Use memory-based eviction
+    cache_memory_mb: Optional[int] = None  # None = auto-detect (cache_memory_percent of RAM)
+    cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
+    cache_ttl_minutes: float = 0  # Cache entry TTL in minutes (0 = no expiration)
+
+    # Legacy entry-count prefix cache (fallback when paged+memory-aware both off)
+    prefix_cache_size: int = 100
+
+    # Disk cache L2 (persistent across restarts, non-paged path)
+    enable_disk_cache: bool = False
+    disk_cache_dir: Optional[str] = None  # None = ~/.cache/vmlx-engine/prompt-cache/<hash>
+    disk_cache_max_gb: float = 10.0
+
+    # Block-level disk cache L2 (persistent, paged path)
+    enable_block_disk_cache: bool = False
+    block_disk_cache_dir: Optional[str] = None  # None = ~/.cache/vmlx-engine/block-cache/<hash>
+    block_disk_cache_max_gb: float = 10.0
+
+    # Model path (used to scope disk cache per model)
+    model_path: Optional[str] = None
+
+    # Hybrid SSM state cache budget (companion cache for SSM layer states).
+    # These entries can be tens or hundreds of MB each on Nemotron/Gemma
+    # hybrid models, so bound by both count and bytes.
+    ssm_state_cache_size: int = 8
+    ssm_state_cache_max_mb: Optional[int] = 512
+
+    # Maximum images per request (guard against Metal OOM from excessive images)
+    max_images_per_request: int = 20
+
+    # Optional pre-built single-worker executor for model ops. When the
+    # caller (BatchedEngine._start_mllm) loads the model on a dedicated
+    # executor, it should pass that same executor here so step()/prefill
+    # share one thread with the load. See MLLMScheduler.__init__ for the
+    # JANGTQ Metal kernel stream-isolation rationale. None -> scheduler
+    # creates its own (load runs on a different thread, JANGTQ-VL
+    # bundles will hit the stream issue).
+    step_executor: Any = None
+
+
+@dataclass
+class MLLMRequest:
+    """
+    Extended request for MLLM processing.
+
+    Includes all multimodal data needed for generation.
+    """
+
+    request_id: str
+    prompt: str
+    images: Optional[List[str]] = None
+    videos: Optional[List[str]] = None
+    audio: Optional[List[Any]] = None
+    sampling_params: SamplingParams = field(default_factory=SamplingParams)
+    arrival_time: float = field(default_factory=time.time)
+
+    # Batch generator UID (assigned when scheduled)
+    batch_uid: Optional[int] = None
+
+    # Status tracking
+    status: RequestStatus = RequestStatus.WAITING
+    output_text: str = ""
+    output_tokens: List[int] = field(default_factory=list)
+    finish_reason: Optional[str] = None
+
+    # Token counts
+    num_prompt_tokens: int = 0
+    num_output_tokens: int = 0
+
+    # Video processing parameters (per-request overrides)
+    video_fps: Optional[float] = None
+    video_max_frames: Optional[int] = None
+    extra_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # Error recovery
+    _retry_count: int = 0
+
+
+@dataclass
+class MLLMSchedulerOutput:
+    """
+    Output from a scheduling step.
+
+    Contains information about what was scheduled and results.
+    """
+
+    # Requests scheduled in this step
+    scheduled_request_ids: List[str] = field(default_factory=list)
+    # Total tokens scheduled
+    num_scheduled_tokens: int = 0
+    # Requests that finished in this step
+    finished_request_ids: Set[str] = field(default_factory=set)
+    # Request outputs (tokens generated)
+    outputs: List[RequestOutput] = field(default_factory=list)
+    # Whether any work was done
+    has_work: bool = False
+    # Optional gated diagnostic timings from scheduler.step().
+    trace_timings: Dict[str, float] = field(default_factory=dict)
+
+
+class MLLMScheduler:
+    """Scheduler for Vision Language Model requests with continuous batching.
+
+    This is the main entry point for multimodal inference. It owns:
+
+    - **Request queues**: waiting (deque) and running (dict) with thread-safe lock
+    - **Cache infrastructure**: one of paged/memory-aware/legacy + optional disk L2
+    - **Batch generator**: MLLMBatchGenerator (lazy, recreated on sampler change)
+    - **Metal memory**: GC timer, wired limit, cache limit
+    - **Streaming**: per-request output queues with detokenizer pool
+
+    Thread safety: _queue_lock (RLock) protects waiting/running mutations.
+    step() runs in a background thread; add_request_async() from the event loop.
+
+    Cache init priority (in __init__):
+      1. Detect hybrid model -> auto-switch to paged if needed
+      2. Paged cache (with optional BlockDiskStore)
+      3. Memory-aware cache (elif)
+      4. Legacy prefix cache (elif)
+      5. Disk cache L2 (additive, non-paged paths)
+      6. KV cache quantization setup
+
+    Key methods:
+      - ``add_request()`` / ``add_request_async()`` -- enqueue a VLM request
+      - ``step()`` -- one generation step (schedule + generate + cleanup)
+      - ``stream_outputs()`` -- async generator for streaming tokens
+      - ``abort_request()`` -- cancel a running/waiting request
+      - ``get_stats()`` -- cache hit rates, throughput, memory usage
+      - ``reset()`` -- clear all state and caches
+
+    Example (sync)::
+
+        scheduler = MLLMScheduler(model, processor, config)
+        request_id = scheduler.add_request(
+            prompt="What's in this image?",
+            images=["photo.jpg"]
+        )
+        while scheduler.has_requests():
+            output = scheduler.step()
+            for req_output in output.outputs:
+                if req_output.finished:
+                    print(f"Finished: {req_output.output_text}")
+
+    Example (async streaming)::
+
+        await scheduler.start()
+        request_id = await scheduler.add_request_async(...)
+        async for output in scheduler.stream_outputs(request_id):
+            print(output.new_text, end="")
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        processor: Any,
+        config: Optional[MLLMSchedulerConfig] = None,
+    ):
+        """
+        Initialize MLLM scheduler with full cache infrastructure.
+
+        Init sequence:
+        1. Detect hybrid model (SSM + attention) -> auto-switch to paged
+        2. Initialize cache tier (paged > memory-aware > legacy, exclusive)
+        3. Initialize disk L2 (additive, if enabled)
+        4. Configure KV cache quantization (storage boundary)
+        5. Set up request queues, UID mappings, output queues
+        6. Start Metal GC timer for sustained-traffic memory management
+
+        Args:
+            model: The VLM model
+            processor: The VLM processor
+            config: Scheduler configuration
+        """
+        self.model = model
+        self.processor = processor
+        self.config = config or MLLMSchedulerConfig()
+
+        # Thread-safe lock for wait/run queues since MLLM step() runs in background thread
+        self._queue_lock = threading.RLock()
+        # Separate lock for batch generator next()/remove() to prevent abort race
+        self._batch_lock = threading.RLock()
+
+        # Dedicated single-worker executor for ALL model-touching code
+        # (prefill, decode, cache extract). MLX streams are thread-local —
+        # asyncio.to_thread dispatches to a multi-worker pool where each
+        # call may land on a different thread (asyncio_0, asyncio_1, ...),
+        # so Stream(gpu, 1) created during model load on MainThread becomes
+        # invisible. Pinning every step() to the same worker thread (and
+        # loading the model on that worker) keeps the stream registry
+        # consistent and lets JANGTQ Metal kernels resolve their dispatch
+        # streams cleanly.
+        #
+        # The caller (BatchedEngine._start_mllm) may pass a pre-built
+        # executor that ALSO ran the model load — using that same executor
+        # here ensures load + every subsequent step() share one worker
+        # thread. If no executor is provided, a fresh single-worker pool
+        # is created (load then runs on a different thread, and JANGTQ-VL
+        # bundles will hit the stream issue — pre-existing behavior).
+        from concurrent.futures import ThreadPoolExecutor
+        _provided = config.step_executor if config is not None else None
+        if _provided is not None:
+            self._step_executor = _provided
+        else:
+            self._step_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mllm-worker"
+            )
+
+        # Get model config
+        self.model_config = getattr(model, "config", None)
+
+        # Token-level Prefix caching for the language model
+        self.paged_cache_manager = None
+        self.block_aware_cache = None
+        self.memory_aware_cache = None
+        self.prefix_cache = None
+        self.disk_cache = None
+        self._block_disk_l2_enabled = False
+        self._ssm_companion_disk_store = None
+        self._ssm_companion_model_key = ""
+        self._kv_cache_bits = 0
+        self._kv_cache_group_size = 64
+        self._tq_active = False
+        self._hybrid_live_tq_policy = None
+        self._hybrid_live_tq_attention_layers = []
+        self._hybrid_live_tq_companion_layers = []
+
+        # Detect hybrid models (mixed KVCache + MambaCache layers)
+        lang_model = self.model.language_model if hasattr(self.model, "language_model") else self.model
+        # ZAYA/ZAYA1-VL are hybrid-shaped but have a first-class typed CCA
+        # cache contract (KV + conv_state + prev_hs). They must not enter
+        # the generic Qwen-style SSM companion path.
+        self._uses_zaya_cache = (
+            _model_uses_zaya_cache_contract(lang_model)
+            or _model_uses_zaya_cache_contract(self.model)
+        )
+        self._is_hybrid = False
+        try:
+            self._is_hybrid = self._is_hybrid_model(lang_model)
+        except Exception as e:
+            logger.warning(f"Failed to detect hybrid cache model: {e}")
+
+        # Detect mixed-attention models (e.g. Gemma 4 = 25 sliding + 5 full).
+        # Detection is diagnostic only. The cache path must preserve
+        # RotatingKVCache metadata instead of bypassing all prefix tiers.
+        self._mixed_attention_cache_model = False
+        try:
+            self._mixed_attention_cache_model = self._model_has_mixed_attention(lang_model)
+            if self._mixed_attention_cache_model:
+                logger.info(
+                    "VLM mixed-attention model detected (e.g. Gemma 4 sliding+full). "
+                    "Prefix cache remains enabled; RotatingKVCache metadata will be "
+                    "preserved during truncation and paged/L2 reconstruction."
+                )
+        except Exception as e:
+            logger.debug(f"Mixed-attention detection failed: {e}")
+
+        if self._uses_zaya_cache and self.config.enable_prefix_cache:
+            if not self.config.use_paged_cache:
+                logger.info(
+                    "ZAYA/CCA typed cache requires paged prefix cache. "
+                    "Auto-switching VLM prefix-only configuration to paged "
+                    "cache so zaya_cca_v1 records carry KV + conv_state + "
+                    "prev_hs."
+                )
+                self.config.use_paged_cache = True
+                self.config.use_memory_aware_cache = False
+            else:
+                self.config.use_memory_aware_cache = False
+
+        if self._is_hybrid and not self._uses_zaya_cache:
+            try:
+                from .utils.mamba_cache import ensure_mamba_support
+                ensure_mamba_support()
+                logger.info(
+                    "VLM hybrid model detected (MambaCache + KVCache layers). "
+                    "Mamba batching support enabled."
+                )
+            except Exception as e:
+                logger.warning(f"Failed to enable Mamba batching support: {e}")
+                self._is_hybrid = False  # Fall back to standard KV-only handling
+            # Auto-switch to paged cache (MambaCache can't be truncated by memory-aware cache)
+            if self._is_hybrid and self.config.enable_prefix_cache and not self.config.use_paged_cache:
+                logger.info(
+                    "Auto-switching VLM to paged cache for hybrid model "
+                    "(memory-aware cache can't truncate MambaCache)."
+                )
+                self.config.use_paged_cache = True
+                self.config.use_memory_aware_cache = False
+
+        # --- Cache initialization chain (paged > memory-aware > legacy) ---
+        if self.config.enable_prefix_cache:
+            if self.config.use_paged_cache:
+                # Paged cache with optional block-level disk store (L2)
+                block_disk_store = None
+                if self.config.enable_block_disk_cache:
+                    cache_dir = self.config.block_disk_cache_dir
+                    if cache_dir is None and self.config.model_path:
+                        # Include quant config and paged-cache schema in hash
+                        # to prevent cross-config / stale L2 cache poisoning.
+                        quant_tag = self.config.kv_cache_quantization or "none"
+                        from .prefix_cache import PAGED_CACHE_SCHEMA_VERSION
+                        block_scope_key = (
+                            f"{self.config.model_path}:quant={quant_tag}"
+                            f":paged_cache_schema={PAGED_CACHE_SCHEMA_VERSION}"
+                            f":{runtime_cache_fingerprint()}"
+                        )
+                        model_hash = hashlib.sha256(
+                            block_scope_key.encode()
+                        ).hexdigest()[:12]
+                        cache_dir = os.path.join(
+                            os.path.expanduser("~"),
+                            ".cache", "vmlx-engine", "block-cache", model_hash,
+                        )
+                    elif cache_dir is None:
+                        cache_dir = os.path.join(
+                            os.path.expanduser("~"),
+                            ".cache", "vmlx-engine", "block-cache", "default",
+                        )
+                    try:
+                        from .block_disk_store import BlockDiskStore
+                        block_disk_store = BlockDiskStore(
+                            cache_dir=cache_dir,
+                            max_size_gb=self.config.block_disk_cache_max_gb,
+                        )
+                        self._block_disk_l2_enabled = True
+                        logger.info(
+                            f"VLM block disk cache enabled: dir={cache_dir}, "
+                            f"max={self.config.block_disk_cache_max_gb}GB"
+                        )
+                        if self._is_hybrid and not self._uses_zaya_cache:
+                            try:
+                                try:
+                                    ssm_budget_gb = float(
+                                        os.environ.get(
+                                            "VMLX_SSM_DISK_CACHE_MAX_GB",
+                                            str(self.config.block_disk_cache_max_gb),
+                                        )
+                                    )
+                                    if ssm_budget_gb <= 0:
+                                        ssm_budget_gb = (
+                                            self.config.block_disk_cache_max_gb
+                                        )
+                                except ValueError:
+                                    ssm_budget_gb = self.config.block_disk_cache_max_gb
+                                self._ssm_companion_disk_store = (
+                                    SSMCompanionDiskStore(
+                                        directory=os.path.join(
+                                            cache_dir, "ssm_companion"
+                                        ),
+                                        budget_bytes=int(
+                                            ssm_budget_gb * (1024 ** 3)
+                                        ),
+                                    )
+                                )
+                                logger.info(
+                                    "VLM hybrid SSM companion L2 enabled: dir=%s, "
+                                    "max=%.3gGB",
+                                    self._ssm_companion_disk_store.directory,
+                                    ssm_budget_gb,
+                                )
+                            except Exception as ssm_e:
+                                logger.warning(
+                                    "VLM hybrid SSM companion L2 init failed; "
+                                    "continuing with in-memory SSM companion only: %s",
+                                    ssm_e,
+                                )
+                    except Exception as e:
+                        logger.error(
+                            f"VLM block disk cache init failed at {cache_dir}: {e}. "
+                            "Continuing without block disk cache."
+                        )
+
+                try:
+                    from .paged_cache import PagedCacheManager
+                    from .prefix_cache import BlockAwarePrefixCache
+
+                    self.paged_cache_manager = PagedCacheManager(
+                        block_size=self.config.paged_cache_block_size,
+                        max_blocks=self.config.max_cache_blocks,
+                        disk_store=block_disk_store,
+                    )
+                    self.block_aware_cache = BlockAwarePrefixCache(
+                        model=lang_model,
+                        paged_cache_manager=self.paged_cache_manager,
+                    )
+                    if self._is_hybrid and not self._uses_zaya_cache:
+                        effective_kv_bits = (
+                            4 if self.config.kv_cache_quantization == "q4"
+                            else 8 if self.config.kv_cache_quantization == "q8"
+                            else 0
+                        )
+                        try:
+                            from .prefix_cache import compute_model_cache_key
+
+                            model_key = compute_model_cache_key(
+                                lang_model,
+                                model_path=self.config.model_path,
+                                smelt_enabled=False,
+                                smelt_pct=0.0,
+                                tq_enabled=False,
+                                kv_quant_bits=effective_kv_bits,
+                            )
+                        except Exception:
+                            scope = (
+                                f"{self.config.model_path or ''}:"
+                                f"kv={self.config.kv_cache_quantization}:"
+                                f"block={self.config.paged_cache_block_size}"
+                            )
+                            model_key = hashlib.sha256(scope.encode()).hexdigest()
+                        self._ssm_companion_model_key = model_key
+                    logger.info(
+                        f"VLM Paged cache enabled: block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={self.config.max_cache_blocks}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize VLM paged cache: {e}")
+                    self.paged_cache_manager = None
+                    self.block_aware_cache = None
+
+            elif self.config.use_memory_aware_cache:
+                # Memory-aware cache (L1, recommended for large models)
+                try:
+                    from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+                    cache_config = MemoryCacheConfig(
+                        max_memory_mb=self.config.cache_memory_mb,
+                        max_memory_percent=self.config.cache_memory_percent,
+                        ttl_minutes=self.config.cache_ttl_minutes,
+                    )
+                    self.memory_aware_cache = MemoryAwarePrefixCache(
+                        model=lang_model,
+                        config=cache_config,
+                    )
+                    logger.info(
+                        f"VLM memory-aware cache enabled: "
+                        f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
+                    )
+                except Exception as e:
+                    logger.warning(f"VLM memory-aware cache init failed: {e}")
+
+            else:
+                # Legacy entry-count prefix cache
+                try:
+                    from .prefix_cache import PrefixCacheManager
+                    self.prefix_cache = PrefixCacheManager(
+                        model=lang_model,
+                        max_entries=self.config.prefix_cache_size,
+                    )
+                    logger.info(
+                        f"VLM prefix cache enabled: max_entries={self.config.prefix_cache_size}"
+                    )
+                except Exception as e:
+                    logger.warning(f"VLM prefix cache init failed: {e}")
+
+        # Disk cache L2 (persistent across restarts, for non-paged paths)
+        if self.config.enable_disk_cache and self.config.enable_prefix_cache:
+            base_dir = self.config.disk_cache_dir or os.path.expanduser(
+                "~/.cache/vmlx-engine/prompt-cache"
+            )
+            if self.config.model_path:
+                quant_tag = self.config.kv_cache_quantization or "none"
+                # Include layer count to invalidate on architecture change
+                n_layers = 0
+                lm = self.model.language_model if hasattr(self.model, 'language_model') else self.model
+                for _attr in ('args', 'config'):
+                    _cfg = getattr(lm, _attr, None)
+                    if _cfg:
+                        n_layers = getattr(_cfg, 'num_hidden_layers', 0)
+                        if n_layers:
+                            break
+                from .prefix_cache import PAGED_CACHE_SCHEMA_VERSION
+                scope_key = (
+                    f"{self.config.model_path}:quant={quant_tag}:layers={n_layers}"
+                    f":prefix_cache_schema={PAGED_CACHE_SCHEMA_VERSION}"
+                    f":{runtime_cache_fingerprint()}"
+                )
+                model_hash = hashlib.sha256(
+                    scope_key.encode()
+                ).hexdigest()[:12]
+                model_slug = os.path.basename(self.config.model_path.rstrip("/"))
+                cache_dir = os.path.join(base_dir, f"{model_slug}_{model_hash}")
+            else:
+                cache_dir = base_dir
+            try:
+                from .disk_cache import DiskCacheManager
+                self.disk_cache = DiskCacheManager(
+                    cache_dir=cache_dir,
+                    max_size_gb=self.config.disk_cache_max_gb,
+                )
+                logger.info(f"VLM disk cache (L2) enabled: dir={cache_dir}")
+            except Exception as e:
+                logger.warning(f"VLM disk cache init failed: {e}")
+        elif self.config.enable_disk_cache and not self.config.enable_prefix_cache:
+            logger.warning(
+                "VLM disk cache requires prefix cache to be enabled — disk cache disabled"
+            )
+
+        # KV cache quantization for prefix cache storage (2-4x memory reduction)
+        # MLA models (Mistral 4, DeepSeek V2/V3) store compressed KV latents —
+        # quantizing already-compressed representations destroys quality.
+        _is_mla = self._detect_mla()
+        if self._uses_zaya_cache and self.config.kv_cache_quantization != "none":
+            logger.info(
+                "ZAYA/CCA typed cache detected — disabling generic KV cache "
+                "quantization (was: %s). zaya_cca_v1 must preserve KV plus "
+                "CCA conv_state/prev_hs until a typed partial codec proves "
+                "numeric parity.",
+                self.config.kv_cache_quantization,
+            )
+            self.config.kv_cache_quantization = "none"
+        if _is_mla and self.config.kv_cache_quantization != "none":
+            logger.info("KV cache quantization disabled: MLA model (compressed KV latents)")
+            self.config.kv_cache_quantization = "none"
+        if self.config.kv_cache_quantization != "none":
+            if self.config.enable_prefix_cache:
+                bits = 4 if self.config.kv_cache_quantization == "q4" else 8
+                self._wrap_make_cache_quantized(bits, self.config.kv_cache_group_size)
+                logger.info(
+                    f"VLM KV cache quantization enabled: {self.config.kv_cache_quantization} "
+                    f"(bits={bits}, group_size={self.config.kv_cache_group_size})"
+                )
+            else:
+                logger.warning(
+                    f"KV cache quantization '{self.config.kv_cache_quantization}' requested "
+                    "but prefix cache is disabled — quantization has no effect without prefix cache"
+                )
+
+        self._tq_active = self._detect_turboquant_make_cache()
+        self._tq_batch_api = self._detect_turboquant_batch_api()
+        self._capture_hybrid_turboquant_policy()
+        self._enforce_turboquant_single_sequence()
+
+        # Get stop tokens from tokenizer
+        self.stop_tokens = self._get_stop_tokens()
+        self._log_runtime_cache_contract(lang_model)
+
+        # Batch generator (created lazily, recreated on sampler param change)
+        self.batch_generator: Optional[MLLMBatchGenerator] = None
+        self._current_sampler_params: tuple = ()
+
+        # Request management - following vLLM's design
+        self.waiting: deque[MLLMRequest] = deque()  # Waiting queue (FCFS)
+        self.running: Dict[str, MLLMRequest] = {}  # Running requests by ID
+        self.requests: Dict[str, MLLMRequest] = {}  # All requests by ID
+        self.finished_req_ids: Set[str] = set()  # Recently finished
+        self._pending_aborts: Set[str] = set()  # Deferred aborts (Metal safety)
+
+        # Mapping between our request IDs and BatchGenerator UIDs
+        self.request_id_to_uid: Dict[str, int] = {}
+        self.uid_to_request_id: Dict[int, str] = {}
+
+        # Output queues for async streaming
+        self.output_queues: Dict[str, asyncio.Queue] = {}
+        self._scheduler_trace_timings: Dict[str, Dict[str, float]] = {}
+
+        # Streaming detokenizer pool for correct multi-byte character handling
+        self._detokenizer_pool: Dict[str, Any] = {}
+
+        # Async processing control
+        self._running = False
+        self._processing_task: Optional[asyncio.Task] = None
+
+        # Statistics
+        self.num_requests_processed = 0
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self._cache_hit_requests = 0
+        self._cache_hit_tokens = 0
+        self._cache_hit_tokens_by_detail: Dict[str, int] = {}
+
+        # Periodic Metal memory cache cleanup timer (matches LLM scheduler).
+        # During sustained MLLM traffic, self.running is never empty so
+        # _cleanup_finished's clear_mlx_memory_cache() never triggers.
+        self._last_metal_gc_time = time.monotonic()
+        self._metal_gc_interval = 60.0  # seconds
+
+        # Log cache configuration summary for diagnostics
+        cache_mode = "none"
+        if self.block_aware_cache is not None:
+            cache_mode = "paged"
+        elif self.memory_aware_cache is not None:
+            cache_mode = "memory-aware"
+        elif self.prefix_cache is not None:
+            cache_mode = "legacy"
+        if self._uses_zaya_cache and self.block_aware_cache is not None:
+            logger.info(
+                "ZAYA/CCA typed paged prefix cache enabled — VLM cache "
+                "records use zaya_cca_v1 state (KV + conv_state + prev_hs); "
+                "generic KV quantization remains disabled."
+            )
+        logger.info(
+            f"MLLM Scheduler initialized: cache_mode={cache_mode}, "
+            f"hybrid={self._is_hybrid}, "
+            f"zaya_cca={self._uses_zaya_cache}, "
+            f"kv_quant={self.config.kv_cache_quantization}, "
+            f"prompt_l2={self.disk_cache is not None}, "
+            f"block_l2={self._block_disk_l2_enabled}, "
+            f"max_seqs={self.config.max_num_seqs}"
+        )
+
+    def _log_runtime_cache_contract(self, model: Any) -> None:
+        """Log per-layer cache classes for production-gate topology checks."""
+        if not hasattr(model, "make_cache"):
+            return
+        try:
+            cache = model.make_cache() or []
+            layout = []
+            for idx, slot in enumerate(cache):
+                cls = type(slot).__name__
+                if cls == "CacheList":
+                    sub = [
+                        type(sub_slot).__name__
+                        for sub_slot in getattr(slot, "caches", ())
+                    ]
+                    layout.append(f"{idx}:CacheList({','.join(sub)})")
+                else:
+                    layout.append(f"{idx}:{cls}")
+            model_type = getattr(self.model_config, "model_type", None) or "unknown"
+            logger.info(
+                "Runtime cache layout: model_type=%s layers=%d layout=%s",
+                model_type,
+                len(cache),
+                ";".join(layout),
+            )
+        except Exception as exc:
+            logger.debug("Runtime cache layout logging skipped: %s", exc)
+
+    def _get_detokenizer(self, request_id: str, tokenizer: Any) -> Any:
+        """Get or create a streaming detokenizer for a request."""
+        if request_id not in self._detokenizer_pool:
+            detok = NaiveStreamingDetokenizer(tokenizer)
+            detok.reset()
+            self._detokenizer_pool[request_id] = detok
+        return self._detokenizer_pool[request_id]
+
+    def _cleanup_detokenizer(self, request_id: str) -> None:
+        """Remove the streaming detokenizer for a finished request."""
+        self._detokenizer_pool.pop(request_id, None)
+
+    @staticmethod
+    def _is_hybrid_model(model: Any) -> bool:
+        """Check if VLM language model uses non-standard cache types.
+
+        Returns True for models with mixed KVCache + MambaCache/ArraysCache layers,
+        or pure Mamba/SSM models. These need special handling:
+        - Auto-switch to paged cache (memory-aware can't truncate SSM states)
+        - Enable MambaCache batching support (ensure_mamba_support)
+        - HybridSSMStateCache for companion SSM state caching
+
+        Detection: calls model.make_cache() and checks cache type names.
+        Pure KV types (KVCache, RotatingKVCache, QuantizedKVCache) -> False.
+        Any other type (ArraysCache, MambaCache, CacheList with mixed) -> True.
+        """
+        if not hasattr(model, "make_cache"):
+            return False
+        try:
+            cache = model.make_cache()
+            cache_types = {type(c).__name__ for c in cache}
+            # Dynamic detection: any type ending with "KVCache" is a KV type
+            kv_types = {t for t in cache_types if t == "KVCache" or t.endswith("KVCache")}
+            non_kv = cache_types - kv_types
+            # CacheList is a wrapper, not a non-KV type
+            non_kv.discard("CacheList")
+            if not non_kv:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _mllm_request_has_media_cache_context(
+        self,
+        request: Any,
+        token_ids: Optional[List[int]] = None,
+    ) -> bool:
+        """Return True when a VLM request must not use token-only caches.
+
+        Image/video embeddings are path-dependent. A token-only prefix key is
+        safe for text-only follow-up turns, but not for requests that carry
+        media inputs or media placeholder tokens. Keep this helper shared by
+        every MLLM cache store path so paged, memory-aware, legacy, and disk L2
+        cannot drift into different safety policies.
+        """
+        if request is None:
+            return False
+        if getattr(request, "images", None) or getattr(request, "videos", None):
+            return True
+        if not token_ids:
+            return False
+        try:
+            contains_placeholders = (
+                self.batch_generator is not None
+                and self.batch_generator._tokens_contain_media_placeholders(
+                    list(token_ids)
+                )
+            )
+            return bool(contains_placeholders)
+        except Exception:
+            return False
+
+    def _mllm_media_prefix_cache_allowed(
+        self,
+        request: Any,
+        token_ids: Optional[List[int]] = None,
+    ) -> bool:
+        """Return True when a media prompt may use media-keyed prefix cache.
+
+        This is intentionally opt-in while Qwen3.6 VL cache gates are being
+        expanded. ZAYA CCA remains excluded: its clean store path re-prefills
+        from text tokens and would lose image-conditioned state.
+        """
+        enabled = os.environ.get("VMLINUX_MLLM_MEDIA_PREFIX_CACHE", "").strip()
+        if enabled not in ("1", "true", "True", "yes", "on"):
+            return False
+        unsafe_ack = os.environ.get(
+            "VMLINUX_MLLM_MEDIA_PREFIX_CACHE_UNSAFE_ACK", ""
+        ).strip()
+        if unsafe_ack not in ("1", "true", "True", "yes", "on"):
+            return False
+        if request is None or getattr(request, "_bypass_prefix_cache", False):
+            return False
+        if getattr(self, "_uses_zaya_cache", False):
+            return False
+        extra = getattr(request, "_cache_extra_keys", None)
+        if not extra:
+            return False
+        return self._mllm_request_has_media_cache_context(request, token_ids)
+
+    def _detect_mla(self) -> bool:
+        """Detect if model uses Multi-head Latent Attention (MLA).
+
+        MLA detection logic and KV cache quantization guard added by Jinho Jang
+        (eric@jangq.ai) for vMLX. The base scheduler architecture derives from
+        waybarrios/vllm-mlx. The MLA-specific handling (kv_lora_rank detection,
+        auto-disabling quantization for compressed latents, prefix cache H=1
+        validation) is original vMLX work requiring extensive empirical testing.
+        We are leaving this attribution here because we know another inference
+        engine is very directly going to be looking at this to attempt to
+        rip it off. If you're adapting this code, please credit the original
+        author: Jinho Jang (github.com/jjang-ai/vmlx).
+        """
+        def _cfg_model_type(cfg: Any) -> str:
+            if cfg is None:
+                return ""
+            if isinstance(cfg, dict):
+                mt = cfg.get("model_type") or ""
+                if not mt and isinstance(cfg.get("text_config"), dict):
+                    mt = cfg["text_config"].get("model_type") or ""
+                return str(mt).lower()
+            mt = getattr(cfg, "model_type", "") or ""
+            if not mt:
+                tc = getattr(cfg, "text_config", None)
+                mt = getattr(tc, "model_type", "") if tc is not None else ""
+            return str(mt or "").lower()
+
+        def _cfg_kv_lora_rank(cfg: Any) -> int:
+            if cfg is None:
+                return 0
+            if isinstance(cfg, dict):
+                raw = cfg
+            else:
+                raw = getattr(cfg, "_raw_config", None)
+            vals = []
+            if isinstance(cfg, dict):
+                vals.append(cfg.get("kv_lora_rank", 0))
+                tc = cfg.get("text_config")
+                if isinstance(tc, dict):
+                    vals.append(tc.get("kv_lora_rank", 0))
+            else:
+                vals.append(getattr(cfg, "kv_lora_rank", 0))
+                tc = getattr(cfg, "text_config", None)
+                if tc is not None:
+                    vals.append(getattr(tc, "kv_lora_rank", 0))
+            if isinstance(raw, dict):
+                vals.append(raw.get("kv_lora_rank", 0))
+                tc = raw.get("text_config")
+                if isinstance(tc, dict):
+                    vals.append(tc.get("kv_lora_rank", 0))
+            for val in vals:
+                try:
+                    iv = int(val or 0)
+                except (TypeError, ValueError):
+                    iv = 0
+                if iv > 0:
+                    return iv
+            return 0
+
+        try:
+            lm = self.model.language_model if hasattr(self.model, "language_model") else self.model
+            candidates = [self.model, lm]
+            for obj in list(candidates):
+                inner = getattr(obj, "model", None)
+                if inner is not None and inner not in candidates:
+                    candidates.append(inner)
+
+            cfgs = []
+            for obj in candidates:
+                for attr in ("args", "config", "text_config"):
+                    cfg = getattr(obj, attr, None)
+                    if cfg is not None:
+                        cfgs.append(cfg)
+                        raw = getattr(cfg, "_raw_config", None)
+                        if isinstance(raw, dict):
+                            cfgs.append(raw)
+                        tc = getattr(cfg, "text_config", None)
+                        if tc is not None:
+                            cfgs.append(tc)
+                        if isinstance(cfg, dict) and isinstance(cfg.get("text_config"), dict):
+                            cfgs.append(cfg["text_config"])
+
+            for cfg in cfgs:
+                model_type = _cfg_model_type(cfg)
+                if model_type in ("bailing_hybrid", "bailing_moe_v2_5"):
+                    # Ling/Bailing's runtime stores full per-head KV, not H=1
+                    # compressed MLA latents. Keep normal KV/TQ cache support.
+                    continue
+                if _cfg_kv_lora_rank(cfg) > 0:
+                    return True
+                if model_type == "mistral4":
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _detect_turboquant_make_cache(self) -> bool:
+        """Detect JANG TurboQuant KV patches on VLM wrappers or language models."""
+
+        def _is_mock_object(obj: Any) -> bool:
+            return type(obj).__module__ == "unittest.mock"
+
+        def _safe_attr(obj: Any, name: str) -> Any:
+            if obj is None:
+                return None
+            # unittest.mock fabricates arbitrary attributes on access. A blind
+            # wrapper walk over `.model.language_model.model...` never
+            # terminates and can hang tests or proxy-heavy integrations. Only
+            # use attributes explicitly assigned on mocks.
+            if _is_mock_object(obj):
+                return getattr(obj, "__dict__", {}).get(name)
+            return getattr(obj, name, None)
+
+        def _is_tq_make_cache(obj: Any) -> bool:
+            make_cache = _safe_attr(obj, "make_cache")
+            return make_cache is not None and is_turboquant_make_cache(make_cache)
+
+        seen = set()
+        stack = [self.model]
+        while stack:
+            obj = stack.pop()
+            if obj is None or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            if _is_tq_make_cache(obj):
+                return True
+            for attr in ("model", "language_model"):
+                nxt = _safe_attr(obj, attr)
+                if nxt is not None and nxt is not obj and id(nxt) not in seen:
+                    stack.append(nxt)
+        return False
+
+    def _detect_turboquant_batch_api(self) -> bool:
+        """Return True when all VLM TurboQuant cache slots expose batch API v1."""
+
+        def _is_mock_object(obj: Any) -> bool:
+            return type(obj).__module__ == "unittest.mock"
+
+        def _safe_attr(obj: Any, name: str) -> Any:
+            if obj is None:
+                return None
+            if _is_mock_object(obj):
+                return getattr(obj, "__dict__", {}).get(name)
+            return getattr(obj, name, None)
+
+        seen = set()
+        stack = [self.model]
+        required_methods = ("extend", "filter", "extract", "prepare", "finalize")
+        while stack:
+            obj = stack.pop()
+            if obj is None or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+
+            make_cache = _safe_attr(obj, "make_cache")
+            if make_cache is not None and is_turboquant_make_cache(make_cache):
+                try:
+                    cache = make_cache() or []
+                except Exception:
+                    return False
+                tq_slots = [c for c in cache if type(c).__name__ == "TurboQuantKVCache"]
+                if not tq_slots:
+                    return False
+                return all(
+                    getattr(slot, "_vmlx_batch_api", None) == "turboquant_kv_v1"
+                    and all(callable(getattr(slot, name, None)) for name in required_methods)
+                    for slot in tq_slots
+                )
+
+            for attr in ("model", "language_model"):
+                nxt = _safe_attr(obj, attr)
+                if nxt is not None and nxt is not obj and id(nxt) not in seen:
+                    stack.append(nxt)
+        return False
+
+    def _capture_hybrid_turboquant_policy(self) -> None:
+        """Copy selective hybrid TQ metadata from the patched language model."""
+
+        def _safe_attr(obj: Any, name: str) -> Any:
+            if obj is None:
+                return None
+            if type(obj).__module__ == "unittest.mock":
+                return getattr(obj, "__dict__", {}).get(name)
+            return getattr(obj, name, None)
+
+        seen = set()
+        stack = [self.model]
+        while stack:
+            obj = stack.pop()
+            if obj is None or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            make_cache = _safe_attr(obj, "make_cache")
+            policy = getattr(make_cache, "_vmlx_hybrid_tq_policy", None)
+            if policy:
+                self._hybrid_live_tq_policy = policy
+                self._hybrid_live_tq_attention_layers = list(
+                    getattr(make_cache, "_vmlx_hybrid_tq_attention_layers", ()) or []
+                )
+                self._hybrid_live_tq_companion_layers = list(
+                    getattr(make_cache, "_vmlx_hybrid_tq_companion_layers", ()) or []
+                )
+                return
+            for attr in ("model", "language_model"):
+                nxt = _safe_attr(obj, attr)
+                if nxt is not None and nxt is not obj and id(nxt) not in seen:
+                    stack.append(nxt)
+
+    def _enforce_turboquant_single_sequence(self) -> None:
+        """Keep MLLM live batching honest for TurboQuantKVCache."""
+        if not self._tq_active:
+            return
+
+        if self._tq_batch_api:
+            logger.info(
+                "VLM TurboQuantKVCache live decode preserving configured batching "
+                "(batch cache API=turboquant_kv_v1)."
+            )
+            return
+
+        changed = []
+        if self.config.max_num_seqs != 1:
+            changed.append(f"max_num_seqs {self.config.max_num_seqs}->1")
+            self.config.max_num_seqs = 1
+        if self.config.prefill_batch_size != 1:
+            changed.append(f"prefill_batch_size {self.config.prefill_batch_size}->1")
+            self.config.prefill_batch_size = 1
+        if self.config.completion_batch_size != 1:
+            changed.append(
+                f"completion_batch_size {self.config.completion_batch_size}->1"
+            )
+            self.config.completion_batch_size = 1
+        if changed:
+            logger.warning(
+                "VLM TurboQuantKVCache live decode is single-sequence only "
+                "with this jang_tools build (missing batch API turboquant_kv_v1); "
+                "overriding %s.",
+                ", ".join(changed),
+            )
+
+    def _detect_cache_head_dims(self) -> Tuple[int, ...]:
+        """Detect VLM language-model cache trailing dims for KV quant validation."""
+        try:
+            return detect_cache_head_dims(self.model)
+        except Exception as e:
+            logger.debug(f"Could not detect VLM cache head dims: {e}")
+            return ()
+
+    def _detect_head_dim(self) -> Optional[int]:
+        """Detect the primary VLM KV cache trailing dim from config."""
+        dims = self._detect_cache_head_dims()
+        if dims:
+            return dims[0]
+        return None
+
+    def _wrap_make_cache_quantized(self, bits: int, group_size: int) -> None:
+        """
+        Configure KV cache quantization for VLM prefix cache storage.
+
+        Quantization is applied at the storage/retrieval boundary — full-precision
+        KVCache during generation, quantized storage in prefix cache for 2-4x
+        memory savings. Validates head_dim compatibility and runs round-trip test.
+        """
+        try:
+            from mlx_lm.models.cache import QuantizedKVCache
+            import mlx.core as mx
+        except ImportError:
+            logger.warning(
+                "QuantizedKVCache not available. VLM KV cache quantization disabled."
+            )
+            return
+
+        # Patch QuantizedKVCache.size if needed
+        if not hasattr(QuantizedKVCache, '_size_patched'):
+            needs_patch = True
+            try:
+                test_qkv = QuantizedKVCache(group_size=64, bits=bits)
+                test_qkv.offset = 42
+                if callable(getattr(test_qkv, 'size', None)) and test_qkv.size() == 42:
+                    needs_patch = False
+            except Exception:
+                pass
+            if needs_patch:
+                def _qkv_size(self):
+                    return getattr(self, 'offset', 0)
+                QuantizedKVCache.size = _qkv_size
+                logger.debug("Patched QuantizedKVCache.size() to return self.offset")
+            QuantizedKVCache._size_patched = True
+
+        # Validate cache trailing-dim compatibility
+        cache_head_dims = self._detect_cache_head_dims()
+        head_dim = cache_head_dims[0] if cache_head_dims else None
+        if cache_head_dims:
+            adjusted_group_size = choose_supported_kv_group_size(
+                cache_head_dims, group_size
+            )
+            if adjusted_group_size is None:
+                logger.error(
+                    "VLM KV quant: no supported group_size for "
+                    f"cache_head_dims={cache_head_dims}. Disabled."
+                )
+                return
+            if adjusted_group_size != group_size:
+                logger.warning(
+                    f"VLM KV quant: group_size={group_size} doesn't divide "
+                    f"cache_head_dims={cache_head_dims} or is unsupported. "
+                    f"Auto-adjusting to {adjusted_group_size}."
+                )
+                group_size = adjusted_group_size
+            logger.info(
+                f"VLM KV quant validated: cache_head_dims={cache_head_dims}, "
+                f"group_size={group_size}"
+            )
+
+        # Round-trip test
+        try:
+            test_dim = head_dim or 128
+            test_tensor = mx.random.normal((1, 4, 8, test_dim))
+            quantized = mx.quantize(test_tensor, group_size=group_size, bits=bits)
+            dequantized = mx.dequantize(
+                quantized[0], quantized[1], quantized[2],
+                group_size=group_size, bits=bits,
+            )
+            mx.eval(dequantized)
+            logger.info(f"VLM KV quant round-trip test passed: bits={bits}, group_size={group_size}")
+        except Exception as e:
+            logger.error(f"VLM KV quant round-trip test FAILED: {e}. Disabling.")
+            return
+
+        self._kv_cache_bits = bits
+        self._kv_cache_group_size = group_size
+
+    @staticmethod
+    def _validate_cache(cache: Any, *, source: str) -> bool:
+        """Validate live VLM cache objects before store/reuse."""
+        try:
+            from .cache_record_validator import reject_live_cache_or_warn
+            return reject_live_cache_or_warn(cache, source=source)
+        except Exception:
+            return cache is not None and (not isinstance(cache, list) or len(cache) > 0)
+
+    def _quantize_cache_for_storage(self, cache: List[Any]) -> List[Any]:
+        """
+        Quantize KVCache layers for prefix cache storage (2-4x memory reduction).
+        Preserves non-KVCache layers (MambaCache, etc.).
+        Recurses into CacheList sub-caches for MoE models.
+        """
+        if not self._kv_cache_bits:
+            return cache
+        try:
+            from mlx_lm.models.cache import KVCache, QuantizedKVCache
+            try:
+                from mlx_lm.models.cache import CacheList as _CacheList
+            except ImportError:
+                _CacheList = None
+            import mlx.core as mx
+        except ImportError:
+            return cache
+
+        bits = self._kv_cache_bits
+        group_size = self._kv_cache_group_size
+        result = []
+        for layer_cache in cache:
+            if _CacheList is not None and isinstance(layer_cache, _CacheList):
+                # MoE: quantize each sub-cache independently
+                quantized_subs = []
+                for sc in layer_cache.caches:
+                    if (
+                        isinstance(sc, KVCache)
+                        and not isinstance(sc, QuantizedKVCache)
+                        and sc.keys is not None
+                    ):
+                        try:
+                            qkv = QuantizedKVCache(group_size=group_size, bits=bits)
+                            qkv.keys = tuple(mx.quantize(sc.keys, group_size=group_size, bits=bits))
+                            qkv.values = tuple(mx.quantize(sc.values, group_size=group_size, bits=bits))
+                            qkv.offset = sc.offset
+                            quantized_subs.append(qkv)
+                        except Exception as exc:
+                            logger.debug("KV quantization failed for CacheList sub-cache: %s", exc)
+                            quantized_subs.append(sc)
+                    else:
+                        quantized_subs.append(sc)
+                result.append(_CacheList(*quantized_subs))
+            elif (
+                isinstance(layer_cache, KVCache)
+                and not isinstance(layer_cache, QuantizedKVCache)
+                and layer_cache.keys is not None
+            ):
+                try:
+                    qkv = QuantizedKVCache(group_size=group_size, bits=bits)
+                    qkv.keys = tuple(mx.quantize(layer_cache.keys, group_size=group_size, bits=bits))
+                    qkv.values = tuple(mx.quantize(layer_cache.values, group_size=group_size, bits=bits))
+                    qkv.offset = layer_cache.offset
+                    result.append(qkv)
+                except Exception as exc:
+                    logger.debug("KV quantization failed for layer, keeping original: %s", exc)
+                    result.append(layer_cache)
+            else:
+                result.append(layer_cache)
+        return result
+
+    def _truncate_hybrid_cache(
+        self, raw_cache: List[Any], prompt_len: int
+    ) -> Optional[List[Any]]:
+        """
+        Truncate cache for hybrid models (MambaCache + KVCache layers).
+
+        Unlike the LLM scheduler's _truncate_cache_to_prompt_length, this method
+        handles hybrid models by:
+        - Truncating KVCache layers normally (to prompt_len - 1)
+        - Passing MambaCache layers through unchanged (they're cumulative state)
+
+        MambaCache/ArraysCache layers are included in _extract_cache_states()
+        as cumulative entries (stored in last block only, "skip" in others).
+        """
+        target_len = prompt_len - 1
+        if not raw_cache or target_len <= 0:
+            return None
+
+        truncated = []
+        for layer_cache in raw_cache:
+            # Guard: skip dicts (extracted state dicts, not live cache objects).
+            # dict.keys is a builtin_function_or_method that matches hasattr
+            # but has no .ndim, causing crashes.
+            if isinstance(layer_cache, dict):
+                truncated.append(layer_cache)
+                continue
+            if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
+                try:
+                    k = layer_cache.keys
+                    v = layer_cache.values
+                    # Guard: k must be a tensor with .ndim (not a method or other object)
+                    if not hasattr(k, 'ndim'):
+                        truncated.append(layer_cache)
+                        continue
+
+                    if isinstance(k, tuple):
+                        # QuantizedKVCache
+                        try:
+                            from mlx_lm.models.cache import QuantizedKVCache
+                        except ImportError:
+                            return None
+                        safe_target = min(target_len, k[0].shape[-2])
+                        if safe_target <= 0:
+                            return None
+                        new_cache = QuantizedKVCache(
+                            group_size=layer_cache.group_size,
+                            bits=layer_cache.bits,
+                        )
+                        new_cache.keys = tuple(t[..., :safe_target, :] for t in k)
+                        new_cache.values = tuple(t[..., :safe_target, :] for t in v)
+                        new_cache.offset = safe_target
+                        truncated.append(new_cache)
+                    else:
+                        # Standard KVCache / RotatingKVCache.
+                        # CRITICAL: preserve the original class for sliding-
+                        # window layers (e.g. Gemma 4's 25 sliding_attention
+                        # layers). Demoting them to KVCache drops `keep` /
+                        # `max_size` / `_idx`, so on the next turn the model
+                        # sees a non-rotating buffer with invalid window
+                        # state on the next turn.
+                        from mlx_lm.models.cache import KVCache
+                        cls_name = type(layer_cache).__name__
+                        new_cache = None
+                        if "Rotating" in cls_name:
+                            try:
+                                from mlx_lm.models.cache import RotatingKVCache
+                                max_size = getattr(layer_cache, "max_size", target_len)
+                                keep = getattr(layer_cache, "keep", 0)
+                                offset = getattr(layer_cache, "offset", 0)
+                                if offset > max_size:
+                                    # Wrapped circular buffer — head-aligned
+                                    # slice is not in temporal order. Skip.
+                                    return None
+                                new_cache = RotatingKVCache(
+                                    max_size=max_size,
+                                    keep=keep,
+                                )
+                            except ImportError:
+                                new_cache = KVCache()
+                        if new_cache is None:
+                            new_cache = KVCache()
+                        ndim = k.ndim
+                        if ndim == 4:
+                            safe_target = min(target_len, k.shape[2])
+                            new_cache.keys = k[:, :, :safe_target, :]
+                            new_cache.values = v[:, :, :safe_target, :]
+                        elif ndim == 3:
+                            safe_target = min(target_len, k.shape[1])
+                            new_cache.keys = k[:, :safe_target, :]
+                            new_cache.values = v[:, :safe_target, :]
+                        else:
+                            return None
+                        new_cache.offset = safe_target
+                        if "Rotating" in cls_name and hasattr(new_cache, "_idx"):
+                            new_cache._idx = safe_target
+                        truncated.append(new_cache)
+                except Exception as e:
+                    logger.warning(f"Failed to truncate KVCache layer: {e}")
+                    return None
+            elif hasattr(layer_cache, "caches") and isinstance(
+                getattr(layer_cache, "caches", None), (list, tuple)
+            ):
+                # CacheList (MoE models like DeepSeek V3, Mistral 4): recursively truncate
+                # each sub-cache independently, then wrap back in CacheList.
+                try:
+                    sub_truncated = self._truncate_hybrid_cache(
+                        list(layer_cache.caches), prompt_len
+                    )
+                    if sub_truncated is None:
+                        return None
+                    from mlx_lm.models.cache import CacheList
+                    new_cl = CacheList.__new__(CacheList)
+                    new_cl.caches = sub_truncated
+                    truncated.append(new_cl)
+                except Exception as e:
+                    logger.warning(f"Failed to truncate CacheList layer: {e}")
+                    truncated.append(layer_cache)
+            elif hasattr(layer_cache, "cache") and isinstance(
+                getattr(layer_cache, "cache", None), list
+            ):
+                # MambaCache: pass through unchanged — will be skipped
+                # during _extract_cache_states() since it can't be blocked
+                truncated.append(layer_cache)
+            else:
+                # Unknown cache type — skip this layer
+                truncated.append(layer_cache)
+
+        return truncated
+
+    def _model_has_mixed_attention(self, lang_model) -> bool:
+        """Return True for models that interleave sliding-window and full
+        attention layers (Gemma 4 pattern).
+
+        Detection is conservative: we only return True when we can prove
+        the config has at least two distinct attention modes. For everything
+        else we return False and the normal prefix-cache pipeline runs.
+        """
+        def _cfg_value(cfg, key):
+            if isinstance(cfg, dict):
+                return cfg.get(key)
+            return getattr(cfg, key, None)
+
+        candidates = []
+        for attr in ('args', 'config'):
+            cfg = getattr(lang_model, attr, None)
+            if cfg is not None:
+                candidates.append(cfg)
+                tc = _cfg_value(cfg, 'text_config')
+                if tc is not None:
+                    candidates.append(tc)
+        for cfg in candidates:
+            cache_subtype = str(_cfg_value(cfg, "cache_subtype") or "").lower()
+            model_type = str(_cfg_value(cfg, "model_type") or "").lower()
+            text_cfg = _cfg_value(cfg, "text_config")
+            text_model_type = str(_cfg_value(text_cfg, "model_type") or "").lower()
+            sliding_window = _cfg_value(cfg, "sliding_window")
+            if sliding_window is None:
+                sliding_window = _cfg_value(text_cfg, "sliding_window")
+            if (
+                cache_subtype
+                in {
+                    "mixed_swa_kv",
+                    "step3p7_full_sliding_kv",
+                    "mimo_v2_asymmetric_swa",
+                }
+                or (
+                    model_type == "step3p7"
+                    and text_model_type == "step3p5"
+                    and sliding_window is not None
+                )
+            ):
+                return True
+            layer_types = _cfg_value(cfg, 'layer_types')
+            if layer_types and isinstance(layer_types, (list, tuple)):
+                kinds = {str(k).lower() for k in layer_types}
+                if len(kinds) >= 2 and any('sliding' in k for k in kinds):
+                    return True
+        return False
+
+    def _detect_n_kv_heads(self) -> int:
+        """Detect number of KV heads from VLM language model config.
+
+        Mirrors Scheduler._detect_n_kv_heads() for GQA head normalization.
+        BatchKVCache.merge() inflates H to max across batch; this provides
+        the ground-truth KV head count to slice away inflated heads.
+        """
+        if hasattr(self, '_n_kv_heads_cached'):
+            return self._n_kv_heads_cached
+        n_kv = 0
+        try:
+            # VLM wrappers may expose MLA config via language_model.config.text_config
+            # (Kimi K2.6 around DeepseekV3, glm_moe_dsa around deepseek_v32).
+            # Walk the same model + language_model + inner .model candidates and
+            # the same args/config/text_config attrs as Scheduler._detect_mla
+            # and PrefixCache._get_n_kv_heads. Carve out Ling/Bailing whose MLA
+            # runtime stores expanded per-head KV (do not collapse to H=1).
+            candidates = [self.model]
+            lm = getattr(self.model, 'language_model', None)
+            if lm is not None and lm not in candidates:
+                candidates.append(lm)
+            for obj in list(candidates):
+                inner = getattr(obj, 'model', None)
+                if inner is not None and inner not in candidates:
+                    candidates.append(inner)
+
+            # PASS 1: MLA detection (H=1 collapse) with bailing carve-out.
+            for obj in candidates:
+                for attr in ('args', 'config', 'text_config'):
+                    cfg = getattr(obj, attr, None)
+                    if cfg is None:
+                        continue
+                    model_type = str(getattr(cfg, 'model_type', '') or '').lower()
+                    if not model_type:
+                        tc = getattr(cfg, 'text_config', None)
+                        if tc is not None:
+                            model_type = str(getattr(tc, 'model_type', '') or '').lower()
+                    kv_lora_rank = getattr(cfg, 'kv_lora_rank', 0)
+                    if not kv_lora_rank:
+                        tc = getattr(cfg, 'text_config', None)
+                        if tc is not None:
+                            kv_lora_rank = getattr(tc, 'kv_lora_rank', 0)
+                    if kv_lora_rank and kv_lora_rank > 0:
+                        if model_type in ('bailing_hybrid', 'bailing_moe_v2_5'):
+                            # Ling/Bailing keeps full per-head KV.
+                            n_kv = int(getattr(cfg, 'num_attention_heads', 0) or 0)
+                            if not n_kv:
+                                tc = getattr(cfg, 'text_config', None)
+                                if tc is not None:
+                                    n_kv = int(getattr(tc, 'num_attention_heads', 0) or 0)
+                        else:
+                            n_kv = 1
+                        break
+                if n_kv:
+                    break
+
+            # PASS 2: standard num_key_value_heads / num_kv_heads / num_attention_heads.
+            if not n_kv:
+                for obj in candidates:
+                    for attr in ('args', 'config', 'text_config'):
+                        cfg = getattr(obj, attr, None)
+                        if cfg is None:
+                            continue
+                        n_kv = (
+                            getattr(cfg, 'num_key_value_heads', 0)
+                            or getattr(cfg, 'num_kv_heads', 0)
+                        )
+                        if not n_kv:
+                            tc = getattr(cfg, 'text_config', None)
+                            if tc is not None:
+                                n_kv = (
+                                    getattr(tc, 'num_key_value_heads', 0)
+                                    or getattr(tc, 'num_kv_heads', 0)
+                                )
+                        if n_kv:
+                            break
+                        n_kv = getattr(cfg, 'num_attention_heads', 0)
+                        if not n_kv:
+                            tc = getattr(cfg, 'text_config', None)
+                            if tc is not None:
+                                n_kv = getattr(tc, 'num_attention_heads', 0)
+                        if n_kv:
+                            break
+                    if n_kv:
+                        break
+        except Exception:
+            pass
+        if not isinstance(n_kv, int):
+            n_kv = 0
+        self._n_kv_heads_cached = n_kv
+        return n_kv
+
+    def _detect_allowed_n_kv_heads(self) -> Set[int]:
+        """Return every config-declared KV head count that can appear by layer.
+
+        MiMo V2 and Gemma-style VLMs can mix full-attention and sliding-window
+        attention layers with different KV head counts. Storage-time GQA
+        normalization must only trim inflated batch-merge heads, not legitimate
+        per-layer SWA heads.
+        """
+        if hasattr(self, "_allowed_n_kv_heads_cached"):
+            return self._allowed_n_kv_heads_cached
+
+        allowed: Set[int] = set()
+        primary = self._detect_n_kv_heads()
+        if primary > 0:
+            allowed.add(primary)
+
+        try:
+            candidates = [self.model]
+            lm = getattr(self.model, "language_model", None)
+            if lm is not None and lm not in candidates:
+                candidates.append(lm)
+            for obj in list(candidates):
+                inner = getattr(obj, "model", None)
+                if inner is not None and inner not in candidates:
+                    candidates.append(inner)
+
+            for obj in candidates:
+                for attr in ("args", "config", "text_config"):
+                    cfg = getattr(obj, attr, None)
+                    if cfg is None:
+                        continue
+                    for field in (
+                        "num_key_value_heads",
+                        "num_kv_heads",
+                        "num_global_key_value_heads",
+                        "global_num_key_value_heads",
+                        "swa_num_key_value_heads",
+                        "num_swa_key_value_heads",
+                        "sliding_num_key_value_heads",
+                        "local_num_key_value_heads",
+                    ):
+                        val = getattr(cfg, field, None)
+                        if val is None:
+                            tc = getattr(cfg, "text_config", None)
+                            if tc is not None:
+                                val = getattr(tc, field, None)
+                        if isinstance(val, int) and val > 0:
+                            allowed.add(val)
+        except Exception:
+            pass
+
+        self._allowed_n_kv_heads_cached = allowed
+        return allowed
+
+    def _normalize_gqa_state(
+        self,
+        state,
+        n_kv: int,
+        allowed_n_kv_heads: Optional[Set[int]] = None,
+    ):
+        """Normalize GQA head inflation in a cache state tuple.
+
+        Returns the state with inflated heads sliced down to n_kv.
+        Handles both plain tensors and quantized tuples (data, scales, zeros).
+        """
+        if not (isinstance(state, tuple) and len(state) == 2 and n_kv > 0):
+            return state
+        keys, values = state
+        if hasattr(keys, 'shape') and len(keys.shape) == 4:
+            actual_h = int(keys.shape[1])
+            if allowed_n_kv_heads and actual_h in allowed_n_kv_heads:
+                return state
+            if actual_h > n_kv:
+                return (keys[:, :n_kv, :, :], values[:, :n_kv, :, :])
+        elif (isinstance(keys, (tuple, list)) and len(keys) >= 1
+                and hasattr(keys[0], 'shape') and len(keys[0].shape) == 4
+                and keys[0].shape[1] > n_kv):
+            actual_h = int(keys[0].shape[1])
+            if allowed_n_kv_heads and actual_h in allowed_n_kv_heads:
+                return state
+            return (
+                tuple(t[:, :n_kv, :, :] for t in keys),
+                tuple(t[:, :n_kv, :, :] for t in values),
+            )
+        return state
+
+    def _extract_cache_states(self, raw_cache: List[Any]) -> List[Dict[str, Any]]:
+        """
+        Extract actual tensor state from each layer cache for paged storage.
+
+        Converts raw KVCache/MambaCache objects into state-dict format that
+        BlockAwarePrefixCache.store_cache() expects:
+            {"state": (keys, values), "meta_state": (offset,), "class_name": "KVCache"}
+
+        Handles CacheList (MoE models) by extracting each sub-cache independently,
+        matching the format expected by _extract_block_tensor_slice().
+
+        This is the VLM equivalent of Scheduler._extract_cache_states().
+        """
+        if not raw_cache:
+            return []
+
+        try:
+            from mlx_lm.models.cache import CacheList as _CacheList
+        except ImportError:
+            _CacheList = None
+
+        n_kv = self._detect_n_kv_heads()
+        allowed_n_kv_heads = self._detect_allowed_n_kv_heads()
+        extracted = []
+        for i, layer_cache in enumerate(raw_cache):
+            try:
+                # CacheList (MoE models): extract each sub-cache independently.
+                # Produces {"class_name": "CacheList", "sub_caches": [...]} format
+                # matching what _extract_block_tensor_slice expects.
+                if _CacheList is not None and isinstance(layer_cache, _CacheList):
+                    sub_caches = []
+                    for sc in layer_cache.caches:
+                        if hasattr(sc, "cache") and isinstance(
+                            getattr(sc, "cache", None), list
+                        ):
+                            # SSM sub-cache: cumulative state
+                            sub_caches.append({
+                                "state": sc.state,
+                                "meta_state": sc.meta_state,
+                                "class_name": type(sc).__name__,
+                            })
+                        elif hasattr(sc, "state") and hasattr(sc, "meta_state"):
+                            sub_state = self._normalize_gqa_state(
+                                sc.state,
+                                n_kv,
+                                allowed_n_kv_heads=allowed_n_kv_heads,
+                            )
+                            sub_caches.append({
+                                "state": sub_state,
+                                "meta_state": sc.meta_state,
+                                "class_name": type(sc).__name__,
+                            })
+                    if sub_caches:
+                        extracted.append({
+                            "class_name": "CacheList",
+                            "state": None,
+                            "meta_state": None,
+                            "sub_caches": sub_caches,
+                        })
+                    continue
+                # MambaCache/ArraysCache: cumulative state (SSM layers in hybrid models).
+                # Include in extraction so _extract_block_tensor_slice() can tag them
+                # as ("cumulative", ...) in the last block, enabling prefix cache
+                # restore for hybrid SSM models on exact prefix matches.
+                if hasattr(layer_cache, "cache") and isinstance(
+                    getattr(layer_cache, "cache", None), list
+                ):
+                    if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
+                        cls_name = type(layer_cache).__name__
+                        extracted.append({
+                            "state": layer_cache.state,
+                            "meta_state": layer_cache.meta_state,
+                            "class_name": cls_name,
+                        })
+                    else:
+                        cls_name = type(layer_cache).__name__
+                        extracted.append({
+                            "state": None,
+                            "meta_state": None,
+                            "class_name": cls_name,
+                        })
+                    continue
+                elif hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
+                    state = self._normalize_gqa_state(
+                        layer_cache.state,
+                        n_kv,
+                        allowed_n_kv_heads=allowed_n_kv_heads,
+                    )
+                    meta = layer_cache.meta_state
+                    cls_name = type(layer_cache).__name__
+                    # Ensure QuantizedKVCache meta includes group_size and bits.
+                    if cls_name == "QuantizedKVCache" and isinstance(meta, (tuple, list)) and len(meta) < 3:
+                        g = getattr(layer_cache, 'group_size', 64)
+                        b = getattr(layer_cache, 'bits', 8)
+                        meta = (meta[0] if meta else '0', str(g), str(b))
+                    extracted.append({
+                        "state": state,
+                        "meta_state": meta,
+                        "class_name": cls_name,
+                    })
+                else:
+                    logger.debug(
+                        f"VLM cache layer {i} ({type(layer_cache).__name__}) "
+                        f"lacks state/meta_state — skipping"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to extract VLM cache state from layer {i}: {e}")
+
+        if extracted:
+            logger.debug(
+                f"VLM cache extraction: {len(extracted)}/{len(raw_cache)} layers"
+            )
+
+        return extracted
+
+    def _get_stop_tokens(self) -> Set[int]:
+        """Get stop token IDs from tokenizer.
+
+        Also checks the model config registry for additional eos_tokens
+        (e.g., Gemma 4 uses <turn|> as end-of-turn alongside <eos>).
+        """
+        stop_tokens = set()
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
+
+        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            if isinstance(tokenizer.eos_token_id, list):
+                stop_tokens.update(tokenizer.eos_token_id)
+            else:
+                stop_tokens.add(tokenizer.eos_token_id)
+
+        if hasattr(tokenizer, "eos_token_ids") and tokenizer.eos_token_ids is not None:
+            if isinstance(tokenizer.eos_token_ids, (list, set, tuple)):
+                stop_tokens.update(tokenizer.eos_token_ids)
+            else:
+                stop_tokens.add(tokenizer.eos_token_ids)
+
+        # Add extra eos_tokens from model config registry.
+        # Includes ALL entries, not just [1:] — for MLLM models the
+        # tokenizer is loaded by mlx_vlm without the LLM-path eos override,
+        # so index 0 may NOT already be set on the tokenizer. Gemma 3 / 3n
+        # specifically: registry puts `<end_of_turn>` at index 0 but the
+        # tokenizer's built-in eos_token_id is `<eos>`, so without this
+        # the model loops emitting `<end_of_turn>` forever. Set semantics
+        # makes duplicates a no-op.
+        model_name = getattr(tokenizer, 'name_or_path', None)
+        if model_name:
+            try:
+                from .model_config_registry import get_model_config_registry
+                registry = get_model_config_registry()
+                model_config = registry.lookup(model_name)
+                if model_config.eos_tokens:
+                    for eos_str in model_config.eos_tokens:
+                        try:
+                            ids = tokenizer.encode(eos_str, add_special_tokens=False)
+                            if len(ids) == 1:
+                                stop_tokens.add(ids[0])
+                                logger.debug(f"Added extra stop token: {eos_str!r} → {ids[0]}")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        return stop_tokens
+
+    def _ensure_batch_generator(
+        self, sampling_params: Optional[SamplingParams] = None
+    ) -> None:
+        """Ensure batch generator exists with compatible sampling parameters.
+
+        If sampling_params differ from the current generator's settings,
+        the generator is recreated (unless active requests prevent it).
+
+        On recreation, clears ALL 3 cache tiers (paged, memory-aware, legacy)
+        because cache objects contain tensor references tied to the old generator.
+        Passes all cache objects and quantization settings to the new generator.
+        """
+        from .sampling import make_sampler
+
+        # If no sampling params provided and generator exists, keep current
+        if sampling_params is None and self.batch_generator is not None:
+            return
+
+        # Use provided params or sensible defaults
+        temp = sampling_params.temperature if sampling_params else 0.7
+        top_p = sampling_params.top_p if sampling_params else 0.9
+        top_k = sampling_params.top_k if sampling_params else 0
+        min_p = sampling_params.min_p if sampling_params else 0.0
+        rep_penalty = sampling_params.repetition_penalty if sampling_params else 1.0
+
+        new_params = (temp, top_p, top_k, min_p, rep_penalty)
+
+        if self.batch_generator is not None:
+            if self._current_sampler_params != new_params:
+                # Sampling params changed — update the generator's default sampler
+                # in place instead of recreating. Per-request samplers (via
+                # _make_request_sampler) override this anyway, so this only
+                # affects requests without explicit sampling params.
+                # This avoids clearing all caches on temperature changes.
+                self.batch_generator.sampler = make_sampler(
+                    temp=temp, top_p=top_p, min_p=min_p, top_k=top_k
+                )
+                self._current_sampler_params = new_params
+                logger.debug(
+                    f"Updated MLLM default sampler: temp={temp}, top_p={top_p}, "
+                    f"top_k={top_k}, min_p={min_p}"
+                )
+            return
+
+        sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+
+        self.batch_generator = MLLMBatchGenerator(
+            model=self.model,
+            processor=self.processor,
+            max_tokens=self.config.default_max_tokens,
+            stop_tokens=self.stop_tokens,
+            sampler=sampler,
+            prefill_batch_size=self.config.prefill_batch_size,
+            completion_batch_size=self.config.completion_batch_size,
+            prefill_step_size=self.config.prefill_step_size,
+            enable_vision_cache=self.config.enable_vision_cache,
+            vision_cache_size=self.config.vision_cache_size,
+            paged_cache_manager=self.paged_cache_manager,
+            block_aware_cache=self.block_aware_cache,
+            memory_aware_cache=self.memory_aware_cache,
+            prefix_cache=self.prefix_cache,
+            disk_cache=self.disk_cache,
+            kv_cache_bits=self._kv_cache_bits,
+            kv_cache_group_size=self._kv_cache_group_size,
+            ssm_state_cache_size=self.config.ssm_state_cache_size,
+            ssm_state_cache_max_mb=self.config.ssm_state_cache_max_mb,
+            ssm_state_disk_store=self._ssm_companion_disk_store,
+            ssm_state_cache_model_key=self._ssm_companion_model_key,
+            enable_prefix_cache=self.config.enable_prefix_cache,
+            uses_zaya_cache=self._uses_zaya_cache,
+            mixed_attention_cache_model=self._mixed_attention_cache_model,
+        )
+        self._current_sampler_params = new_params
+
+    def _prefill_for_prompt_only_cache(self, tokens: List[int]) -> Optional[List[Any]]:
+        """Run clean text-only prompt prefill for cache warm endpoint."""
+        if not tokens:
+            return None
+        self._ensure_batch_generator()
+        if self.batch_generator is None:
+            return None
+        return self.batch_generator._prefill_for_clean_path_dependent_cache(tokens)
+
+    # ========== Sync API (step-based) ==========
+
+    def add_request(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+        videos: Optional[List[str]] = None,
+        audio: Optional[List[Any]] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        request_id: Optional[str] = None,
+        stop: Optional[List[str]] = None,
+        **kwargs,
+    ) -> str:
+        """
+        Add a multimodal request to the scheduler (sync version).
+
+        Args:
+            prompt: Text prompt (should be formatted with chat template)
+            images: List of image inputs (paths, URLs, base64)
+            videos: List of video inputs
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            request_id: Optional custom request ID
+            stop: Stop sequences (string patterns)
+            **kwargs: Additional generation parameters
+
+        Returns:
+            Request ID for tracking
+        """
+        if request_id is None:
+            request_id = str(uuid.uuid4())
+
+        # H2: Guard against excessive images causing Metal OOM
+        if images and len(images) > self.config.max_images_per_request:
+            raise ValueError(
+                f"Request contains {len(images)} images, exceeding the limit of "
+                f"{self.config.max_images_per_request}. Reduce image count or increase "
+                f"max_images_per_request in config."
+            )
+
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=kwargs.get("top_k", 0),
+            min_p=kwargs.get("min_p", 0.0),
+            repetition_penalty=kwargs.get("repetition_penalty", 1.0),
+            stop=stop or [],
+            stop_token_ids=kwargs.get("stop_token_ids", []),
+        )
+
+        request = MLLMRequest(
+            request_id=request_id,
+            prompt=prompt,
+            images=images,
+            videos=videos,
+            audio=audio,
+            sampling_params=sampling_params,
+            video_fps=kwargs.get("video_fps"),
+            video_max_frames=kwargs.get("video_max_frames"),
+        )
+        request.extra_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if isinstance(key, str) and key.startswith("_vmlx_")
+        }
+        if "enable_thinking" in kwargs:
+            request.enable_thinking = kwargs.get("enable_thinking")
+        _max_prompt_tokens = int(kwargs.get("max_prompt_tokens", 0) or 0)
+        if _max_prompt_tokens > 0:
+            request._max_prompt_tokens = _max_prompt_tokens
+            if not images and not videos and not audio:
+                tokenizer = getattr(self.processor, "tokenizer", self.processor)
+                try:
+                    token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                except TypeError:
+                    token_ids = tokenizer.encode(prompt)
+                if len(token_ids) > _max_prompt_tokens:
+                    raise PromptTooLongError(
+                        len(token_ids),
+                        _max_prompt_tokens,
+                        source="tokenized VLM text prompt",
+                        request_id=request_id,
+                    )
+        # Mark multi-turn requests for cache skip heuristic.
+        # num_messages > 2 means at least system + user + assistant history.
+        request._has_history = kwargs.get("num_messages", 1) > 2
+
+        # Attach gen_prompt_len for prefix cache key stripping.
+        # Strips generation prompt tokens (e.g., <|im_start|>assistant\n<think>\n)
+        # from the paged cache block hash to enable multi-turn cache hits.
+        _gpl = kwargs.get("gen_prompt_len", 0)
+        if _gpl > 0:
+            request._gen_prompt_len = _gpl
+
+        # Per-request cache bypass (cache_salt / skip_prefix_cache). When set,
+        # the MLLM scheduler will skip EVERY prefix cache layer — paged,
+        # memory-aware, legacy, disk L2, block disk, SSM companion, and the
+        # multimodal vision / pixel_values caches.
+        if kwargs.get("bypass_prefix_cache", False):
+            request._bypass_prefix_cache = True
+
+        with self._queue_lock:
+            if request_id in self.requests:
+                raise ValueError(f"Request {request_id} already exists")
+            self.requests[request_id] = request
+            self.waiting.append(request)
+
+        logger.debug(
+            f"Added MLLM request {request_id}: "
+            f"{len(images or [])} images, {len(videos or [])} videos"
+        )
+
+        return request_id
+
+    def abort_request(self, request_id: str) -> bool:
+        """
+        Abort a request.
+
+        Args:
+            request_id: The request ID to abort
+
+        Returns:
+            True if request was found and aborted
+        """
+        with self._queue_lock:
+            request = self.requests.pop(request_id, None)
+            if request is None:
+                return False
+
+            # Remove from waiting queue
+            if request.status == RequestStatus.WAITING:
+                try:
+                    self.waiting.remove(request)
+                except ValueError:
+                    pass
+
+            # DEFER batch generator removal to prevent Metal assertion crash.
+            # Client disconnects can happen while Metal command buffers are
+            # in-flight. Calling remove() immediately would touch cache
+            # tensors mid-computation. Instead, mark for deferred cleanup
+            # which runs after the current Metal computation completes.
+            if request_id in self.request_id_to_uid:
+                if not hasattr(self, '_pending_aborts'):
+                    self._pending_aborts = set()
+                self._pending_aborts.add(request_id)
+                # Don't remove UID mappings here — done in deferred processing
+
+            if request_id in self.running:
+                del self.running[request_id]
+
+            # Clean up paged cache block tables (prevent leak)
+            # Use delete_block_table on abort so ref_counts are decremented
+            if self.block_aware_cache is not None:
+                self.block_aware_cache._request_tables.pop(request_id, None)
+                if self.paged_cache_manager is not None:
+                    self.paged_cache_manager.delete_block_table(request_id)
+
+            # Clean up streaming detokenizer
+            self._cleanup_detokenizer(request_id)
+
+            # Clear extracted cache GC reference
+            request._extracted_cache = None
+
+            # Mark as aborted
+            request.status = RequestStatus.FINISHED_ABORTED
+            self.finished_req_ids.add(request_id)
+
+            # Signal output queue (inside lock to prevent race with queue cleanup)
+            if request_id in self.output_queues:
+                try:
+                    self.output_queues[request_id].put_nowait(None)
+                except asyncio.QueueFull:
+                    # Force-deliver sentinel to prevent stream_outputs hang
+                    try:
+                        self.output_queues[request_id].get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    try:
+                        self.output_queues[request_id].put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass
+
+        # Free Metal memory when all requests done
+        if not self.running:
+            clear_mlx_memory_cache(log=logger)
+
+        logger.debug(f"Aborted request {request_id}")
+        return True
+
+    def has_requests(self) -> bool:
+        """Check if there are any pending or running requests."""
+        return bool(self.waiting or self.running)
+
+    def get_num_waiting(self) -> int:
+        """Get number of waiting requests."""
+        return len(self.waiting)
+
+    def get_num_running(self) -> int:
+        """Get number of running requests."""
+        return len(self.running)
+
+    def _schedule_waiting(self) -> List[MLLMRequest]:
+        """
+        Move requests from waiting queue to running.
+
+        Returns:
+            List of requests that were scheduled
+        """
+        # Use first waiting request's sampling params to configure the generator
+        first_params = self.waiting[0].sampling_params if self.waiting else None
+        self._ensure_batch_generator(first_params)
+
+        scheduled = []
+        batch_requests = []
+
+        while self.waiting and len(self.running) < self.config.max_num_seqs:
+            # Memory-pressure guard: don't admit new requests if GPU memory is critically low
+            try:
+                active_mem, max_mem = get_effective_metal_working_set_bytes(mx)
+                guard_threshold = get_metal_ws_guard_threshold()
+                if active_mem > 0 and len(self.running) > 0:
+                    if max_mem > 0 and (active_mem / max_mem * 100.0) >= guard_threshold:
+                        logger.debug(
+                            "Memory pressure (%.1fGB / %.1fGB = %.0f%%), "
+                            "deferring new request admission",
+                            active_mem / 1e9,
+                            max_mem / 1e9,
+                            active_mem / max_mem * 100.0,
+                        )
+                        break
+            except Exception:
+                pass  # Metal API not available — skip check
+
+            request = self.waiting.popleft()
+
+            # Create batch request
+            batch_req = MLLMBatchRequest(
+                uid=-1,  # Will be assigned by batch generator
+                request_id=request.request_id,
+                prompt=request.prompt,
+                images=request.images,
+                videos=request.videos,
+                audio=request.audio,
+                max_tokens=request.sampling_params.max_tokens,
+                temperature=request.sampling_params.temperature,
+                top_p=request.sampling_params.top_p,
+                top_k=request.sampling_params.top_k,
+                min_p=request.sampling_params.min_p,
+                repetition_penalty=request.sampling_params.repetition_penalty,
+                max_prompt_tokens=int(getattr(request, "_max_prompt_tokens", 0) or 0),
+                enable_thinking=getattr(request, "enable_thinking", None),
+                video_fps=request.video_fps,
+                video_max_frames=request.video_max_frames,
+            )
+            if request.extra_kwargs:
+                batch_req.extra_kwargs.update(request.extra_kwargs)
+            # Forward gen_prompt_len so the batch generator can strip it
+            # from cache fetch keys to match the store key (which also strips).
+            _gpl = getattr(request, '_gen_prompt_len', 0)
+            if _gpl > 0:
+                batch_req._gen_prompt_len = _gpl
+            if getattr(request, '_bypass_prefix_cache', False):
+                batch_req._bypass_prefix_cache = True
+            if request.sampling_params.stop:
+                batch_req._stop_strings = list(request.sampling_params.stop)
+            batch_requests.append(batch_req)
+
+            request.status = RequestStatus.RUNNING
+            self.running[request.request_id] = request
+            # NOTE: prompt token count is NOT known yet at scheduling time
+            # (it comes from batch generator's first response).
+            # Tracking is done at request finish time instead.
+            scheduled.append(request)
+
+        # Merge per-request stop_token_ids into batch generator stop tokens.
+        # Track per-request additions so they can be removed on cleanup
+        # (prevents stop tokens leaking across unrelated requests).
+        if batch_requests and self.batch_generator is not None:
+            for request in scheduled:
+                if request.sampling_params.stop_token_ids:
+                    new_tokens = set(request.sampling_params.stop_token_ids)
+                    self.batch_generator.stop_tokens.update(new_tokens)
+                    request._added_stop_tokens = new_tokens
+            uids = self.batch_generator.insert(batch_requests)
+
+            for uid, request in zip(uids, scheduled):
+                self.request_id_to_uid[request.request_id] = uid
+                self.uid_to_request_id[uid] = request.request_id
+                request.batch_uid = uid
+
+                logger.debug(f"Scheduled request {request.request_id} (uid={uid})")
+
+        return scheduled
+
+    def _process_batch_responses(
+        self, responses: List[MLLMBatchResponse]
+    ) -> Tuple[List[RequestOutput], Set[str]]:
+        """
+        Process responses from batch generator.
+
+        Args:
+            responses: List of MLLMBatchResponse objects
+
+        Returns:
+            Tuple of (outputs, finished_request_ids)
+        """
+        outputs = []
+        finished_ids = set()
+
+        tokenizer = (
+            self.processor.tokenizer
+            if hasattr(self.processor, "tokenizer")
+            else self.processor
+        )
+
+        def _has_pending_gen_prefix(req: MLLMRequest, resp: MLLMBatchResponse) -> bool:
+            if hasattr(req, "_gen_prefix_tokens"):
+                return bool(getattr(req, "_gen_prefix_tokens", None))
+            return bool(getattr(resp, "gen_prefix_tokens", None) or [])
+
+        def _can_coalesce(req: MLLMRequest, resp: MLLMBatchResponse) -> bool:
+            if getattr(req.sampling_params, "stop", None):
+                return False
+            if _has_pending_gen_prefix(req, resp):
+                return False
+            if resp.finish_reason == "error" or getattr(resp, "error", None):
+                return False
+            if getattr(resp, "logprobs", None) is not None:
+                return False
+            return True
+
+        def _coalesce_until(start: int, req: MLLMRequest, uid: int) -> int:
+            end = start
+            while end < len(responses):
+                candidate = responses[end]
+                if candidate.uid != uid:
+                    break
+                if not _can_coalesce(req, candidate):
+                    break
+                end += 1
+                if candidate.finish_reason is not None:
+                    break
+            return end
+
+        def _process_coalesced(
+            request_id: str,
+            request: MLLMRequest,
+            burst: List[MLLMBatchResponse],
+        ) -> RequestOutput:
+            for resp in burst:
+                cache_extra_keys = getattr(resp, "cache_extra_keys", None)
+                if cache_extra_keys:
+                    request._cache_extra_keys = dict(cache_extra_keys)
+
+            if request.num_prompt_tokens == 0:
+                for resp in burst:
+                    prompt_ids = getattr(resp, "prompt_token_ids", None)
+                    if prompt_ids:
+                        request.num_prompt_tokens = len(prompt_ids)
+                        break
+
+            tokens = [int(resp.token) for resp in burst]
+            request.output_tokens.extend(tokens)
+            request.num_output_tokens = len(request.output_tokens)
+
+            detok = self._get_detokenizer(request_id, tokenizer)
+            for resp in burst:
+                if resp.finish_reason != "stop":
+                    detok.add_token(resp.token)
+            new_text = detok.last_segment
+
+            finish_response = next(
+                (resp for resp in reversed(burst) if resp.finish_reason is not None),
+                None,
+            )
+            response_for_usage = finish_response or burst[-1]
+            output = RequestOutput(
+                request_id=request_id,
+                new_token_ids=tokens,
+                new_text=new_text,
+                output_token_ids=list(request.output_tokens),
+                prompt_tokens=request.num_prompt_tokens,
+                completion_tokens=request.num_output_tokens,
+                cached_tokens=max(
+                    int(getattr(resp, "cached_tokens", 0) or 0) for resp in burst
+                ),
+                cache_detail=(
+                    next(
+                        (
+                            getattr(resp, "cache_detail", "")
+                            for resp in reversed(burst)
+                            if getattr(resp, "cache_detail", "")
+                        ),
+                        "",
+                    )
+                    or ""
+                ),
+            )
+
+            if finish_response is not None:
+                if getattr(finish_response, "prompt_cache", None) is not None:
+                    request._extracted_cache = finish_response.prompt_cache
+                    request._extracted_tokens = getattr(
+                        finish_response, "prompt_token_ids", []
+                    )
+                else:
+                    logger.info(
+                        "VLM finish response for %s had no prompt_cache "
+                        "(finish_reason=%s, prompt_tokens=%d); prefix cache "
+                        "store will be skipped",
+                        request_id,
+                        finish_response.finish_reason,
+                        len(getattr(finish_response, "prompt_token_ids", []) or []),
+                    )
+
+                finish_reason = finish_response.finish_reason
+                if finish_reason == "stop":
+                    request.status = RequestStatus.FINISHED_STOPPED
+                elif finish_reason == "length":
+                    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+                output.finished = True
+                output.finish_reason = finish_reason
+                detok.finalize()
+                output.output_text = detok.text
+                request.output_text = output.output_text
+                request.finish_reason = finish_reason
+
+                self.total_prompt_tokens += request.num_prompt_tokens
+                self.total_completion_tokens += request.num_output_tokens
+                self.num_requests_processed += 1
+                self._record_cache_hit(response_for_usage, request)
+
+            return output
+
+        idx = 0
+        while idx < len(responses):
+            response = responses[idx]
+            request_id = self.uid_to_request_id.get(response.uid)
+            if request_id is None:
+                idx += 1
+                continue
+
+            request = self.running.get(request_id)
+            if request is None:
+                idx += 1
+                continue
+
+            coalesced_end = _coalesce_until(idx, request, response.uid)
+            if coalesced_end - idx > 1:
+                output = _process_coalesced(
+                    request_id,
+                    request,
+                    responses[idx:coalesced_end],
+                )
+                outputs.append(output)
+                if output.finished:
+                    finished_ids.add(request_id)
+                idx = coalesced_end
+                continue
+
+            cache_extra_keys = getattr(response, "cache_extra_keys", None)
+            if cache_extra_keys:
+                request._cache_extra_keys = dict(cache_extra_keys)
+
+            # Set prompt token count from first response (batch generator knows actual count)
+            if request.num_prompt_tokens == 0:
+                prompt_ids = getattr(response, "prompt_token_ids", None)
+                if prompt_ids:
+                    request.num_prompt_tokens = len(prompt_ids)
+
+            # Append token to request
+            request.output_tokens.append(response.token)
+            request.num_output_tokens = len(request.output_tokens)
+
+            # vmlx#reasoning-leak-2026-04-21: thinking-capable models
+            # (Qwen 3.6 / Gemma 4 / MiniMax / Nemotron Cascade) occasionally
+            # re-emit the generation prefix (<|im_start|>assistant\n<think>\n
+            # or equivalent) as their first output tokens on multi-turn when
+            # prior assistant history arrives without a reasoning_content
+            # wrapper. The model predicts position L+1..L+gpl as if it were
+            # starting a fresh turn from scratch.
+            #
+            # Detection: compare the first `gen_prompt_len` output tokens
+            # against the prompt's trailing `gen_prompt_len` tokens. When they
+            # match exactly, the model is echoing its own prompt suffix and we
+            # suppress those tokens from the output stream. Once a divergence
+            # or `gen_prompt_len` matches consume, pass-through resumes.
+            #
+            # Skip the check entirely when: no gen-prefix was captured, we've
+            # already passed the prefix window, or the request opted out of
+            # suppression (e.g. because divergence was detected mid-window).
+            # On the first response the gen-prefix arrives from the batch
+            # generator via `response.gen_prefix_tokens`; we snapshot it onto
+            # the SchedulerRequest so subsequent tokens can consult the same
+            # list without re-fetching from the response object.
+            if not hasattr(request, "_gen_prefix_tokens"):
+                request._gen_prefix_tokens = list(
+                    getattr(response, "gen_prefix_tokens", None) or []
+                )
+            _gen_prefix = request._gen_prefix_tokens
+            _skip_this_token = False
+            if _gen_prefix:
+                _out_idx = request.num_output_tokens - 1  # 0-based index of this token
+                if _out_idx < len(_gen_prefix):
+                    _expected = _gen_prefix[_out_idx]
+                    if response.token == _expected:
+                        # Re-emitted prefix — suppress
+                        _skip_this_token = True
+                        if _out_idx == 0:
+                            logger.info(
+                                f"Request {request_id}: suppressing re-emitted "
+                                f"gen-prefix ({len(_gen_prefix)} tokens, model "
+                                f"echoed prompt suffix on multi-turn)"
+                            )
+                    else:
+                        # Divergence inside the window — mark as non-echo so
+                        # subsequent tokens are treated normally.
+                        request._gen_prefix_tokens = []
+
+            # Use streaming detokenizer for correct multi-byte char handling
+            detok = self._get_detokenizer(request_id, tokenizer)
+
+            # Check if this is a stop token BEFORE adding to detokenizer
+            # so stop tokens (e.g. <|im_end|>) don't leak into new_text
+            is_stop = response.finish_reason == "stop"
+            string_stop_truncate = -1  # >=0 when string stop matched
+
+            if _skip_this_token:
+                # Token consumed by gen-prefix suppression; no delta to emit
+                new_text = ""
+            elif not is_stop:
+                detok.add_token(response.token)
+                new_text = detok.last_segment
+
+                # Post-decode string stop sequence check.
+                # MLLMBatchGenerator only handles EOS stop tokens;
+                # string stop sequences need decoded-text matching.
+                # Skip matching inside <think> blocks — reasoning content
+                # should not trigger user-specified stop sequences.
+                if request.sampling_params.stop:
+                    full_text = detok.text
+                    # Skip matching inside unclosed <think> blocks
+                    in_think = '<think>' in full_text and '</think>' not in full_text.split('<think>')[-1]
+                    if not in_think:
+                        max_stop_len = max(len(s) for s in request.sampling_params.stop)
+                        search_start = max(0, len(full_text) - len(new_text) - max_stop_len + 1)
+                        last_think_end = full_text.rfind('</think>')
+                        if last_think_end >= 0:
+                            search_start = max(search_start, last_think_end + len('</think>'))
+                        for stop_str in request.sampling_params.stop:
+                            idx = full_text.find(stop_str, search_start)
+                            if idx >= 0:
+                                string_stop_truncate = idx
+                                new_text = ""
+                                break
+            else:
+                new_text = ""
+
+            # Create output
+            output = RequestOutput(
+                request_id=request_id,
+                new_token_ids=[response.token],
+                new_text=new_text,
+                output_token_ids=list(request.output_tokens),
+                prompt_tokens=request.num_prompt_tokens,
+                completion_tokens=request.num_output_tokens,
+                cached_tokens=getattr(response, 'cached_tokens', 0),
+                cache_detail=getattr(response, 'cache_detail', "") or "",
+            )
+
+            # Determine effective finish reason (string stop overrides)
+            finish_reason = response.finish_reason
+            if string_stop_truncate >= 0:
+                finish_reason = "stop"
+
+            # Check if finished
+            if finish_reason is not None:
+                if getattr(response, "prompt_cache", None) is not None:
+                    request._extracted_cache = response.prompt_cache
+                    request._extracted_tokens = getattr(response, "prompt_token_ids", [])
+                else:
+                    logger.info(
+                        "VLM finish response for %s had no prompt_cache "
+                        "(finish_reason=%s, prompt_tokens=%d); prefix cache "
+                        "store will be skipped",
+                        request_id,
+                        finish_reason,
+                        len(getattr(response, "prompt_token_ids", []) or []),
+                    )
+
+                if finish_reason == "stop":
+                    request.status = RequestStatus.FINISHED_STOPPED
+                elif finish_reason == "length":
+                    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                elif finish_reason == "error":
+                    # Issue #56 Bug 1: surface batched prefill failures as a
+                    # distinct status. Falls back to FINISHED_STOPPED if the
+                    # status enum doesn't have an error variant (older builds).
+                    request.status = getattr(
+                        RequestStatus, "FINISHED_ERROR", RequestStatus.FINISHED_STOPPED
+                    )
+                    # Attach error detail on the request so the async output
+                    # consumer / server.py can raise it as an HTTPException
+                    # instead of a silent 200 with empty content.
+                    _err = getattr(response, "error", None)
+                    if _err:
+                        request._prefill_error = _err
+                        output.error = _err
+                    _err_code = getattr(response, "error_code", None)
+                    if _err_code:
+                        output.error_code = _err_code
+                        output.error_prompt_tokens = getattr(
+                            response, "error_prompt_tokens", None
+                        )
+                        output.error_max_prompt_tokens = getattr(
+                            response, "error_max_prompt_tokens", None
+                        )
+                        output.error_source = getattr(response, "error_source", None)
+
+                output.finished = True
+                output.finish_reason = finish_reason
+                finished_ids.add(request_id)
+
+                # Finalize detokenizer and use its complete text
+                detok.finalize()
+                if string_stop_truncate >= 0:
+                    output.output_text = detok.text[:string_stop_truncate]
+                else:
+                    output.output_text = detok.text
+                request.output_text = output.output_text
+                request.finish_reason = finish_reason
+
+                # For string stop: tell batch generator to stop generating
+                if string_stop_truncate >= 0 and self.batch_generator is not None:
+                    uid = request.batch_uid
+                    if uid is not None:
+                        try:
+                            self.batch_generator.remove([uid])
+                        except Exception:
+                            pass
+
+                self.total_prompt_tokens += request.num_prompt_tokens
+                self.total_completion_tokens += request.num_output_tokens
+                self.num_requests_processed += 1
+                self._record_cache_hit(response, request)
+
+                logger.debug(
+                    f"Request {request_id} finished: {finish_reason}, "
+                    f"prompt={request.num_prompt_tokens}, "
+                    f"completion={request.num_output_tokens} tokens"
+                )
+
+            outputs.append(output)
+            idx += 1
+
+        return outputs, finished_ids
+
+    def _record_cache_hit(self, response: MLLMBatchResponse, request: MLLMRequest) -> None:
+        """Aggregate per-request cache hits for /v1/cache/stats and /health.
+
+        MLLM responses already expose cached_tokens in per-request API usage.
+        Keep scheduler-level telemetry in sync so the panel and release gates
+        do not report "0 cached tokens" while the response usage proves a hit.
+        """
+        if getattr(request, "_cache_hit_recorded", False):
+            return
+        try:
+            cached_tokens = int(getattr(response, "cached_tokens", 0) or 0)
+        except Exception:
+            cached_tokens = 0
+        request._cached_tokens = cached_tokens
+        if cached_tokens <= 0:
+            request._cache_hit_recorded = True
+            return
+        detail = str(
+            getattr(response, "cache_detail", "")
+            or getattr(request, "_cache_detail", "")
+            or "unknown"
+        )
+        self._cache_hit_requests += 1
+        self._cache_hit_tokens += cached_tokens
+        self._cache_hit_tokens_by_detail[detail] = (
+            self._cache_hit_tokens_by_detail.get(detail, 0) + cached_tokens
+        )
+        execution = getattr(request, "_cache_execution", None)
+        if isinstance(execution, dict):
+            execution["cache_detail"] = detail
+        batch_stats = getattr(getattr(self, "batch_generator", None), "_stats", None)
+        batch_execution = getattr(batch_stats, "last_cache_execution", None)
+        if isinstance(batch_execution, dict):
+            batch_execution["cache_detail"] = detail
+            if batch_stats is not None:
+                batch_stats.last_cache_execution = dict(batch_execution)
+        request._cache_hit_recorded = True
+
+    def _cleanup_finished(self, finished_ids: Set[str]) -> None:
+        """Clean up finished requests and store KV cache for future prefix reuse.
+
+        For each finished request, this method:
+        1. Stores the extracted KV cache via the active cache tier (paged,
+           memory-aware, or legacy) with optional disk L2 write and quantization.
+        2. Cleans up the streaming detokenizer.
+        3. Removes from running dict, UID mappings, paged cache tracking.
+        4. Removes from master requests dict to free output_tokens/cache refs.
+        5. Triggers Metal GC when all requests done.
+
+        The _extracted_cache and _extracted_tokens attributes are set on the
+        MLLMRequest by _process_batch_responses() during step(). They are always
+        set to None in a finally block after store to prevent memory leaks.
+        """
+        trace_enabled = _mllm_scheduler_trace_enabled()
+        trace_last = time.perf_counter() if trace_enabled else 0.0
+        cleanup_trace: Dict[str, float] = {}
+
+        def _trace_mark(name: str) -> None:
+            nonlocal trace_last
+            if not trace_enabled:
+                return
+            now = time.perf_counter()
+            cleanup_trace[name] = cleanup_trace.get(name, 0.0) + max(
+                now - trace_last, 0.0
+            )
+            trace_last = now
+
+        # Snapshot stop tokens from requests that will survive this cleanup.
+        # This prevents reading from self.running during the loop (it's mutated per iteration).
+        _surviving_stops = set()
+        for rid, req in self.running.items():
+            if rid not in finished_ids:
+                _surviving_stops.update(getattr(req, '_added_stop_tokens', set()))
+        _trace_mark("snapshot_s")
+
+        for request_id in finished_ids:
+            request = self.running.get(request_id)
+
+            # Cacheability is decided by the prompt prefix, not by output
+            # length. A first chat turn can produce a one-token answer and
+            # still be the exact prefix needed by turn 2; skipping that store
+            # makes MLLM routes semantically coherent but forces full
+            # re-prefill and reports cached_tokens=0 on multi-turn chats.
+            # Benchmarks that legitimately need fresh execution use the
+            # explicit cache_salt / skip_prefix_cache bypass below.
+            _output_len = getattr(request, 'num_output_tokens', 0) if request else 0
+            _skip_cache_store = False
+            # Hard bypass from cache_salt / skip_prefix_cache — overrides
+            # normal cache storage and suppresses every store site.
+            if request is not None and getattr(request, '_bypass_prefix_cache', False):
+                _skip_cache_store = True
+            if _skip_cache_store:
+                logger.debug(
+                    f"Skipping cache store for {request_id}: "
+                    f"output_len={_output_len}, explicit prefix-cache bypass"
+                )
+                if request is not None:
+                    request._extracted_cache = None
+            if trace_enabled:
+                logger.info(
+                    "VMLINUX_MLLM_CLEANUP_STATE request_id=%s request_present=%s "
+                    "block_cache=%s skip_store=%s extracted_cache=%s "
+                    "extracted_tokens=%d prompt_tokens=%d completion_tokens=%d",
+                    request_id,
+                    request is not None,
+                    self.block_aware_cache is not None,
+                    _skip_cache_store,
+                    bool(
+                        request is not None
+                        and getattr(request, "_extracted_cache", None) is not None
+                    ),
+                    len(getattr(request, "_extracted_tokens", []) or [])
+                    if request is not None
+                    else 0,
+                    int(getattr(request, "num_prompt_tokens", 0) or 0)
+                    if request is not None
+                    else 0,
+                    int(getattr(request, "num_output_tokens", 0) or 0)
+                    if request is not None
+                    else 0,
+                )
+
+            # --- Cache store: paged path ---
+            if self.block_aware_cache is not None and not _skip_cache_store:
+                if request is not None and getattr(request, "_extracted_cache", None) is not None:
+                    try:
+                        token_list = getattr(request, "_extracted_tokens", [])
+                        if token_list:
+                            media_context = self._mllm_request_has_media_cache_context(
+                                request, token_list
+                            )
+                            media_cache_allowed = (
+                                media_context
+                                and self._mllm_media_prefix_cache_allowed(
+                                    request, token_list
+                                )
+                            )
+                            if media_context and not media_cache_allowed:
+                                logger.info(
+                                    "Skipping VLM prefix cache store for %s: "
+                                    "prompt contains media context/placeholders; "
+                                    "media embeddings are path-dependent and "
+                                    "must not be rebuilt from text-only tokens",
+                                    request_id,
+                                )
+                                request._extracted_cache = None
+                            prompt_len = len(token_list)
+                            truncated_tokens = (
+                                token_list[: prompt_len - 1]
+                                if prompt_len > 1
+                                else list(token_list)
+                            )
+                            cached_tokens = int(
+                                getattr(request, "_cached_tokens", 0) or 0
+                            )
+                            _uses_zaya_cache = bool(
+                                getattr(self, "_uses_zaya_cache", False)
+                            )
+                            _uses_mixed_attention_cache = bool(
+                                getattr(self, "_mixed_attention_cache_model", False)
+                            )
+                            raw_for_layout = request._extracted_cache
+                            if callable(raw_for_layout):
+                                try:
+                                    raw_for_layout = raw_for_layout()
+                                    request._extracted_cache = raw_for_layout
+                                except Exception:
+                                    raw_for_layout = None
+                            if (
+                                not _uses_mixed_attention_cache
+                                and isinstance(raw_for_layout, list)
+                                and any(
+                                    type(layer).__name__ == "RotatingKVCache"
+                                    for layer in raw_for_layout
+                                )
+                            ):
+                                _uses_mixed_attention_cache = True
+                                logger.info(
+                                    "Detected mixed-SWA VLM cache layout for %s "
+                                    "from extracted RotatingKVCache layers; using "
+                                    "clean prompt-boundary store",
+                                    request_id,
+                                )
+                            if truncated_tokens and cached_tokens >= len(truncated_tokens):
+                                logger.debug(
+                                    "Skipping VLM paged cache store for %s: "
+                                    "cached prefix already covers %d/%d cache-key tokens",
+                                    request_id,
+                                    cached_tokens,
+                                    len(truncated_tokens),
+                                )
+                                cache_blocks = None
+                                request._extracted_cache = None
+                            else:
+                                raw = request._extracted_cache
+                                if raw is None:
+                                    cache_blocks = None
+                                elif _uses_zaya_cache or _uses_mixed_attention_cache:
+                                    # ZAYA CCA and Gemma-style mixed-SWA caches are
+                                    # path-dependent. ZAYA conv_state/prev_hs and
+                                    # RotatingKVCache windows cannot be recovered
+                                    # safely from post-generation state. Re-prefill
+                                    # exactly the N-1 cache key and store that clean
+                                    # typed state. If the clean prefill is
+                                    # unavailable, skip the store instead of writing
+                                    # a contaminated hit that later hurts coherence
+                                    # or speed.
+                                    cache_blocks = None
+                                    prefill_fn = getattr(
+                                        self.batch_generator,
+                                        "_prefill_for_clean_path_dependent_cache",
+                                        None,
+                                    )
+                                    if not callable(prefill_fn):
+                                        prefill_fn = getattr(
+                                            self.batch_generator,
+                                            "_prefill_for_clean_ssm",
+                                            None,
+                                        )
+                                    _tight_memory_drain_active = bool(
+                                        getattr(
+                                            self.batch_generator,
+                                            "_tight_memory_prefill_drain",
+                                            False,
+                                        )
+                                    )
+                                    _force_tight_clean_store = os.environ.get(
+                                        "VMLINUX_MLLM_TIGHT_MEMORY_CLEAN_PREFILL_STORE",
+                                        "0",
+                                    ).lower() in {"1", "true", "yes", "on"}
+                                    _tight_clean_store_max_tokens_raw = os.environ.get(
+                                        "VMLINUX_MLLM_TIGHT_MEMORY_CLEAN_PREFILL_STORE_MAX_TOKENS"
+                                    )
+                                    _tight_clean_store_cap_explicit = (
+                                        _tight_clean_store_max_tokens_raw is not None
+                                    )
+                                    try:
+                                        _tight_clean_store_max_tokens = int(
+                                            _tight_clean_store_max_tokens_raw or "128"
+                                        )
+                                    except (TypeError, ValueError):
+                                        _tight_clean_store_max_tokens = 512
+                                    try:
+                                        _safe_headroom_max_tokens = int(
+                                            os.environ.get(
+                                                "VMLINUX_MLLM_TIGHT_MEMORY_CLEAN_PREFILL_SAFE_HEADROOM_MAX_TOKENS",
+                                                "768",
+                                            )
+                                        )
+                                    except (TypeError, ValueError):
+                                        _safe_headroom_max_tokens = 768
+                                    try:
+                                        _safe_headroom_min_gb = float(
+                                            os.environ.get(
+                                                "VMLINUX_MLLM_TIGHT_MEMORY_CLEAN_PREFILL_SAFE_HEADROOM_MIN_GB",
+                                                "8",
+                                            )
+                                        )
+                                    except (TypeError, ValueError):
+                                        _safe_headroom_min_gb = 8.0
+                                    try:
+                                        _active_bytes, _max_ws_bytes = (
+                                            get_effective_metal_working_set_bytes(mx)
+                                        )
+                                    except Exception:
+                                        _active_bytes = 0
+                                        _max_ws_bytes = 0
+                                    _free_bytes = max(
+                                        0,
+                                        int(_max_ws_bytes or 0) - int(_active_bytes or 0),
+                                    )
+                                    _bounded_tight_clean_store = (
+                                        _tight_clean_store_max_tokens > 0
+                                        and prompt_len <= _tight_clean_store_max_tokens
+                                    )
+                                    _safe_headroom_clean_store = (
+                                        _safe_headroom_max_tokens > 0
+                                        and prompt_len <= _safe_headroom_max_tokens
+                                        and (
+                                            not _tight_clean_store_cap_explicit
+                                            or _bounded_tight_clean_store
+                                        )
+                                        and _free_bytes
+                                        >= int(max(0.0, _safe_headroom_min_gb) * 1024**3)
+                                    )
+                                    tight_memory_clean_store_disabled = (
+                                        _uses_mixed_attention_cache
+                                        and _tight_memory_drain_active
+                                        and not _force_tight_clean_store
+                                        and not _bounded_tight_clean_store
+                                        and not _safe_headroom_clean_store
+                                    )
+                                    if tight_memory_clean_store_disabled:
+                                        logger.info(
+                                            "Skipping mixed-SWA VLM paged cache store "
+                                            "for %s: tight-memory clean prompt "
+                                            "prefill disabled to avoid Metal OOM "
+                                            "(prompt_tokens=%d)",
+                                            request_id,
+                                            prompt_len,
+                                        )
+                                    elif truncated_tokens and callable(prefill_fn):
+                                        cache_blocks = prefill_fn(truncated_tokens)
+                                    if cache_blocks is None:
+                                        if _uses_zaya_cache:
+                                            logger.info(
+                                                "Skipping ZAYA VLM paged cache store "
+                                                "for %s: clean zaya_cca_v1 prompt "
+                                                "prefill unavailable",
+                                                request_id,
+                                            )
+                                        else:
+                                            logger.info(
+                                                "Skipping mixed-SWA VLM paged cache store "
+                                                "for %s: clean mixed_swa_kv_v1 prompt "
+                                                "prefill unavailable",
+                                                request_id,
+                                            )
+                                else:
+                                    cache_blocks = raw() if callable(raw) else raw
+                            if cache_blocks is None:
+                                logger.info(
+                                    "Skipping VLM paged cache store for %s: "
+                                    "resolved extracted cache is empty "
+                                    "(mixed_swa=%s, zaya_cca=%s, prompt_tokens=%d, "
+                                    "cache_callable=%s)",
+                                    request_id,
+                                    _uses_mixed_attention_cache,
+                                    _uses_zaya_cache,
+                                    prompt_len,
+                                    callable(getattr(request, "_extracted_cache", None)),
+                                )
+                            else:
+                                if _uses_zaya_cache or _uses_mixed_attention_cache:
+                                    cache_blocks = list(cache_blocks)
+                                else:
+                                    cache_blocks = self._truncate_hybrid_cache(
+                                        cache_blocks, prompt_len
+                                    )
+                                if cache_blocks is None:
+                                    logger.debug(
+                                        f"Cache truncation failed for {request_id}"
+                                    )
+                                elif not self._validate_cache(
+                                    cache_blocks,
+                                    source=f"mllm-paged-store:{request_id}",
+                                ):
+                                    logger.warning(
+                                        f"VLM paged cache store rejected unsafe "
+                                        f"live cache for {request_id}"
+                                    )
+                                else:
+                                    # NOTE: gen_prompt_len is already stripped from _extracted_tokens
+                                    # by the batch generator (_original_token_ids at line 1411-1413).
+                                    # Do NOT strip again here — double stripping collapses the
+                                    # token list to near-zero length.
+                                    # L2: persist to disk before quantization.
+                                    # Skip for hybrid models — the prompt-level disk cache
+                                    # can't reconstruct SSM state on fetch (mllm_batch_generator
+                                    # guards with `if not self._is_hybrid`), so writing is
+                                    # wasted I/O. Block-level disk cache (block_disk_store)
+                                    # still works for hybrid via the paged path.
+                                    if (
+                                        self.disk_cache is not None
+                                        and not self._is_hybrid
+                                        and not media_context
+                                    ):
+                                        try:
+                                            self.disk_cache.store(token_list, cache_blocks)
+                                        except Exception as de:
+                                            logger.debug(f"VLM disk cache store failed for {request_id}: {de}")
+                                    if getattr(self, '_kv_cache_bits', 0):
+                                        cache_blocks = self._quantize_cache_for_storage(cache_blocks)
+                                        if not self._validate_cache(
+                                            cache_blocks,
+                                            source=f"mllm-paged-store-quant:{request_id}",
+                                        ):
+                                            logger.warning(
+                                                f"VLM paged cache store rejected unsafe "
+                                                f"quantized live cache for {request_id}"
+                                            )
+                                            cache_blocks = None
+                                    if cache_blocks is not None:
+                                        cache_states = self._extract_cache_states(cache_blocks)
+                                        if cache_states:
+                                            self.block_aware_cache.store_cache(
+                                                request_id,
+                                                truncated_tokens,
+                                                cache_states,
+                                                cache_extra_keys=(
+                                                    getattr(request, "_cache_extra_keys", None)
+                                                    if media_cache_allowed
+                                                    else None
+                                                ),
+                                            )
+                                            logger.info(
+                                                f"VLM Scheduler stored paged Prefix Cache for "
+                                                f"{request_id}: {len(cache_states)} layers, "
+                                                f"truncated to {len(truncated_tokens)} tokens"
+                                                f"{' with media side-key' if media_cache_allowed else ''}"
+                                            )
+                                        else:
+                                            logger.info(
+                                                "Skipping VLM paged cache store for %s: "
+                                                "extracted cache produced no storable layer states "
+                                                "(raw_layers=%d, prompt_tokens=%d)",
+                                                request_id,
+                                                len(cache_blocks)
+                                                if isinstance(cache_blocks, list)
+                                                else -1,
+                                                prompt_len,
+                                            )
+                        else:
+                            logger.info(
+                                "Skipping VLM paged cache store for %s: "
+                                "finish response had cache but no prompt token ids",
+                                request_id,
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to store VLM paged cache for {request_id}: {e}", exc_info=True)
+                    finally:
+                        if request is not None:
+                            request._extracted_cache = None
+                elif request is not None:
+                    logger.info(
+                        "Skipping VLM paged cache store for %s: no extracted "
+                        "prompt cache on finished request (prompt_tokens=%d, "
+                        "completion_tokens=%d)",
+                        request_id,
+                        int(getattr(request, "num_prompt_tokens", 0) or 0),
+                        int(getattr(request, "num_output_tokens", 0) or 0),
+                    )
+
+            # --- Cache store: memory-aware path ---
+            elif self.memory_aware_cache is not None and not _skip_cache_store:
+                if (
+                    request is not None
+                    and getattr(request, "_extracted_cache", None) is not None
+                    and getattr(request, "_extracted_tokens", None)
+                ):
+                    try:
+                        prompt_tokens = list(request._extracted_tokens)
+                        prompt_len = len(prompt_tokens)
+                        if self._mllm_request_has_media_cache_context(
+                            request, prompt_tokens
+                        ):
+                            logger.info(
+                                "Skipping VLM memory-aware cache store for %s: "
+                                "prompt contains media context/placeholders; "
+                                "media embeddings are path-dependent and "
+                                "must not be saved under a token-only "
+                                "prefix key",
+                                request_id,
+                            )
+                            request._extracted_cache = None
+                        raw_cache = request._extracted_cache
+                        if callable(raw_cache):
+                            raw_cache = raw_cache()
+                        if raw_cache:
+                            cache_to_store = self._truncate_hybrid_cache(raw_cache, prompt_len)
+                            if cache_to_store is not None and self._validate_cache(
+                                cache_to_store,
+                                source=f"mllm-memory-store:{request_id}",
+                            ):
+                                cache_key_tokens = (
+                                    prompt_tokens[:prompt_len - 1]
+                                    if prompt_len > 1
+                                    else list(prompt_tokens)
+                                )
+                                # L2: persist to disk (skip hybrid — SSM can't be reconstructed on fetch)
+                                if self.disk_cache is not None and not self._is_hybrid:
+                                    try:
+                                        self.disk_cache.store(prompt_tokens, cache_to_store)
+                                    except Exception as de:
+                                        logger.debug(f"VLM disk store failed for {request_id}: {de}")
+                                if getattr(self, '_kv_cache_bits', 0):
+                                    cache_to_store = self._quantize_cache_for_storage(cache_to_store)
+                                    if not self._validate_cache(
+                                        cache_to_store,
+                                        source=f"mllm-memory-store-quant:{request_id}",
+                                    ):
+                                        logger.warning(
+                                            f"VLM memory-aware cache store rejected unsafe "
+                                            f"quantized live cache for {request_id}"
+                                        )
+                                        cache_to_store = None
+                                if cache_to_store is not None:
+                                    stored = self.memory_aware_cache.store(cache_key_tokens, cache_to_store)
+                                    if stored:
+                                        logger.info(
+                                            f"VLM stored memory-aware cache for {request_id} "
+                                            f"({len(cache_key_tokens)} cache-key tokens from "
+                                            f"{prompt_len} prompt tokens)"
+                                        )
+                    except Exception as e:
+                        logger.warning(f"VLM memory-aware cache store failed for {request_id}: {e}")
+                    finally:
+                        if request is not None:
+                            request._extracted_cache = None
+
+            # --- Cache store: legacy prefix cache path ---
+            elif self.prefix_cache is not None and not _skip_cache_store:
+                if (
+                    request is not None
+                    and getattr(request, "_extracted_cache", None) is not None
+                    and getattr(request, "_extracted_tokens", None)
+                ):
+                    try:
+                        prompt_tokens = list(request._extracted_tokens)
+                        prompt_len = len(prompt_tokens)
+                        if self._mllm_request_has_media_cache_context(
+                            request, prompt_tokens
+                        ):
+                            logger.info(
+                                "Skipping VLM legacy prefix cache store for %s: "
+                                "prompt contains media context/placeholders; "
+                                "media embeddings are path-dependent and "
+                                "must not be saved under a token-only "
+                                "prefix key",
+                                request_id,
+                            )
+                            request._extracted_cache = None
+                        raw_cache = request._extracted_cache
+                        if callable(raw_cache):
+                            raw_cache = raw_cache()
+                        if raw_cache:
+                            cache_to_store = self._truncate_hybrid_cache(raw_cache, prompt_len)
+                            if cache_to_store is not None and self._validate_cache(
+                                cache_to_store,
+                                source=f"mllm-prefix-store:{request_id}",
+                            ):
+                                cache_key_tokens = (
+                                    prompt_tokens[:prompt_len - 1]
+                                    if prompt_len > 1
+                                    else list(prompt_tokens)
+                                )
+                                if self.disk_cache is not None and not self._is_hybrid:
+                                    try:
+                                        self.disk_cache.store(prompt_tokens, cache_to_store)
+                                    except Exception as de:
+                                        logger.debug(f"VLM disk store failed for {request_id}: {de}")
+                                if getattr(self, '_kv_cache_bits', 0):
+                                    cache_to_store = self._quantize_cache_for_storage(cache_to_store)
+                                    if not self._validate_cache(
+                                        cache_to_store,
+                                        source=f"mllm-prefix-store-quant:{request_id}",
+                                    ):
+                                        logger.warning(
+                                            f"VLM legacy prefix cache store rejected unsafe "
+                                            f"quantized live cache for {request_id}"
+                                        )
+                                        cache_to_store = None
+                                if cache_to_store is not None:
+                                    self.prefix_cache.store_cache(cache_key_tokens, cache_to_store)
+                                    logger.debug(
+                                        f"VLM stored legacy prefix cache for {request_id} "
+                                        f"({len(cache_key_tokens)} cache-key tokens from "
+                                        f"{prompt_len} prompt tokens)"
+                                    )
+                    except Exception as e:
+                        logger.debug(f"VLM prefix cache store failed for {request_id}: {e}")
+                    finally:
+                        if request is not None:
+                            request._extracted_cache = None
+            _trace_mark("cache_store_s")
+
+            # Remove per-request stop tokens from batch generator.
+            # Use _surviving_stops snapshot (captured before cleanup loop) to avoid
+            # reading from self.running which is mutated during the loop.
+            if (
+                request is not None
+                and self.batch_generator is not None
+                and getattr(request, '_added_stop_tokens', None)
+            ):
+                removable = request._added_stop_tokens - _surviving_stops - self.stop_tokens
+                self.batch_generator.stop_tokens -= removable
+
+            # Clean up streaming detokenizer
+            self._cleanup_detokenizer(request_id)
+
+            # Remove from running
+            if request_id in self.running:
+                del self.running[request_id]
+
+            # Remove UID mappings
+            if request_id in self.request_id_to_uid:
+                uid = self.request_id_to_uid[request_id]
+                if uid in self.uid_to_request_id:
+                    del self.uid_to_request_id[uid]
+                del self.request_id_to_uid[request_id]
+
+            # Clean up paged cache request tracking to free tensor references
+            if self.block_aware_cache is not None:
+                self.block_aware_cache._request_tables.pop(request_id, None)
+            if self.paged_cache_manager is not None:
+                self.paged_cache_manager.detach_request(request_id)
+
+            # Remove from master request dict to free output_tokens and cache refs
+            self.requests.pop(request_id, None)
+
+            # Track as finished
+            self.finished_req_ids.add(request_id)
+            _trace_mark("bookkeeping_s")
+
+        # Clear Metal memory cache when all requests done (vision tensors are large)
+        if finished_ids and not self.running:
+            clear_mlx_memory_cache(log=logger)
+        _trace_mark("clear_memory_s")
+        if trace_enabled and finished_ids:
+            logger.info(
+                "VMLINUX_MLLM_CLEANUP_TRACE finished=%d snapshot_ms=%.3f "
+                "cache_store_ms=%.3f bookkeeping_ms=%.3f clear_memory_ms=%.3f",
+                len(finished_ids),
+                cleanup_trace.get("snapshot_s", 0.0) * 1000.0,
+                cleanup_trace.get("cache_store_s", 0.0) * 1000.0,
+                cleanup_trace.get("bookkeeping_s", 0.0) * 1000.0,
+                cleanup_trace.get("clear_memory_s", 0.0) * 1000.0,
+            )
+
+    def step(self) -> MLLMSchedulerOutput:
+        """Execute one scheduling step -- the core generation loop tick.
+
+        Called repeatedly by _step_and_dispatch() in the background thread.
+        Each call:
+
+        1. _schedule_waiting() moves queued requests -> running (under lock)
+        2. batch_generator.next() generates one token for all active requests
+        3. _process_batch_responses() extracts tokens, detokenizes, checks stops
+        4. _cleanup_finished() stores cache, frees memory, removes state
+        5. Periodic Metal GC every 60s during sustained traffic
+
+        Error recovery: on GPU/cache errors, attempts retry (max 2) per request
+        by re-queueing. On persistent failure, finishes request with error.
+
+        Returns:
+            MLLMSchedulerOutput with results of this step
+        """
+        output = MLLMSchedulerOutput()
+        trace_enabled = _mllm_scheduler_trace_enabled()
+        step_t0 = time.perf_counter() if trace_enabled else 0.0
+        trace_last = step_t0
+
+        def _trace_mark(name: str) -> None:
+            nonlocal trace_last
+            if not trace_enabled:
+                return
+            now = time.perf_counter()
+            output.trace_timings[name] = output.trace_timings.get(name, 0.0) + max(
+                now - trace_last, 0.0
+            )
+            trace_last = now
+
+        # Process deferred aborts — safe now because previous step's
+        # Metal computation has completed. Hold _queue_lock to prevent
+        # race with abort_request() modifying _pending_aborts/UID maps.
+        if self._pending_aborts:
+            with self._queue_lock:
+                aborts = list(self._pending_aborts)
+                self._pending_aborts.clear()
+            for rid in aborts:
+                with self._queue_lock:
+                    uid = self.request_id_to_uid.pop(rid, None)
+                if uid is not None:
+                    if self.batch_generator is not None:
+                        try:
+                            with self._batch_lock:
+                                self.batch_generator.remove([uid])
+                        except Exception as e:
+                            logger.warning(f"Deferred abort remove failed for {rid}: {e}")
+                    with self._queue_lock:
+                        self.uid_to_request_id.pop(uid, None)
+                logger.debug(f"Processed deferred abort for {rid}")
+        _trace_mark("abort_s")
+
+        # Schedule waiting requests
+        with self._queue_lock:
+            scheduled = self._schedule_waiting()
+            output.scheduled_request_ids = [r.request_id for r in scheduled]
+            output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+
+            # Identify if we have running requests before releasing lock
+            has_running = self.batch_generator is not None and len(self.running) > 0
+        _trace_mark("schedule_s")
+
+        # Run generation step if we have running requests (OUTSIDE QUEUE LOCK)
+        if has_running:
+            try:
+                with self._batch_lock:
+                    next_fn = (
+                        getattr(self.batch_generator, "next_burst", None)
+                        if getattr(type(self.batch_generator), "next_burst", None) is not None
+                        else None
+                    )
+                    if callable(next_fn):
+                        responses = next_fn()
+                    else:
+                        responses = self.batch_generator.next()
+                _trace_mark("batch_next_s")
+            except Exception as step_err:
+                # Cache corruption or GPU error — recover by clearing state
+                # and rescheduling (matching LLM scheduler pattern).
+                # Limit retries to prevent infinite loops on persistent errors.
+                import traceback
+                logger.error(f"MLLM batch generation error: {step_err}\n{traceback.format_exc()}")
+                try:
+                    self.batch_generator.close()
+                except Exception:
+                    pass
+                self.batch_generator = None
+                self._current_sampler_params = ()
+
+                with self._queue_lock:
+                    max_retries = 2
+                    retryable = []
+                    failed = []
+                    for req_id, req in list(self.running.items()):
+                        req._retry_count += 1
+                        if req._retry_count <= max_retries:
+                            req.status = RequestStatus.WAITING
+                            req.output_tokens.clear()
+                            req.num_output_tokens = 0
+                            req.output_text = ""
+                            req.finish_reason = None
+                            self.waiting.appendleft(req)
+                            retryable.append(req_id)
+                        else:
+                            # Permanent failure — send error response
+                            req.finish_reason = "stop"
+                            req.output_text = f"Generation failed: {step_err}"
+                            failed.append(req_id)
+                        self._cleanup_detokenizer(req_id)
+                    # Clean up paged cache block tables for all running requests
+                    # to prevent stale entries on retry
+                    if self.block_aware_cache is not None:
+                        for req_id in self.running:
+                            self.block_aware_cache._request_tables.pop(req_id, None)
+                    if self.paged_cache_manager is not None:
+                        for req_id in self.running:
+                            self.paged_cache_manager.delete_block_table(req_id)
+
+                    self.running.clear()
+                    self.request_id_to_uid.clear()
+                    self.uid_to_request_id.clear()
+
+                    if failed:
+                        # Push error responses for permanently failed requests
+                        output.finished_request_ids = failed
+                        for req_id in failed:
+                            req = self.requests.get(req_id)
+                            if req:
+                                output.outputs.append(RequestOutput(
+                                    request_id=req_id,
+                                    output_text=f"Generation failed: {step_err}",
+                                    finished=True,
+                                    finish_reason="stop",
+                                ))
+                        self._cleanup_finished(set(failed))
+                        logger.error(
+                            f"MLLM scheduler: {len(failed)} requests failed permanently"
+                        )
+
+                    if retryable:
+                        logger.info(
+                            f"MLLM scheduler recovered: "
+                            f"{len(retryable)} requests rescheduled"
+                        )
+                    return output
+
+            output.has_work = True
+
+            if responses:
+                with self._queue_lock:
+                    outputs, finished_ids = self._process_batch_responses(responses)
+                    _trace_mark("process_responses_s")
+                    output.outputs = outputs
+                    output.finished_request_ids = finished_ids
+                    self._cleanup_finished(finished_ids)
+                    _trace_mark("cleanup_finished_s")
+                _trace_mark("process_cleanup_s")
+            else:
+                _trace_mark("process_responses_s")
+                _trace_mark("cleanup_finished_s")
+                _trace_mark("process_cleanup_s")
+        else:
+            _trace_mark("batch_next_s")
+            _trace_mark("process_responses_s")
+            _trace_mark("cleanup_finished_s")
+            _trace_mark("process_cleanup_s")
+
+        with self._queue_lock:
+            # Clear finished tracking for next step
+            self.finished_req_ids = set()
+        _trace_mark("finish_tracking_s")
+
+        # Periodic Metal memory cache cleanup during sustained traffic.
+        # Vision models hold large pixel_value tensors and cross-attention states
+        # that fragment Metal's allocator cache.
+        _now = time.monotonic()
+        if _now - self._last_metal_gc_time > self._metal_gc_interval:
+            self._last_metal_gc_time = _now
+            if clear_mlx_memory_cache(log=logger):
+                logger.debug("VLM periodic Metal memory cache cleanup")
+        _trace_mark("metal_gc_s")
+
+        # Async SSM rederive for hybrid thinking MLLM models. When idle (no
+        # active requests), pop one task from the batch generator's rederive
+        # queue and run a clean prompt-only prefill to capture SSM state that
+        # matches its key. Future fetches then hit with is_complete=True and
+        # skip the full re-prefill. One task per tick keeps decode latency
+        # unaffected when requests arrive during queue processing.
+        if (
+            self._is_hybrid
+            and not self.running
+            and self.batch_generator is not None
+            and hasattr(self.batch_generator, "run_idle_rederive")
+        ):
+            try:
+                with self._batch_lock:
+                    self.batch_generator.run_idle_rederive()
+            except Exception as _rd_err:
+                logger.debug(f"MLLM idle rederive tick failed: {_rd_err}")
+        _trace_mark("idle_rederive_s")
+        if trace_enabled:
+            output.trace_timings["total_s"] = max(time.perf_counter() - step_t0, 0.0)
+
+        return output
+
+    def _dispatch_outputs(self, step_output: "MLLMSchedulerOutput") -> None:
+        """Push step outputs to async queues. Must be called on the event loop thread."""
+        if step_output.outputs:
+            for req_output in step_output.outputs:
+                queue = self.output_queues.get(req_output.request_id)
+                if queue is not None:
+                    try:
+                        queue.put_nowait(req_output)
+                    except asyncio.QueueFull:
+                        if req_output.finished:
+                            # Finished token MUST be delivered — drain one to make room
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            try:
+                                queue.put_nowait(req_output)
+                            except asyncio.QueueFull:
+                                pass
+                    if req_output.finished:
+                        # Sentinel MUST be delivered — without it stream_outputs hangs
+                        try:
+                            queue.put_nowait(None)
+                        except asyncio.QueueFull:
+                            # Queue is full but we must deliver sentinel.
+                            # This should never happen (8192 buffer), but handle it.
+                            logger.warning(f"Output queue full for {req_output.request_id}, forcing sentinel")
+                            try:
+                                queue.get_nowait()  # Drain one item to make room
+                            except asyncio.QueueEmpty:
+                                pass
+                            try:
+                                queue.put_nowait(None)
+                            except asyncio.QueueFull:
+                                pass
+
+    def _fail_all_requests(self, error_msg: str) -> None:
+        """Fail all waiting and running requests with an error so callers don't hang."""
+        with self._queue_lock:
+            failed_ids = set()
+            # Fail running requests
+            for req_id, req in list(self.running.items()):
+                req.status = RequestStatus.FINISHED_ABORTED
+                queue = self.output_queues.get(req_id)
+                if queue is not None:
+                    try:
+                        queue.put_nowait(RequestOutput(
+                            request_id=req_id,
+                            output_text=f"[Error: {error_msg}]",
+                            finished=True,
+                            finish_reason="stop",
+                        ))
+                    except asyncio.QueueFull:
+                        pass
+                    # Sentinel MUST be delivered separately
+                    try:
+                        queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            queue.put_nowait(None)
+                        except asyncio.QueueFull:
+                            pass
+                failed_ids.add(req_id)
+            # Fail waiting requests
+            for req in list(self.waiting):
+                req_id = req.request_id
+                req.status = RequestStatus.FINISHED_ABORTED
+                queue = self.output_queues.get(req_id)
+                if queue is not None:
+                    try:
+                        queue.put_nowait(RequestOutput(
+                            request_id=req_id,
+                            output_text=f"[Error: {error_msg}]",
+                            finished=True,
+                            finish_reason="stop",
+                        ))
+                    except asyncio.QueueFull:
+                        pass
+                    # Sentinel MUST be delivered separately
+                    try:
+                        queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            queue.put_nowait(None)
+                        except asyncio.QueueFull:
+                            pass
+                failed_ids.add(req_id)
+            # Cleanup — do NOT pop output_queues here; the error+sentinel are
+            # already enqueued and stream_outputs() will drain them. If we pop
+            # the queue now, stream_outputs() will find no queue and return
+            # empty, losing the error message (user sees 0 tokens instead of error).
+            self.waiting.clear()
+            for req_id in failed_ids:
+                self.running.pop(req_id, None)
+                self.requests.pop(req_id, None)
+                # Leave output_queues[req_id] — stream_outputs reads the error then cleans up
+                self._cleanup_detokenizer(req_id)
+                # Clean up UID mappings
+                uid = self.request_id_to_uid.pop(req_id, None)
+                if uid is not None:
+                    self.uid_to_request_id.pop(uid, None)
+            self.finished_req_ids.clear()
+            # Reset batch generator so next request starts fresh
+            if self.batch_generator is not None:
+                try:
+                    self.batch_generator.close()
+                except Exception:
+                    pass
+                self.batch_generator = None
+
+    def get_request(self, request_id: str) -> Optional[MLLMRequest]:
+        """Get a request by ID."""
+        return self.requests.get(request_id)
+
+    def remove_finished_request(self, request_id: str) -> Optional[MLLMRequest]:
+        """Remove a finished request from tracking."""
+        return self.requests.pop(request_id, None)
+
+    # ========== Async API (for streaming) ==========
+
+    async def start(self) -> None:
+        """Start the async scheduler processing loop."""
+        if self._running:
+            return
+
+        self._running = True
+        self._processing_task = asyncio.create_task(self._process_loop())
+        logger.info(
+            f"MLLM Scheduler started with max_num_seqs={self.config.max_num_seqs}"
+        )
+
+    async def stop(self) -> None:
+        """Stop the scheduler."""
+        self._running = False
+        if self._processing_task:
+            self._processing_task.cancel()
+            try:
+                await self._processing_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.batch_generator is not None:
+            self.batch_generator.close()
+            self.batch_generator = None
+
+        logger.info("MLLM Scheduler stopped")
+
+    async def _process_loop(self) -> None:
+        """Main async processing loop."""
+        while self._running:
+            try:
+                if self.has_requests():
+                    # Run step on the dedicated single-worker executor
+                    # to keep all MLX ops on the SAME thread as model load.
+                    # See `_step_executor` field comment for the JANGTQ
+                    # Metal kernel stream-isolation rationale.
+                    loop = asyncio.get_running_loop()
+                    trace_enabled = _mllm_scheduler_trace_enabled()
+                    executor_t0 = time.perf_counter() if trace_enabled else 0.0
+                    step_output = await loop.run_in_executor(
+                        self._step_executor, self.step
+                    )
+                    executor_s = (
+                        time.perf_counter() - executor_t0 if trace_enabled else 0.0
+                    )
+                    # Dispatch outputs on the event loop (asyncio.Queue is not thread-safe)
+                    dispatch_t0 = time.perf_counter() if trace_enabled else 0.0
+                    self._dispatch_outputs(step_output)
+                    dispatch_s = (
+                        time.perf_counter() - dispatch_t0 if trace_enabled else 0.0
+                    )
+                    if trace_enabled and step_output.outputs:
+                        self._record_scheduler_trace(
+                            step_output,
+                            executor_s=executor_s,
+                            dispatch_s=dispatch_s,
+                        )
+                else:
+                    # No work, wait a bit
+                    await asyncio.sleep(0.01)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                import traceback
+                logger.error(f"Error in MLLM process loop: {e}\n{traceback.format_exc()}")
+                # Fail all waiting+running requests so callers don't hang forever
+                self._fail_all_requests(str(e))
+                await asyncio.sleep(0.1)
+
+    def _record_scheduler_trace(
+        self,
+        step_output: MLLMSchedulerOutput,
+        *,
+        executor_s: float,
+        dispatch_s: float,
+    ) -> None:
+        for req_output in step_output.outputs:
+            request_id = req_output.request_id
+            timing = self._scheduler_trace_timings.setdefault(
+                request_id,
+                {
+                    "steps": 0.0,
+                    "executor_s": 0.0,
+                    "dispatch_s": 0.0,
+                    "output_items": 0.0,
+                    "output_tokens": 0.0,
+                    "step_total_s": 0.0,
+                    "schedule_s": 0.0,
+                    "batch_next_s": 0.0,
+                    "process_cleanup_s": 0.0,
+                    "process_responses_s": 0.0,
+                    "cleanup_finished_s": 0.0,
+                    "metal_gc_s": 0.0,
+                },
+            )
+            timing["steps"] += 1.0
+            timing["executor_s"] += max(executor_s, 0.0)
+            timing["dispatch_s"] += max(dispatch_s, 0.0)
+            timing["output_items"] += 1.0
+            timing["output_tokens"] += float(len(req_output.new_token_ids or []))
+            trace_timings = step_output.trace_timings or {}
+            for key in (
+                "total_s",
+                "schedule_s",
+                "batch_next_s",
+                "process_cleanup_s",
+                "process_responses_s",
+                "cleanup_finished_s",
+                "metal_gc_s",
+            ):
+                target = "step_total_s" if key == "total_s" else key
+                timing[target] += max(float(trace_timings.get(key, 0.0) or 0.0), 0.0)
+            if req_output.finished:
+                logger.info(
+                    "VMLINUX_MLLM_SCHEDULER_TRACE request_id=%s steps=%d "
+                    "output_items=%d output_tokens=%d executor_ms=%.3f "
+                    "dispatch_ms=%.3f step_ms=%.3f schedule_ms=%.3f "
+                    "batch_next_ms=%.3f process_cleanup_ms=%.3f "
+                    "process_responses_ms=%.3f cleanup_finished_ms=%.3f "
+                    "metal_gc_ms=%.3f",
+                    request_id,
+                    int(timing["steps"]),
+                    int(timing["output_items"]),
+                    int(timing["output_tokens"]),
+                    timing["executor_s"] * 1000.0,
+                    timing["dispatch_s"] * 1000.0,
+                    timing["step_total_s"] * 1000.0,
+                    timing["schedule_s"] * 1000.0,
+                    timing["batch_next_s"] * 1000.0,
+                    timing["process_cleanup_s"] * 1000.0,
+                    timing["process_responses_s"] * 1000.0,
+                    timing["cleanup_finished_s"] * 1000.0,
+                    timing["metal_gc_s"] * 1000.0,
+                )
+                self._scheduler_trace_timings.pop(request_id, None)
+
+    async def add_request_async(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+        videos: Optional[List[str]] = None,
+        audio: Optional[List[Any]] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        **kwargs,
+    ) -> str:
+        """
+        Add a multimodal request (async version with output queue).
+
+        Args:
+            prompt: Text prompt
+            images: List of image inputs
+            videos: List of video inputs
+            audio: List of audio inputs
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            **kwargs: Additional parameters
+
+        Returns:
+            Request ID for tracking
+        """
+        request_id = self.add_request(
+            prompt=prompt,
+            images=images,
+            videos=videos,
+            audio=audio,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **kwargs,
+        )
+
+        # Create output queue for streaming
+        self.output_queues[request_id] = asyncio.Queue(maxsize=8192)
+
+        return request_id
+
+    async def stream_outputs(
+        self,
+        request_id: str,
+    ) -> AsyncIterator[RequestOutput]:
+        """
+        Stream outputs for a request.
+
+        Args:
+            request_id: The request ID to stream
+
+        Yields:
+            RequestOutput objects as tokens are generated
+        """
+        output_queue = self.output_queues.get(request_id)
+        if output_queue is None:
+            return
+
+        try:
+            while True:
+                output = await output_queue.get()
+                if output is None:
+                    break
+                yield output
+        finally:
+            # Cleanup queue — runs on normal exit AND GeneratorExit (client disconnect)
+            if request_id in self.output_queues:
+                del self.output_queues[request_id]
+            # If the request is still running (client disconnected mid-stream),
+            # abort it so the slot is freed
+            if request_id in self.running:
+                self.abort_request(request_id)
+
+    async def generate(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+        videos: Optional[List[str]] = None,
+        audio: Optional[List[Any]] = None,
+        **kwargs,
+    ) -> RequestOutput:
+        """
+        Generate complete output for a request (non-streaming).
+
+        Args:
+            prompt: Text prompt
+            images: Image inputs
+            videos: Video inputs
+            audio: Audio inputs
+            **kwargs: Generation parameters
+
+        Returns:
+            Final RequestOutput
+        """
+        request_id = await self.add_request_async(
+            prompt=prompt,
+            images=images,
+            videos=videos,
+            audio=audio,
+            **kwargs,
+        )
+
+        # Collect all outputs
+        final_output = None
+        async for output in self.stream_outputs(request_id):
+            final_output = output
+            if output.finished:
+                break
+
+        if final_output is None:
+            # Create empty output on error
+            final_output = RequestOutput(
+                request_id=request_id,
+                output_text="",
+                finished=True,
+                finish_reason="stop",
+            )
+
+        # Cleanup
+        if request_id in self.requests:
+            del self.requests[request_id]
+
+        return final_output
+
+    # ========== Stats and utilities ==========
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get scheduler statistics including all cache mode metrics.
+
+        Returns dict with: queue sizes, token counts, batch generator stats,
+        vision cache stats, and active cache tier stats (paged/memory-aware/
+        legacy/disk). Used by /v1/stats endpoint and health monitoring.
+        """
+        with self._queue_lock:
+            stats = {
+                "num_waiting": len(self.waiting),
+                "num_running": len(self.running),
+                "num_finished": len(self.finished_req_ids),
+                "num_requests_processed": self.num_requests_processed,
+                "total_prompt_tokens": self.total_prompt_tokens,
+                "total_completion_tokens": self.total_completion_tokens,
+                "cache_hit_requests": self._cache_hit_requests,
+                "cache_hit_tokens": self._cache_hit_tokens,
+                "cache_hit_tokens_by_detail": dict(self._cache_hit_tokens_by_detail),
+            }
+
+            if self.batch_generator is not None:
+                batch_stats = self.batch_generator.stats()
+                batch_stats_dict = batch_stats.to_dict()
+                stats["batch_generator"] = batch_stats_dict
+                stats["last_cache_execution"] = batch_stats_dict.get(
+                    "last_cache_execution"
+                )
+                stats["vision_cache"] = self.batch_generator.get_vision_cache_stats()
+
+            # Cache stats for all cache modes
+            if self.block_aware_cache is not None:
+                try:
+                    paged_stats = self.block_aware_cache.get_stats()
+                    stats["paged_cache"] = {
+                        "type": "paged",
+                        "block_size": self.config.paged_cache_block_size,
+                        "max_blocks": self.config.max_cache_blocks,
+                        "hits": paged_stats.get("hits", 0),
+                        "misses": paged_stats.get("misses", 0),
+                        "hit_rate": paged_stats.get("hit_rate", 0.0),
+                        "tokens_saved": paged_stats.get("tokens_saved", 0),
+                        "entry_count": paged_stats.get("entry_count", 0),
+                    }
+                    if self.paged_cache_manager is not None:
+                        stats["paged_cache"]["allocated_blocks"] = (
+                            len(self.paged_cache_manager.allocated_blocks)
+                            if hasattr(self.paged_cache_manager, "allocated_blocks")
+                            else 0
+                        )
+                except Exception:
+                    pass
+            if self.memory_aware_cache is not None:
+                try:
+                    stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
+                except Exception:
+                    stats["memory_aware_cache"] = {"type": "memory_aware"}
+            if self.prefix_cache is not None:
+                try:
+                    stats["prefix_cache"] = {
+                        "type": "legacy",
+                        "max_entries": self.config.prefix_cache_size,
+                    }
+                except Exception:
+                    pass
+            if self.disk_cache is not None:
+                try:
+                    # Surface real L2 counters: hits/misses/entries/TQ-native etc.
+                    # Previously only reported `{type:disk, enabled:True}` which
+                    # left the /v1/cache/stats endpoint showing disk_cache as a
+                    # stub even when actual L2 prompt restores worked.
+                    disk_stats = self.disk_cache.stats()
+                    disk_stats["type"] = "disk"
+                    disk_stats["enabled"] = True
+                    stats["disk_cache"] = disk_stats
+                except Exception:
+                    stats["disk_cache"] = {"type": "disk", "enabled": True}
+
+            if self.batch_generator is not None:
+                ssm_cache = getattr(self.batch_generator, "_ssm_state_cache", None)
+                if ssm_cache is not None:
+                    nbytes = int(getattr(ssm_cache, "total_nbytes", 0) or 0)
+                    max_bytes = getattr(ssm_cache, "max_bytes", None)
+                    stats["ssm_companion_cache"] = {
+                        "entries": int(getattr(ssm_cache, "size", 0) or 0),
+                        "max_entries": int(getattr(ssm_cache, "max_entries", 0) or 0),
+                        "nbytes": nbytes,
+                        "nbytes_mb": round(nbytes / (1024 * 1024), 2),
+                        "max_bytes": max_bytes,
+                        "max_bytes_mb": (
+                            round(max_bytes / (1024 * 1024), 2)
+                            if max_bytes is not None
+                            else None
+                        ),
+                        "disk_enabled": bool(getattr(ssm_cache, "disk_enabled", False)),
+                    }
+
+            return stats
+
+    def reset(self) -> None:
+        """Reset all scheduler state: queues, requests, UIDs, caches, generator.
+
+        Signals all output queues with None sentinel, removes active requests
+        from batch generator, clears all collections, destroys batch generator,
+        and triggers a final Metal GC. Does NOT clear the cache tiers themselves
+        (paged/memory-aware/legacy) -- those persist for reuse.
+        """
+        with self._queue_lock:
+            # Signal all output queues with sentinel to unblock async consumers
+            for req_id, queue in self.output_queues.items():
+                try:
+                    queue.put_nowait(None)
+                except (asyncio.QueueFull, Exception):
+                    pass
+
+            # Remove from batch generator
+            if self.batch_generator is not None:
+                uids = list(self.uid_to_request_id.keys())
+                if uids:
+                    try:
+                        self.batch_generator.remove(uids)
+                    except Exception:
+                        pass
+
+            self.waiting.clear()
+            self.running.clear()
+            self.requests.clear()
+            self.finished_req_ids.clear()
+            self.request_id_to_uid.clear()
+            self.uid_to_request_id.clear()
+            self._detokenizer_pool.clear()
+
+        if self.batch_generator is not None:
+            self.batch_generator.close()
+            self.batch_generator = None
+            self._current_sampler_params = ()
+
+        # Single Metal GC after everything is cleaned up
+        clear_mlx_memory_cache(log=logger)
+
+    def deep_reset(self) -> None:
+        """Deep reset: clear ALL state including cache tiers.
+
+        Unlike reset(), this also clears prefix/paged/memory-aware caches
+        and model-level cache state. Used for sleep/wake transitions.
+        """
+        self.reset()
+
+        # Clear all cache tiers
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.clear()
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear()
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
+
+        # Clear model-level cache state
+        if hasattr(self.model, 'cache'):
+            self.model.cache = None
+        if hasattr(self.model, 'layers'):
+            for layer in self.model.layers:
+                if hasattr(layer, 'cache'):
+                    layer.cache = None
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'cache'):
+                    layer.self_attn.cache = None
+
+        clear_mlx_memory_cache(log=logger)

@@ -1,0 +1,1424 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Model family configurations for vmlx-engine.
+
+Defines configuration profiles for all supported model families including
+cache types, tokenizer settings, tool parsers, and architecture hints
+indexed strictly by Hugging Face `model_type`.
+
+Must stay in sync with panel/src/main/model-config-registry.ts (TypeScript side).
+"""
+
+from .model_config_registry import ModelConfig, ModelConfigRegistry
+
+HARMONY_CHAT_TEMPLATE = """\
+{%- if tools %}
+    {{- '<|start|>system<|message|>' }}
+    {%- if messages[0].role == 'system' %}
+        {{- messages[0].content + '\\n\\n' }}
+    {%- endif %}
+    {{- "# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\"name\\": <function-name>, \\"arguments\\": <args-json-object>}\\n</tool_call>\\nYou may also use the native format: to=<function-name> code{<args-json-object>}\\nYou MUST call tools when the task requires external information or actions. Do not just describe what you would do — actually call the tool.<|end|>\\n" }}
+{%- else %}
+    {%- if messages[0].role == 'system' %}
+        {{- '<|start|>system<|message|>' + messages[0].content + '<|end|>\\n' }}
+    {%- endif %}
+{%- endif %}
+{%- for message in messages %}
+    {%- if message.role == "user" or (message.role == "system" and not loop.first) %}
+        {{- '<|start|>' + message.role + '<|message|>' + message.content + '<|end|>\\n' }}
+    {%- elif message.role == "assistant" %}
+        {{- '<|start|>assistant<|message|>' }}
+        {%- if message.content %}
+            {{- message.content }}
+        {%- endif %}
+        {%- if message.tool_calls %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if (loop.first and message.content) or (not loop.first) %}
+                    {{- '\\n' }}
+                {%- endif %}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<tool_call>\\n{"name": "' }}
+                {{- tool_call.name }}
+                {{- '", "arguments": ' }}
+                {%- if tool_call.arguments is string %}
+                    {{- tool_call.arguments }}
+                {%- else %}
+                    {{- tool_call.arguments | tojson }}
+                {%- endif %}
+                {{- '}\\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|end|>\\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|start|>user<|message|>' }}
+        {%- endif %}
+        {{- '\\n<tool_response>\\n' }}
+        {{- message.content }}
+        {{- '\\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|end|>\\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|start|>assistant<|message|>' }}
+{%- endif %}
+"""
+
+
+def register_all(registry=None):
+    if registry is None:
+        registry = ModelConfigRegistry()
+
+    existing = {c.family_name for c in registry._configs}
+
+    def _register(config):
+        if config.family_name not in existing:
+            registry.register(config)
+            existing.add(config.family_name)
+
+    # ZAYA (Zyphra) — CCA attention + top-1 MoE.
+    #
+    # ZAYA is reasoning-capable, and the qwen3 parser extracts generated
+    # <think> blocks on the thinking rail. The honest product contract is
+    # supports_thinking=True. think_in_template stays False because the default
+    # no-thinking prompt must start generation in visible content, not make the
+    # parser route every first token into reasoning_content.
+    _register(
+        ModelConfig(
+            family_name="zaya",
+            model_types=["zaya"],
+            cache_type="hybrid",
+            cache_subtype="zaya_cca",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="zaya_xml",
+            reasoning_parser="qwen3",
+            think_in_template=False,
+            supports_thinking=True,
+            supports_native_tools=True,
+            architecture_hints={"default_enable_thinking": False},
+            priority=3,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="zaya1_vl",
+            model_types=["zaya1_vl"],
+            cache_type="hybrid",
+            cache_subtype="zaya_cca",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="zaya_xml",
+            # Current ZAYA1-VL bundles have a plain VLM template and live proof
+            # showed synthetic qwen3 thinking returns hidden-only output. Keep
+            # vision/tools/cache enabled, but do not expose reasoning until the
+            # uploaded artifact has a real VLM thinking contract.
+            reasoning_parser=None,
+            think_in_template=False,
+            supports_thinking=False,
+            supports_native_tools=True,
+            is_mllm=True,
+            architecture_hints={"default_enable_thinking": False},
+            priority=3,
+        )
+    )
+
+    # ── Qwen family ──
+
+    # Note: qwen3_5 / qwen3_5_moe model_types are shared between text and VL/video
+    # variants. Base rows stay text-only, then registry.lookup(path) upgrades
+    # concrete bundles to is_mllm=True when config.json declares media metadata.
+    _register(
+        ModelConfig(
+            family_name="qwen3_5",
+            model_types=["qwen3_5"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_thinking=True,
+            is_mllm=False,
+            priority=4,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen3_5_moe",
+            # qwen3_5_moe_text is the inner text_config.model_type for Qwen3.6-35B-A3B
+            # (VLM wrapper: architectures=Qwen3_5MoeForConditionalGeneration). Without
+            # registering it, the text_config disambiguator in the registry misses it
+            # and falls back to default — no reasoning parser, no tool parser.
+            model_types=["qwen3_5_moe", "qwen3_5_moe_text"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_thinking=True,
+            is_mllm=False,
+            priority=4,
+        )
+    )
+
+    # Laguna (poolside) — 33B/3B agentic-coding MoE.
+    #
+    # Architecture (per `~/jang/jang-tools/jang_tools/laguna/README.md`):
+    # 40 layers, hybrid SLIDING-WINDOW + full attention with PER-LAYER head
+    # count (48 full / 64 SWA, sliding_window=512), dual RoPE (full uses
+    # YaRN, SWA uses default), 256 routed experts top-8 + 1 shared,
+    # sigmoid routing with per-head gating (`g_proj`), q_norm/k_norm in
+    # attention, dense layer 0 + sparse layers 1..39. Text-only — no
+    # vision / audio / video.
+    #
+    # cache_type="kv" (HONEST STATE): Laguna interleaves SWA and full-
+    # attention layers per `config.json["layer_types"]`. The vmlx hybrid
+    # scheduler is designed for SSM+attention hybrids (Nemotron-H,
+    # Qwen3.5-A3B, Jamba etc. — non-KV layers carry cumulative SSM state),
+    # NOT for SWA+full hybrids where every layer IS a KV variant. The
+    # right Laguna integration would either:
+    #   (a) extend `_hybrid_kv_positions` detection to recognize layer-
+    #       types with mixed RotatingKVCache + KVCache, or
+    #   (b) keep this row as cache_type="kv" and rely on each layer's
+    #       per-layer cache class assignment via `model.make_cache()`.
+    # `vmlx_engine/loaders/laguna.py` now provides the thin adapter needed
+    # by the OpenAI-compatible scheduler path, including standard make_cache
+    # and __call__(input_ids, mask=None, cache=None) semantics. Keep this row
+    # as cache_type="kv": every layer is attention-backed, but layer-local
+    # cache classes still need to preserve full-vs-SWA differences.
+    #
+    # Tokenizer: poolside-flavored (vocab 100352). DESPITE the README
+    # claim that Laguna ships "Qwen2-flavored" tokens, the bundle's
+    # `generation_config.json` lists `eos_token_id: [2, 24]` —
+    # token 2 = `〈|EOS|〉` (the special end marker), token 24 =
+    # `</assistant>` (the chat-template assistant turn close, see the
+    # tail of `chat_template.jinja`). Setting `eos_token` to
+    # `<|im_end|>` (Qwen convention) silently fails because that
+    # string isn't in Laguna's vocab — the tokenizer keeps the bundle
+    # default but the engine's decode-loop stop list ends up empty,
+    # and the model loops past the natural turn boundary emitting
+    # literal `</assistant>\n</assistant>\n...` then hallucinating
+    # follow-up turns. Use the strings that ARE in the vocab.
+    #
+    # Reasoning parser: Laguna's chat template gates `<think>` blocks
+    # behind `enable_thinking=true` (default false). The qwen3 parser
+    # extracts `<think>...</think>` if present and otherwise routes
+    # all output to `content`, so leaving it auto-applied is safe.
+    _register(
+        ModelConfig(
+            family_name="laguna",
+            model_types=["laguna"],
+            cache_type="kv",
+            eos_tokens=["</assistant>", "〈|EOS|〉"],
+            tool_parser="qwen",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_thinking=True,
+            is_mllm=False,
+            priority=10,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen3",
+            model_types=["qwen3"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_native_tools=True,
+            supports_thinking=True,
+            priority=10,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen3_moe",
+            model_types=["qwen3_moe"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_native_tools=True,
+            supports_thinking=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen3_vl",
+            model_types=["qwen3_vl", "qwen3_vl_moe"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_thinking=True,
+            is_mllm=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen3_next",
+            model_types=["qwen3_next"],
+            cache_type="mamba",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_thinking=True,
+            priority=1,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen2",
+            model_types=["qwen2", "qwen2_moe", "qwen"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            supports_native_tools=True,
+            priority=20,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen2_vl",
+            model_types=["qwen2_vl", "qwen2_5_vl"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            is_mllm=True,
+            priority=10,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="qwen_mamba",
+            model_types=["qwen_mamba"],
+            cache_type="mamba",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="qwen",
+            priority=5,
+        )
+    )
+
+    # MiMo-V2.5 JANG_2L: multimodal artifact with text-first runtime.
+    #
+    # Source contract imported from erics-m5-max2.local:~/jang on 2026-05-27:
+    # full attention layers use 4 KV heads, SWA layers use 8 KV heads, V states
+    # are scaled by 0.707. The current target bundle removes MTP tensors and
+    # keeps base decode autoregressive. MiMo's template emits generic XML
+    # function calls, not Qwen tools. Current MiMo JANGTQ_2 live proof shows
+    # requested thinking can stop with all output hidden in reasoning_content and
+    # no visible final answer, so do not advertise reasoning until a visible-final
+    # thinking proof exists.
+    _register(
+        ModelConfig(
+            family_name="mimo_v2",
+            model_types=["mimo_v2"],
+            cache_type="kv",
+            cache_subtype="mimo_v2_asymmetric_swa",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="xml_function",
+            reasoning_parser=None,
+            think_in_template=False,
+            supports_thinking=False,
+            supports_native_tools=True,
+            is_mllm=True,
+            architecture_hints={
+                "runtime_mtp_mode": "absent",
+                "full_attention_kv_heads": 4,
+                "swa_attention_kv_heads": 8,
+                "attention_value_scale": 0.707,
+                "swa_window": 128,
+                "swa_attention_sink_bias": True,
+            },
+            priority=4,
+        )
+    )
+
+    # ── Llama family ──
+
+    _register(
+        ModelConfig(
+            family_name="llama4",
+            model_types=["llama4"],
+            cache_type="kv",
+            tool_parser="llama",
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="llama",
+            model_types=["llama"],
+            cache_type="kv",
+            tool_parser="llama",
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=20,
+        )
+    )
+
+    # ── Mistral family ──
+
+    _register(
+        ModelConfig(
+            family_name="devstral",
+            model_types=["devstral"],
+            cache_type="kv",
+            tool_parser="mistral",
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="codestral",
+            model_types=["codestral"],
+            cache_type="kv",
+            tool_parser="mistral",
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="pixtral",
+            model_types=["pixtral"],
+            cache_type="kv",
+            tool_parser="mistral",
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            is_mllm=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="mistral",
+            model_types=["mistral", "mixtral"],
+            cache_type="kv",
+            tool_parser="mistral",
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=20,
+        )
+    )
+
+    # Mistral 4 (MLA + MoE) — original vMLX integration by Jinho Jang (eric@jangq.ai)
+    # MLA attention with kv_lora_rank=256, q_lora_rank=1024 requires:
+    #   - kv_b_proj split into embed_q/unembed_out (JANG loader)
+    #   - bfloat16 for MoE expert overflow prevention
+    #   - KV cache quantization disabled (MLA stores compressed latents)
+    #   - Prefix cache head validation returns 1 (not num_key_value_heads)
+    #   - reasoning_effort "none"/"high" via [MODEL_SETTINGS] template block
+    #   - VLM wrapper (mistral3) with _Mistral4VLMBackbone dispatch
+    # This took significant original engineering. Please credit if you adapt.
+    _register(
+        ModelConfig(
+            family_name="mistral4",
+            model_types=["mistral4"],
+            cache_type="kv",
+            tool_parser="mistral",
+            reasoning_parser="mistral",
+            think_in_template=False,
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=30,
+        )
+    )
+
+    # Mistral 3 VLM wrapper (pixtral, mistral3) — also used by Mistral 4 as VLM envelope
+    # text_config.model_type lookup in registry resolves mistral3→mistral4 for MLA models
+    _register(
+        ModelConfig(
+            family_name="mistral3",
+            model_types=["mistral3"],
+            cache_type="kv",
+            is_mllm=True,
+            tool_parser="mistral",
+            reasoning_parser=None,  # Only mistral4 has reasoning; detected via text_config
+            think_in_template=False,
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=10,
+        )
+    )
+
+    # ministral3 — Mistral-Medium-3.5-128B's inner text decoder type.
+    # Outer wrapper is `mistral3` (registered above) with PIXTRAL vision;
+    # inner text decoder is `ministral3` (dense GQA 96/8, head_dim 128,
+    # 88 layers, hidden 12288, 256K YaRN — NOT mistral4 MLA, NOT legacy
+    # mistral). When loaded text-only the registry needs this inner
+    # type registered so reasoning + tool detection pick the right
+    # parsers (mistral_v3-flavored chat template, no reasoning by
+    # default — the model itself doesn't ship a thinking block).
+    #
+    # `family_name="ministral3"` (NOT "mistral3"): the registry routes
+    # by family_name when model_type appears at the TOP LEVEL of
+    # config.json. We've seen Mistral-Medium-3.5 bundles ship
+    # `model_type=mistral3` outer + `text_config.model_type=ministral3`
+    # inner (the canonical layout) AND occasionally bundles where the
+    # outer model_type is `ministral3` directly (text-only-extracted
+    # builds, custom finetunes, future renames). Without the
+    # `ministral3` family_name registration the latter shape resolves
+    # to family=unknown → no tool/reasoning parser → silent garbage.
+    _register(
+        ModelConfig(
+            family_name="ministral3",
+            model_types=["ministral3"],
+            cache_type="kv",
+            is_mllm=False,  # text-only inner
+            tool_parser="mistral",
+            reasoning_parser=None,
+            think_in_template=False,
+            supports_native_tools=True,
+            preserve_native_tool_format=True,
+            priority=10,
+        )
+    )
+
+    # ── DeepSeek family ──
+
+    _register(
+        ModelConfig(
+            family_name="deepseek_vl",
+            model_types=["deepseek_vl", "deepseek_vl2", "deepseek_vl_v2"],
+            cache_type="kv",
+            tool_parser="deepseek",
+            is_mllm=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="deepseek",
+            # deepseek_v32 is DSv3.2 (kv_lora_rank=512, MLA family).
+            # MLA H=1 collapse is enforced at runtime via Scheduler._detect_mla
+            # (reads kv_lora_rank), so cache_type stays "kv" — same as
+            # deepseek_v3 — and the scheduler does the right thing.
+            model_types=["deepseek_v2", "deepseek_v3", "deepseek_v32", "deepseek2", "deepseek"],
+            cache_type="kv",
+            tool_parser="deepseek",
+            reasoning_parser="deepseek_r1",
+            priority=20,
+        )
+    )
+
+    # GLM-5.1 (glm_moe_dsa): inherits deepseek_v32 architecture (MLA + MoE).
+    # Same fp32-SDPA fix applies. Uses DeepSeek R1 reasoning parser since
+    # GLM-5.1 emits <think>...</think> tags (same as DeepSeek V3.2).
+    _register(
+        ModelConfig(
+            family_name="glm5",
+            model_types=["glm_moe_dsa"],
+            cache_type="kv",
+            tool_parser="deepseek",
+            reasoning_parser="deepseek_r1",
+            think_in_template=True,
+            priority=20,
+        )
+    )
+
+    # Kimi K2.6 (kimi_k25) — DeepseekV3 text backbone + MoonViT 27-block
+    # vision tower + PatchMergerMLP projector. Text wrapper class name
+    # in HuggingFace is Kimi_K25ForConditionalGeneration which registers
+    # model_type="kimi_k25"; mlx_vlm's kimi_vl module handles both the
+    # Kimi-VL-A3B (Moonlight) and K2.6 variants (identical vision +
+    # projector architecture), so load routes through the kimi_k25 →
+    # kimi_vl remap installed by jang_tools.load_jangtq_kimi_vlm.
+    #
+    # Tool/reasoning parsers: Kimi K2 uses TS-style tool calls (kimi_k2
+    # parser in mlx_lm.tool_parsers) with <think> reasoning tags shared
+    # with DeepSeek R1. Bundle is 2-bit MXTQ quantized — JANGTQ loader
+    # auto-detects via .tq_packed suffix. Cache type: "kv" at engine
+    # boundary (MLA is internal to DeepseekV3Attention, cache surface
+    # is standard KV).
+    # Kimi K2.6 (kimi_k25) chat template uses `<|im_user|>` (163587),
+    # `<|im_assistant|>` (163588), `<|im_system|>` (163594) as role-boundary
+    # markers. Generation prompt is `<|im_assistant|>assistant<|im_middle|>`
+    # so the model starts AFTER the role marker — legitimate output never
+    # contains `<|im_user|>` or `<|im_system|>`. Without these stops a
+    # hallucinated new turn would not terminate generation (same class as
+    # the 2026-05-03 DSV4 incident). eos_tokens[0] (`<|im_end|>`, 163586)
+    # is the primary EOS already in tokenizer eos_token_id.
+    _register(
+        ModelConfig(
+            family_name="kimi_k25",
+            model_types=["kimi_k25"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>", "<|im_user|>", "<|im_system|>"],
+            # "kimi" is the canonical parser name in VALID_TOOL_PARSERS
+            # (tests/test_model_config_registry.py); KimiToolParser registers
+            # the aliases ["kimi", "kimi_k2", "moonshot"] at import so this
+            # resolves to the same class as "kimi_k2".
+            tool_parser="kimi",
+            reasoning_parser="deepseek_r1",
+            think_in_template=True,
+            supports_thinking=True,
+            is_mllm=True,
+            priority=20,
+        )
+    )
+
+    # DeepSeek V4-Flash (deepseek_v4) — 284B total / ~13B active, MLA with
+    # head_dim=512, 256 routed experts top-6 + 1 shared, sqrtsoftplus routing
+    # with hash layers for first 3 blocks, mHC (Manifold Hyper-Connections)
+    # hc_mult=4, attention sink per head, inverse RoPE on output, swiglu_limit=10,
+    # 1M context via YaRN factor=16 from 65k, sliding window 128, compressor+
+    # indexer for compressed global context. Runtime lives in
+    # jang_tools.dsv4.mlx_model (~1128 LOC) and is registered into mlx_lm
+    # via jang_tools.dsv4.mlx_register at load time. Not VLM.
+    #
+    # Public reasoning modes per research/DSV4-RUNTIME-ARCHITECTURE.md §4:
+    #   - chat          (instruct, thinking suppressed via trailing </think>)
+    #   - thinking      (reasoning_effort=high)
+    #   - thinking max  (reasoning_effort=max, passed to the canonical encoder)
+    # Multi-turn: jang_config.chat.reasoning.drop_earlier_reasoning=true →
+    # strip prior <think>...</think> blocks from history when building next
+    # prompt. Our deepseek_r1 reasoning parser handles the <think> tags;
+    # think_in_template=True so the empty-tag suppression trick works.
+    #
+    # Tool calls use DSML format: <｜DSML｜invoke name="fn">...<｜DSML｜parameter
+    # name="p" string="true">val</｜DSML｜parameter></｜DSML｜invoke>.
+    # Parser name "dsml" registered in tool_parsers (see DSV4 test_chat.py).
+    #
+    # Cache type "kv" at engine boundary. Internally DSV4 uses a custom
+    # DeepseekV4Cache wrapping a RotatingKVCache(max_size=sliding_window=128,
+    # keep=0) for local attention + compressor/indexer state buffers for
+    # cross-window pooling. Loader constructs it via make_cache(); engine
+    # just drives update_and_fetch like standard KV.
+    #
+    # Bundle formats (per §5 cheat sheet): JANG_2L (107 GB), JANGTQ2 (74 GB
+    # recommended prod default), JANGTQ4 (173 GB highest fidelity), JANG4
+    # (173 GB uniform 4-bit). Do NOT use JANGTQ4-HP (mxfp4+bf16 unstable).
+    # eos_tokens contains BOTH the special EOS and the user-turn marker.
+    # `generation_config.json` ships only `eos_token_id: 1` (the
+    # `<｜end▁of▁sentence｜>` token). DeepSeek-R1-style reasoning models
+    # also need `<｜User｜>` (id 128803) in the stop set as a defense
+    # against the model hallucinating a new user turn — without it the
+    # decoder happily keeps generating past the natural assistant
+    # boundary, looping in `<think>` mode and never emitting `</think>`.
+    # `eos_tokens[0]` is consumed by the tokenizer-config override at
+    # `models/llm.py`; everything beyond [0] gets registered via
+    # `tokenizer.add_eos_token()` after the wrapper loads (see
+    # `models/llm.py` post-load hook).
+    # 2026-05-03 panel repro: DSV4 in chat-mode/thinking-mode would
+    # generate a clean response, then continue past the natural turn
+    # boundary by emitting a literal `<｜Assistant｜>` token (id 128804)
+    # to fake a brand-new assistant turn (panel rendered the special
+    # token as "🤖" then kept streaming the model's "🤖 My name is...
+    # I am DeepAI..." hallucination loop). The eos_token_id and
+    # `<｜User｜>` (128803) defenses didn't trigger because the model
+    # chose `<｜Assistant｜>` (128804) instead. Add it as a third stop
+    # so a stray Assistant marker terminates generation immediately.
+    # The model should never emit this token mid-response — it only
+    # ever appears in prompt-side turn boundaries.
+    _register(
+        ModelConfig(
+            family_name="deepseek_v4",
+            model_types=["deepseek_v4"],
+            cache_type="kv",
+            cache_subtype="deepseek_v4_composite",
+            eos_tokens=[
+                "<｜end▁of▁sentence｜>",
+                "<｜User｜>",
+                "<｜Assistant｜>",
+                "<｜latest_reminder｜>",
+            ],
+            tool_parser="dsml",
+            reasoning_parser="deepseek_r1",
+            think_in_template=True,
+            supports_thinking=True,
+            priority=20,
+        )
+    )
+
+    # ── Ling-2.6-flash / Bailing-V2.5 (bailing_hybrid model_type) ──
+    # Hybrid MLA + Lightning-Attn-2 (Gated Linear Attention). Layer
+    # dispatch is controlled by `layer_group_size` (default 8 for
+    # Ling-2.6-flash): every group_size-th layer is MLA (softmax), the
+    # rest are linear-attn — see research/LING-RUNTIME-ARCHITECTURE.md
+    # §2. The runtime model class lives at
+    # `mlx_lm/models/bailing_hybrid.py` (vendored under
+    # `panel/scripts/patches/bailing_hybrid.patched.py` and installed by
+    # `bundle-python.sh`).
+    #
+    # Cache type "hybrid" — engine builds KVCache slots for the MLA
+    # layers and ArraysCache(size=1) for the linear-attn layers.
+    #
+    # 2026-05-11 production contract: expose Ling/Bailing as plain-content
+    # chat in vMLX. Local sidecars and templates still contain a historical
+    # "detailed thinking on/off" system-message switch, but there is no
+    # request-level `enable_thinking` template variable and live product rows
+    # were validated on the visible-answer path. Do not auto-attach a
+    # reasoning parser or advertise a Thinking button from stale sidecars.
+    #
+    # This is not Harmony. It is not Hy3. Hy3 uses qwen3 reasoning + Hunyuan
+    # tools. Ling uses DeepSeek-style tools, hybrid SSM cache, and no exposed
+    # reasoning rail in the product UI/API contract.
+    # MTP layer (`model.layers.32`) is loaded but skipped in standard
+    # generation; spec-decode wiring is a future pass. Tool format is
+    # DeepSeek-style.
+    #
+    # 2026-05-06 EOS correction: Ling-2.6 has TWO EOS tokens per
+    # `generation_config.json::eos_token_id`:
+    #   156892 = `<|endoftext|>`
+    #   156895 = `<|role_end|>`
+    # Earlier comment incorrectly transposed these IDs. Older bundles (<.20)
+    # whose `generation_config.json` missed the secondary EOS — or paths
+    # that bypass the BatchedEngine multi-eos UNION hook — would only stop
+    # at one of the two, producing the "answer never terminates, falls into
+    # one repeated token" loop. Registry now lists both so the union
+    # always covers both tokens regardless of bundle metadata.
+    _register(
+        ModelConfig(
+            family_name="ling",
+            model_types=["bailing_hybrid", "bailing_moe_v2_5"],
+            cache_type="hybrid",
+            eos_tokens=["<|role_end|>", "<|endoftext|>"],
+            tool_parser="deepseek",
+            # Ling/Bailing is NOT a reasoning model. Eric directive 2026-05-11:
+            # do not auto-attach a reasoning parser; do not advertise thinking
+            # capability. Ling chat output should be treated as plain content.
+            reasoning_parser=None,
+            think_in_template=False,
+            supports_thinking=False,
+            priority=20,
+        )
+    )
+
+    # ── GLM family (CRITICAL: different reasoning parsers per variant) ──
+
+    # GPT-OSS: Harmony <|channel|> protocol reasoning
+    _register(
+        ModelConfig(
+            family_name="gpt_oss",
+            model_types=["gpt_oss"],
+            cache_type="kv",
+            tool_parser="glm47",
+            reasoning_parser="openai_gptoss",
+            chat_template_custom=HARMONY_CHAT_TEMPLATE,
+            preserve_native_tool_format=True,
+            priority=3,
+        )
+    )
+
+    # GLM-4.7 Flash (MoE): also uses Harmony/openai_gptoss reasoning, NOT deepseek_r1
+    _register(
+        ModelConfig(
+            family_name="glm4_moe",
+            model_types=["glm4_moe", "glm4_moe_lite"],
+            cache_type="kv",
+            tool_parser="glm47",
+            reasoning_parser="openai_gptoss",
+            chat_template_custom=HARMONY_CHAT_TEMPLATE,
+            preserve_native_tool_format=True,
+            priority=3,
+        )
+    )
+
+    # GLM-Z1: reasoning model using Harmony channel protocol (same as GPT-OSS/GLM-4.7).
+    # Uses openai_gptoss parser for <|channel|>analysis reasoning, NOT deepseek_r1.
+    # The Harmony template does not inject <think>, so think_in_template must be False.
+    # (Shares model_type "glm4" with base GLM-4, disambiguated by name in lookup())
+    _register(
+        ModelConfig(
+            family_name="glm_z1",
+            model_types=[],  # No unique model_type — disambiguated by name in lookup()
+            cache_type="kv",
+            tool_parser="glm47",
+            reasoning_parser="openai_gptoss",
+            chat_template_custom=HARMONY_CHAT_TEMPLATE,
+            preserve_native_tool_format=True,
+            priority=2,
+        )
+    )
+
+    # GLM-4 / ChatGLM: base model (tools only, no reasoning)
+    _register(
+        ModelConfig(
+            family_name="chatglm",
+            model_types=["chatglm", "glm4", "glm"],
+            cache_type="kv",
+            tool_parser="glm47",
+            chat_template_custom=HARMONY_CHAT_TEMPLATE,
+            preserve_native_tool_format=True,
+            priority=20,
+        )
+    )
+
+    # ── StepFun family ──
+
+    # Step-1V is a vision-language model
+    _register(
+        ModelConfig(
+            family_name="step_vl",
+            model_types=["step1v"],
+            cache_type="kv",
+            tool_parser="step3p5",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            is_mllm=True,
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="step",
+            model_types=["step3p5", "step"],
+            cache_type="kv",
+            tool_parser="step3p5",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            priority=10,
+        )
+    )
+
+    # Step-3.7 Flash VLM wrapper. The top-level model_type is step3p7 and the
+    # text decoder is step3p5 with alternating full/sliding KV attention
+    # (`sliding_window=512`). Keep this as KV, not hybrid SSM: every layer is an
+    # attention cache variant and the runtime must preserve full-vs-sliding
+    # layer cache classes instead of routing it through SSM companion state.
+    _register(
+        ModelConfig(
+            family_name="step3p7",
+            model_types=["step3p7"],
+            cache_type="kv",
+            cache_subtype="step3p7_full_sliding_kv",
+            tool_parser="step3p5",
+            reasoning_parser="qwen3",
+            think_in_template=True,
+            supports_thinking=True,
+            is_mllm=True,
+            architecture_hints={
+                "text_model_type": "step3p5",
+                "attention_arch": "full_and_sliding_kv",
+                "sliding_window": 512,
+            },
+            priority=4,
+        )
+    )
+
+    # ── Gemma family ──
+
+    _register(
+        ModelConfig(
+            family_name="gemma4",
+            model_types=["gemma4"],
+            cache_type="kv",
+            tool_parser="gemma4",
+            reasoning_parser="gemma4",  # qwen3 parser is more robust with quantized models
+            supports_thinking=True,
+            eos_tokens=["<eos>", "<turn|>"],
+            special_tokens_to_clean=["<turn|>", "<|turn>", "<|channel>", "<channel|>"],
+            is_mllm=True,
+            architecture_hints={"inject_pixel_values": True},
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="gemma4_text",
+            model_types=["gemma4_text"],
+            cache_type="kv",
+            tool_parser="gemma4",
+            reasoning_parser="gemma4",  # qwen3 parser is more robust with quantized models
+            supports_thinking=True,
+            eos_tokens=["<eos>", "<turn|>"],
+            special_tokens_to_clean=["<turn|>", "<|turn>", "<|channel>", "<channel|>"],
+            priority=4,
+        )
+    )
+
+    # Gemma 3 / Gemma 3n — Google's documented function-calling format is
+    # a `tool_code` Python-code-block, NOT hermes JSON. Was previously
+    # misconfigured with tool_parser="hermes" which silently failed to
+    # extract calls, leaving clients with raw `` ```tool_code\nfunc(..)\n``` ``
+    # in the content. Also needs `<end_of_turn>` in eos_tokens —
+    # without it Gemma 3/3n enters an infinite loop emitting the
+    # token after the first tool call.
+    _register(
+        ModelConfig(
+            family_name="gemma3",
+            model_types=["gemma3"],
+            cache_type="kv",
+            tool_parser="gemma3",
+            reasoning_parser=None,
+            eos_tokens=["<end_of_turn>", "<eos>"],
+            is_mllm=True,
+            architecture_hints={"inject_pixel_values": True},
+            priority=10,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="gemma3_text",
+            model_types=["gemma3_text"],
+            cache_type="kv",
+            tool_parser="gemma3",
+            reasoning_parser=None,
+            eos_tokens=["<end_of_turn>", "<eos>"],
+            priority=8,
+        )
+    )
+
+    # Gemma 3n (E2B / E4B) — tiny text+vision+audio Gemma. Uses the same
+    # `tool_code` block format as Gemma 3. Previously unregistered,
+    # so fresh users of gemma-3n-E2B-it-4bit etc. got family="unknown"
+    # and no tool/reasoning parser auto-applied.
+    _register(
+        ModelConfig(
+            family_name="gemma3n",
+            model_types=["gemma3n"],
+            cache_type="kv",
+            tool_parser="gemma3",
+            reasoning_parser=None,
+            eos_tokens=["<end_of_turn>", "<eos>"],
+            is_mllm=True,
+            priority=10,
+        )
+    )
+    _register(
+        ModelConfig(
+            family_name="gemma3n_text",
+            model_types=["gemma3n_text"],
+            cache_type="kv",
+            tool_parser="gemma3",
+            reasoning_parser=None,
+            eos_tokens=["<end_of_turn>", "<eos>"],
+            priority=8,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="gemma",
+            model_types=["gemma", "gemma2"],
+            cache_type="kv",
+            priority=30,
+        )
+    )
+
+    # MedGemma: multimodal medical model (uses gemma2 model_type,
+    # disambiguated by name matching in lookup())
+    _register(
+        ModelConfig(
+            family_name="medgemma",
+            model_types=[],  # No unique model_type — uses gemma2, disambiguated by name
+            cache_type="kv",
+            is_mllm=True,
+            architecture_hints={"inject_pixel_values": True},
+            priority=3,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="paligemma",
+            model_types=["paligemma", "paligemma2"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=15,
+        )
+    )
+
+    # ── Phi family ──
+
+    _register(
+        ModelConfig(
+            family_name="phi4_reasoning",
+            model_types=["phi4_reasoning"],
+            cache_type="kv",
+            tool_parser="hermes",
+            reasoning_parser="deepseek_r1",
+            priority=2,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="phi4_multimodal",
+            model_types=["phi4mm"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=2,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="phi4",
+            model_types=["phi4", "phi4flash"],
+            cache_type="kv",
+            tool_parser="hermes",
+            priority=10,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="phi3_v",
+            model_types=["phi3v"],
+            cache_type="kv",
+            tool_parser="llama",
+            is_mllm=True,
+            priority=8,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="phi3",
+            model_types=["phi3", "phi3small", "phi"],
+            cache_type="kv",
+            tool_parser="llama",
+            priority=20,
+        )
+    )
+
+    # ── Hermes (NousResearch) ──
+
+    _register(
+        ModelConfig(
+            family_name="hermes",
+            model_types=["hermes"],
+            cache_type="kv",
+            tool_parser="hermes",
+            priority=30,
+        )
+    )
+
+    # ── Nemotron (NVIDIA) ──
+
+    _register(
+        ModelConfig(
+            family_name="nemotron",
+            model_types=["nemotron"],
+            cache_type="kv",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="nemotron",
+            reasoning_parser="deepseek_r1",
+            think_in_template=True,
+            supports_thinking=True,
+            tokenizer_fallback=True,
+            priority=10,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="nemotron_h",
+            # nemotron_h_v2 is the newer NVIDIA Nemotron-H v2 model_type
+            # alias; same hybrid SSM+attention architecture as nemotron_h.
+            model_types=["nemotron_h", "nemotron_h_v2"],
+            cache_type="hybrid",
+            cache_subtype="nemotron_h_ssm_attention",
+            eos_tokens=["<|im_end|>"],
+            tool_parser="nemotron",
+            reasoning_parser="deepseek_r1",
+            think_in_template=True,
+            supports_thinking=True,
+            tokenizer_fallback=True,
+            architecture_hints={"attention_arch": "hybrid_ssm_attention"},
+            priority=10,
+        )
+    )
+
+    # ── Cohere ──
+
+    _register(
+        ModelConfig(
+            family_name="cohere",
+            model_types=["cohere", "cohere2"],
+            cache_type="kv",
+            priority=20,
+        )
+    )
+
+    # ── IBM Granite ──
+
+    _register(
+        ModelConfig(
+            family_name="granite",
+            model_types=["granite", "granite_moe"],
+            cache_type="kv",
+            tool_parser="granite",
+            priority=20,
+        )
+    )
+
+    # IBM Granite MoE Hybrid (granite-4.0 family) — Mamba+attention layers,
+    # uses ArraysCache+KVCache. Different cache_type from plain granite.
+    _register(
+        ModelConfig(
+            family_name="granitemoehybrid",
+            model_types=["granitemoehybrid"],
+            cache_type="hybrid",
+            tool_parser="granite",
+            priority=10,
+        )
+    )
+
+    # Liquid AI LFM2 (Conv1d-SSM + attention hybrid). LFM2-MoE is the MoE
+    # variant. The chat template emits Liquid Python-call-list tool calls.
+    _register(
+        ModelConfig(
+            family_name="lfm2",
+            model_types=["lfm2", "lfm2_moe"],
+            cache_type="hybrid",
+            cache_subtype="lfm2_moe_hybrid_ssm",
+            tool_parser="lfm2",
+            reasoning_parser="qwen3",
+            architecture_hints={
+                "attention_arch": "hybrid_ssm_attention",
+                "cache_schema": "hybrid_ssm_v1",
+                "ssm_companion_cache": True,
+                "attention_kv_storage_quantization": True,
+            },
+            priority=10,
+        )
+    )
+
+    # ── MiniMax ──
+
+    # MiniMax M2/M2.5/M2.7 chat template uses `]~b]` (token id 200019) as the
+    # role-boundary prefix for every role start (`]~b]system`, `]~b]user`,
+    # `]~b]ai`, `]~b]tool`). The generation prompt is `]~b]ai\n<think>\n`, so
+    # the model starts AFTER the role marker and legitimate output should
+    # NEVER contain `]~b]`. Without this stop, a hallucinated `]~b]user`
+    # would not terminate generation — same hallucination-loop class as the
+    # 2026-05-03 DSV4 `<｜Assistant｜>` incident. eos_tokens[0] (`[e~[`,
+    # 200020) is the primary EOS already in tokenizer_config.json::eos_token;
+    # eos_tokens[1] adds the role-boundary stop via scheduler.py:1981-1993.
+    _register(
+        ModelConfig(
+            family_name="minimax",
+            model_types=["minimax", "minimax_m2", "minimax_m2_5"],
+            cache_type="kv",
+            eos_tokens=["[e~[", "]~b]"],
+            tool_parser="minimax",
+            reasoning_parser="minimax_m2",
+            think_in_template=True,
+            supports_thinking=True,
+            priority=20,
+        )
+    )
+
+    # ── xLAM (Salesforce) — no unique model_type, usually Llama-based ──
+
+    # ── Kimi/Moonshot ──
+
+    _register(
+        ModelConfig(
+            family_name="kimi",
+            model_types=["kimi_k2"],
+            cache_type="kv",
+            tool_parser="kimi",
+            reasoning_parser="deepseek_r1",
+            priority=20,
+        )
+    )
+
+    # ── InternLM ──
+
+    _register(
+        ModelConfig(
+            family_name="internlm",
+            model_types=["internlm", "internlm2", "internlm3"],
+            cache_type="kv",
+            priority=20,
+        )
+    )
+
+    # ── EXAONE ──
+
+    _register(
+        ModelConfig(
+            family_name="exaone",
+            model_types=["exaone", "exaone3"],
+            cache_type="kv",
+            priority=20,
+        )
+    )
+
+    # ── OLMo ──
+
+    _register(
+        ModelConfig(
+            family_name="olmo",
+            model_types=["olmo", "olmo2"],
+            cache_type="kv",
+            priority=20,
+        )
+    )
+
+    # ── VLM / MLLM models ──
+
+    _register(
+        ModelConfig(
+            family_name="llava",
+            model_types=["llava", "llava_next"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=20,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="idefics",
+            model_types=["idefics2", "idefics3"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=15,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="cogvlm",
+            model_types=["cogvlm", "cogvlm2"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=20,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="florence",
+            model_types=["florence2"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=20,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="got_ocr",
+            model_types=["got_ocr2"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=15,
+            description="GOT-OCR2 (General OCR Theory) — document/scene OCR",
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="molmo",
+            model_types=["molmo"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=20,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="minicpm_v",
+            model_types=["minicpmv"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=20,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="smolvlm",
+            model_types=["smolvlm"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=20,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="internvl",
+            model_types=["internvl_chat"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=15,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="internlm_xcomposer",
+            model_types=["internlm_xcomposer2"],
+            cache_type="kv",
+            is_mllm=True,
+            priority=8,
+        )
+    )
+
+    # ── SSM / Mamba ──
+
+    _register(
+        ModelConfig(
+            family_name="falcon_mamba",
+            model_types=["falcon_mamba"],
+            cache_type="mamba",
+            priority=5,
+        )
+    )
+
+    # Falcon H1 — hybrid SSM+attention via CacheList(ArraysCache, KVCache).
+    # Different cache contract from pure falcon_mamba; needs hybrid routing.
+    _register(
+        ModelConfig(
+            family_name="falcon_h1",
+            model_types=["falcon_h1"],
+            cache_type="hybrid",
+            priority=5,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="mamba",
+            model_types=["mamba", "mamba2", "codestral_mamba"],
+            cache_type="mamba",
+            priority=30,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="rwkv",
+            # rwkv7 added — pure SSM (ArraysCache only, no KV); same cache
+            # contract as rwkv5/6.
+            model_types=["rwkv", "rwkv5", "rwkv6", "rwkv7"],
+            cache_type="mamba",
+            priority=30,
+        )
+    )
+
+    # ── Hybrid SSM ──
+
+    _register(
+        ModelConfig(
+            family_name="jamba",
+            model_types=["jamba"],
+            cache_type="hybrid",
+            priority=10,
+        )
+    )
+
+    # ── Hunyuan / Tencent Hy3 (model_type=hy_v3) ──
+    #
+    # Tencent Hy3-preview, ~295B total / ~21B active, dense GQA + MoE
+    # (192 experts, top-8, sigmoid + expert-bias routing) + 1 MTP layer.
+    # Source contract per `~/jang/docs/runtime/2026-05-09-hy3-runtime-handoff-vmlx-python-swift.md`:
+    #
+    #   - Architecture: 80 decoder layers + 1 MTP, dense causal GQA
+    #     (64 Q heads, 8 KV heads, head_dim=128, q/k RMSNorm before RoPE,
+    #     RoPE theta 11158840, context 262144).
+    #   - MoE: sigmoid router + expert-bias correction, top-8, 1 always-active
+    #     shared expert, layer 0 dense FFN (first_k_dense_replace=1),
+    #     route_norm=True, router_scaling_factor=2.826.
+    #   - Cache: standard causal KV. NOT MLA, NOT SSM hybrid, NOT CCA, NOT VL.
+    #   - MTP: `num_nextn_predict_layers=1`. First runtime: `preserved_disabled`
+    #     (normal autoregressive decode using only the 80 base layers).
+    #   - Reasoning: `<think>...</think>` tags + `<｜reasoning_mode｜>reasoning_effort:
+    #     no_think|low|high`. Default `no_think` emits closed `<think></think>`
+    #     prefill. The tags are qwen3-compatible and match the JANG
+    #     capabilities contract.
+    #   - Tool format: Hunyuan/Tencent custom XML
+    #     `<tool_calls><tool_call>NAME<tool_sep><arg_key>K</arg_key>
+    #     <arg_value>V</arg_value>...</tool_call></tool_calls>`. New
+    #     `hunyuan` tool parser (NOT hermes/qwen JSON).
+    #   - Special tokens: `<｜hy_User｜>`, `<｜hy_Assistant｜>`, `<｜hy_eos｜>`.
+    #     Role-boundary stops: model output should never emit `<｜hy_User｜>`
+    #     or `<｜hy_Assistant｜>` mid-response (same hallucination-loop class
+    #     as DSV4/MiniMax/Kimi role-marker fixes).
+    #   - Provisional contract until first bundle ships and `verify_directory`
+    #     proves the per-projection bit map. think_in_template=False because
+    #     the template prefills `<think></think>` for default `no_think`,
+    #     so the parser must NOT pre-classify the first chunk as reasoning.
+    #     supports_thinking=True because the model DOES support `<think>`
+    #     blocks via `reasoning_effort=low|high` opt-in.
+    _register(
+        ModelConfig(
+            family_name="hy_v3",
+            model_types=["hy_v3"],
+            cache_type="kv",
+            eos_tokens=[
+                "<｜hy_eos｜>",
+                "<｜hy_User｜>",
+                "<｜hy_Assistant｜>",
+            ],
+            tool_parser="hunyuan",
+            reasoning_parser="qwen3",
+            think_in_template=False,
+            supports_thinking=True,
+            supports_native_tools=True,
+            priority=20,
+        )
+    )
+
+    # ── Others ──
+
+    _register(
+        ModelConfig(
+            family_name="starcoder",
+            model_types=["starcoder2"],
+            cache_type="kv",
+            priority=30,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="stablelm",
+            model_types=["stablelm"],
+            cache_type="kv",
+            priority=30,
+        )
+    )
+
+    _register(
+        ModelConfig(
+            family_name="baichuan",
+            model_types=["baichuan"],
+            cache_type="kv",
+            priority=30,
+        )
+    )

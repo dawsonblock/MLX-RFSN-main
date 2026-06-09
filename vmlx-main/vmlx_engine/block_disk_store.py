@@ -1,0 +1,1280 @@
+# SPDX-License-Identifier: Apache-2.0
+# Block disk store is original vMLX work by Jinho Jang (eric@jangq.ai).
+# L2 SSD cache tier with safetensors serialization, hybrid SSM cumulative
+# state persistence, orig_dtype metadata, and QuantizedKVCache support.
+# github.com/jjang-ai/vmlx
+"""
+Block-level disk persistence for paged KV cache.
+
+Provides an L2 disk tier behind the L1 in-memory PagedCacheManager.
+Blocks are stored as safetensors files indexed by their chain hash.
+
+Architecture:
+- Each block (e.g. 64 tokens of KV data) is stored as a separate safetensors file
+- Content-addressable: file path derived from the block's chain hash
+- SQLite WAL index maps hash → file for fast lookup
+- Background writer thread prevents disk I/O from blocking inference
+- LRU eviction when total disk usage exceeds configured max
+
+Integration points:
+- On L1 eviction: write block to disk before freeing RAM
+- On L1 lookup miss: check disk before recomputing
+- On generation complete: write-through new blocks to disk
+
+Supported cache_data tuple types (from prefix_cache.py):
+- ("kv", keys_slice, values_slice) — standard KVCache
+- ("quantized_kv", keys_tuple, values_tuple, meta) — QuantizedKVCache
+- ("rotating_kv", keys_slice, values_slice, max_size, keep[, offset, idx])
+  — RotatingKVCache
+- ("cumulative", state_list, meta, class_name) — MambaCache/ArraysCache
+- ("deepseek_v4", state_tree, meta, class_name, cache_meta) — DSV4
+  composite cache (SWA local + CSA/HCA compressor/indexer pools)
+- ("deepseek_v4_pending", class_name, cache_meta) — non-terminal DSV4
+  marker so paged/L2 chain hashes remain materialized without duplicating
+  full CSA/HCA pool state in every block
+- ("zaya_cca", kv_entry, cca_state, cca_meta, cache_meta) — ZAYA CCA
+  typed cache: standard KV pages plus terminal conv_state/prev_hs
+- ("skip",) — placeholder for cumulative layers in non-last blocks
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import sqlite3
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+try:
+    import mlx.core as mx
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
+
+def _json_safe(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, tuple):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, list):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    return str(obj)
+
+
+def _pack_tree(obj: Any, tensors: Dict[str, Any], prefix: str, counter: List[int]) -> Dict[str, Any]:
+    """Flatten a nested cache-state tree into safetensors + JSON metadata."""
+    if obj is None:
+        return {"kind": "none"}
+    if hasattr(obj, "shape"):
+        key = f"{prefix}_{counter[0]}"
+        counter[0] += 1
+        tensors[key] = obj
+        return {
+            "kind": "tensor",
+            "key": key,
+            "orig_dtype": str(getattr(obj, "dtype", "")),
+        }
+    if isinstance(obj, tuple):
+        return {
+            "kind": "tuple",
+            "items": [_pack_tree(x, tensors, prefix, counter) for x in obj],
+        }
+    if isinstance(obj, list):
+        return {
+            "kind": "list",
+            "items": [_pack_tree(x, tensors, prefix, counter) for x in obj],
+        }
+    return {"kind": "literal", "value": _json_safe(obj)}
+
+
+def _unpack_tree(node: Any, data: Dict[str, Any]) -> Any:
+    if not isinstance(node, dict):
+        return None
+    kind = node.get("kind")
+    if kind == "none":
+        return None
+    if kind == "literal":
+        return node.get("value")
+    if kind == "tensor":
+        arr = data.get(node.get("key", ""))
+        if arr is not None and HAS_MLX:
+            orig_dt = node.get("orig_dtype")
+            if orig_dt and orig_dt != str(getattr(arr, "dtype", "")):
+                target = getattr(mx, orig_dt.replace("mlx.core.", ""), None)
+                if target is not None:
+                    try:
+                        arr = arr.astype(target)
+                    except Exception:
+                        pass
+        return arr
+    if kind == "tuple":
+        return tuple(_unpack_tree(x, data) for x in node.get("items", []))
+    if kind == "list":
+        return [_unpack_tree(x, data) for x in node.get("items", [])]
+    return None
+
+
+
+class BlockDiskStore:
+    """
+    Content-addressable block storage on disk for paged KV cache.
+
+    Each block is serialized as a safetensors file containing per-layer
+    KV tensors. A SQLite index maps chain hashes to file paths for O(1) lookup.
+
+    Args:
+        cache_dir: Directory to store cache files.
+        max_size_gb: Maximum total cache size in GB. 0 = unlimited.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str,
+        max_size_gb: float = 10.0,
+        expected_num_layers: Optional[int] = None,
+        **kwargs,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.blocks_dir = self.cache_dir / "blocks"
+        self.blocks_dir.mkdir(parents=True, exist_ok=True)
+        self.max_size_bytes = int(max(0.0, max_size_gb) * 1024**3)
+
+        # Codex 2026-05-06 contract #4: expected layer count from model
+        # config (e.g. 43 for DSV4-Flash). Validator hard-rejects cache
+        # records whose layer count differs — that is the canonical
+        # "wrong-model L2 entry" signal. ``None`` skips the check (e.g.
+        # a generic store without model context); per-tensor + total
+        # byte caps still apply.
+        self._expected_num_layers: Optional[int] = expected_num_layers
+
+        # SQLite index
+        self._db_path = self.cache_dir / "block_index.db"
+        self._init_db()
+
+        # Stats (protected by _stats_lock for cross-thread accuracy)
+        self._stats_lock = threading.Lock()
+        self.disk_hits = 0
+        self.disk_misses = 0
+        self.disk_writes = 0
+        self.disk_evictions = 0
+
+        # Per-thread read connections (thread-local storage).
+        # MLLM batch generator runs fetch_cache on a worker thread — SQLite
+        # connections created on one thread can't be used from another.
+        # Using threading.local() gives each thread its own connection.
+        self._thread_local = threading.local()
+        # Initialize for the current (main) thread
+        self._ensure_read_conn()
+
+        # Background writer thread
+        # Queue items: (block_hash, tmp_path_str, dtype_str, num_layers, token_count)
+        # or special commands: ("__access__", ...) or ("__cleanup__", ...)
+        self._write_queue: queue.Queue = queue.Queue(maxsize=1000)
+        self._tmp_seq = 0  # Monotonic counter for unique temp file names
+        self._stop_event = threading.Event()
+        self._writer_thread = threading.Thread(
+            target=self._background_writer, daemon=True, name="block-disk-writer"
+        )
+        self._writer_thread.start()
+
+        # Clean up orphaned .tmp files from crashed writes
+        self._cleanup_orphaned_tmp()
+
+        entry_count = self._count_entries()
+        total_size = self._total_size()
+        logger.info(
+            f"BlockDiskStore initialized: dir={self.cache_dir}, "
+            f"max_size={max_size_gb:.1f}GB, entries={entry_count}, "
+            f"size={total_size / 1024**3:.2f}GB"
+        )
+
+    def _init_db(self) -> None:
+        """Create SQLite index with WAL mode."""
+        conn = sqlite3.connect(str(self._db_path))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS blocks (
+                    block_hash    TEXT PRIMARY KEY,
+                    file_name     TEXT NOT NULL,
+                    num_tokens    INTEGER NOT NULL,
+                    num_layers    INTEGER NOT NULL,
+                    dtype         TEXT NOT NULL,
+                    file_size     INTEGER NOT NULL,
+                    created_at    REAL NOT NULL,
+                    last_accessed REAL NOT NULL,
+                    access_count  INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_blocks_lru ON blocks(last_accessed ASC)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ensure_read_conn(self) -> sqlite3.Connection:
+        """Get or create a read connection for the current thread."""
+        conn = getattr(self._thread_local, 'read_conn', None)
+        if conn is None:
+            conn = sqlite3.connect(str(self._db_path), timeout=1.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._thread_local.read_conn = conn
+        return conn
+
+    @property
+    def _read_conn(self) -> sqlite3.Connection:
+        """Thread-safe read connection accessor."""
+        return self._ensure_read_conn()
+
+    def _cleanup_orphaned_tmp(self) -> None:
+        """Remove orphaned .tmp files left from crashed writes."""
+        try:
+            count = 0
+            for tmp in self.blocks_dir.rglob("*.tmp.safetensors"):
+                try:
+                    tmp.unlink()
+                    count += 1
+                except OSError:
+                    pass
+            if count:
+                logger.info(f"BlockDiskStore: cleaned up {count} orphaned .tmp file(s)")
+        except Exception:
+            pass
+
+    def _count_entries(self) -> int:
+        return self._read_conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
+
+    def _total_size(self) -> int:
+        return self._read_conn.execute(
+            "SELECT COALESCE(SUM(file_size), 0) FROM blocks"
+        ).fetchone()[0]
+
+    def _hash_to_path(self, hash_hex: str) -> Path:
+        """Shard by first 2 chars for filesystem efficiency."""
+        shard = hash_hex[:2]
+        shard_dir = self.blocks_dir / shard
+        shard_dir.mkdir(exist_ok=True)
+        return shard_dir / f"{hash_hex}.safetensors"
+
+    def has_block(self, block_hash: bytes) -> bool:
+        """Return whether a block hash has a readable finalized L2 entry."""
+        hash_hex = block_hash.hex()
+        try:
+            row = self._read_conn.execute(
+                "SELECT file_name FROM blocks WHERE block_hash = ?",
+                (hash_hex,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            self._thread_local.read_conn = sqlite3.connect(
+                str(self._db_path),
+                timeout=1.0,
+            )
+            row = self._read_conn.execute(
+                "SELECT file_name FROM blocks WHERE block_hash = ?",
+                (hash_hex,),
+            ).fetchone()
+        if row is None:
+            return False
+        return (self.cache_dir / row[0]).exists()
+
+    # =========================================================================
+    # Read
+    # =========================================================================
+
+    def read_block(self, block_hash: bytes) -> Optional[List[Tuple]]:
+        """
+        Read a block from disk by its chain hash.
+
+        This method is read-only on the main thread — access metadata updates
+        are deferred to the background writer to avoid blocking inference.
+
+        Args:
+            block_hash: The BlockHash (SHA-256 chain hash bytes)
+
+        Returns:
+            cache_data in the same format as CacheBlock.cache_data,
+            or None if not found on disk.
+        """
+        if not HAS_MLX:
+            return None
+
+        hash_hex = block_hash.hex()
+
+        try:
+            row = self._read_conn.execute(
+                "SELECT file_name, dtype FROM blocks WHERE block_hash = ?",
+                (hash_hex,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Connection might be stale after writer vacuum — reconnect
+            self._thread_local.read_conn = sqlite3.connect(str(self._db_path), timeout=1.0)
+            row = self._read_conn.execute(
+                "SELECT file_name, dtype FROM blocks WHERE block_hash = ?",
+                (hash_hex,)
+            ).fetchone()
+
+        if row is None:
+            with self._stats_lock:
+                self.disk_misses += 1
+            return None
+
+        file_name, dtype = row
+
+        file_path = self.cache_dir / file_name
+
+        if not file_path.exists():
+            # Stale index entry — queue cleanup to background writer
+            self._queue_index_cleanup(hash_hex)
+            with self._stats_lock:
+                self.disk_misses += 1
+            return None
+
+        try:
+            # Codex 2026-05-06 follow-up: validate the safetensors HEADER
+            # BEFORE calling mx.load. Without this, a corrupt-header file
+            # whose declared shapes describe multi-hundred-GB tensors makes
+            # mx.load itself trigger [metal::malloc] BEFORE the post-load
+            # validator can reject the record. Reads only ~1 KB of header
+            # JSON and rejects + deletes the file if any tensor exceeds the
+            # 4 GB / 16 GB / 256K dim caps.
+            try:
+                from .cache_record_validator import (
+                    reject_safetensors_or_warn,
+                    reject_or_warn,
+                )
+            except Exception:
+                reject_safetensors_or_warn = None
+                reject_or_warn = None
+            if reject_safetensors_or_warn is not None:
+                if not reject_safetensors_or_warn(
+                    str(file_path),
+                    expected_num_layers=getattr(self, "_expected_num_layers", None),
+                    source=f"L2-disk-header:{hash_hex[:12]}",
+                    delete_on_reject=True,
+                ):
+                    # File deleted on reject; queue index cleanup too.
+                    self._queue_index_cleanup(hash_hex)
+                    with self._stats_lock:
+                        self.disk_misses += 1
+                    return None
+
+            data = mx.load(str(file_path))
+            cache_data = _deserialize_block(data, dtype)
+            # Post-load validator (defense in depth): the header validator
+            # only sees declared shapes, not the deserialized cache_data
+            # tag/shape coherence. This catch covers bugs the header check
+            # couldn't see (e.g. tag mismatch, missing fields).
+            if reject_or_warn is not None:
+                if not reject_or_warn(
+                    cache_data,
+                    expected_num_layers=getattr(self, "_expected_num_layers", None),
+                    source=f"L2-disk:{hash_hex[:12]}",
+                ):
+                    # Reject + queue cleanup so we don't try this entry again.
+                    self._queue_index_cleanup(hash_hex)
+                    with self._stats_lock:
+                        self.disk_misses += 1
+                    return None
+            with self._stats_lock:
+                self.disk_hits += 1
+            # Queue access metadata update to background (non-blocking)
+            self._queue_access_update(hash_hex)
+            logger.debug(f"Disk cache hit: {hash_hex[:12]} ({dtype}, {len(cache_data)} layers)")
+            return cache_data
+        except Exception as e:
+            logger.warning(f"Failed to load block {hash_hex[:12]}: {e}")
+            # Corrupt file — queue removal
+            self._queue_index_cleanup(hash_hex)
+            with self._stats_lock:
+                self.disk_misses += 1
+            return None
+
+    def _queue_access_update(self, hash_hex: str) -> None:
+        """Queue an access time update for the background writer."""
+        try:
+            self._write_queue.put_nowait(("__access__", hash_hex, time.time()))
+        except queue.Full:
+            pass  # Non-critical metadata update — safe to drop
+
+    def _queue_index_cleanup(self, hash_hex: str) -> None:
+        """Queue a stale index entry cleanup for the background writer."""
+        try:
+            self._write_queue.put_nowait(("__cleanup__", hash_hex, 0))
+        except queue.Full:
+            pass  # Will be cleaned up on next access attempt
+
+    # =========================================================================
+    # Write (async)
+    # =========================================================================
+
+    def write_block_async(
+        self,
+        block_hash: bytes,
+        cache_data: List[Tuple],
+        token_count: int,
+    ) -> None:
+        """
+        Queue a block for background writing to disk. Non-blocking.
+
+        ALL MLX operations happen on the calling (main) thread:
+        - Serialize cache_data to flat tensor dict
+        - Materialize lazy arrays with mx.eval()
+        - Write safetensors file with mx.save_safetensors()
+
+        The background thread ONLY does: atomic rename + SQLite index update.
+        This prevents Metal command buffer crashes from concurrent GPU access
+        (mx.save_safetensors accesses Metal buffer memory internally).
+
+        Args:
+            block_hash: Chain hash (BlockHash bytes)
+            cache_data: CacheBlock.cache_data — list of typed tuples per layer
+            token_count: Number of tokens in this block
+        """
+        if not HAS_MLX:
+            return
+
+        hash_hex = block_hash.hex()
+
+        # Pre-serialize on the calling (main) thread.
+        try:
+            tensors, dtype, num_layers = _serialize_block(cache_data)
+            if num_layers == 0:
+                return
+
+            # Normalize all tensors to MLX arrays that mx.save_safetensors
+            # can handle.  Two issues to fix:
+            # 1. numpy ndarrays (from numpy-sliced block data) — convert to mx
+            # 2. bfloat16 dtype (unsupported by safetensors) — cast to float16
+            import numpy as np
+            needs_eval = []
+            for k, v in tensors.items():
+                if isinstance(v, np.ndarray):
+                    tensors[k] = mx.array(v)
+                    needs_eval.append(tensors[k])
+                elif isinstance(v, mx.array) and v.dtype == mx.bfloat16:
+                    tensors[k] = v.astype(mx.float16)
+                    needs_eval.append(tensors[k])
+
+            # Materialize all lazy MLX arrays on the calling thread.
+            arrays_to_eval = [v for v in tensors.values() if isinstance(v, mx.array)]
+            if arrays_to_eval:
+                mx.eval(*arrays_to_eval)  # noqa: S307 — mlx tensor materialization
+
+            # Write safetensors file on the main thread.
+            # mx.save_safetensors accesses Metal buffer memory internally,
+            # so it MUST run on the same thread as inference to avoid
+            # concurrent Metal command buffer assertions.
+            file_path = self._hash_to_path(hash_hex)
+            seq = self._tmp_seq
+            self._tmp_seq += 1
+            tmp_path = file_path.with_name(f"{file_path.stem}.{seq}.tmp.safetensors")
+            mx.save_safetensors(str(tmp_path), tensors)
+        except Exception as e:
+            logger.debug(f"Pre-serialize/write failed for block {hash_hex[:12]}: {e}")
+            return
+
+        # Queue only the rename + DB update for the background thread.
+        # No MLX operations happen after this point.
+        try:
+            self._write_queue.put_nowait(
+                (block_hash, str(tmp_path), dtype, num_layers, token_count)
+            )
+        except queue.Full:
+            # Clean up the temp file since background won't process it
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            logger.warning("BlockDiskStore write queue full (1000), dropping block write")
+
+    def _background_writer(self) -> None:
+        """Background thread: drain write queue and persist blocks.
+
+        Uses a persistent write connection for the lifetime of this thread,
+        avoiding the overhead of opening/closing a SQLite connection per
+        operation. The connection is created once at thread start.
+        """
+        write_conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+        write_conn.execute("PRAGMA journal_mode=WAL")
+
+        try:
+            while not self._stop_event.is_set():
+                # Collect a batch: block on the first item (with timeout so we
+                # can check the stop event), then drain any remaining items.
+                batch = []
+                try:
+                    item = self._write_queue.get(timeout=0.2)
+                    batch.append(item)
+                except queue.Empty:
+                    continue
+
+                # Drain remaining items without blocking
+                while True:
+                    try:
+                        batch.append(self._write_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                for item in batch:
+                    try:
+                        if item[0] == "__access__":
+                            _, hash_hex, ts = item
+                            self._update_access(write_conn, hash_hex, ts)
+                        elif item[0] == "__cleanup__":
+                            _, hash_hex, _ = item
+                            self._cleanup_entry(write_conn, hash_hex)
+                        else:
+                            block_hash, tmp_path_str, dtype, num_layers, token_count = item
+                            self._write_block(write_conn, block_hash, tmp_path_str, dtype, num_layers, token_count)
+                    except Exception as e:
+                        h = item[0] if isinstance(item[0], str) else (
+                            item[0].hex()[:12] if isinstance(item[0], bytes) else "?"
+                        )
+                        logger.warning(f"Background writer error ({h}): {e}")
+
+                # Evict if over budget
+                self._maybe_evict(write_conn)
+        finally:
+            write_conn.close()
+
+    def _update_access(self, conn: sqlite3.Connection, hash_hex: str, ts: float) -> None:
+        """Update last_accessed time in the index (background thread only)."""
+        conn.execute(
+            "UPDATE blocks SET last_accessed = ?, access_count = access_count + 1 "
+            "WHERE block_hash = ?",
+            (ts, hash_hex)
+        )
+        conn.commit()
+
+    def _cleanup_entry(self, conn: sqlite3.Connection, hash_hex: str) -> None:
+        """Remove a stale index entry and its file (background thread only)."""
+        row = conn.execute(
+            "SELECT file_name FROM blocks WHERE block_hash = ?", (hash_hex,)
+        ).fetchone()
+        if row:
+            file_path = self.cache_dir / row[0]
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            conn.execute("DELETE FROM blocks WHERE block_hash = ?", (hash_hex,))
+            conn.commit()
+
+    def _write_block(
+        self,
+        conn: sqlite3.Connection,
+        block_hash: bytes,
+        tmp_path_str: str,
+        dtype: str,
+        num_layers: int,
+        token_count: int,
+    ) -> None:
+        """Finalize a pre-written block file (called from background thread).
+
+        The safetensors file was already written by the main thread.
+        This method ONLY does: atomic rename + SQLite index update.
+        No MLX operations — prevents Metal command buffer crashes.
+        """
+        hash_hex = block_hash.hex()
+        tmp_path = Path(tmp_path_str)
+
+        # Skip if already on disk
+        exists = conn.execute(
+            "SELECT 1 FROM blocks WHERE block_hash = ?", (hash_hex,)
+        ).fetchone()
+        if exists:
+            # Clean up the temp file — block already persisted
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+
+        # Atomic rename from temp to final path
+        file_path = self._hash_to_path(hash_hex)
+        rel_path = file_path.relative_to(self.cache_dir)
+
+        try:
+            os.rename(str(tmp_path), str(file_path))
+        except Exception:
+            # Clean up partial file
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+        file_size = file_path.stat().st_size
+        now = time.time()
+
+        conn.execute(
+            """INSERT OR IGNORE INTO blocks
+               (block_hash, file_name, num_tokens, num_layers, dtype,
+                file_size, created_at, last_accessed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (hash_hex, str(rel_path), token_count, num_layers, dtype,
+             file_size, now, now)
+        )
+        conn.commit()
+
+        with self._stats_lock:
+            self.disk_writes += 1
+        logger.debug(
+            f"Disk cache write: {hash_hex[:12]} ({dtype}, {num_layers} layers, "
+            f"{file_size / 1024:.1f}KB, {token_count} tokens)"
+        )
+
+    # =========================================================================
+    # Eviction
+    # =========================================================================
+
+    def _maybe_evict(self, conn: sqlite3.Connection) -> None:
+        """Evict LRU blocks if total disk usage exceeds max."""
+        if self.max_size_bytes <= 0:
+            return
+
+        total = conn.execute(
+            "SELECT COALESCE(SUM(file_size), 0) FROM blocks"
+        ).fetchone()[0]
+
+        if total <= self.max_size_bytes:
+            return
+
+        target = int(self.max_size_bytes * 0.8)  # Free down to 80%
+        rows = conn.execute(
+            "SELECT block_hash, file_name, file_size FROM blocks "
+            "ORDER BY last_accessed ASC"
+        ).fetchall()
+
+        evicted = 0
+        for hash_hex, file_name, file_size in rows:
+            if total <= target:
+                break
+            file_path = self.cache_dir / file_name
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            conn.execute("DELETE FROM blocks WHERE block_hash = ?", (hash_hex,))
+            total -= file_size
+            evicted += 1
+
+        conn.commit()
+
+        if evicted:
+            with self._stats_lock:
+                self.disk_evictions += evicted
+            logger.info(
+                f"Disk cache eviction: removed {evicted} blocks "
+                f"(now {total / 1024**3:.2f}GB)"
+            )
+
+    # =========================================================================
+    # Management
+    # =========================================================================
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return cache statistics."""
+        conn = sqlite3.connect(str(self._db_path), timeout=1.0)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(file_size), 0), "
+                "COALESCE(SUM(access_count), 0), "
+                "COALESCE(SUM(num_tokens), 0) FROM blocks"
+            ).fetchone()
+        finally:
+            conn.close()
+        with self._stats_lock:
+            return {
+                "blocks_on_disk": row[0],
+                "disk_size_bytes": row[1],
+                "disk_size_gb": round(row[1] / 1024**3, 3),
+                "total_accesses": row[2],
+                "total_tokens_on_disk": int(row[3]),
+                "total_cached_tokens": int(row[3]),
+                "disk_hits": self.disk_hits,
+                "disk_misses": self.disk_misses,
+                "disk_writes": self.disk_writes,
+                "disk_evictions": self.disk_evictions,
+            }
+
+    def clear(self) -> None:
+        """Clear all cached blocks from disk."""
+        import shutil
+        # Drain the write queue so the background writer doesn't write
+        # blocks we're about to delete
+        while not self._write_queue.empty():
+            try:
+                self._write_queue.get_nowait()
+            except queue.Empty:
+                break
+        if self.blocks_dir.exists():
+            shutil.rmtree(self.blocks_dir)
+            self.blocks_dir.mkdir(parents=True)
+        conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+        try:
+            conn.execute("DELETE FROM blocks")
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info("Disk cache cleared")
+
+    def shutdown(self) -> None:
+        """Stop background writer and flush pending writes."""
+        self._stop_event.set()
+        self._writer_thread.join(timeout=5.0)
+        if self._writer_thread.is_alive():
+            logger.warning("BlockDiskStore writer thread did not stop in time, skipping flush")
+            return
+        # Flush remaining (safe because writer thread has stopped)
+        remaining = []
+        while not self._write_queue.empty():
+            try:
+                remaining.append(self._write_queue.get_nowait())
+            except queue.Empty:
+                break
+        if remaining:
+            flush_conn = sqlite3.connect(str(self._db_path), timeout=5.0)
+            flush_conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                for item in remaining:
+                    try:
+                        if item[0] == "__access__":
+                            self._update_access(flush_conn, item[1], item[2])
+                        elif item[0] == "__cleanup__":
+                            self._cleanup_entry(flush_conn, item[1])
+                        elif isinstance(item[0], bytes):
+                            self._write_block(flush_conn, item[0], item[1], item[2], item[3], item[4])
+                    except Exception:
+                        pass
+            finally:
+                flush_conn.close()
+        # Close thread-local read connection (current thread only)
+        try:
+            conn = getattr(self._thread_local, 'read_conn', None)
+            if conn is not None:
+                conn.close()
+                self._thread_local.read_conn = None
+        except Exception:
+            pass
+
+
+# =============================================================================
+# Serialization / Deserialization (module-level functions)
+# =============================================================================
+
+def _serialize_block(
+    cache_data: List[Tuple],
+) -> Tuple[Dict[str, Any], str, int]:
+    """
+    Convert CacheBlock.cache_data to a flat dict of named tensors for safetensors.
+
+    Per-layer type tags are stored in metadata so deserialization can handle
+    mixed-type blocks (e.g. hybrid Mamba-Transformer models).
+
+    The naming convention encodes layer index and tensor role:
+      layer_{i}_keys, layer_{i}_values          — standard kv
+      layer_{i}_keys_data, _scales, _zeros       — quantized kv
+      layer_{i}_max_size, layer_{i}_keep          — rotating kv params
+      layer_{i}_cumulative_{j}                    — cumulative state arrays
+      layer_{i}_dsv4_state_{j}                    — DSV4 nested state arrays
+      layer_{i}_zaya_cca_state_{j}                 — ZAYA CCA nested state arrays
+      layer_{i}_no_state                           — explicit no-state layer
+
+    Returns:
+        (tensor_dict, dtype_string, total_cache_layers). The total layer
+        count includes skip entries so L2 records remain model-shape scoped.
+    """
+    if not HAS_MLX:
+        return {}, "unknown", 0
+
+    tensors: Dict[str, Any] = {}
+    num_layers_with_data = 0
+    # Per-layer metadata including type tags for mixed-type block support
+    meta: Dict[str, Any] = {
+        "__layer_types__": {},
+        "__num_cache_layers__": len(cache_data),
+    }
+    try:
+        from .prefix_cache import runtime_cache_fingerprint
+
+        meta["__runtime_cache_fingerprint__"] = runtime_cache_fingerprint()
+    except Exception:
+        meta["__runtime_cache_fingerprint__"] = "unknown"
+
+    for i, layer_data in enumerate(cache_data):
+        tag = layer_data[0]
+
+        if tag == "skip":
+            continue
+
+        num_layers_with_data += 1
+        meta["__layer_types__"][str(i)] = tag
+
+        if tag == "kv":
+            _, keys, values = layer_data
+            tensors[f"layer_{i}_keys"] = keys
+            tensors[f"layer_{i}_values"] = values
+            # Record original dtype so deserialization can restore it
+            # after bfloat16→float16 cast (safetensors doesn't support bf16)
+            if hasattr(keys, "dtype"):
+                meta.setdefault("__orig_dtypes__", {})[str(i)] = str(keys.dtype)
+
+        elif tag == "quantized_kv":
+            _, keys_tuple, values_tuple, layer_meta = layer_data
+            tensors[f"layer_{i}_keys_data"] = keys_tuple[0]
+            tensors[f"layer_{i}_keys_scales"] = keys_tuple[1]
+            tensors[f"layer_{i}_keys_zeros"] = keys_tuple[2]
+            tensors[f"layer_{i}_values_data"] = values_tuple[0]
+            tensors[f"layer_{i}_values_scales"] = values_tuple[1]
+            tensors[f"layer_{i}_values_zeros"] = values_tuple[2]
+            if layer_meta:
+                meta[str(i)] = {"quant_meta": layer_meta}
+
+        elif tag == "rotating_kv":
+            _, keys, values, max_size, keep, *window_state = layer_data
+            tensors[f"layer_{i}_keys"] = keys
+            tensors[f"layer_{i}_values"] = values
+            tensors[f"layer_{i}_max_size"] = mx.array([max_size], dtype=mx.int32)
+            tensors[f"layer_{i}_keep"] = mx.array([keep], dtype=mx.int32)
+            offset = window_state[0] if len(window_state) >= 1 else None
+            idx_state = window_state[1] if len(window_state) >= 2 else None
+            if offset is not None:
+                tensors[f"layer_{i}_offset"] = mx.array([offset], dtype=mx.int32)
+            if idx_state is not None:
+                tensors[f"layer_{i}_idx"] = mx.array([idx_state], dtype=mx.int32)
+            if hasattr(keys, "dtype"):
+                meta.setdefault("__orig_dtypes__", {})[str(i)] = str(keys.dtype)
+
+        elif tag == "cache_list":
+            # CacheList (MoE models): each sub-cache is serialized independently
+            _, sub_slices = layer_data
+            sub_count = 0
+            for j, sub_entry in enumerate(sub_slices):
+                sub_tag = sub_entry[0]
+                if sub_tag == "skip":
+                    continue
+                elif sub_tag == "kv":
+                    _, sk, sv = sub_entry
+                    tensors[f"layer_{i}_sub_{j}_keys"] = sk
+                    tensors[f"layer_{i}_sub_{j}_values"] = sv
+                    if hasattr(sk, "dtype"):
+                        meta.setdefault("__orig_dtypes__", {})[f"{i}_sub_{j}"] = str(sk.dtype)
+                    sub_count += 1
+                elif sub_tag == "cumulative":
+                    _, sub_state, sub_meta, sub_cls = sub_entry
+                    if isinstance(sub_state, (list, tuple)):
+                        for k, arr in enumerate(sub_state):
+                            if hasattr(arr, "shape"):
+                                tensors[f"layer_{i}_sub_{j}_cumulative_{k}"] = arr
+                    meta.setdefault(str(i), {}).setdefault("subs", {})[str(j)] = {
+                        "class_name": sub_cls, "meta": sub_meta
+                    }
+                    sub_count += 1
+            meta.setdefault(str(i), {})["sub_count"] = len(sub_slices)
+
+        elif tag == "zaya_cca":
+            _, kv_entry, cca_state, cca_meta, cache_meta = layer_data
+            layer_meta = {
+                "cache_meta": _json_safe(cache_meta),
+                "cca_meta": _json_safe(cca_meta),
+                "terminal": cca_state is not None,
+            }
+            if isinstance(kv_entry, (tuple, list)) and kv_entry:
+                kv_tag = kv_entry[0]
+                layer_meta["kv_tag"] = kv_tag
+                if kv_tag == "kv":
+                    _, zk, zv = kv_entry
+                    tensors[f"layer_{i}_zaya_keys"] = zk
+                    tensors[f"layer_{i}_zaya_values"] = zv
+                    if hasattr(zk, "dtype"):
+                        meta.setdefault("__orig_dtypes__", {})[f"{i}_zaya_kv"] = str(zk.dtype)
+                elif kv_tag == "quantized_kv":
+                    _, zkt, zvt, zmeta = kv_entry
+                    tensors[f"layer_{i}_zaya_keys_data"] = zkt[0]
+                    tensors[f"layer_{i}_zaya_keys_scales"] = zkt[1]
+                    tensors[f"layer_{i}_zaya_keys_zeros"] = zkt[2]
+                    tensors[f"layer_{i}_zaya_values_data"] = zvt[0]
+                    tensors[f"layer_{i}_zaya_values_scales"] = zvt[1]
+                    tensors[f"layer_{i}_zaya_values_zeros"] = zvt[2]
+                    layer_meta["quant_meta"] = _json_safe(zmeta)
+            if cca_state is not None:
+                counter = [0]
+                layer_meta["cca_state_tree"] = _pack_tree(
+                    cca_state,
+                    tensors,
+                    f"layer_{i}_zaya_cca_state",
+                    counter,
+                )
+            meta[str(i)] = layer_meta
+
+        elif tag == "no_state":
+            _, class_name = layer_data
+            tensors[f"layer_{i}_no_state"] = mx.array([1], dtype=mx.int8)
+            meta[str(i)] = {"class_name": class_name}
+
+        elif tag == "cumulative":
+            _, state_list, layer_meta, class_name = layer_data
+            if isinstance(state_list, (list, tuple)):
+                for j, arr in enumerate(state_list):
+                    if hasattr(arr, "shape"):
+                        tensors[f"layer_{i}_cumulative_{j}"] = arr
+            meta[str(i)] = {"class_name": class_name, "meta": layer_meta}
+
+        elif tag == "deepseek_v4":
+            _, state_tree, layer_meta, class_name, cache_meta = layer_data
+            counter = [0]
+            tree_meta = _pack_tree(
+                state_tree,
+                tensors,
+                f"layer_{i}_dsv4_state",
+                counter,
+            )
+            meta[str(i)] = {
+                "class_name": class_name,
+                "meta": _json_safe(layer_meta),
+                "cache_meta": _json_safe(cache_meta),
+                "state_tree": tree_meta,
+            }
+
+        elif tag == "deepseek_v4_pending":
+            _, class_name, cache_meta = layer_data
+            tensors[f"layer_{i}_dsv4_pending"] = mx.array([1], dtype=mx.int32)
+            meta[str(i)] = {
+                "class_name": class_name,
+                "cache_meta": _json_safe(cache_meta),
+            }
+
+    # Determine dominant dtype for the DB index (informational only)
+    type_set = set(meta["__layer_types__"].values())
+    if len(type_set) == 1:
+        dtype = type_set.pop()
+    elif type_set:
+        dtype = "mixed"
+    else:
+        dtype = "kv"
+
+    # Store metadata as a serialized JSON tensor.
+    # Use a non-reserved key — safetensors has a special "__metadata__"
+    # header that expects a string-to-string dict. Writing a uint8 tensor
+    # under that name triggers C++ JSON type_error.302 ("type must be
+    # string, but is array") on load → disk cache hits become silent
+    # misses because _deserialize_block returns [] and the block is
+    # treated as corrupt + cleanup-queued.
+    if meta:
+        meta_bytes = json.dumps(meta).encode("utf-8")
+        tensors["__vmlx_block_meta__"] = mx.array(
+            list(meta_bytes), dtype=mx.uint8
+        )
+
+    num_layers = len(cache_data) if num_layers_with_data else 0
+    return tensors, dtype, num_layers
+
+
+def _deserialize_block(
+    data: Dict[str, Any],
+    dtype: str,
+) -> List[Tuple]:
+    """
+    Reconstruct CacheBlock.cache_data from loaded safetensors dict.
+
+    Uses per-layer type tags from metadata for mixed-type block support.
+    Falls back to the dtype field for backward compatibility with blocks
+    serialized before per-layer tags were added.
+    """
+    # Extract metadata if present. Try the new key first; fall back to
+    # the legacy `__metadata__` key for blocks written by older builds
+    # (pre-fix, still readable because this loader does the read, not
+    # safetensors' reserved-name parser).
+    meta: Dict[str, Any] = {}
+    meta_arr = data.get("__vmlx_block_meta__")
+    if meta_arr is None:
+        meta_arr = data.get("__metadata__")
+    if meta_arr is not None:
+        try:
+            meta_bytes = bytes(meta_arr.tolist())
+            meta = json.loads(meta_bytes.decode("utf-8"))
+        except Exception:
+            pass
+    # Remove from data dict so it's not picked up as a layer
+    data.pop("__vmlx_block_meta__", None)
+    data.pop("__metadata__", None)
+
+    try:
+        from .prefix_cache import runtime_cache_fingerprint
+
+        current_runtime = runtime_cache_fingerprint()
+    except Exception:
+        current_runtime = "unknown"
+    stored_runtime = meta.get("__runtime_cache_fingerprint__")
+    if stored_runtime != current_runtime:
+        logger.info(
+            "Disk cache block runtime fingerprint mismatch; treating as miss "
+            "(stored=%s current=%s)",
+            stored_runtime or "missing",
+            current_runtime,
+        )
+        return []
+
+    # Per-layer type map (new format with __layer_types__)
+    layer_types = meta.get("__layer_types__", {})
+    # Per-layer original dtypes (for restoring bfloat16 after float16 cast)
+    orig_dtypes = meta.get("__orig_dtypes__", {})
+
+    # Find all layer indices
+    layer_indices: Dict[int, str] = {}
+    for key in data:
+        parts = key.split("_")
+        if len(parts) >= 2 and parts[0] == "layer":
+            try:
+                idx = int(parts[1])
+                if idx not in layer_indices:
+                    layer_indices[idx] = key
+            except ValueError:
+                continue
+
+    declared_num_layers = meta.get("__num_cache_layers__")
+    try:
+        declared_num_layers = int(declared_num_layers)
+    except (TypeError, ValueError):
+        declared_num_layers = 0
+
+    if not layer_indices:
+        return []
+
+    max_layer = max(layer_indices.keys())
+    num_cache_layers = max(max_layer + 1, declared_num_layers)
+    cache_data: List[Tuple] = []
+
+    for i in range(num_cache_layers):
+        if i not in layer_indices:
+            cache_data.append(("skip",))
+            continue
+
+        # Determine this layer's type: prefer per-layer tag, fallback to global dtype
+        layer_type = layer_types.get(str(i), _infer_layer_type(data, i, dtype))
+
+        if layer_type == "kv":
+            keys = data.get(f"layer_{i}_keys")
+            values = data.get(f"layer_{i}_values")
+            if keys is not None and values is not None:
+                # Restore original dtype if it was cast during serialization
+                # (e.g. bfloat16 -> float16 because safetensors doesn't support bf16)
+                orig_dt = orig_dtypes.get(str(i))
+                if HAS_MLX and orig_dt and orig_dt != str(keys.dtype):
+                    target = getattr(mx, orig_dt.replace("mlx.core.", ""), None)
+                    if target is not None:
+                        keys = keys.astype(target)
+                        values = values.astype(target)
+                cache_data.append(("kv", keys, values))
+            else:
+                cache_data.append(("skip",))
+
+        elif layer_type == "quantized_kv":
+            try:
+                keys_tuple = (
+                    data[f"layer_{i}_keys_data"],
+                    data[f"layer_{i}_keys_scales"],
+                    data[f"layer_{i}_keys_zeros"],
+                )
+                values_tuple = (
+                    data[f"layer_{i}_values_data"],
+                    data[f"layer_{i}_values_scales"],
+                    data[f"layer_{i}_values_zeros"],
+                )
+                layer_meta_dict = meta.get(str(i), {})
+                layer_meta = layer_meta_dict.get("quant_meta", layer_meta_dict.get("meta", {}))
+                cache_data.append(("quantized_kv", keys_tuple, values_tuple, layer_meta))
+            except KeyError:
+                cache_data.append(("skip",))
+
+        elif layer_type == "rotating_kv":
+            keys = data.get(f"layer_{i}_keys")
+            values = data.get(f"layer_{i}_values")
+            max_size_arr = data.get(f"layer_{i}_max_size")
+            keep_arr = data.get(f"layer_{i}_keep")
+            offset_arr = data.get(f"layer_{i}_offset")
+            idx_arr = data.get(f"layer_{i}_idx")
+            if keys is not None and values is not None:
+                orig_dt = orig_dtypes.get(str(i))
+                if HAS_MLX and orig_dt and orig_dt != str(keys.dtype):
+                    target = getattr(mx, orig_dt.replace("mlx.core.", ""), None)
+                    if target is not None:
+                        keys = keys.astype(target)
+                        values = values.astype(target)
+                max_size = int(max_size_arr.item()) if max_size_arr is not None else 0
+                keep = int(keep_arr.item()) if keep_arr is not None else 0
+                offset = int(offset_arr.item()) if offset_arr is not None else None
+                idx_state = int(idx_arr.item()) if idx_arr is not None else None
+                cache_data.append(
+                    ("rotating_kv", keys, values, max_size, keep, offset, idx_state)
+                )
+            else:
+                cache_data.append(("skip",))
+
+        elif layer_type == "cache_list":
+            # CacheList (MoE models): reconstruct sub-caches
+            layer_meta_dict = meta.get(str(i), {})
+            sub_count = layer_meta_dict.get("sub_count", 0)
+            subs_meta = layer_meta_dict.get("subs", {})
+            sub_slices = []
+            for j in range(sub_count):
+                sk = data.get(f"layer_{i}_sub_{j}_keys")
+                sv = data.get(f"layer_{i}_sub_{j}_values")
+                if sk is not None and sv is not None:
+                    # Restore original dtype if cast
+                    orig_dt = orig_dtypes.get(f"{i}_sub_{j}")
+                    if HAS_MLX and orig_dt and orig_dt != str(sk.dtype):
+                        target = getattr(mx, orig_dt.replace("mlx.core.", ""), None)
+                        if target is not None:
+                            sk = sk.astype(target)
+                            sv = sv.astype(target)
+                    sub_slices.append(("kv", sk, sv))
+                elif f"layer_{i}_sub_{j}_cumulative_0" in data:
+                    sub_meta_dict = subs_meta.get(str(j), {})
+                    sub_cls = sub_meta_dict.get("class_name", "")
+                    sub_meta_val = sub_meta_dict.get("meta", "")
+                    sub_arrays = []
+                    k = 0
+                    while f"layer_{i}_sub_{j}_cumulative_{k}" in data:
+                        sub_arrays.append(data[f"layer_{i}_sub_{j}_cumulative_{k}"])
+                        k += 1
+                    sub_slices.append(("cumulative", sub_arrays, sub_meta_val, sub_cls))
+                else:
+                    sub_slices.append(("skip",))
+            cache_data.append(("cache_list", sub_slices))
+
+        elif layer_type == "zaya_cca":
+            layer_meta_dict = meta.get(str(i), {})
+            kv_tag = layer_meta_dict.get("kv_tag", "skip")
+            if kv_tag == "kv":
+                zk = data.get(f"layer_{i}_zaya_keys")
+                zv = data.get(f"layer_{i}_zaya_values")
+                if zk is not None and zv is not None:
+                    orig_dt = orig_dtypes.get(f"{i}_zaya_kv")
+                    if HAS_MLX and orig_dt and orig_dt != str(zk.dtype):
+                        target = getattr(mx, orig_dt.replace("mlx.core.", ""), None)
+                        if target is not None:
+                            zk = zk.astype(target)
+                            zv = zv.astype(target)
+                    kv_entry = ("kv", zk, zv)
+                else:
+                    kv_entry = ("skip",)
+            elif kv_tag == "quantized_kv":
+                try:
+                    zkt = (
+                        data[f"layer_{i}_zaya_keys_data"],
+                        data[f"layer_{i}_zaya_keys_scales"],
+                        data[f"layer_{i}_zaya_keys_zeros"],
+                    )
+                    zvt = (
+                        data[f"layer_{i}_zaya_values_data"],
+                        data[f"layer_{i}_zaya_values_scales"],
+                        data[f"layer_{i}_zaya_values_zeros"],
+                    )
+                    kv_entry = (
+                        "quantized_kv",
+                        zkt,
+                        zvt,
+                        layer_meta_dict.get("quant_meta", ()),
+                    )
+                except KeyError:
+                    kv_entry = ("skip",)
+            else:
+                kv_entry = ("skip",)
+            cca_state = _unpack_tree(
+                layer_meta_dict.get("cca_state_tree"),
+                data,
+            ) if layer_meta_dict.get("terminal") else None
+            cache_data.append((
+                "zaya_cca",
+                kv_entry,
+                cca_state,
+                layer_meta_dict.get("cca_meta", ""),
+                layer_meta_dict.get("cache_meta", {}),
+            ))
+
+        elif layer_type == "no_state":
+            layer_meta_dict = meta.get(str(i), {})
+            cache_data.append(("no_state", layer_meta_dict.get("class_name", "")))
+
+        elif layer_type == "cumulative":
+            layer_meta_dict = meta.get(str(i), {})
+            class_name = layer_meta_dict.get("class_name", "")
+            layer_meta_val = layer_meta_dict.get("meta", "")
+            state_arrays = []
+            j = 0
+            while f"layer_{i}_cumulative_{j}" in data:
+                state_arrays.append(data[f"layer_{i}_cumulative_{j}"])
+                j += 1
+            if state_arrays:
+                cache_data.append(("cumulative", state_arrays, layer_meta_val, class_name))
+            else:
+                cache_data.append(("skip",))
+        elif layer_type == "deepseek_v4":
+            layer_meta_dict = meta.get(str(i), {})
+            class_name = layer_meta_dict.get("class_name", "DeepseekV4Cache")
+            layer_meta_val = layer_meta_dict.get("meta", "")
+            cache_meta = layer_meta_dict.get("cache_meta", {})
+            state_tree = layer_meta_dict.get("state_tree")
+            state = _unpack_tree(state_tree, data)
+            if state is not None:
+                cache_data.append((
+                    "deepseek_v4",
+                    state,
+                    layer_meta_val,
+                    class_name,
+                    cache_meta,
+                ))
+            else:
+                cache_data.append(("skip",))
+        elif layer_type == "deepseek_v4_pending":
+            layer_meta_dict = meta.get(str(i), {})
+            cache_data.append((
+                "deepseek_v4_pending",
+                layer_meta_dict.get("class_name", "DeepseekV4Cache"),
+                layer_meta_dict.get("cache_meta", {}),
+            ))
+        else:
+            cache_data.append(("skip",))
+
+    return cache_data
+
+
+def _infer_layer_type(data: Dict[str, Any], layer_idx: int, fallback_dtype: str) -> str:
+    """Infer a layer's type from its tensor keys (backward compat for old blocks)."""
+    prefix = f"layer_{layer_idx}_"
+    has_keys_data = f"{prefix}keys_data" in data
+    has_cumulative = f"{prefix}cumulative_0" in data
+    has_dsv4 = f"{prefix}dsv4_state_0" in data
+    has_dsv4_pending = f"{prefix}dsv4_pending" in data
+    has_max_size = f"{prefix}max_size" in data
+    has_keys = f"{prefix}keys" in data
+    has_sub = f"{prefix}sub_0_keys" in data or f"{prefix}sub_0_cumulative_0" in data
+
+    if has_sub:
+        return "cache_list"
+    if has_keys_data:
+        return "quantized_kv"
+    if has_cumulative:
+        return "cumulative"
+    if has_dsv4:
+        return "deepseek_v4"
+    if has_dsv4_pending:
+        return "deepseek_v4_pending"
+    if has_max_size and has_keys:
+        return "rotating_kv"
+    if has_keys:
+        return "kv"
+    return fallback_dtype

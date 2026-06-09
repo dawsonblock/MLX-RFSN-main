@@ -1,0 +1,88 @@
+{
+  "release": "experimental",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 256,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 445.71129200085124,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999776482582,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 16,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": 0.11105088433578203,
+          "latency_ms": 442.4143340002047,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.8881778195500374,
+          "logit_cosine_min": 0.784585177898407,
+          "logit_max_abs_diff": 8.59423440694809,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.6,
+          "kl_divergence_mean": 0.09977936037466861,
+          "token_positions_evaluated": 16,
+          "status": "fail",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 512,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "mode": "none",
+          "avg_nll_delta": 0.0,
+          "latency_ms": 464.08054099993024,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999962747097,
+          "logit_cosine_min": 0.9999999403953552,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 16,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "experimental_hybrid",
+          "mode": "hybrid_polar_cartesian",
+          "avg_nll_delta": 0.06574524035295326,
+          "latency_ms": 460.09679099915957,
+          "route_used": "experimental",
+          "logit_cosine_mean": 0.8915538638830185,
+          "logit_cosine_min": 0.7478991746902466,
+          "logit_max_abs_diff": 8.096759855747223,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.5375,
+          "kl_divergence_mean": 0.06251171942426481,
+          "token_positions_evaluated": 16,
+          "status": "fail",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "",
+    "best_memory_config_passing_all_contexts": "",
+    "rejected_configs": [
+      "experimental_hybrid"
+    ],
+    "production_ready": false
+  }
+}

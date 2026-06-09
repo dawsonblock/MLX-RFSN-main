@@ -1,0 +1,136 @@
+{
+  "release": "main27",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 512,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 4810.739125001419,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000037252903,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs64",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": 1.3219946481513034e-05,
+          "latency_ms": 3313.1412910006475,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9997828705236316,
+          "logit_cosine_min": 0.9992324113845825,
+          "logit_max_abs_diff": 0.3678642655722797,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 2.3243424327468176e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 1024,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 2225.1427909977792,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999823048711,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs64",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": 2.55045300718848e-05,
+          "latency_ms": 3214.015292000113,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9997687488794327,
+          "logit_cosine_min": 0.9990808963775635,
+          "logit_max_abs_diff": 0.4136227201670408,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.990625,
+          "kl_divergence_mean": 2.0273606251564047e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 2048,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 3614.211583000724,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000027939677,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "k8_v4_gs64",
+          "k_bits": 8,
+          "v_bits": 4,
+          "group_size": 64,
+          "avg_nll_delta": -1.3156882346265775e-05,
+          "latency_ms": 31970.84425000139,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9998105559498072,
+          "logit_cosine_min": 0.999372124671936,
+          "logit_max_abs_diff": 0.33813313813880086,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 1.395015766014751e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "k8_v4_gs64",
+    "best_memory_config_passing_all_contexts": "k8_v4_gs64",
+    "recommended_default": "k8_v4_gs64",
+    "rejected_configs": [],
+    "production_ready": false
+  }
+}

@@ -1,0 +1,1184 @@
+{
+  "baseline_dir": "benchmarks/proof_baselines/main10",
+  "current_dir": "artifacts/proof/main12",
+  "thresholds": {
+    "kv": {
+      "latency_max_regression_pct": {
+        "store_latency_ms": 200.0,
+        "retrieve_latency_ms": 200.0
+      },
+      "quality_max_drop_abs": {
+        "key_cosine_sim": 0.008,
+        "value_cosine_sim": 0.02
+      },
+      "quality_max_rise_abs": {
+        "key_rel_mae": 0.02,
+        "value_rel_mae": 0.06,
+        "key_max_abs_error": 0.04,
+        "value_max_abs_error": 0.2
+      }
+    },
+    "e2e": {
+      "latency_max_regression_pct": {
+        "cache_miss_total_latency_ms": 30.0,
+        "cache_hit_total_latency_ms": 30.0
+      },
+      "quality_max_drop_abs": {
+        "quant_audit_cosine": 0.015,
+        "sparse_audit_cosine": 0.03,
+        "audit_cosine": 0.03
+      }
+    },
+    "absolute_quality_min": {
+      "absolute_sparse_audit_cosine_min": 0.9,
+      "absolute_quant_audit_cosine_min": 0.95,
+      "absolute_value_cosine_min": 0.9
+    }
+  },
+  "strict_missing": false,
+  "strict_absolute": false,
+  "absolute_quality": {
+    "absolute_sparse_audit_cosine_min": {
+      "label": "Sparse quality",
+      "metric": "sparse_audit_cosine",
+      "threshold": 0.9,
+      "status": "warn",
+      "min_value": 0.4996378421783447
+    },
+    "absolute_quant_audit_cosine_min": {
+      "label": "Quant quality",
+      "metric": "quant_audit_cosine",
+      "threshold": 0.95,
+      "status": "pass",
+      "min_value": 0.9703969359397888
+    },
+    "absolute_value_cosine_min": {
+      "label": "KV value quality",
+      "metric": "value_cosine_sim",
+      "threshold": 0.9,
+      "status": "pass",
+      "min_value": 0.9699910283088684
+    }
+  },
+  "absolute_warnings": [
+    {
+      "section": "e2e",
+      "metric": "sparse_audit_cosine",
+      "rule": "absolute_quality_min",
+      "threshold": 0.9,
+      "observed": 0.4996378421783447,
+      "details": "Sparse quality below absolute minimum: sparse_audit_cosine min 0.499638 < 0.900000"
+    }
+  ],
+  "absolute_breaches": [],
+  "warning_unsafe_for_llm_deployment": true,
+  "sections": {
+    "kv": {
+      "compared_scenarios": [
+        "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+        "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+        "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+        "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+        "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+        "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+        "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+        "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+        "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False"
+      ],
+      "missing_scenarios": [],
+      "extra_scenarios": [],
+      "metric_deltas": [
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "store_latency_ms",
+          "baseline": 21.432958004879765,
+          "current": 18.592042004456744,
+          "observed": -13.254894633658191,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "retrieve_latency_ms",
+          "baseline": 10.050875003798865,
+          "current": 9.00320899381768,
+          "observed": -10.42362987884344,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "key_cosine_sim",
+          "baseline": 0.999982476234436,
+          "current": 0.999982476234436,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9700300097465515,
+          "current": 0.9700300097465515,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "key_rel_mae",
+          "baseline": 0.006306956522166729,
+          "current": 0.006306956522166729,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "value_rel_mae",
+          "baseline": 0.26702815294265747,
+          "current": 0.26702815294265747,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "key_max_abs_error",
+          "baseline": 0.02072286605834961,
+          "current": 0.02072286605834961,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=False",
+          "metric": "value_max_abs_error",
+          "baseline": 0.8980423212051392,
+          "current": 0.8980423212051392,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "store_latency_ms",
+          "baseline": 208.974582987139,
+          "current": 66.77337500150315,
+          "observed": -68.0471308773409,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "retrieve_latency_ms",
+          "baseline": 62.88608399336226,
+          "current": 53.02970799675677,
+          "observed": -15.673381725670582,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "key_cosine_sim",
+          "baseline": 0.999982476234436,
+          "current": 0.999982476234436,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9699910283088684,
+          "current": 0.9699910283088684,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "key_rel_mae",
+          "baseline": 0.005860436242073774,
+          "current": 0.005860436242073774,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "value_rel_mae",
+          "baseline": 0.24823878705501556,
+          "current": 0.24823878705501556,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "key_max_abs_error",
+          "baseline": 0.042821288108825684,
+          "current": 0.042821288108825684,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=3|incoherent=True",
+          "metric": "value_max_abs_error",
+          "baseline": 1.919440507888794,
+          "current": 1.919440507888794,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "store_latency_ms",
+          "baseline": 23.43670799746178,
+          "current": 18.307083009858616,
+          "observed": -21.887139559697157,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "retrieve_latency_ms",
+          "baseline": 11.541334009962156,
+          "current": 9.197624996886589,
+          "observed": -20.307089380244463,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "key_cosine_sim",
+          "baseline": 0.999982476234436,
+          "current": 0.999982476234436,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9999823570251465,
+          "current": 0.9999823570251465,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "key_rel_mae",
+          "baseline": 0.006306956522166729,
+          "current": 0.006306956522166729,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "value_rel_mae",
+          "baseline": 0.006302158813923597,
+          "current": 0.006302158813923597,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "key_max_abs_error",
+          "baseline": 0.02072286605834961,
+          "current": 0.02072286605834961,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 32, 4096, 128)|k=8|v=8|incoherent=False",
+          "metric": "value_max_abs_error",
+          "baseline": 0.021274298429489136,
+          "current": 0.021274298429489136,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "store_latency_ms",
+          "baseline": 1.5872499934630468,
+          "current": 0.8380000072065741,
+          "observed": -47.20428346777097,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "retrieve_latency_ms",
+          "baseline": 1.354291001916863,
+          "current": 0.7868329994380474,
+          "observed": -41.90074376006602,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "key_cosine_sim",
+          "baseline": 0.9999824166297913,
+          "current": 0.9999824166297913,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9700178503990173,
+          "current": 0.9700178503990173,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "key_rel_mae",
+          "baseline": 0.00631355307996273,
+          "current": 0.00631355307996273,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "value_rel_mae",
+          "baseline": 0.267108291387558,
+          "current": 0.267108291387558,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "key_max_abs_error",
+          "baseline": 0.019597060978412628,
+          "current": 0.019597060978412628,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=False",
+          "metric": "value_max_abs_error",
+          "baseline": 0.7895931005477905,
+          "current": 0.7895931005477905,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "store_latency_ms",
+          "baseline": 6.636124991928227,
+          "current": 4.079291989910416,
+          "observed": -38.529006086048476,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "retrieve_latency_ms",
+          "baseline": 5.018832991481759,
+          "current": 3.1201249948935583,
+          "observed": -37.83166325340558,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "key_cosine_sim",
+          "baseline": 0.9999822974205017,
+          "current": 0.9999822974205017,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9700643420219421,
+          "current": 0.9700643420219421,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "key_rel_mae",
+          "baseline": 0.005859941244125366,
+          "current": 0.005859941244125366,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "value_rel_mae",
+          "baseline": 0.24806949496269226,
+          "current": 0.24806949496269226,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "key_max_abs_error",
+          "baseline": 0.032712191343307495,
+          "current": 0.032712191343307495,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=3|incoherent=True",
+          "metric": "value_max_abs_error",
+          "baseline": 1.3542907238006592,
+          "current": 1.3542907238006592,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "store_latency_ms",
+          "baseline": 1.3561669911723584,
+          "current": 0.8037910010898486,
+          "observed": -40.73067650798669,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "retrieve_latency_ms",
+          "baseline": 1.1974579974776134,
+          "current": 0.6100000027799979,
+          "observed": -49.058755792275555,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "key_cosine_sim",
+          "baseline": 0.9999824166297913,
+          "current": 0.9999824166297913,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9999824166297913,
+          "current": 0.9999824166297913,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "key_rel_mae",
+          "baseline": 0.00631355307996273,
+          "current": 0.00631355307996273,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "value_rel_mae",
+          "baseline": 0.006300057750195265,
+          "current": 0.006300057750195265,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "key_max_abs_error",
+          "baseline": 0.019597060978412628,
+          "current": 0.019597060978412628,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 1024, 64)|k=8|v=8|incoherent=False",
+          "metric": "value_max_abs_error",
+          "baseline": 0.019924819469451904,
+          "current": 0.019924819469451904,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "store_latency_ms",
+          "baseline": 1.906833000248298,
+          "current": 1.0840410104719922,
+          "observed": -43.14966175166709,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "retrieve_latency_ms",
+          "baseline": 1.342749994364567,
+          "current": 0.7498750055674464,
+          "observed": -44.15378821711993,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "key_cosine_sim",
+          "baseline": 0.9999822974205017,
+          "current": 0.9999822974205017,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9700464606285095,
+          "current": 0.9700464606285095,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "key_rel_mae",
+          "baseline": 0.0063169547356665134,
+          "current": 0.0063169547356665134,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "value_rel_mae",
+          "baseline": 0.2669861912727356,
+          "current": 0.2669861912727356,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "key_max_abs_error",
+          "baseline": 0.020263373851776123,
+          "current": 0.020263373851776123,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=False",
+          "metric": "value_max_abs_error",
+          "baseline": 0.8000398874282837,
+          "current": 0.8000398874282837,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "store_latency_ms",
+          "baseline": 6.0763750079786405,
+          "current": 3.483624997898005,
+          "observed": -42.66935478268213,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "retrieve_latency_ms",
+          "baseline": 4.826165997656062,
+          "current": 3.043415999854915,
+          "observed": -36.9392598320692,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "key_cosine_sim",
+          "baseline": 0.9999824166297913,
+          "current": 0.9999824166297913,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9700079560279846,
+          "current": 0.9700079560279846,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "key_rel_mae",
+          "baseline": 0.005844393279403448,
+          "current": 0.005844393279403448,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "value_rel_mae",
+          "baseline": 0.248267263174057,
+          "current": 0.248267263174057,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "key_max_abs_error",
+          "baseline": 0.03766840696334839,
+          "current": 0.03766840696334839,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=3|incoherent=True",
+          "metric": "value_max_abs_error",
+          "baseline": 1.540197491645813,
+          "current": 1.540197491645813,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "store_latency_ms",
+          "baseline": 2.0368749974295497,
+          "current": 1.0449169931234792,
+          "observed": -48.69999413601128,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "retrieve_latency_ms",
+          "baseline": 1.3812910037813708,
+          "current": 0.8957499958341941,
+          "observed": -35.15124666836877,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 200.0
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "key_cosine_sim",
+          "baseline": 0.9999822974205017,
+          "current": 0.9999822974205017,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.008
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "value_cosine_sim",
+          "baseline": 0.9999824166297913,
+          "current": 0.9999824166297913,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "key_rel_mae",
+          "baseline": 0.0063169547356665134,
+          "current": 0.0063169547356665134,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.02
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "value_rel_mae",
+          "baseline": 0.0062971399165689945,
+          "current": 0.0062971399165689945,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.06
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "key_max_abs_error",
+          "baseline": 0.020263373851776123,
+          "current": 0.020263373851776123,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.04
+        },
+        {
+          "section": "kv",
+          "scenario": "shape=(1, 8, 2048, 64)|k=8|v=8|incoherent=False",
+          "metric": "value_max_abs_error",
+          "baseline": 0.018954992294311523,
+          "current": 0.018954992294311523,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_rise_abs",
+          "threshold": 0.2
+        }
+      ],
+      "breaches": []
+    },
+    "e2e": {
+      "compared_scenarios": [
+        "cache_hit_compressed_path",
+        "cache_miss_full_precision_path",
+        "cache_miss_use_compressed_on_miss_path",
+        "dense_decode_path",
+        "sparse_decode_path"
+      ],
+      "missing_scenarios": [],
+      "extra_scenarios": [
+        "dense_baseline",
+        "sparse_disabled_by_default",
+        "sparse_topk_025_sink1_recent4",
+        "sparse_topk_050_sink1_recent2",
+        "sparse_topk_050_sink1_recent4",
+        "sparse_topk_075_sink1_recent2"
+      ],
+      "metric_deltas": [
+        {
+          "section": "e2e",
+          "scenario": "cache_hit_compressed_path",
+          "metric": "cache_miss_total_latency_ms",
+          "baseline": 14.487000007648021,
+          "current": 10.494208996533416,
+          "observed": -27.56119975845046,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_hit_compressed_path",
+          "metric": "cache_hit_total_latency_ms",
+          "baseline": 7.641207994311117,
+          "current": 6.2653329950990155,
+          "observed": -18.00598806152693,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_hit_compressed_path",
+          "metric": "quant_audit_cosine",
+          "baseline": 0.970818281173706,
+          "current": 0.970818281173706,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.015
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_hit_compressed_path",
+          "metric": "sparse_audit_cosine",
+          "baseline": 0.753969669342041,
+          "current": 0.7554906606674194,
+          "observed": -0.001520991325378418,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_hit_compressed_path",
+          "metric": "audit_cosine",
+          "baseline": 0.753969669342041,
+          "current": 0.7554906606674194,
+          "observed": -0.001520991325378418,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_full_precision_path",
+          "metric": "cache_miss_total_latency_ms",
+          "baseline": 26.581665995763615,
+          "current": 7.9939999995986,
+          "observed": -69.92664041120439,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_full_precision_path",
+          "metric": "cache_hit_total_latency_ms",
+          "baseline": 9.586209009285085,
+          "current": 6.610541997360997,
+          "observed": -31.041123858679626,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_full_precision_path",
+          "metric": "quant_audit_cosine",
+          "baseline": 0.970818281173706,
+          "current": 0.970818281173706,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.015
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_full_precision_path",
+          "metric": "sparse_audit_cosine",
+          "baseline": 0.753969669342041,
+          "current": 0.7554906606674194,
+          "observed": -0.001520991325378418,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_full_precision_path",
+          "metric": "audit_cosine",
+          "baseline": 0.753969669342041,
+          "current": 0.7554906606674194,
+          "observed": -0.001520991325378418,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_use_compressed_on_miss_path",
+          "metric": "cache_miss_total_latency_ms",
+          "baseline": 17.69791699189227,
+          "current": 10.82600001245737,
+          "observed": -38.82895926443234,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_use_compressed_on_miss_path",
+          "metric": "cache_hit_total_latency_ms",
+          "baseline": 7.8729579981882125,
+          "current": 6.880749991978519,
+          "observed": -12.602734657520449,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_use_compressed_on_miss_path",
+          "metric": "quant_audit_cosine",
+          "baseline": 0.970818281173706,
+          "current": 0.970818281173706,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.015
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_use_compressed_on_miss_path",
+          "metric": "sparse_audit_cosine",
+          "baseline": 0.753969669342041,
+          "current": 0.7554906606674194,
+          "observed": -0.001520991325378418,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "cache_miss_use_compressed_on_miss_path",
+          "metric": "audit_cosine",
+          "baseline": 0.753969669342041,
+          "current": 0.7554906606674194,
+          "observed": -0.001520991325378418,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "dense_decode_path",
+          "metric": "cache_miss_total_latency_ms",
+          "baseline": 22.335041998303495,
+          "current": 9.15308301046025,
+          "observed": -59.01918155714464,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "dense_decode_path",
+          "metric": "cache_hit_total_latency_ms",
+          "baseline": 13.944374994025566,
+          "current": 4.9671659944579005,
+          "observed": -64.37871187065701,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "dense_decode_path",
+          "metric": "quant_audit_cosine",
+          "baseline": 0.9703969359397888,
+          "current": 0.9703969359397888,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.015
+        },
+        {
+          "section": "e2e",
+          "scenario": "dense_decode_path",
+          "metric": "sparse_audit_cosine",
+          "baseline": null,
+          "current": null,
+          "observed": null,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "dense_decode_path",
+          "metric": "audit_cosine",
+          "baseline": 0.9999999403953552,
+          "current": 0.9999999403953552,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "sparse_decode_path",
+          "metric": "cache_miss_total_latency_ms",
+          "baseline": 14.200916994013824,
+          "current": 10.418207995826378,
+          "observed": -26.63707561829977,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "sparse_decode_path",
+          "metric": "cache_hit_total_latency_ms",
+          "baseline": 8.358832987141795,
+          "current": 6.982334001804702,
+          "observed": -16.467597659320752,
+          "unit": "pct",
+          "rule": "latency_max_regression_pct",
+          "threshold": 30.0
+        },
+        {
+          "section": "e2e",
+          "scenario": "sparse_decode_path",
+          "metric": "quant_audit_cosine",
+          "baseline": 0.970818281173706,
+          "current": 0.970818281173706,
+          "observed": 0.0,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.015
+        },
+        {
+          "section": "e2e",
+          "scenario": "sparse_decode_path",
+          "metric": "sparse_audit_cosine",
+          "baseline": 0.6001606583595276,
+          "current": 0.8209198713302612,
+          "observed": -0.22075921297073364,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        },
+        {
+          "section": "e2e",
+          "scenario": "sparse_decode_path",
+          "metric": "audit_cosine",
+          "baseline": 0.6001606583595276,
+          "current": 0.8209198713302612,
+          "observed": -0.22075921297073364,
+          "unit": "abs",
+          "rule": "quality_max_drop_abs",
+          "threshold": 0.03
+        }
+      ],
+      "breaches": []
+    }
+  },
+  "total_breaches": 0
+}

@@ -1,0 +1,8095 @@
+# SPDX-License-Identifier: Apache-2.0
+# Base architecture from waybarrios/vllm-mlx. MLA cache guards, gen_prompt_len
+# prefix cache fix, hybrid SSM handling, and MoE CacheList support added by
+# Jinho Jang (eric@jangq.ai) for vMLX (github.com/jjang-ai/vmlx).
+"""
+Scheduler for vmlx-engine continuous batching.
+
+This module provides a Scheduler class that manages request scheduling
+using mlx-lm's BatchGenerator for efficient continuous batching.
+
+The scheduler follows vLLM's design with:
+- Waiting queue for pending requests
+- Running set for active requests
+- Continuous batching via BatchGenerator
+"""
+
+import logging
+import os
+import random
+import re
+import time
+import traceback
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from mlx_lm.generate import BatchGenerator, generation_stream
+from .sampling import make_sampler
+from .block_disk_store import BlockDiskStore
+from .disk_cache import DiskCacheManager
+from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+from .mlx_memory import clear_mlx_memory_cache
+from .paged_cache import PagedCacheManager
+from .prefix_cache import (
+    BlockAwarePrefixCache,
+    PAGED_CACHE_SCHEMA_VERSION,
+    PrefixCacheManager,
+    compute_model_cache_key,
+    runtime_cache_fingerprint,
+)
+from .errors import PromptTooLongError
+from .prompt_lookup import NgramIndex, find_draft_tokens, pld_stats
+from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .mllm_batch_generator import HybridSSMStateCache, _fix_hybrid_cache
+from .state_machine import SequenceStateMachine, make_state_machine
+from .logprobs import format_token_logprobs_for_output as _format_token_logprobs_for_output
+from .utils.mamba_cache import (
+    ensure_mamba_support,
+    register_generation_logprobs,
+    unregister_generation_logprobs,
+)
+from .utils.single_batch_generator import SingleBatchGenerator
+from .utils.head_dim_detection import (
+    choose_supported_kv_group_size,
+    detect_cache_head_dims,
+)
+from .utils.hybrid_tq_cache import is_turboquant_make_cache
+from .utils.ssm_companion_disk_store import SSMCompanionDiskStore
+from .utils.memory_limits import (
+    get_effective_metal_working_set_bytes,
+    get_metal_ws_guard_threshold,
+)
+
+logger = logging.getLogger(__name__)
+
+# Enable MambaCache batching support for models like Nemotron
+ensure_mamba_support()
+
+# Error patterns that indicate cache corruption (must be specific to avoid
+# matching unrelated errors — e.g., "cache" alone would match any error
+# mentioning cache files, directories, or variables).
+CACHE_CORRUPTION_PATTERNS = [
+    "'NoneType' object is not subscriptable",
+    "BatchKVCache",
+    "cache_data",
+    "cache corruption",
+    "cache mismatch",
+    "dimension mismatch",
+    "shape mismatch",
+    "cannot merge",
+    "cannot extract",
+    # Metal GPU / OOM errors — recover by clearing cache and rescheduling
+    "MTLCommandBuffer",
+    "MTLDevice",
+    "out of memory",
+    "Cannot allocate memory",
+    "Allocation failed",
+]
+
+
+def _rebuild_meta_state_after_truncation(
+    cls_name: str,
+    orig_meta: tuple,
+    safe_len: int,
+) -> Optional[tuple]:
+    """Rebuild a cache layer's meta_state after slicing its KV tensors to
+    ``safe_len`` tokens. Returns ``None`` to signal "cannot safely truncate —
+    skip this store" (used for RotatingKVCache when the circular buffer has
+    already wrapped).
+
+    Why this exists: different mlx-lm cache classes pack different fields
+    into ``meta_state``, and blindly overwriting slot 0 with the new length
+    silently corrupted RotatingKVCache's ``keep`` field, producing word-loop
+    generations after the first cache hit on Gemma 4 (25 sliding + 5 full
+    attention layers).
+
+    meta_state layouts (from mlx_lm/models/cache.py):
+      - ``KVCache``          → ``(offset,)``
+      - ``QuantizedKVCache`` → ``(offset, group_size, bits)``
+      - ``RotatingKVCache``  → ``(keep, max_size, offset, _idx)``
+    """
+    if "Rotating" in cls_name:
+        if not orig_meta or len(orig_meta) < 4:
+            return (str(0), str(safe_len), str(safe_len), str(safe_len))
+        try:
+            keep = int(orig_meta[0])
+            max_size = int(orig_meta[1])
+            offset = int(orig_meta[2])
+        except (ValueError, TypeError):
+            return (str(0), str(safe_len), str(safe_len), str(safe_len))
+        if offset > max_size:
+            # Circular buffer has wrapped — slot order != token order, so
+            # a head-aligned slice is meaningless. Refuse to store.
+            return None
+        return (
+            str(keep),
+            str(max_size),
+            str(safe_len),
+            str(safe_len),
+        )
+    # KVCache / QuantizedKVCache: slot 0 IS the offset. Preserve tail
+    # (group_size, bits, …) unchanged.
+    if orig_meta:
+        return (str(safe_len),) + tuple(orig_meta[1:])
+    return (str(safe_len),)
+
+
+class SchedulingPolicy(Enum):
+    """Scheduling policy for request ordering."""
+
+    FCFS = "fcfs"  # First-Come-First-Served
+    PRIORITY = "priority"  # Priority-based
+
+
+# Queue SSM re-derive for every non-empty paged KV store. A higher threshold
+# made short hybrid prompts write KV blocks that could never become full
+# KV+SSM hits, so repeated Ling/Bailing requests always re-prefilled despite
+# a paged cache hit. The companion cache LRU and queue cap bound memory.
+SSM_REDERIVE_MIN_TOKENS = 1
+SSM_REDERIVE_QUEUE_CAP = 8
+
+
+@dataclass
+class SchedulerConfig:
+    """Configuration for the scheduler."""
+
+    # Maximum number of concurrent requests in the batch
+    max_num_seqs: int = 1
+    # Maximum tokens to process per step (for prefill chunking)
+    max_num_batched_tokens: int = 8192
+    # Scheduling policy
+    policy: SchedulingPolicy = SchedulingPolicy.FCFS
+    # BatchGenerator settings
+    prefill_batch_size: int = 512
+    completion_batch_size: int = 512
+    prefill_step_size: int = 2048
+
+    # Prefix cache settings
+    enable_prefix_cache: bool = True
+    prefix_cache_size: int = 100  # Max cached entries (legacy, ignored if memory-aware)
+    # Optional global byte budget for the prefix cache. None = unlimited (eviction
+    # by entry count only). When set, eviction also fires when total cached bytes
+    # exceed this. Mirrors mlx-lm 0.31.2 LRUPromptCache(--prompt-cache-bytes).
+    prefix_cache_max_bytes: Optional[int] = None
+    # Default cache_type for entries stored at request completion. Segment
+    # boundaries (Agent 2) override this with "system" / "user" as appropriate.
+    prefix_cache_default_type: str = "assistant"
+
+    # Memory-aware cache settings (recommended for large models)
+    use_memory_aware_cache: bool = True  # Use memory-based eviction
+    cache_memory_mb: Optional[int] = None  # None = auto-detect (20% of available RAM)
+    cache_memory_percent: float = 0.20  # Fraction of available RAM if auto-detecting
+    cache_ttl_minutes: float = 0  # Cache entry TTL in minutes (0 = no expiration)
+
+    # Paged cache settings (experimental - for memory efficiency)
+    use_paged_cache: bool = (
+        False  # Use BlockAwarePrefixCache instead of PrefixCacheManager
+    )
+    paged_cache_block_size: int = 64  # Tokens per block
+    max_cache_blocks: int = 1000  # Maximum number of cache blocks
+
+    # KV cache quantization (reduces GPU memory ~2-4x per cache layer)
+    kv_cache_quantization: str = "none"  # "none", "q4", "q8"
+    kv_cache_group_size: int = 64
+    kv_cache_quantization_explicit: bool = False
+
+    # Disk cache (L2 persistence for prompt caches)
+    enable_disk_cache: bool = False
+    disk_cache_dir: Optional[str] = (
+        None  # None = ~/.cache/vmlx-engine/prompt-cache/<model_hash>
+    )
+    disk_cache_max_gb: float = 10.0  # 0 = unlimited
+    model_path: Optional[str] = None  # Used to scope disk cache per model
+
+    # Loader fingerprint inputs (F6 + A4 Concern #1). Mixed into the trie
+    # cache key so two sessions on the same model with divergent loader
+    # configs (smelt %, JANG quant bits) never share K/V entries — divergent
+    # tensors otherwise produce silent corruption on cross-session fetch.
+    smelt_enabled: bool = False
+    smelt_pct: Optional[float] = None  # Smelt expert percentage when enabled
+
+    # Block-level disk cache (L2 for paged cache blocks)
+    enable_block_disk_cache: bool = False
+    block_disk_cache_dir: Optional[str] = (
+        None  # None = ~/.cache/vmlx-engine/block-cache/<model_hash>
+    )
+    block_disk_cache_max_gb: float = 10.0  # 0 = unlimited
+
+    # Prompt Lookup Decoding (PLD) speculative acceleration
+    pld_enabled: bool = (
+        False  # Enable PLD (opt-in; best for long structured/repetitive output)
+    )
+    pld_summary_interval: int = (
+        487  # Log effectiveness summary every N spec-decode tokens
+    )
+
+    # SequenceStateMachine for token-level reasoning/stop detection (Phase 3c).
+    # When True (default) the per-token loop builds a state machine from the
+    # active reasoning parser's tag tokens and uses O(1) per-token state
+    # transitions instead of O(L) substring scans. Falls back to substring
+    # scan automatically when no parser is registered or the parser provides
+    # no tag tokens. Set False to force the legacy substring path for
+    # debugging or rollback. See `vmlx_engine/state_machine.py` and
+    # `agentprogress/2/decisions.md` D-A2-005.
+    use_state_machine_stops: bool = True
+
+    # SSM companion cache budget for hybrid (Mamba/GatedDelta) models. Mirrors
+    # `MLLMSchedulerConfig`. Entries can be tens/hundreds of MB, so production
+    # defaults are deliberately conservative and byte-bound.
+    ssm_state_cache_size: int = 8
+    ssm_state_cache_max_mb: Optional[int] = 512
+
+    # Dedicated single-worker ThreadPoolExecutor that loaded the model and
+    # must run every step()/BatchGenerator call. MLX streams are
+    # thread-local — if step() runs on a different thread than load, JANGTQ
+    # Metal kernels fail with `RuntimeError: There is no Stream(gpu, N) in
+    # current thread`. The MLLM scheduler has had this since 2026-04-25
+    # (mlxstudio JANGTQ-VL thread fix); the LLM path was missing it,
+    # causing uvicorn workers to crash on every JANGTQ chat request.
+    # `BatchedEngine._start_llm` now constructs a `llm-worker` executor,
+    # loads on it, then forwards it here so `EngineCore._engine_loop`
+    # dispatches `scheduler.step()` to the same worker thread.
+    step_executor: Any = None
+
+
+@dataclass
+class SchedulerOutput:
+    """
+    Output from a scheduling step.
+
+    Contains information about what was scheduled and results.
+    """
+
+    # Requests scheduled in this step
+    scheduled_request_ids: List[str] = field(default_factory=list)
+    # Total tokens scheduled
+    num_scheduled_tokens: int = 0
+    # Requests that finished in this step
+    finished_request_ids: Set[str] = field(default_factory=set)
+    # Request outputs (tokens generated)
+    outputs: List[RequestOutput] = field(default_factory=list)
+    # Whether any work was done
+    has_work: bool = False
+
+
+class Scheduler:
+    """
+    Scheduler for continuous batching using mlx-lm BatchGenerator.
+
+    This scheduler manages the lifecycle of requests:
+    1. Requests arrive and are added to the waiting queue
+    2. Scheduler moves requests from waiting to running (via BatchGenerator)
+    3. BatchGenerator processes all running requests together
+    4. Finished requests are removed and outputs returned
+
+    The key insight is that mlx-lm's BatchGenerator already implements
+    continuous batching at the token level, so we use it as the backend.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        config: Optional[SchedulerConfig] = None,
+    ):
+        """
+        Initialize the scheduler.
+
+        Args:
+            model: The MLX model
+            tokenizer: The tokenizer
+            config: Scheduler configuration
+        """
+        self.model = model
+        self.tokenizer = tokenizer
+        self.config = config or SchedulerConfig()
+
+        # Loader thread executor — every step()/BatchGenerator call must
+        # run on the SAME thread that loaded the model, because MLX Metal
+        # streams are thread-local. JANGTQ DSV4-Flash (and other JANGTQ
+        # bundles) allocate kernels on the loader thread; running step()
+        # on the asyncio event-loop thread crashes with
+        # `RuntimeError: There is no Stream(gpu, N) in current thread.`
+        # MLLMScheduler has had this since 2026-04-25 (see _step_executor
+        # there). Engine_core._engine_loop reads this attribute and, when
+        # present, dispatches scheduler.step() through it.
+        self._step_executor = self.config.step_executor
+
+        # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
+        self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
+
+        # Request management - following vLLM's design
+        self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
+        self.running: Dict[str, Request] = {}  # Running requests by ID
+        self.requests: Dict[str, Request] = {}  # All requests by ID
+        self.finished_req_ids: Set[str] = set()  # Recently finished
+        self._pending_aborts: Set[str] = set()  # Deferred aborts (processed in step())
+
+        # Mapping between our request IDs and BatchGenerator UIDs
+        self.request_id_to_uid: Dict[str, int] = {}
+        self.uid_to_request_id: Dict[int, str] = {}
+
+        # BatchGenerator - the actual batching engine
+        self.batch_generator: Optional[BatchGenerator] = None
+        self._current_sampler_params: Optional[Tuple] = None
+
+        # Base stop tokens (model EOS) — used to prevent over-removal in H1 cleanup
+        self.stop_tokens: Set[int] = self._get_stop_tokens()
+
+        # KV cache quantization bits (0 = disabled). Initialized here so all
+        # code paths can use self._kv_cache_bits directly without getattr().
+        self._kv_cache_bits: int = 0
+        self._kv_cache_group_size: int = 64
+
+        # TTFT EWMA tracking (alpha = 0.1 gives ~10-sample effective window)
+        self._ewma_ttft: float = 0.0
+        self._ttft_alpha: float = 0.1
+
+        self._model_type_for_runtime = self._detect_model_type_for_runtime(model)
+        # Track if model uses mixed cache types. DSV4's DeepseekV4Cache and
+        # ZAYA's CCA CacheList are first-class typed cache contracts, not SSM
+        # companion-cache rows.
+        self._uses_dsv4_cache = self._model_uses_dsv4_cache(model)
+        self._uses_zaya_cache = (
+            self._model_type_for_runtime == "zaya"
+            or self._model_uses_zaya_cache(model)
+        )
+        self._is_hybrid = self._is_hybrid_model(model)
+        # Do not silently widen repetition-penalty history for families whose
+        # chat templates contain EOS/turn-boundary sentinels in the prompt.
+        # A 512-token lookback penalizes legitimate stop tokens on MiniMax/Ling
+        # multi-turn chats and can create the continuation loops it was meant
+        # to prevent.
+        self._long_repetition_context = self._model_type_for_runtime in {
+            "deepseek_v4",
+        }
+        _model_make_cache = getattr(model, "make_cache", None)
+        self._tq_active = bool(
+            _model_make_cache and is_turboquant_make_cache(_model_make_cache)
+        )
+        self._hybrid_live_tq_policy = getattr(
+            _model_make_cache, "_vmlx_hybrid_tq_policy", None
+        )
+        self._hybrid_live_tq_attention_layers = list(
+            getattr(_model_make_cache, "_vmlx_hybrid_tq_attention_layers", ()) or []
+        )
+        self._hybrid_live_tq_companion_layers = list(
+            getattr(_model_make_cache, "_vmlx_hybrid_tq_companion_layers", ()) or []
+        )
+        self._tq_batch_api = self._turboquant_cache_supports_batch_api(model)
+        self._log_runtime_cache_contract(model)
+        if self._tq_active and self._tq_batch_api:
+            logger.info(
+                "TurboQuantKVCache live decode preserving configured batching "
+                "(batch cache API=turboquant_kv_v1)."
+            )
+        elif self._tq_active:
+            changed = []
+            if self.config.max_num_seqs != 1:
+                changed.append(f"max_num_seqs {self.config.max_num_seqs}->1")
+                self.config.max_num_seqs = 1
+            if self.config.prefill_batch_size != 1:
+                changed.append(f"prefill_batch_size {self.config.prefill_batch_size}->1")
+                self.config.prefill_batch_size = 1
+            if self.config.completion_batch_size != 1:
+                changed.append(
+                    f"completion_batch_size {self.config.completion_batch_size}->1"
+                )
+                self.config.completion_batch_size = 1
+            if changed:
+                logger.warning(
+                    "TurboQuantKVCache live decode is single-sequence only "
+                    "with this jang_tools build (missing batch API "
+                    "turboquant_kv_v1); overriding %s.",
+                    ", ".join(changed),
+                )
+
+        # mlxstudio#138: surface the precedence when both knobs are set.
+        # Without VMLX_DISABLE_TQ_KV, the loader's TQ patch wins because
+        # BatchGenerator runs `model.make_cache()` and gets TurboQuantKVCache;
+        # the scheduler's q4/q8 wrap below still installs but only patches
+        # `QuantizedKVCache.size()` upstream — it never wraps a TQ cache.
+        # Make the precedence visible so the user knows their flag is
+        # being shadowed and how to opt out.
+        if self._tq_active and self.config.kv_cache_quantization != "none":
+            if getattr(self.config, "kv_cache_quantization_explicit", False):
+                logger.warning(
+                    f"--kv-cache-quantization='{self.config.kv_cache_quantization}' "
+                    f"requested but jang_config.turboquant.enabled=true is in effect "
+                    f"(TurboQuantKVCache patched make_cache). The bundle's calibrated "
+                    f"TQ takes precedence; your flag will not change live-decode KV "
+                    f"bit-width. Set VMLX_DISABLE_TQ_KV=1 to skip TQ and let q4/q8 "
+                    f"take effect."
+                )
+            else:
+                logger.info(
+                    "KV cache auto mode: TurboQuantKVCache is active for live decode; "
+                    f"stored prefix/cache snapshots still use "
+                    f"{self.config.kv_cache_quantization} when applicable."
+                )
+
+        if (
+            self._uses_zaya_cache
+            and self.config.kv_cache_quantization != "none"
+        ):
+            logger.info(
+                "ZAYA/CCA typed cache detected — disabling generic KV cache "
+                "quantization (was: %s). ZAYA CCA can only quantize the "
+                "standard KV subcache after a typed partial codec proves "
+                "conv_state/prev_hs parity.",
+                self.config.kv_cache_quantization,
+            )
+            self.config.kv_cache_quantization = "none"
+        elif (
+            self._is_hybrid
+            and not self._uses_dsv4_cache
+            and not self._uses_zaya_cache
+            and self.config.kv_cache_quantization != "none"
+        ):
+            if (
+                self._tq_active
+                and self._hybrid_live_tq_policy == "attention_kv_only"
+            ):
+                logger.info(
+                    "Hybrid/path-dependent cache model detected — live "
+                    "TurboQuant KV active for attention KVCache layers; q4/q8 "
+                    "remains storage-boundary quantization for prefix/paged/L2. "
+                    "Hybrid non-KV state is preserved full precision and "
+                    "restored through the SSM companion cache or clean-prefill "
+                    "rederive (stored_kv_quantization=%s).",
+                    self.config.kv_cache_quantization,
+                )
+            else:
+                logger.info(
+                    "Hybrid/path-dependent cache model detected — using q4/q8 only at cache storage boundaries "
+                    "(attention KVCache layers). Hybrid non-KV state is preserved full precision "
+                    "and restored through the SSM companion cache or clean-prefill rederive "
+                    "(stored_kv_quantization=%s).",
+                    self.config.kv_cache_quantization,
+                )
+
+        # Mixed-attention models (Gemma 4 = sliding + full) require preserving
+        # RotatingKVCache metadata through truncation, paged blocks, and L2
+        # restore. The old blanket prefix-cache bypass hid that path entirely;
+        # keep detection only as a diagnostic now that RotatingKVCache-aware
+        # truncation/reconstruction is implemented.
+        self._mixed_attention_cache_model = False
+        try:
+            self._mixed_attention_cache_model = self._model_has_mixed_attention(model)
+            if self._mixed_attention_cache_model:
+                logger.info(
+                    "LLM mixed-attention model detected (e.g. Gemma 4 sliding+full). "
+                    "Prefix cache remains enabled; RotatingKVCache metadata will be "
+                    "preserved during truncation and paged/L2 reconstruction."
+                )
+        except Exception as e:
+            logger.debug(f"Mixed-attention detection failed: {e}")
+
+        # Per-model SequenceStateMachine for token-level reasoning/stop detection.
+        # Lazy-built on first request because we need the reasoning parser instance
+        # which lives in server.py as a module-level singleton (would be a circular
+        # import if eager). When None, the per-token loop falls back to the legacy
+        # substring `<think>` scan in `_should_skip_string_stop_for_reasoning`.
+        # See `agentprogress/2/decisions.md` D-A2-005 / D-A2-006 for the design.
+        self._reasoning_sm: Optional[SequenceStateMachine] = None
+        self._reasoning_sm_resolved: bool = False
+        # Rollback flag — if Phase 3c integration regresses, set this to False
+        # to fall back to the legacy substring path without rebuilding.
+        self._use_sm_stops: bool = getattr(self.config, "use_state_machine_stops", True)
+
+        # Pre-compute hybrid cache layout for SSM companion.
+        # _hybrid_kv_positions: layer indices that are KVCache (attention).
+        # _hybrid_num_layers: total layer count in model cache.
+        self._hybrid_kv_positions: Optional[List[int]] = None
+        self._hybrid_num_layers: Optional[int] = None
+        self._ssm_state_cache: Optional[HybridSSMStateCache] = None
+        if (
+            self._is_hybrid
+            and not self._uses_dsv4_cache
+            and not self._uses_zaya_cache
+            and self.config.enable_prefix_cache
+            and hasattr(model, "make_cache")
+        ):
+            try:
+                from mlx_lm.models.cache import KVCache as _KVC
+
+                _template = model.make_cache()
+                self._hybrid_num_layers = len(_template)
+                self._hybrid_kv_positions = [
+                    i
+                    for i, t in enumerate(_template)
+                    if type(t).__name__
+                    in (
+                        "KVCache",
+                        "RotatingKVCache",
+                        "QuantizedKVCache",
+                        "TurboQuantKVCache",
+                    )
+                ]
+                # Honour SchedulerConfig budgets. The old default of 50 entries
+                # let hybrid users grow several GB of resident SSM state on
+                # short unique prompts; entry count alone is not enough because
+                # entry size scales with architecture and prompt.
+                _ssm_cache_size = getattr(self.config, "ssm_state_cache_size", 8) or 8
+                _ssm_cache_max_mb = getattr(
+                    self.config, "ssm_state_cache_max_mb", 512
+                )
+                _ssm_model_key = compute_model_cache_key(
+                    model,
+                    model_path=self.config.model_path,
+                    smelt_enabled=self.config.smelt_enabled,
+                    smelt_pct=self.config.smelt_pct,
+                    tq_enabled=bool(self._tq_active),
+                    kv_quant_bits=(
+                        4 if self.config.kv_cache_quantization == "q4"
+                        else 8 if self.config.kv_cache_quantization == "q8"
+                        else 0
+                    ),
+                )
+                self._ssm_state_cache = HybridSSMStateCache(
+                    max_entries=_ssm_cache_size,
+                    model_key=_ssm_model_key,
+                    max_bytes=(
+                        int(_ssm_cache_max_mb) * 1024 * 1024
+                        if _ssm_cache_max_mb is not None
+                        else None
+                    ),
+                )
+                logger.info(
+                    f"Hybrid SSM cache: {len(self._hybrid_kv_positions)}/"
+                    f"{self._hybrid_num_layers} KV layers, "
+                    f"SSM companion enabled (entries={_ssm_cache_size}, "
+                    f"max_mb={_ssm_cache_max_mb}, model_key={_ssm_model_key[:12]})"
+                )
+            except Exception as _e:
+                logger.warning(f"Failed to init hybrid SSM cache layout: {_e}")
+        elif self._uses_zaya_cache:
+            if self.config.enable_prefix_cache and self.config.use_paged_cache:
+                logger.info(
+                    "ZAYA/CCA typed paged prefix cache enabled — terminal "
+                    "blocks store CCA conv_state + prev_hs and block disk L2 "
+                    "uses zaya_cca_v1 serialization. Generic TurboQuant KV "
+                    "remains disabled for this family."
+                )
+            else:
+                logger.info(
+                    "ZAYA/CCA cache contract detected but prefix cache is disabled; "
+                    "CCA prompt-state lookup/store/re-derive is disabled for this run"
+                )
+        elif self._is_hybrid and not self._uses_dsv4_cache:
+            logger.info(
+                "Hybrid SSM cache detected but prefix cache is disabled; "
+                "SSM companion lookup/store/re-derive is disabled for this run"
+            )
+
+        # Prompt lookup decoding — measurement state (Phase 1)
+        # Maps request_id -> (draft_tokens, expected_start_output_idx, hit_count)
+        self._pld_pending: Dict[str, Tuple[List[int], int, int]] = {}
+        # Per-request n-gram hash index for O(1) draft lookup
+        self._pld_ngram_indices: Dict[str, NgramIndex] = {}
+
+        # Prompt lookup decoding — Phase 2/3 (actual batched verification)
+        # Phase 2 (temp≈0): greedy acceptance, argmax bonus.
+        # Phase 3 (temp>0): probabilistic acceptance, sampled correction/bonus.
+        self._pld_spec_enabled: bool = self.config.pld_enabled
+        self._pld_spec_max_temp: float = float(os.getenv("VMLX_PLD_MAX_TEMP", "1.0"))
+        # Adaptive K: hybrid SSM/attention models process verify tokens
+        # sequentially in SSM layers.  K=2 balances verify cost (1.75x)
+        # against per-cycle overhead (remove/insert ≈ 15-30ms).  K=1 has
+        # lower verify cost (1.0x) but pays the same fixed overhead per
+        # cycle with fewer tokens to amortize it.  K=2 wins when the
+        # fixed overhead exceeds ~15ms, which remove/insert clearly does.
+        self._pld_num_drafts: int = 2 if self._is_hybrid else 5
+        self._pld_spec_attempts: int = 0
+        self._pld_spec_accepted: int = 0  # total accepted draft tokens
+        self._pld_spec_wasted: int = 0  # total rejected draft tokens
+        # Per-window counters for periodic summary (reset after each log)
+        self._pld_win_attempts: int = 0
+        self._pld_win_accepted: int = 0
+        self._pld_win_full: int = 0  # rounds where all K drafts accepted
+        self._pld_win_zero: int = 0  # rounds where 0 drafts accepted
+        self._pld_win_tokens: int = 0  # tokens emitted while PLD active
+        self._pld_win_d0_skip: int = 0  # d0 pre-check skips (wasted cycles avoided)
+        # Auto-tune: TCP slow-start inspired wall-clock throughput control.
+        # Window starts at 10 tokens, doubles each positive window (exponential
+        # growth), caps at _pld_summary_interval.  On congestion (PLD hurting),
+        # disables and resets window to 10.  Probes after 5× interval tokens.
+        self._pld_auto_enabled: bool = True
+        self._pld_at_window: int = 1  # current auto-tune window (TCP cwnd)
+        self._pld_at_probe_tokens: int = 0  # tokens counted while disabled
+        self._pld_win_cycle_wall_s: float = 0.0
+        self._pld_win_step_wall_s: float = 0.0
+        self._pld_win_total_tokens: int = 0
+        self._pld_summary_interval: int = self.config.pld_summary_interval
+        if self._pld_spec_enabled:
+            logger.info(
+                "[PLD] enabled — K=%d (%s model), d0 pre-check active, "
+                "auto-tune on (slow-start window=1→%d)",
+                self._pld_num_drafts,
+                "hybrid" if self._is_hybrid else "pure-attention",
+                self._pld_summary_interval,
+            )
+        self._pld_summary_next: int = 1  # first window is 1 token (slow start)
+
+        # Prefix cache for KV state reuse
+        self.prefix_cache: Optional[PrefixCacheManager] = None
+        self.memory_aware_cache: Optional[MemoryAwarePrefixCache] = None
+        self.paged_cache_manager: Optional[PagedCacheManager] = None
+        self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
+
+        # Auto-detect hybrid models (MambaCache + KVCache) and switch to
+        # paged cache, since memory-aware cache can't truncate MambaCache.
+        if (
+            self.config.enable_prefix_cache
+            and not self.config.use_paged_cache
+            and self._uses_zaya_cache
+        ):
+            logger.info(
+                "ZAYA/CCA typed cache requires paged prefix cache. "
+                "Auto-switching prefix-only configuration to paged cache "
+                "so zaya_cca_v1 records carry KV + conv_state + prev_hs."
+            )
+            self.config.use_paged_cache = True
+            self.config.use_memory_aware_cache = False
+        elif (
+            self.config.enable_prefix_cache
+            and not self.config.use_paged_cache
+            and self.config.use_memory_aware_cache
+            and self._is_hybrid
+        ):
+            logger.info(
+                "Non-standard cache model detected (MambaCache/hybrid layers). "
+                "Auto-switching to paged cache for correct cache reuse."
+            )
+            self.config.use_paged_cache = True
+            self.config.use_memory_aware_cache = False
+
+        # Active generation KV cache has no explicit memory cap — relies on
+        # MLX/Metal's own memory management and macOS memory pressure signals.
+        # The prefix cache (L1) has a 32GB hard cap but active KV does not.
+        # For large MoE models with many experts, monitor system memory usage.
+
+        # Apply KV cache quantization if requested AND prefix cache is enabled.
+        # Quantization only affects prefix cache storage/retrieval — without prefix
+        # cache there are no stored KV states to quantize.
+        # MLA models (DeepSeek V3, Mistral 4) store compressed KV latents — quantizing
+        # these destroys quality. Auto-disable for MLA, same as MLLM scheduler.
+        # Original MLA cache integration by Jinho Jang (eric@jangq.ai) — vMLX/mlxstudio.
+        # Symmetric with MLLMScheduler._detect_mla — walks model +
+        # language_model + inner .model wrappers, inspects args/config/
+        # text_config + _raw_config, so wrapped models (Kimi K2.6 mlx_vlm
+        # around DeepseekV3, glm_moe_dsa inheriting deepseek_v32, mistral4
+        # text wrappers) are caught the same way the LLM scheduler's other
+        # cache-record validator already does.
+        _is_mla = self._detect_mla()
+        # User opt-in override for non-DSV4 MLA auto-disable. DeepSeek V3 /
+        # Mistral 4 stash compressed latents in KV — quantizing them again
+        # is double-lossy and harms quality. DSV4 is stricter: its native
+        # DeepseekV4Cache already owns the heterogeneous SWA + CSA/HCA cache
+        # compression contract (optionally PoolQuantizedV4Cache for compressed
+        # pools), so generic q4/q8 prefix-cache quantization is always forced
+        # off for DSV4.
+        _mla_kvq_env = os.environ.get("VMLX_ALLOW_MLA_KV_QUANT")
+        _allow_mla_kvq = _mla_kvq_env in ("1", "true", "True", "yes", "on")
+        _is_dsv4_composite = self._uses_dsv4_cache
+        if (
+            self.config.kv_cache_quantization != "none"
+            and _is_dsv4_composite
+        ):
+            logger.info(
+                "DSV4 composite cache detected — forcing generic KV cache "
+                "quantization off (was: %s). DSV4 uses native "
+                "DeepseekV4Cache SWA + CSA/HCA state; optional "
+                "DSV4_POOL_QUANT compresses the CSA/HCA pools without "
+                "replacing the composite cache with QuantizedKVCache.",
+                self.config.kv_cache_quantization,
+            )
+            self.config.kv_cache_quantization = "none"
+        elif (
+            self.config.kv_cache_quantization != "none"
+            and _is_mla
+            and not _is_dsv4_composite
+            and not _allow_mla_kvq
+        ):
+            logger.info(
+                f"MLA model detected (kv_lora_rank > 0) — disabling KV cache quantization "
+                f"(was: {self.config.kv_cache_quantization}). MLA stores compressed latents "
+                f"that should not be further quantized. Set VMLX_ALLOW_MLA_KV_QUANT=1 to "
+                f"override if you accept the quality risk."
+            )
+            self.config.kv_cache_quantization = "none"
+        elif (
+            self.config.kv_cache_quantization != "none"
+            and _is_mla
+            and not _is_dsv4_composite
+            and _allow_mla_kvq
+        ):
+            logger.warning(
+                f"MLA model + KV cache quantization='{self.config.kv_cache_quantization}' "
+                f"requested via VMLX_ALLOW_MLA_KV_QUANT=1 — running double-lossy KV quant "
+                f"on compressed latents. Expect some output drift; turn off if quality matters."
+            )
+        if self.config.kv_cache_quantization != "none":
+            if self.config.enable_prefix_cache:
+                bits = 4 if self.config.kv_cache_quantization == "q4" else 8
+                self._wrap_make_cache_quantized(bits, self.config.kv_cache_group_size)
+                logger.info(
+                    f"KV cache quantization enabled: {self.config.kv_cache_quantization} "
+                    f"(bits={bits}, group_size={self.config.kv_cache_group_size})"
+                )
+            else:
+                logger.warning(
+                    f"KV cache quantization '{self.config.kv_cache_quantization}' requested "
+                    "but prefix cache is disabled — quantization has no effect without prefix cache"
+                )
+
+        if self._uses_dsv4_cache and self.config.use_paged_cache:
+            logger.info(
+                "DSV4 DeepseekV4Cache-aware paged prefix cache enabled — "
+                "terminal blocks store full SWA+CSA/HCA composite state and "
+                "block disk L2 uses deepseek_v4_v7 nested-state serialization "
+                "with N-1 prompt-token keys."
+            )
+
+        if self.config.enable_prefix_cache:
+            logger.info(
+                "Prefix cache requires continuous batching — enabled automatically"
+            )
+            if self.config.use_paged_cache:
+                # Create optional block-level disk store (L2)
+                block_disk_store = None
+                if self.config.enable_block_disk_cache:
+                    cache_dir = self.config.block_disk_cache_dir
+                    if cache_dir is None and self.config.model_path:
+                        import hashlib
+
+                        # Include quant + runtime cache shape in hash to prevent
+                        # cross-config cache poisoning (same fix as prompt disk
+                        # cache — C3, extended for DSV4 tri-mode cache schema).
+                        quant_tag = self.config.kv_cache_quantization or "none"
+                        dsv4_scope = ""
+                        zaya_scope = ""
+                        if self._uses_dsv4_cache:
+                            # Include the unsafe-override env in the scope so
+                            # safe/default runs can NEVER share namespace with
+                            # `VMLX_DSV4_TRUST_TRIMMED_CACHE=1` debug runs that
+                            # store post-generation contaminated state.
+                            _unsafe_trim = (
+                                "1"
+                                if os.environ.get(
+                                    "VMLX_DSV4_TRUST_TRIMMED_CACHE", "0"
+                                ).lower() in ("1", "true", "yes")
+                                else "0"
+                            )
+                            dsv4_scope = (
+                                f":dsv4_long_ctx={os.environ.get('DSV4_LONG_CTX', '0')}"
+                                f":dsv4_pool_quant={os.environ.get('DSV4_POOL_QUANT', '')}"
+                                f":dsv4_unsafe_trim={_unsafe_trim}"
+                                f":dsv4_paged_block_size={self.config.paged_cache_block_size}"
+                                ":dsv4_cache_schema=deepseek_v4_v7"
+                            )
+                        elif self._uses_zaya_cache:
+                            zaya_scope = ":zaya_cache_schema=zaya_cca_v1"
+                        block_scope_key = (
+                            f"{self.config.model_path}:quant={quant_tag}"
+                            f":paged_cache_schema={PAGED_CACHE_SCHEMA_VERSION}"
+                            f":{runtime_cache_fingerprint()}"
+                            f"{dsv4_scope}"
+                            f"{zaya_scope}"
+                        )
+                        model_hash = hashlib.sha256(
+                            block_scope_key.encode()
+                        ).hexdigest()[:12]
+                        cache_dir = os.path.join(
+                            os.path.expanduser("~"),
+                            ".cache",
+                            "vmlx-engine",
+                            "block-cache",
+                            model_hash,
+                        )
+                    elif cache_dir is None:
+                        logger.warning(
+                            "Block disk cache: model_path not set, using shared 'default' dir. "
+                            "Different models will share cache — this may cause issues."
+                        )
+                        cache_dir = os.path.join(
+                            os.path.expanduser("~"),
+                            ".cache",
+                            "vmlx-engine",
+                            "block-cache",
+                            "default",
+                        )
+                    # Derive expected layer count
+                    # from model config and pass to BlockDiskStore so the
+                    # validator can hard-reject wrong-model L2 entries.
+                    _expected_n_layers = self._expected_cache_layer_count()
+                    try:
+                        block_disk_store = BlockDiskStore(
+                            cache_dir=cache_dir,
+                            max_size_gb=self.config.block_disk_cache_max_gb,
+                            expected_num_layers=_expected_n_layers,
+                        )
+                        logger.info(
+                            f"Block disk cache enabled: dir={cache_dir}, "
+                            f"max={self.config.block_disk_cache_max_gb}GB, "
+                            f"expected_layers={_expected_n_layers}"
+                        )
+                        if (
+                            self._is_hybrid
+                            and not self._uses_dsv4_cache
+                            and not self._uses_zaya_cache
+                            and self._ssm_state_cache is not None
+                        ):
+                            try:
+                                try:
+                                    _ssm_budget_gb = float(
+                                        os.environ.get(
+                                            "VMLX_SSM_DISK_CACHE_MAX_GB",
+                                            str(self.config.block_disk_cache_max_gb),
+                                        )
+                                    )
+                                    if _ssm_budget_gb <= 0:
+                                        _ssm_budget_gb = (
+                                            self.config.block_disk_cache_max_gb
+                                        )
+                                except ValueError:
+                                    _ssm_budget_gb = self.config.block_disk_cache_max_gb
+                                _ssm_disk = SSMCompanionDiskStore(
+                                    directory=os.path.join(cache_dir, "ssm_companion"),
+                                    budget_bytes=int(_ssm_budget_gb * (1024 ** 3)),
+                                )
+                                self._ssm_state_cache.attach_disk_store(_ssm_disk)
+                                logger.info(
+                                    "Hybrid SSM companion L2 enabled: dir=%s, max=%.3gGB",
+                                    _ssm_disk.directory,
+                                    _ssm_budget_gb,
+                                )
+                            except Exception as _ssm_disk_e:
+                                logger.warning(
+                                    "Hybrid SSM companion L2 init failed; "
+                                    "continuing with in-memory SSM companion only: %s",
+                                    _ssm_disk_e,
+                                )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to initialize block disk cache at {cache_dir}: {e}. "
+                            "Continuing without disk cache."
+                        )
+                        block_disk_store = None
+
+                # Use paged cache for memory efficiency
+                self.paged_cache_manager = PagedCacheManager(
+                    block_size=self.config.paged_cache_block_size,
+                    max_blocks=self.config.max_cache_blocks,
+                    disk_store=block_disk_store,
+                )
+                self.block_aware_cache = BlockAwarePrefixCache(
+                    model=model,
+                    paged_cache_manager=self.paged_cache_manager,
+                    model_path=self.config.model_path,
+                    smelt_enabled=self.config.smelt_enabled,
+                    smelt_pct=self.config.smelt_pct,
+                    tq_enabled=(
+                        self._tq_active
+                        and not self._uses_dsv4_cache
+                        and not self._uses_zaya_cache
+                    ),
+                    kv_quant_bits=self._kv_cache_bits,
+                )
+                if self._uses_dsv4_cache:
+                    logger.info(
+                        "DSV4 native composite block index enabled: "
+                        "block_size=%s, max_blocks=%s "
+                        "(not generic paged KV; records deepseek_v4_v7 "
+                        "SWA+CSA/HCA state)",
+                        self.config.paged_cache_block_size,
+                        self.config.max_cache_blocks,
+                    )
+                else:
+                    logger.info(
+                        f"Paged cache enabled: block_size={self.config.paged_cache_block_size}, "
+                        f"max_blocks={self.config.max_cache_blocks}"
+                    )
+            elif self.config.use_memory_aware_cache:
+                # Use memory-aware cache (recommended for large models)
+                cache_config = MemoryCacheConfig(
+                    max_memory_mb=self.config.cache_memory_mb,
+                    max_memory_percent=self.config.cache_memory_percent,
+                    ttl_minutes=self.config.cache_ttl_minutes,
+                )
+                self.memory_aware_cache = MemoryAwarePrefixCache(
+                    model=model,
+                    config=cache_config,
+                    model_path=self.config.model_path,
+                )
+                logger.info(
+                    f"Memory-aware cache enabled: "
+                    f"limit={self.memory_aware_cache.memory_limit_mb:.1f}MB"
+                )
+            else:
+                # Use legacy entry-count based prefix cache (now with optional
+                # global byte budget + cache-type LRU priority — system entries
+                # are pinned and evicted last so shared system prompts persist
+                # across users/sessions).
+                self.prefix_cache = PrefixCacheManager(
+                    model=model,
+                    max_entries=self.config.prefix_cache_size,
+                    max_bytes=self.config.prefix_cache_max_bytes,
+                    model_path=self.config.model_path,
+                    smelt_enabled=self.config.smelt_enabled,
+                    smelt_pct=self.config.smelt_pct,
+                    tq_enabled=(
+                        self._tq_active
+                        and not self._uses_dsv4_cache
+                        and not self._uses_zaya_cache
+                    ),
+                    kv_quant_bits=self._kv_cache_bits,
+                )
+                _bytes_msg = (
+                    f", max_bytes={self.config.prefix_cache_max_bytes}"
+                    if self.config.prefix_cache_max_bytes is not None
+                    else ""
+                )
+                logger.info(
+                    f"Prefix cache enabled with max_entries={self.config.prefix_cache_size}"
+                    f"{_bytes_msg}, type-priority=(assistant→user→system)"
+                )
+
+        # Disk cache (L2) for persistent prompt cache across restarts.
+        # Disk cache entries are loaded lazily on cache miss — no L2-to-L1
+        # warmup at startup. This avoids loading GBs of cache into RAM but
+        # means first request pays full prefill cost.
+        self.disk_cache: Optional[DiskCacheManager] = None
+        if self.config.enable_disk_cache and self.config.enable_prefix_cache:
+            import hashlib
+
+            base_dir = self.config.disk_cache_dir or os.path.expanduser(
+                "~/.cache/vmlx-engine/prompt-cache"
+            )
+            # Scope disk cache per model, quantization, AND layer count to prevent
+            # stale cross-config hits. Without this, restarting with a different model
+            # at the same path could load tensors with wrong layer count or head dims.
+            if self.config.model_path:
+                quant_tag = self.config.kv_cache_quantization or "none"
+                # Include layer count to invalidate on architecture change
+                n_layers = self._expected_cache_layer_count() or 0
+                scope_key = (
+                    f"{self.config.model_path}:quant={quant_tag}:layers={n_layers}"
+                    f":prefix_cache_schema={PAGED_CACHE_SCHEMA_VERSION}"
+                    f":{runtime_cache_fingerprint()}"
+                )
+                model_hash = hashlib.sha256(scope_key.encode()).hexdigest()[:12]
+                model_slug = os.path.basename(self.config.model_path.rstrip("/"))
+                cache_dir = os.path.join(base_dir, f"{model_slug}_{model_hash}")
+            else:
+                cache_dir = base_dir
+            self.disk_cache = DiskCacheManager(
+                cache_dir=cache_dir,
+                max_size_gb=self.config.disk_cache_max_gb,
+                # Pass expected layer count
+                # so the safetensors header validator can hard-reject
+                # wrong-model L2 entries before mx.load triggers
+                # multi-hundred-GB metal::malloc.
+                expected_num_layers=int(n_layers) if n_layers else None,
+            )
+        elif self.config.enable_disk_cache and not self.config.enable_prefix_cache:
+            logger.warning(
+                "Disk cache requires prefix cache to be enabled — disk cache disabled"
+            )
+
+        # Log disk cache + paged cache backend status
+        if self.disk_cache is not None and self.block_aware_cache is not None:
+            logger.info(
+                "Disk cache enabled with paged cache backend — "
+                "L2 writes happen during cache extraction (pre-quantization)"
+            )
+
+        # Streaming detokenizer pool for correct multi-byte character handling.
+        # Single-token decode breaks emoji and other multi-byte UTF-8 chars.
+        self._detokenizer_pool: Dict[str, Any] = {}
+
+        # Statistics
+        self.num_requests_processed = 0
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self._cache_hit_requests = 0
+        self._cache_hit_tokens = 0
+        self._cache_hit_tokens_by_detail: Dict[str, int] = {}
+        self._cache_reuse_skips = 0
+        self._cache_reuse_skip_tokens = 0
+        self._last_cache_reuse_skip: Optional[Dict[str, Any]] = None
+        self._cache_reuse_partial_downgrades = 0
+        self._cache_reuse_partial_tokens = 0
+        self._last_cache_reuse_partial: Optional[Dict[str, Any]] = None
+        self._last_cache_selection: Optional[Dict[str, Any]] = None
+        self._last_cache_execution: Optional[Dict[str, Any]] = None
+
+        # Periodic Metal memory cache cleanup timer.
+        # During sustained multi-request traffic, self.running is never empty
+        # so _cleanup_finished's clear_mlx_memory_cache() never triggers.
+        # This timer ensures Metal's internal allocator cache gets flushed
+        # periodically (every 60s) even during continuous load.
+        self._last_metal_gc_time = time.monotonic()
+        self._metal_gc_interval = 60.0  # seconds
+
+    @staticmethod
+    def _model_has_mixed_attention(model: Any) -> bool:
+        """Return True for models that interleave sliding-window and full
+        attention layers (Gemma 4 pattern). Detection is conservative: only
+        returns True when the config clearly lists at least two distinct
+        attention modes including at least one sliding variant.
+        """
+        def _cfg_value(cfg: Any, key: str) -> Any:
+            if isinstance(cfg, dict):
+                return cfg.get(key)
+            return getattr(cfg, key, None)
+
+        candidates = []
+        for attr in ('args', 'config'):
+            cfg = getattr(model, attr, None)
+            if cfg is not None:
+                candidates.append(cfg)
+                tc = _cfg_value(cfg, 'text_config')
+                if tc is not None:
+                    candidates.append(tc)
+        for cfg in candidates:
+            cache_subtype = str(_cfg_value(cfg, "cache_subtype") or "").lower()
+            model_type = str(_cfg_value(cfg, "model_type") or "").lower()
+            text_cfg = _cfg_value(cfg, "text_config")
+            text_model_type = str(_cfg_value(text_cfg, "model_type") or "").lower()
+            sliding_window = _cfg_value(cfg, "sliding_window")
+            if sliding_window is None:
+                sliding_window = _cfg_value(text_cfg, "sliding_window")
+            if (
+                cache_subtype
+                in {
+                    "mixed_swa_kv",
+                    "step3p7_full_sliding_kv",
+                    "mimo_v2_asymmetric_swa",
+                }
+                or (
+                    model_type == "step3p7"
+                    and text_model_type == "step3p5"
+                    and sliding_window is not None
+                )
+            ):
+                return True
+            layer_types = _cfg_value(cfg, 'layer_types')
+            if layer_types and isinstance(layer_types, (list, tuple)):
+                kinds = {str(k).lower() for k in layer_types}
+                if len(kinds) >= 2 and any('sliding' in k for k in kinds):
+                    return True
+        return False
+
+    @staticmethod
+    def _model_uses_dsv4_cache(model: Any) -> bool:
+        """Return True when model.make_cache() contains DeepseekV4Cache."""
+        if not hasattr(model, "make_cache"):
+            return False
+        try:
+            return any(Scheduler._is_dsv4_cache_object(c) for c in (model.make_cache() or []))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _model_uses_zaya_cache(model: Any) -> bool:
+        """Return True when model.make_cache() contains ZAYA CCA cache slots."""
+        if not hasattr(model, "make_cache"):
+            return False
+        try:
+            cache = model.make_cache() or []
+            names = [type(c).__name__ for c in cache]
+            return "ZayaNoStateCache" in names or (
+                "CacheList" in names
+                and any("zaya" in str(type(c).__module__).lower() for c in cache)
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _turboquant_cache_supports_batch_api(model: Any) -> bool:
+        """Return True when every TurboQuant cache declares real batch support."""
+        if not hasattr(model, "make_cache"):
+            return False
+        try:
+            cache = model.make_cache() or []
+        except Exception:
+            return False
+        tq_slots = [c for c in cache if type(c).__name__ == "TurboQuantKVCache"]
+        if not tq_slots:
+            return False
+        required_methods = ("extend", "filter", "extract", "prepare", "finalize")
+        for slot in tq_slots:
+            if getattr(slot, "_vmlx_batch_api", None) != "turboquant_kv_v1":
+                return False
+            if not all(callable(getattr(slot, name, None)) for name in required_methods):
+                return False
+        return True
+
+    def _log_runtime_cache_contract(self, model: Any) -> None:
+        """Log per-layer cache classes for production-gate topology checks."""
+        if not hasattr(model, "make_cache"):
+            return
+        try:
+            cache = model.make_cache() or []
+            layout = []
+            for idx, slot in enumerate(cache):
+                cls = type(slot).__name__
+                if cls == "CacheList":
+                    sub = [
+                        type(sub_slot).__name__
+                        for sub_slot in getattr(slot, "caches", ())
+                    ]
+                    layout.append(f"{idx}:CacheList({','.join(sub)})")
+                else:
+                    layout.append(f"{idx}:{cls}")
+            logger.info(
+                "Runtime cache layout: model_type=%s layers=%d layout=%s",
+                self._model_type_for_runtime or "unknown",
+                len(cache),
+                ";".join(layout),
+            )
+        except Exception as exc:
+            logger.debug("Runtime cache layout logging skipped: %s", exc)
+
+    @staticmethod
+    def _is_dsv4_cache_class_name(class_name: str) -> bool:
+        return class_name in {"DeepseekV4Cache", "PoolQuantizedV4Cache"}
+
+    @staticmethod
+    def _is_dsv4_cache_object(cache: Any) -> bool:
+        try:
+            return any(
+                Scheduler._is_dsv4_cache_class_name(cls.__name__)
+                for cls in type(cache).__mro__
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_hybrid_model(model: Any) -> bool:
+        """Check if model uses non-standard cache types requiring paged cache.
+
+        Returns True for:
+        - Hybrid models (mixed KVCache + MambaCache layers)
+        - Pure Mamba/SSM models (all MambaCache/ArraysCache layers)
+
+        These models cannot use memory-aware cache (which needs truncatable KVCache)
+        and must be routed to paged cache for correct prefix caching.
+        """
+        if not hasattr(model, "make_cache"):
+            return False
+        try:
+            cache = model.make_cache()
+            cache_types = {type(c).__name__ for c in cache}
+            # Standard KV-only models don't need special handling.
+            # Match any class name ending with "KVCache" (e.g., KVCache,
+            # RotatingKVCache, QuantizedKVCache, ChunkedKVCache) so future
+            # KV cache variants are handled automatically without hardcoding.
+            kv_types = {
+                t for t in cache_types if t == "KVCache" or t.endswith("KVCache")
+            }
+            if any(Scheduler._is_dsv4_cache_class_name(t) for t in cache_types):
+                return False
+            if cache_types and cache_types == kv_types:
+                return False
+            # DSV4 composite attention is handled by _uses_dsv4_cache above,
+            # not by the hybrid SSM companion path.
+            non_kv = cache_types - kv_types
+            non_kv.discard("CacheList")
+            return bool(non_kv)
+        except Exception as e:
+            logger.warning(f"make_cache() failed during hybrid detection: {e}")
+            return False
+
+    def _expected_cache_layer_count(self) -> Optional[int]:
+        """Return the number of cache-bearing layers for validation/scope keys.
+
+        Some hybrid models have transformer blocks that do not own cache state
+        (Nemotron-H MoE/MLP blocks are the current live example: 52 blocks but
+        29 Mamba/attention cache entries). L2/paged validators must compare
+        against the cache contract, not raw ``num_hidden_layers``.
+        """
+        if getattr(self, "_hybrid_num_layers", None):
+            return int(self._hybrid_num_layers)
+        if hasattr(self.model, "make_cache"):
+            try:
+                cache = self.model.make_cache() or []
+                if len(cache) > 0:
+                    return len(cache)
+            except Exception:
+                pass
+        for _attr in ("args", "config"):
+            _cfg = getattr(self.model, _attr, None)
+            if _cfg:
+                _ln = getattr(_cfg, "num_hidden_layers", 0)
+                if _ln:
+                    return int(_ln)
+        return None
+
+    def _detect_mla(self) -> bool:
+        """Detect Multi-head Latent Attention (compressed-latent KV).
+
+        Mirrors ``MLLMScheduler._detect_mla`` so the LLM scheduler's KV-cache
+        quantization gate catches wrapped MLA models (Kimi K2.6 mlx_vlm
+        wrapper around DeepseekV3, glm_moe_dsa inheriting deepseek_v32,
+        mistral4 text wrappers, deepseek_v4 / DSV4 backbones). The earlier
+        inline check only inspected ``self.model.args`` — wrappers expose
+        the relevant config via ``language_model.config.text_config`` and
+        were silently treated as non-MLA, leaving generic q4/q8 prefix-cache
+        quantization on top of an already compressed latent.
+        """
+
+        def _cfg_model_type(cfg: Any) -> str:
+            if cfg is None:
+                return ""
+            if isinstance(cfg, dict):
+                mt = cfg.get("model_type") or ""
+                if not mt and isinstance(cfg.get("text_config"), dict):
+                    mt = cfg["text_config"].get("model_type") or ""
+                return str(mt).lower()
+            mt = getattr(cfg, "model_type", "") or ""
+            if not mt:
+                tc = getattr(cfg, "text_config", None)
+                mt = getattr(tc, "model_type", "") if tc is not None else ""
+            return str(mt or "").lower()
+
+        def _cfg_kv_lora_rank(cfg: Any) -> int:
+            if cfg is None:
+                return 0
+            vals = []
+            if isinstance(cfg, dict):
+                vals.append(cfg.get("kv_lora_rank", 0))
+                tc = cfg.get("text_config")
+                if isinstance(tc, dict):
+                    vals.append(tc.get("kv_lora_rank", 0))
+            else:
+                vals.append(getattr(cfg, "kv_lora_rank", 0))
+                tc = getattr(cfg, "text_config", None)
+                if tc is not None:
+                    vals.append(getattr(tc, "kv_lora_rank", 0))
+                raw = getattr(cfg, "_raw_config", None)
+                if isinstance(raw, dict):
+                    vals.append(raw.get("kv_lora_rank", 0))
+                    tc = raw.get("text_config")
+                    if isinstance(tc, dict):
+                        vals.append(tc.get("kv_lora_rank", 0))
+            for val in vals:
+                try:
+                    iv = int(val or 0)
+                except (TypeError, ValueError):
+                    iv = 0
+                if iv > 0:
+                    return iv
+            return 0
+
+        try:
+            candidates = [self.model]
+            lm = getattr(self.model, "language_model", None)
+            if lm is not None and lm not in candidates:
+                candidates.append(lm)
+            for obj in list(candidates):
+                inner = getattr(obj, "model", None)
+                if inner is not None and inner not in candidates:
+                    candidates.append(inner)
+
+            cfgs: list[Any] = []
+            for obj in candidates:
+                for attr in ("args", "config", "text_config"):
+                    cfg = getattr(obj, attr, None)
+                    if cfg is None:
+                        continue
+                    cfgs.append(cfg)
+                    raw = getattr(cfg, "_raw_config", None)
+                    if isinstance(raw, dict):
+                        cfgs.append(raw)
+                    tc = getattr(cfg, "text_config", None)
+                    if tc is not None:
+                        cfgs.append(tc)
+                    if isinstance(cfg, dict) and isinstance(cfg.get("text_config"), dict):
+                        cfgs.append(cfg["text_config"])
+
+            for cfg in cfgs:
+                model_type = _cfg_model_type(cfg)
+                if model_type in ("bailing_hybrid", "bailing_moe_v2_5"):
+                    # Ling/Bailing's runtime stores full per-head KV, not H=1
+                    # compressed MLA latents. Keep normal KV/TQ cache support.
+                    continue
+                if _cfg_kv_lora_rank(cfg) > 0:
+                    return True
+                if model_type in ("mistral4", "deepseek_v4"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _detect_cache_head_dims(self) -> Tuple[int, ...]:
+        """Detect cache tensor trailing dims for KV quant validation."""
+        try:
+            return detect_cache_head_dims(self.model)
+        except Exception as e:
+            logger.debug(f"Could not detect cache head dims: {e}")
+            return ()
+
+    def _detect_head_dim(self) -> Optional[int]:
+        """Detect the model's primary KV cache trailing dim from config."""
+        dims = self._detect_cache_head_dims()
+        if dims:
+            return dims[0]
+        return None
+
+    def _detect_n_kv_heads(self) -> int:
+        """Detect number of KV heads from model config (for GQA head normalization).
+
+        BatchKVCache.merge() inflates the H dimension to the maximum across
+        all caches in the batch. When the cache is extracted and stored in
+        paged blocks, the inflated head count persists. On the next turn,
+        reconstruct_cache() builds a cache with wrong H, causing a broadcast
+        error. This method provides the ground-truth KV head count so
+        extraction can slice away the inflated heads.
+        """
+        if hasattr(self, "_n_kv_heads_cached"):
+            return self._n_kv_heads_cached
+        n_kv = 0
+        try:
+            # Build candidate list: model + VLM wrapper inner models
+            candidates = [self.model]
+            lm = getattr(self.model, "language_model", None)
+            if lm is not None:
+                candidates.append(lm)
+            mm = getattr(self.model, "model", None)
+            if mm is not None and mm is not self.model:
+                candidates.append(mm)
+            # TWO-PASS: MLA detection first, then num_key_value_heads.
+            # Most MLA families store compressed latent cache with H=1, but
+            # Ling/Bailing's mlx_lm implementation expands and stores full
+            # per-head KV in MLAAttention.update_and_fetch(). Treating it as
+            # H=1 sliced valid (1,32,T,D) cache down to (1,1,T,D) and caused
+            # cache-hit append crashes.
+            for model_obj in candidates:
+                for attr in ("args", "config", "text_config"):
+                    cfg = getattr(model_obj, attr, None)
+                    if cfg is None:
+                        continue
+                    model_type = str(getattr(cfg, "model_type", "") or "").lower()
+                    if not model_type:
+                        tc = getattr(cfg, "text_config", None)
+                        if tc is not None:
+                            model_type = str(
+                                getattr(tc, "model_type", "") or ""
+                            ).lower()
+                    kv_lora_rank = getattr(cfg, "kv_lora_rank", 0)
+                    if not kv_lora_rank:
+                        tc = getattr(cfg, "text_config", None)
+                        if tc is not None:
+                            kv_lora_rank = getattr(tc, "kv_lora_rank", 0)
+                    if kv_lora_rank and kv_lora_rank > 0:
+                        if model_type in ("bailing_hybrid", "bailing_moe_v2_5"):
+                            n_kv = int(getattr(cfg, "num_attention_heads", 0) or 0)
+                            if not n_kv:
+                                tc = getattr(cfg, "text_config", None)
+                                if tc is not None:
+                                    n_kv = int(
+                                        getattr(tc, "num_attention_heads", 0) or 0
+                                    )
+                        else:
+                            n_kv = 1
+                        break
+                if n_kv:
+                    break
+            if not n_kv:
+                for model_obj in candidates:
+                    for attr in ("args", "config", "text_config"):
+                        cfg = getattr(model_obj, attr, None)
+                        if cfg is None:
+                            continue
+                        n_kv = getattr(cfg, "num_key_value_heads", 0) or getattr(
+                            cfg, "num_kv_heads", 0
+                        )
+                        if not n_kv:
+                            tc = getattr(cfg, "text_config", None)
+                            if tc is not None:
+                                n_kv = getattr(tc, "num_key_value_heads", 0) or getattr(
+                                    tc, "num_kv_heads", 0
+                                )
+                        if n_kv:
+                            break
+                    if n_kv:
+                        break
+        except Exception:
+            pass
+        # Ensure the result is always a plain int (guards against MagicMock
+        # or other non-int returns from getattr on unusual model configs)
+        if not isinstance(n_kv, int):
+            n_kv = 0
+        self._n_kv_heads_cached = n_kv
+        return n_kv
+
+    def _detect_allowed_n_kv_heads(self) -> set[int]:
+        """Return all KV head counts that are valid for this model."""
+        if hasattr(self, "_allowed_n_kv_heads_cached"):
+            return self._allowed_n_kv_heads_cached
+        allowed: set[int] = set()
+        primary = self._detect_n_kv_heads()
+        if primary > 0:
+            allowed.add(primary)
+        try:
+            candidates = [self.model]
+            lm = getattr(self.model, "language_model", None)
+            if lm is not None:
+                candidates.append(lm)
+            mm = getattr(self.model, "model", None)
+            if mm is not None and mm is not self.model:
+                candidates.append(mm)
+            for model_obj in candidates:
+                for attr in ("args", "config", "text_config"):
+                    cfg = getattr(model_obj, attr, None)
+                    if cfg is None:
+                        continue
+                    for field in (
+                        "num_global_key_value_heads",
+                        "global_num_key_value_heads",
+                        "swa_num_key_value_heads",
+                        "num_swa_key_value_heads",
+                        "sliding_num_key_value_heads",
+                        "local_num_key_value_heads",
+                    ):
+                        val = getattr(cfg, field, None)
+                        if val is None:
+                            tc = getattr(cfg, "text_config", None)
+                            if tc is not None:
+                                val = getattr(tc, field, None)
+                        if isinstance(val, int) and val > 0:
+                            allowed.add(val)
+        except Exception:
+            pass
+        self._allowed_n_kv_heads_cached = allowed
+        return allowed
+
+    def _detect_config_int_field(self, fields: tuple[str, ...]) -> int:
+        try:
+            candidates = [self.model]
+            lm = getattr(self.model, "language_model", None)
+            if lm is not None:
+                candidates.append(lm)
+            mm = getattr(self.model, "model", None)
+            if mm is not None and mm is not self.model:
+                candidates.append(mm)
+            for model_obj in candidates:
+                for attr in ("args", "config", "text_config"):
+                    cfg = getattr(model_obj, attr, None)
+                    if cfg is None:
+                        continue
+                    for field in fields:
+                        val = getattr(cfg, field, None)
+                        if val is None:
+                            tc = getattr(cfg, "text_config", None)
+                            if tc is not None:
+                                val = getattr(tc, field, None)
+                        if isinstance(val, int) and val > 0:
+                            return val
+        except Exception:
+            pass
+        return 0
+
+    def _cache_head_slice_target(self, class_name: str, actual_heads: int) -> int:
+        """Return target H for safe GQA-inflation slicing, or 0 to keep as-is.
+
+        Mixed full/SWA families such as Gemma 4 and MiMo V2 can legitimately
+        use different KV head counts by cache class. Extraction must not slice
+        an 8-head full-attention KVCache down to the smaller 4-head SWA count.
+        """
+        allowed = self._detect_allowed_n_kv_heads()
+        if allowed and actual_heads in allowed:
+            return 0
+        primary = self._detect_n_kv_heads()
+        if primary <= 0 or actual_heads <= primary:
+            return 0
+        if len(allowed) > 1:
+            if "Rotating" in str(class_name):
+                target = self._detect_config_int_field(
+                    (
+                        "swa_num_key_value_heads",
+                        "num_swa_key_value_heads",
+                        "sliding_num_key_value_heads",
+                        "local_num_key_value_heads",
+                    )
+                )
+            else:
+                target = self._detect_config_int_field(
+                    (
+                        "num_global_key_value_heads",
+                        "global_num_key_value_heads",
+                    )
+                )
+            return target if target > 0 and actual_heads > target else 0
+        return primary
+
+    def _wrap_make_cache_quantized(self, bits: int, group_size: int) -> None:
+        """
+        Configure KV cache quantization for prefix cache storage.
+
+        Quantization is applied at the storage/retrieval boundary of the prefix
+        cache, NOT at model.make_cache() level. This preserves full compatibility
+        with BatchGenerator (which requires KVCache/BatchKVCache) while reducing
+        prefix cache memory footprint by 2-4x.
+
+        During generation: full-precision KVCache (no quality loss).
+        In prefix cache: quantized QuantizedKVCache (memory savings).
+
+        Performs init-time validation:
+        1. Verifies QuantizedKVCache is available
+        2. Checks model head_dim compatibility with group_size
+        3. Runs a quantize/dequantize round-trip test
+        4. Auto-adjusts group_size or disables if incompatible
+        """
+        try:
+            from mlx_lm.models.cache import QuantizedKVCache
+            import mlx.core as mx
+        except ImportError:
+            logger.warning(
+                "QuantizedKVCache not available in this mlx-lm version. "
+                "KV cache quantization disabled."
+            )
+            return
+
+        # Patch QuantizedKVCache.size to return self.offset (upstream bug: returns 0).
+        # Use a regular method (not property) to match KVCache.size() interface.
+        if not hasattr(QuantizedKVCache, "_size_patched"):
+            needs_patch = True
+            try:
+                test_qkv = QuantizedKVCache(group_size=64, bits=bits)
+                test_qkv.offset = 42
+                # size() is a method on _BaseCache, so call with parens
+                if callable(getattr(test_qkv, "size", None)) and test_qkv.size() == 42:
+                    needs_patch = False
+                    logger.info(
+                        "QuantizedKVCache.size() already returns offset — upstream fix detected"
+                    )
+            except Exception:
+                pass
+
+            if needs_patch:
+
+                def _qkv_size(self):
+                    return getattr(self, "offset", 0)
+
+                QuantizedKVCache.size = _qkv_size
+                logger.debug("Patched QuantizedKVCache.size() to return self.offset")
+            QuantizedKVCache._size_patched = True
+
+        # Validate cache trailing-dim compatibility with group_size.
+        # mx.quantize() requires group_size to divide the last dimension.
+        cache_head_dims = self._detect_cache_head_dims()
+        head_dim = cache_head_dims[0] if cache_head_dims else None
+        if cache_head_dims:
+            adjusted_group_size = choose_supported_kv_group_size(
+                cache_head_dims, group_size
+            )
+            if adjusted_group_size is None:
+                logger.error(
+                    "KV cache quantization: no supported group_size found for "
+                    f"cache_head_dims={cache_head_dims}. Disabling KV cache quantization."
+                )
+                return
+            if adjusted_group_size != group_size:
+                logger.warning(
+                    f"KV cache quantization: group_size={group_size} does not divide "
+                    f"cache_head_dims={cache_head_dims} or is unsupported. "
+                    f"Auto-adjusting to group_size={adjusted_group_size}."
+                )
+                group_size = adjusted_group_size
+            logger.info(
+                "KV cache quantization validated: "
+                f"cache_head_dims={cache_head_dims}, group_size={group_size}"
+            )
+
+        # Run a quantize/dequantize round-trip test with realistic tensor shapes.
+        try:
+            test_dim = head_dim or 128
+            test_shape = (1, 4, 8, test_dim)  # (batch, heads, seq, head_dim)
+            test_tensor = mx.random.normal(test_shape)
+            quantized = mx.quantize(test_tensor, group_size=group_size, bits=bits)
+            dequantized = mx.dequantize(
+                quantized[0],
+                quantized[1],
+                quantized[2],
+                group_size=group_size,
+                bits=bits,
+            )
+            # Force evaluation to catch lazy computation errors
+            mx.eval(dequantized)
+            if dequantized.shape != test_tensor.shape:
+                raise ValueError(
+                    f"Shape mismatch: input {test_tensor.shape} vs output {dequantized.shape}"
+                )
+            logger.info(
+                f"KV cache quantization round-trip test passed: "
+                f"bits={bits}, group_size={group_size}, test_shape={test_shape}"
+            )
+        except Exception as e:
+            logger.error(
+                f"KV cache quantization round-trip test FAILED: {e}. "
+                f"Disabling KV cache quantization to prevent generation failures."
+            )
+            return
+
+        self._kv_cache_bits = bits
+        self._kv_cache_group_size = group_size
+        # Persist adjusted group_size to config so diagnostics/stats are accurate
+        if hasattr(self.config, "kv_cache_group_size"):
+            self.config.kv_cache_group_size = group_size
+
+    def _quantize_cache_for_storage(self, cache: List[Any]) -> List[Any]:
+        """
+        Convert KVCache layers to QuantizedKVCache for prefix cache storage.
+
+        Quantizes keys/values using mx.quantize() to reduce memory by 2-4x.
+        Preserves non-KVCache layers (MambaCache, RotatingKVCache, etc.).
+        Recurses into CacheList sub-caches for MoE models.
+        Falls back to unquantized storage on any error.
+        """
+        if not getattr(self, "_kv_cache_bits", 0):
+            return cache
+        try:
+            from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+            try:
+                from mlx_lm.models.cache import CacheList as _CacheList
+            except ImportError:
+                _CacheList = None
+            import mlx.core as mx
+        except ImportError:
+            return cache
+
+        bits = self._kv_cache_bits
+        group_size = self._kv_cache_group_size
+        result = []
+        quantized_count = 0
+        for i, layer_cache in enumerate(cache):
+            if _CacheList is not None and isinstance(layer_cache, _CacheList):
+                # MoE: quantize each sub-cache independently
+                quantized_subs = []
+                for sc in layer_cache.caches:
+                    if (
+                        isinstance(sc, KVCache)
+                        and not isinstance(sc, QuantizedKVCache)
+                        and sc.keys is not None
+                    ):
+                        try:
+                            qkv = QuantizedKVCache(group_size=group_size, bits=bits)
+                            qkv.keys = tuple(
+                                mx.quantize(sc.keys, group_size=group_size, bits=bits)
+                            )
+                            qkv.values = tuple(
+                                mx.quantize(sc.values, group_size=group_size, bits=bits)
+                            )
+                            qkv.offset = sc.offset
+                            quantized_subs.append(qkv)
+                            quantized_count += 1
+                        except Exception as e:
+                            logger.warning(
+                                f"KV quantization failed for CacheList sub-cache in layer {i}: {e}. "
+                                f"Storing unquantized."
+                            )
+                            quantized_subs.append(sc)
+                    else:
+                        quantized_subs.append(sc)
+                result.append(_CacheList(*quantized_subs))
+            elif (
+                isinstance(layer_cache, KVCache)
+                and not isinstance(layer_cache, QuantizedKVCache)
+                and layer_cache.keys is not None
+            ):
+                try:
+                    qkv = QuantizedKVCache(group_size=group_size, bits=bits)
+                    qkv.keys = tuple(
+                        mx.quantize(layer_cache.keys, group_size=group_size, bits=bits)
+                    )
+                    qkv.values = tuple(
+                        mx.quantize(
+                            layer_cache.values, group_size=group_size, bits=bits
+                        )
+                    )
+                    qkv.offset = layer_cache.offset
+                    result.append(qkv)
+                    quantized_count += 1
+                except Exception as e:
+                    # Quantization failed for this layer — store unquantized
+                    logger.warning(
+                        f"KV cache quantization failed for layer {i} "
+                        f"(keys shape={layer_cache.keys.shape}): {e}. "
+                        f"Storing unquantized."
+                    )
+                    result.append(layer_cache)
+            elif self._is_dsv4_cache_object(layer_cache):
+                # DSV4's cache is not a plain KV payload. DeepseekV4Cache
+                # combines SWA local RotatingKVCache with cumulative CSA/HCA
+                # compressed-pool state, and PoolQuantizedV4Cache already
+                # owns the only supported DSV4-native pool compression. Do not
+                # wrap any component in generic QuantizedKVCache for prefix,
+                # paged, or L2 storage; doing so changes the composite cache
+                # type contract and risks stale local/pool mismatches.
+                result.append(layer_cache)
+            else:
+                result.append(layer_cache)
+        if quantized_count > 0:
+            logger.debug(
+                f"Quantized {quantized_count}/{len(cache)} cache layers "
+                f"(bits={bits}, group_size={group_size})"
+            )
+        return result
+
+    def _dequantize_cache_for_use(self, cache: List[Any]) -> Optional[List[Any]]:
+        """
+        Convert QuantizedKVCache layers to KVCache for BatchGenerator.
+
+        Dequantizes stored quantized keys/values back to full precision.
+        BatchGenerator requires KVCache (not QuantizedKVCache) for its batch
+        operations (merge, extract, filter).
+        Recurses into CacheList sub-caches for MoE models.
+
+        Returns None if dequantization fails (caller should treat as cache miss).
+        """
+        try:
+            from mlx_lm.models.cache import KVCache, QuantizedKVCache
+
+            try:
+                from mlx_lm.models.cache import CacheList as _CacheList
+            except ImportError:
+                _CacheList = None
+            import mlx.core as mx
+        except ImportError:
+            return cache
+
+        result = []
+        for i, layer_cache in enumerate(cache):
+            if _CacheList is not None and isinstance(layer_cache, _CacheList):
+                # MoE: recurse into each sub-cache
+                dequantized_subs = []
+                for sc in layer_cache.caches:
+                    if isinstance(sc, QuantizedKVCache):
+                        if sc.keys is not None:
+                            try:
+                                kv = KVCache()
+                                kv.keys = mx.dequantize(
+                                    sc.keys[0],
+                                    sc.keys[1],
+                                    sc.keys[2],
+                                    sc.group_size,
+                                    sc.bits,
+                                )
+                                kv.values = mx.dequantize(
+                                    sc.values[0],
+                                    sc.values[1],
+                                    sc.values[2],
+                                    sc.group_size,
+                                    sc.bits,
+                                )
+                                kv.offset = sc.offset
+                                dequantized_subs.append(kv)
+                            except Exception as e:
+                                logger.warning(
+                                    f"KV dequantization failed in CacheList layer {i}: {e}. "
+                                    f"Treating as cache miss."
+                                )
+                                return None
+                        else:
+                            dequantized_subs.append(KVCache())
+                    else:
+                        dequantized_subs.append(sc)
+                result.append(_CacheList(*dequantized_subs))
+            elif isinstance(layer_cache, QuantizedKVCache):
+                if layer_cache.keys is not None:
+                    try:
+                        kv = KVCache()
+                        kv.keys = mx.dequantize(
+                            layer_cache.keys[0],
+                            layer_cache.keys[1],
+                            layer_cache.keys[2],
+                            layer_cache.group_size,
+                            layer_cache.bits,
+                        )
+                        kv.values = mx.dequantize(
+                            layer_cache.values[0],
+                            layer_cache.values[1],
+                            layer_cache.values[2],
+                            layer_cache.group_size,
+                            layer_cache.bits,
+                        )
+                        kv.offset = layer_cache.offset
+                        result.append(kv)
+                    except Exception as e:
+                        logger.warning(
+                            f"KV cache dequantization failed for layer {i}: {e}. "
+                            f"Treating as cache miss."
+                        )
+                        return None
+                else:
+                    # QuantizedKVCache with keys=None — empty layer, use fresh KVCache
+                    # (BatchGenerator cannot handle QuantizedKVCache objects)
+                    result.append(KVCache())
+            elif self._is_dsv4_cache_object(layer_cache):
+                local = getattr(layer_cache, "local", None)
+                if isinstance(local, QuantizedKVCache):
+                    try:
+                        if local.keys is None:
+                            result.append(layer_cache)
+                            continue
+                        from jang_tools.dsv4.mlx_model import DeepseekV4Cache
+                        from mlx_lm.models.cache import RotatingKVCache
+
+                        def _as_mx_array(x):
+                            if x is None:
+                                return None
+                            if isinstance(x, mx.array):
+                                # Re-home arrays onto the current scheduler
+                                # worker stream. DSV4 cache hits are looked up
+                                # from the API thread but consumed by the
+                                # llm-worker; lazy arrays tied to the API
+                                # thread's Stream(gpu, 0) crash on replay.
+                                return x + mx.zeros_like(x)
+                            if hasattr(x, "shape"):
+                                return mx.array(x)
+                            return x
+
+                        def _as_mx_tree(x):
+                            if isinstance(x, tuple):
+                                return tuple(_as_mx_tree(v) for v in x)
+                            if isinstance(x, list):
+                                return [_as_mx_tree(v) for v in x]
+                            return _as_mx_array(x)
+
+                        q_keys = tuple(_as_mx_array(x) for x in local.keys)
+                        q_values = tuple(_as_mx_array(x) for x in local.values)
+                        keys = mx.dequantize(
+                            q_keys[0],
+                            q_keys[1],
+                            q_keys[2],
+                            local.group_size,
+                            local.bits,
+                        )
+                        values = mx.dequantize(
+                            q_values[0],
+                            q_values[1],
+                            q_values[2],
+                            local.group_size,
+                            local.bits,
+                        )
+                        try:
+                            mx.eval(keys, values)
+                        except Exception:
+                            pass
+
+                        rotating_meta = tuple(
+                            getattr(layer_cache, "_vmlx_dsv4_local_meta_state", ()) or ()
+                        )
+                        sliding_window = int(
+                            getattr(layer_cache, "_vmlx_dsv4_sliding_window", 0)
+                            or (rotating_meta[1] if len(rotating_meta) >= 2 else 128)
+                        )
+                        keep = int(
+                            getattr(layer_cache, "_vmlx_dsv4_keep", 0)
+                            or (rotating_meta[0] if len(rotating_meta) >= 1 else 0)
+                        )
+                        local_rot = RotatingKVCache(max_size=sliding_window, keep=keep)
+                        local_rot.state = (keys, values)
+                        if rotating_meta:
+                            try:
+                                local_rot.meta_state = rotating_meta
+                            except Exception:
+                                local_rot.offset = int(getattr(local, "offset", 0) or 0)
+                                local_rot._idx = min(local_rot.offset, keys.shape[-2])
+                        else:
+                            local_rot.offset = int(getattr(local, "offset", 0) or 0)
+                            local_rot._idx = min(local_rot.offset, keys.shape[-2])
+
+                        restored = DeepseekV4Cache(
+                            sliding_window=sliding_window,
+                            compress_ratio=getattr(layer_cache, "compress_ratio", None),
+                        )
+                        restored.local = local_rot
+                        restored.compressor_state = {
+                            k: _as_mx_tree(v)
+                            for k, v in (
+                                getattr(layer_cache, "compressor_state", {}) or {}
+                            ).items()
+                        }
+                        restored.indexer_state = {
+                            k: _as_mx_tree(v)
+                            for k, v in (
+                                getattr(layer_cache, "indexer_state", {}) or {}
+                            ).items()
+                        }
+                        eval_args = [keys, values]
+                        for state in (
+                            restored.compressor_state,
+                            restored.indexer_state,
+                        ):
+                            for value in state.values():
+                                if isinstance(value, mx.array):
+                                    eval_args.append(value)
+                        try:
+                            mx.eval(*eval_args)
+                        except Exception:
+                            pass
+                        result.append(restored)
+                    except Exception as e:
+                        logger.warning(
+                            f"DSV4 local SWA dequantization failed for layer {i}: {e}. "
+                            f"Treating as cache miss."
+                        )
+                        return None
+                else:
+                    result.append(layer_cache)
+            else:
+                result.append(layer_cache)
+        return result
+
+    def _prefill_for_prompt_only_cache(
+        self, prompt_tokens: List[int]
+    ) -> Optional[List[Any]]:
+        """
+        Run a prefill-only forward pass to get cache state for the given tokens.
+
+        For hybrid models (MambaCache + KVCache), MambaCache is cumulative
+        and can't be truncated from post-generation state. This method runs
+        a separate prefill pass to capture cache state with exactly the given
+        tokens, without output token contamination.
+
+        Args:
+            prompt_tokens: Token IDs to prefill (typically prompt[:-1])
+
+        Returns:
+            List of cache objects with state for exactly the given tokens,
+            or None on failure
+        """
+        if not prompt_tokens:
+            return None
+        try:
+            import mlx.core as mx
+
+            fresh_cache = self.model.make_cache()
+
+            # Process in chunks to avoid Metal GPU timeout on generic/hybrid
+            # prompts. DSV4 is the exception: its CSA/HCA compressor/indexer
+            # pools are path-sensitive, and earlier live probes showed chunked
+            # prefill can corrupt the composite state. Re-derive DSV4 prompt
+            # cache in one shot, matching DSV4BatchGenerator's production
+            # prefill rail.
+            chunk_size = len(prompt_tokens) if self._uses_dsv4_cache else 2048
+            for start in range(0, len(prompt_tokens), chunk_size):
+                chunk = prompt_tokens[start : start + chunk_size]
+                input_ids = mx.array([chunk])
+                _ = self.model(input_ids, cache=fresh_cache)
+                # Materialize after each chunk to prevent massive lazy graph
+                eval_args = []
+                def _collect_tree_arrays(obj):
+                    if obj is None:
+                        return
+                    if isinstance(obj, (tuple, list)):
+                        for item in obj:
+                            _collect_tree_arrays(item)
+                        return
+                    if hasattr(obj, "shape"):
+                        eval_args.append(obj)
+
+                def _collect_cache_arrays(cache_obj):
+                    if cache_obj is None:
+                        return
+                    if hasattr(cache_obj, "caches") and isinstance(
+                        getattr(cache_obj, "caches", None), (list, tuple)
+                    ):
+                        for sub_cache in cache_obj.caches:
+                            _collect_cache_arrays(sub_cache)
+                        return
+                    if Scheduler._is_dsv4_cache_object(cache_obj) and hasattr(
+                        cache_obj, "state"
+                    ):
+                        _collect_tree_arrays(cache_obj.state)
+                        return
+                    if hasattr(cache_obj, "keys") and cache_obj.keys is not None:
+                        # QuantizedKVCache: keys/values are tuples of arrays
+                        if isinstance(cache_obj.keys, tuple):
+                            eval_args.extend(cache_obj.keys)
+                            eval_args.extend(cache_obj.values)
+                        else:
+                            eval_args.extend([cache_obj.keys, cache_obj.values])
+                    elif hasattr(cache_obj, "cache") and isinstance(
+                        cache_obj.cache, list
+                    ):
+                        for arr in cache_obj.cache:
+                            if hasattr(arr, "shape"):
+                                eval_args.append(arr)
+
+                for c in fresh_cache:
+                    _collect_cache_arrays(c)
+                if eval_args:
+                    mx.eval(*eval_args)
+
+            return fresh_cache
+        except Exception as e:
+            logger.warning(f"Prefill-only pass failed: {e}")
+            logger.debug(traceback.format_exc())
+            return None
+
+    def _dsv4_trace_timing(
+        self,
+        event: str,
+        start: float,
+        request_id: Optional[str] = None,
+        **fields: Any,
+    ) -> None:
+        if not self._uses_dsv4_cache:
+            return
+        if os.environ.get("VMLINUX_DSV4_TRACE_TIMINGS", "").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+        try:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            extra = " ".join(f"{k}={v}" for k, v in fields.items())
+            logger.info(
+                "DSV4 timing: component=scheduler event=%s request_id=%s elapsed_ms=%.3f %s",
+                event,
+                request_id,
+                elapsed_ms,
+                extra,
+            )
+        except Exception:
+            pass
+
+    def _get_actual_tokenizer(self, tokenizer: Any) -> Any:
+        """
+        Get the actual tokenizer from a processor or tokenizer.
+
+        MLLM models use processors (e.g., Qwen3VLProcessor) which wrap
+        the tokenizer. This method extracts the actual tokenizer.
+        """
+        # If it has encode method, it's already a tokenizer
+        if hasattr(tokenizer, "encode") and callable(tokenizer.encode):
+            return tokenizer
+        # If it's a processor, get the wrapped tokenizer
+        if hasattr(tokenizer, "tokenizer"):
+            return tokenizer.tokenizer
+        # Fallback to the original
+        return tokenizer
+
+    @staticmethod
+    def _detect_model_type_for_runtime(model: Any) -> str:
+        """Best-effort model_type string for scheduler runtime policy.
+
+        Server-side registry metadata is not plumbed into SchedulerConfig.
+        Cache/repetition policy still needs to distinguish loop-prone
+        families such as DSV4, MiniMax-M2, and Ling/Bailing. Prefer the loaded
+        model config, then class/module names as a fallback.
+        """
+        candidates: list[Any] = []
+        for obj in (model, getattr(model, "model", None), getattr(model, "_model", None)):
+            if obj is not None:
+                candidates.append(obj)
+        for obj in candidates:
+            cfg = getattr(obj, "config", None)
+            if isinstance(cfg, dict):
+                mt = cfg.get("model_type")
+                if isinstance(mt, str) and mt:
+                    return mt.lower()
+                text_cfg = cfg.get("text_config")
+                if isinstance(text_cfg, dict):
+                    mt = text_cfg.get("model_type")
+                    if isinstance(mt, str) and mt:
+                        return mt.lower()
+            elif cfg is not None:
+                mt = getattr(cfg, "model_type", None)
+                if isinstance(mt, str) and mt:
+                    return mt.lower()
+        names = []
+        for obj in candidates:
+            cls = type(obj)
+            names.append(getattr(cls, "__name__", ""))
+            names.append(getattr(cls, "__module__", ""))
+        joined = " ".join(n.lower() for n in names if n)
+        if "deepseek_v4" in joined or "deepseekv4" in joined or "dsv4" in joined:
+            return "deepseek_v4"
+        if "minimax_m2" in joined:
+            return "minimax_m2"
+        if "bailing" in joined or "ling" in joined:
+            return "bailing_hybrid"
+        return ""
+
+    def _decode_tokens(self, token_ids: List[int]) -> str:
+        """
+        Decode token IDs to text, handling both tokenizers and processors.
+        """
+        return self._actual_tokenizer.decode(token_ids)
+
+    @staticmethod
+    def _encode_prompt_text(tokenizer: Any, prompt: str, add_special_tokens: Optional[bool]) -> List[int]:
+        """Encode a scheduler prompt with optional explicit special-token mode."""
+        if add_special_tokens is None:
+            return tokenizer.encode(prompt)
+        try:
+            return tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+        except TypeError:
+            # Some processor/tokenizer shims do not expose the HF kwarg. Fall
+            # back to their native encode path rather than rejecting the request.
+            return tokenizer.encode(prompt)
+
+    def _get_detokenizer(self, request_id: str) -> Any:
+        """Get or create a streaming detokenizer for a request."""
+        if request_id not in self._detokenizer_pool:
+            from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+
+            detok = NaiveStreamingDetokenizer(self._actual_tokenizer)
+            detok.reset()
+            self._detokenizer_pool[request_id] = detok
+        return self._detokenizer_pool[request_id]
+
+    def _cleanup_detokenizer(self, request_id: str) -> None:
+        """Remove the streaming detokenizer for a finished request."""
+        self._detokenizer_pool.pop(request_id, None)
+
+    def _get_stop_tokens(self) -> Set[int]:
+        """Get stop token IDs from tokenizer or processor.
+
+        Also checks the model config registry for additional eos_tokens
+        (e.g., Gemma 4 uses <turn|> as end-of-turn alongside <eos>).
+        """
+        stop_tokens = set()
+        # Check both the processor/tokenizer and the actual tokenizer
+        tok_for_encode = None
+        for tok in [self.tokenizer, self._actual_tokenizer]:
+            if tok is None:
+                continue
+            if tok_for_encode is None:
+                tok_for_encode = tok
+            if hasattr(tok, "eos_token_id") and tok.eos_token_id is not None:
+                if isinstance(tok.eos_token_id, list):
+                    stop_tokens.update(tok.eos_token_id)
+                else:
+                    stop_tokens.add(tok.eos_token_id)
+            if hasattr(tok, "eos_token_ids") and tok.eos_token_ids is not None:
+                if isinstance(tok.eos_token_ids, (list, set, tuple)):
+                    stop_tokens.update(tok.eos_token_ids)
+                else:
+                    # Handle case where eos_token_ids is a single int
+                    stop_tokens.add(tok.eos_token_ids)
+
+        # Add extra eos_tokens from model config registry (e.g., <turn|> for Gemma 4)
+        if tok_for_encode is not None:
+            try:
+                from .model_config_registry import get_model_config_registry
+
+                registry = get_model_config_registry()
+                # Try to find model name from tokenizer's name_or_path
+                model_name = getattr(tok_for_encode, "name_or_path", None)
+                if model_name:
+                    model_config = registry.lookup(model_name)
+                    if model_config.eos_tokens and len(model_config.eos_tokens) > 1:
+                        for eos_str in model_config.eos_tokens[1:]:
+                            try:
+                                ids = tok_for_encode.encode(
+                                    eos_str, add_special_tokens=False
+                                )
+                                if len(ids) == 1:
+                                    stop_tokens.add(ids[0])
+                                    logger.debug(
+                                        f"Added extra stop token: {eos_str!r} → {ids[0]}"
+                                    )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        return stop_tokens
+
+    def _resolve_reasoning_state_machine(self) -> Optional[SequenceStateMachine]:
+        """Lazily build a `SequenceStateMachine` for the current model.
+
+        Pulls the active reasoning parser from `server._reasoning_parser`
+        (lazy import to avoid the scheduler→server circular dependency) and
+        asks it for `reasoning_tag_token_seqs(tokenizer)`. If the parser
+        provides start/end token sequences, builds a state machine with
+        a `normal → reasoning → normal` transition table; otherwise returns
+        None and the per-token loop falls back to the legacy substring path.
+
+        Result is cached on `self._reasoning_sm` after the first call —
+        the resolved state is `_reasoning_sm_resolved=True` even when the
+        result is None, so we don't retry the resolution every token.
+        """
+        if self._reasoning_sm_resolved:
+            return self._reasoning_sm
+        self._reasoning_sm_resolved = True
+        if not self._use_sm_stops:
+            return None
+        try:
+            from . import server as _server  # lazy to dodge circular import
+
+            parser = getattr(_server, "_reasoning_parser", None)
+            if parser is None:
+                return None
+            tags = parser.reasoning_tag_token_seqs(
+                self._actual_tokenizer or self.tokenizer
+            )
+            if not (tags.get("start") or tags.get("end")):
+                return None
+            stop_token_seqs = (
+                [[t] for t in self.stop_tokens] if self.stop_tokens else []
+            )
+            self._reasoning_sm = make_state_machine(
+                model_key=getattr(self.model, "__class__", type(self.model)).__name__,
+                reasoning_parser_id=type(parser).__name__,
+                reasoning_start_tokens=tags.get("start") or (),
+                reasoning_end_tokens=tags.get("end") or (),
+                stop_token_sequences=stop_token_seqs,
+            )
+            return self._reasoning_sm
+        except Exception as e:
+            logger.debug(
+                f"_resolve_reasoning_state_machine: fell back to legacy path ({e!r})"
+            )
+            return None
+
+    def _advance_request_state_machine(
+        self, request: Request, tokens: List[int]
+    ) -> None:
+        """Advance the per-request state machine across the given tokens.
+
+        No-op when the resolver returned None (no reasoning parser configured)
+        or when `_use_sm_stops` is disabled. Lazy-creates `request._sm_state`
+        on first call. Called from the per-token loop on every emitted token
+        (regular sampled token + any speculative tokens).
+        """
+        sm = self._resolve_reasoning_state_machine()
+        if sm is None:
+            return
+        state = getattr(request, "_sm_state", None)
+        if state is None:
+            state = sm.make_state()
+            # Phase 4 prep (Agent 1 directive 2026-04-08): on first init,
+            # advance the state machine across the cached prefix tokens
+            # returned by `PrefixCacheManager.fetch_cache`. The cached tokens
+            # are known-clean by the trie's contract, so we use the
+            # `advance_from` skip-walk (single O(L) pass, no halt detection)
+            # rather than calling `match` per token. This puts the matcher
+            # in the correct state (normal/reasoning) before the first
+            # newly-emitted token without re-scanning the prefix on every
+            # subsequent token.
+            #
+            # AUDIT FIX 2026-04-08 (Agent 2 self-finding): originally read
+            # `request._cached_prefix_len` which is NEVER WRITTEN anywhere
+            # in the codebase — it was a stub field added in Phase 3d in
+            # anticipation of Agent 1 wiring it from `PrefixCacheManager.
+            # fetch_cache` which never happened. The `advance_from` skip
+            # was therefore dead code (always reading 0). The canonical
+            # field for "tokens recovered from prefix cache" is
+            # `request.cached_tokens`, set in 6+ places throughout
+            # `scheduler.add_request` for both paged and legacy paths.
+            cached_prefix_len = (
+                getattr(request, "cached_tokens", 0)
+                or getattr(request, "_cached_prefix_len", 0)
+                or 0
+            )
+            if cached_prefix_len > 0:
+                cached_tokens_slice = (request.prompt_token_ids or [])[
+                    :cached_prefix_len
+                ]
+                if cached_tokens_slice:
+                    try:
+                        state = sm.advance_from(state, cached_tokens_slice)
+                    except Exception as e:
+                        logger.debug(
+                            f"_advance_request_state_machine: advance_from failed "
+                            f"on cached prefix ({e!r}) — falling back to fresh state"
+                        )
+                        state = sm.make_state()
+        for tok in tokens:
+            state, _seq, current = SequenceStateMachine.match(state, tok)
+            if current is None:
+                # State machine signalled halt — record but don't terminate
+                # here; the per-token loop's existing finish_reason flow owns
+                # termination so we don't double-fire.
+                break
+        request._sm_state = state
+
+    def _store_cache_with_segments(
+        self,
+        request: Request,
+        prompt_tokens: List[int],
+        prompt_cache: List[Any],
+    ) -> None:
+        """Store completed prompt cache, segmented by chat-role boundaries.
+
+        Phase 3d (Agent 2): When the request carries `_segment_boundaries`
+        (populated by an API gateway during chat-template rendering), iterate
+        over each boundary and call `prefix_cache.store_cache(prefix_tokens,
+        prefix_cache, cache_type=role)`. This drives Agent 1's
+        `PrefixCacheManager` cache_type-priority LRU so system prefixes are
+        pinned and shared across users/sessions.
+
+        When `_segment_boundaries` is None or empty (legacy callers), falls
+        back to a single store with the default `cache_type="assistant"` —
+        identical to the pre-Phase-3d behaviour.
+
+        The cache trim per segment uses `_truncate_cache_to_prompt_length`
+        when available so the per-segment cache reflects the per-segment
+        prefix length, not the full prompt. If the truncation helper is
+        unavailable on this scheduler instance, the segment falls back to
+        storing the full prompt cache under the boundary's role (still
+        useful for cache_type LRU priority even without per-segment trim).
+        """
+        # F1 backport: dispatch to whichever cache layer is active. The
+        # production default is memory-aware; paged is the hybrid auto-switch
+        # target; legacy entry-count is opt-in. All three now accept
+        # cache_type for cross-session sharing breakthrough activation.
+        active_layer = "none"
+        if self.prefix_cache is not None:
+            active_layer = "prefix"
+        elif self.memory_aware_cache is not None:
+            active_layer = "memory"
+        elif self.block_aware_cache is not None:
+            active_layer = "block"
+        else:
+            return
+
+        def _do_store(tokens_seg: List[int], cache_seg: List[Any], role: str) -> None:
+            """Single-layer store dispatcher honouring cache_type."""
+            if active_layer == "prefix":
+                self.prefix_cache.store_cache(tokens_seg, cache_seg, cache_type=role)
+            elif active_layer == "memory":
+                self.memory_aware_cache.store(tokens_seg, cache_seg, cache_type=role)
+            elif active_layer == "block":
+                # Block cache stores per-request; segment-prefix storage isn't
+                # block-friendly, so we only tag the full-prompt store.
+                # Segment prefixes still update LRU priority via the role tag.
+                self.block_aware_cache.store_cache(
+                    request.request_id,
+                    list(tokens_seg),
+                    self._extract_cache_states(cache_seg),
+                    cache_type=role,
+                )
+
+        boundaries = getattr(request, "_segment_boundaries", None) or []
+        if not boundaries:
+            # Legacy single-store path — preserves pre-Phase-3d behaviour.
+            try:
+                _do_store(prompt_tokens, prompt_cache, "assistant")
+            except Exception as e:
+                logger.debug(f"_store_cache_with_segments legacy path: {e}")
+            return
+
+        # Iterate boundaries in increasing order. Each boundary stores a
+        # PREFIX of length `idx` under its role. The full prompt is also
+        # stored at the END under the final boundary's role (or under
+        # "assistant" if the last boundary doesn't already cover all tokens).
+        try:
+            sorted_bounds = sorted(boundaries, key=lambda b: b[0])
+            seen_full = False
+            for idx, role in sorted_bounds:
+                if idx <= 0 or idx > len(prompt_tokens):
+                    continue
+                prefix = prompt_tokens[:idx]
+                # Trim the cache to the prefix length where possible.
+                # Block cache can't trim individual layers — skip trimming and
+                # rely on the role tag to drive priority eviction only.
+                trimmed = prompt_cache
+                if active_layer != "block":
+                    trim_helper = getattr(
+                        self, "_truncate_cache_to_prompt_length", None
+                    )
+                    if trim_helper is not None and idx < len(prompt_tokens):
+                        try:
+                            trimmed = trim_helper(prompt_cache, idx) or prompt_cache
+                        except Exception:
+                            trimmed = prompt_cache
+                if active_layer == "block" and idx < len(prompt_tokens):
+                    # For block cache, only the full-prompt store carries
+                    # actual data — skip per-segment to avoid duplicate blocks.
+                    continue
+                _do_store(prefix, trimmed, role)
+                if idx == len(prompt_tokens):
+                    seen_full = True
+            # Always make sure the full prompt is stored too — under the
+            # default "assistant" type if no boundary covered the tail.
+            if not seen_full:
+                _do_store(prompt_tokens, prompt_cache, "assistant")
+        except Exception as e:
+            logger.debug(f"_store_cache_with_segments: {e}")
+            # Fall back to legacy single-store on any segment-store error so
+            # we never silently lose the cache entry.
+            try:
+                _do_store(prompt_tokens, prompt_cache, "assistant")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _pick_cache_type_for_request(request: Request) -> str:
+        """Choose the cache_type to tag a full-prompt store with, based on
+        the request's segment boundaries (Phase 3d / F11). Picks the
+        highest-priority role present (system > user > assistant). When no
+        boundaries exist, returns the safe default "assistant".
+
+        This lets the memory-aware and block-aware paths participate in F1
+        cache_type LRU priority eviction without needing to invoke the full
+        segments helper.
+        """
+        try:
+            boundaries = getattr(request, "_segment_boundaries", None) or []
+            roles = {
+                role
+                for _, role in boundaries
+                if role in ("system", "user", "assistant")
+            }
+            for r in ("system", "user", "assistant"):
+                if r in roles:
+                    return r
+        except Exception:
+            pass
+        return "assistant"
+
+    def _is_request_in_reasoning(self, request: Request) -> bool:
+        """Return True iff the per-request state machine is currently in
+        reasoning state. Used to skip user-supplied string-stop matching
+        inside `<think>` blocks (or whatever tag tokens the active parser
+        defines). Falls back to substring scan via `request_text_in_think()`
+        when the state machine is unavailable.
+        """
+        state = getattr(request, "_sm_state", None)
+        if state is None:
+            return False
+        return SequenceStateMachine.current_state(state) == "reasoning"
+
+    def _create_batch_generator(
+        self, sampling_params: SamplingParams
+    ) -> BatchGenerator:
+        """Create a BatchGenerator with the given sampling parameters."""
+        sampler = make_sampler(
+            temp=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            min_p=sampling_params.min_p,
+            top_k=sampling_params.top_k,
+        )
+        if float(sampling_params.temperature or 0.0) == 0.0:
+            try:
+                setattr(sampler, "_vmlx_accepts_logits", True)
+            except Exception:
+                pass
+
+        # Build logits processors (e.g., repetition penalty).
+        #
+        # mlx_lm.BatchGenerator applies global processors to the entire prompt
+        # context, while mlx_lm.generate_step applies repetition penalty from
+        # the final prompt token onward. Install per-request wrappers in
+        # _schedule_waiting() so continuous batching and DSV4 custom generation
+        # match generate_step without suppressing useful prompt vocabulary on
+        # long non-English/code prompts.
+        logits_processors = None
+        if (
+            sampling_params.repetition_penalty
+            and sampling_params.repetition_penalty != 1.0
+        ):
+            from mlx_lm.sample_utils import make_logits_processors
+
+            _rep_context_size = 512 if self._long_repetition_context else 20
+            logits_processors = make_logits_processors(
+                repetition_penalty=sampling_params.repetition_penalty,
+                repetition_context_size=_rep_context_size,
+            )
+
+        stop_tokens = self._get_stop_tokens()
+        # Add custom stop token IDs
+        if sampling_params.stop_token_ids:
+            stop_tokens.update(sampling_params.stop_token_ids)
+
+        # DSV4-Flash family bypass. mlx_lm.BatchGenerator's prefill /
+        # decode loop calls mx.eval / mx.async_eval / inputs.tolist() on
+        # tensors that carry Stream(gpu, N) metadata from MLX C++ internal
+        # kernel scheduling — those streams are bound to threads other
+        # than the worker, so the worker can't materialise the tensors.
+        # Live-traced 18 mitigation iterations (synchronize patches, CPU-
+        # stream copies, internal-stream pre-warm, etc.); none survived.
+        # Use the DSV4-native generator that calls model() forward + sample
+        # in a single pinned stream context per step. Single-batch only
+        # (max_num_seqs must be 1).
+        try:
+            # Sniff the model class name + module path. DSV4 model class
+            # comes from jang_tools.dsv4.mlx_model.{Model,DeepseekV4Model}.
+            _model_for_sniff = getattr(self.model, "_model", self.model)
+            _cls = type(_model_for_sniff)
+            _cls_name = _cls.__name__.lower()
+            _mod_name = (_cls.__module__ or "").lower()
+            _is_dsv4 = (
+                "dsv4" in _mod_name
+                or "deepseek_v4" in _mod_name
+                or "deepseekv4" in _cls_name
+                or "dsv4" in _cls_name
+            )
+            if _is_dsv4:
+                from .utils.dsv4_batch_generator import DSV4BatchGenerator
+                logger.info(
+                    "DSV4-Flash family detected — using DSV4BatchGenerator "
+                    "instead of mlx_lm.BatchGenerator (stream-thread bypass, "
+                    "single-batch only)"
+                )
+                return DSV4BatchGenerator(
+                    model=self.model,
+                    max_tokens=sampling_params.max_tokens,
+                    stop_tokens=stop_tokens,
+                    sampler=sampler,
+                    logits_processors=None,
+                    prefill_batch_size=1,
+                    completion_batch_size=1,
+                    prefill_step_size=self.config.prefill_step_size,
+                    capture_prompt_snapshot=self.block_aware_cache is not None,
+                )
+        except Exception as _dsv4_err:
+            logger.debug(f"DSV4 generator detection failed: {_dsv4_err}")
+
+        try:
+            from .native_mtp import model_has_native_mtp_runtime
+
+            if model_has_native_mtp_runtime(self.model):
+                logger.info(
+                    "Native MTP head detected — using mlx_lm.BatchGenerator "
+                    "even with max_num_seqs=1 so the draft/verify runtime and "
+                    "SSM rollback path are active."
+                )
+                return BatchGenerator(
+                    model=self.model,
+                    max_tokens=sampling_params.max_tokens,
+                    stop_tokens=stop_tokens,
+                    sampler=sampler,
+                    logits_processors=None,
+                    prefill_batch_size=self.config.prefill_batch_size,
+                    completion_batch_size=self.config.completion_batch_size,
+                    prefill_step_size=self.config.prefill_step_size,
+                )
+        except Exception as _mtp_gen_err:
+            logger.debug(f"Native MTP generator detection failed: {_mtp_gen_err}")
+
+        if int(getattr(self.config, "max_num_seqs", 1) or 1) <= 1:
+            logger.info(
+                "max_num_seqs=1 — using vMLX SingleBatchGenerator "
+                "(raw native cache, scheduler-owned single-active path)"
+            )
+            return SingleBatchGenerator(
+                model=self.model,
+                max_tokens=sampling_params.max_tokens,
+                stop_tokens=stop_tokens,
+                sampler=sampler,
+                logits_processors=None,
+                prefill_batch_size=1,
+                completion_batch_size=1,
+                prefill_step_size=self.config.prefill_step_size,
+            )
+
+        return BatchGenerator(
+            model=self.model,
+            max_tokens=sampling_params.max_tokens,
+            stop_tokens=stop_tokens,
+            sampler=sampler,
+            logits_processors=None,
+            prefill_batch_size=self.config.prefill_batch_size,
+            completion_batch_size=self.config.completion_batch_size,
+            prefill_step_size=self.config.prefill_step_size,
+        )
+
+    @staticmethod
+    def _wrap_generated_only_logits_processor(
+        processor: Callable[[Any, Any], Any],
+        skip_prefix_tokens: int,
+    ) -> Callable[[Any, Any], Any]:
+        """Trim prefill-only prompt tokens before applying a logits processor.
+
+        mlx_lm.generate_step evaluates repetition penalty against the final
+        prompt token plus generated tokens. BatchGenerator's TokenBuffer includes
+        every prompt token by default. Keeping the prompt-wide context changes
+        greedy output for prompt-heavy tasks (Ling/Bailing Russian Three.js
+        prompt: first token becomes "Организации" instead of "Вот"). This
+        wrapper preserves generated-only semantics while still letting
+        BatchGenerator own prefill/decode scheduling.
+        """
+
+        skip = max(int(skip_prefix_tokens or 0), 0)
+
+        def _wrapped(tokens: Any, logits: Any) -> Any:
+            if skip <= 0:
+                return processor(tokens, logits)
+            try:
+                # Preserve at least one token. generate_step includes the last
+                # prompt token in the first processor context, then appends
+                # generated tokens on later steps.
+                n = len(tokens)
+                trim = min(skip, max(n - 1, 0))
+                if trim > 0:
+                    tokens = tokens[trim:]
+            except Exception:
+                pass
+            return processor(tokens, logits)
+
+        return _wrapped
+
+    def _request_logits_processors(
+        self,
+        request: Request,
+        tokens_to_process: List[int],
+    ) -> Optional[List[Callable[[Any, Any], Any]]]:
+        """Build BatchGenerator processors with generate_step-compatible context."""
+
+        rep = request.sampling_params.repetition_penalty
+        if not rep or rep == 1.0:
+            return None
+
+        from mlx_lm.sample_utils import make_logits_processors
+
+        rep_context_size = 512 if self._long_repetition_context else 20
+        processors = make_logits_processors(
+            repetition_penalty=rep,
+            repetition_context_size=rep_context_size,
+        )
+        skip_prefix_tokens = max(len(tokens_to_process) - 1, 0)
+        return [
+            self._wrap_generated_only_logits_processor(p, skip_prefix_tokens)
+            for p in processors
+        ]
+
+    def _ensure_batch_generator(self, sampling_params: SamplingParams) -> bool:
+        """Ensure BatchGenerator exists with compatible settings."""
+        sampler_params = (
+            sampling_params.temperature,
+            sampling_params.top_p,
+            sampling_params.min_p,
+            sampling_params.top_k,
+            sampling_params.repetition_penalty,
+        )
+        cleared_cache = False
+
+        # Create new generator if needed or if sampling params changed
+        if (
+            self.batch_generator is None
+            or self._current_sampler_params != sampler_params
+        ):
+            # If we have an existing generator with in-flight requests, we
+            # can't swap it out mid-batch — the new request would run under
+            # the old sampler. Previously this silently returned, which
+            # meant the new request's repetition_penalty / temperature /
+            # top_p was dropped and it inherited whatever the currently
+            # running batch had configured. That produced extremely
+            # confusing "2nd request ignores my repetition_penalty" behavior
+            # and masked actual bugs during testing.
+            #
+            # Fix: still log the warning, but ALSO log the specific param
+            # delta and explicitly note that the new request is going to
+            # use the old params until the batch drains. The alternative
+            # (forcing new requests to wait for a drain) trades correctness
+            # for latency — out of scope for this fix.
+            if self.batch_generator is not None and self.running:
+                _old = self._current_sampler_params
+                logger.warning(
+                    "Sampling parameters changed with active requests. "
+                    "New request will TEMPORARILY run with old params "
+                    "(temp=%s top_p=%s min_p=%s top_k=%s rep_pen=%s) "
+                    "until the current batch drains. New target was "
+                    "(temp=%s top_p=%s min_p=%s top_k=%s rep_pen=%s).",
+                    _old[0] if _old else None,
+                    _old[1] if _old else None,
+                    _old[2] if _old else None,
+                    _old[3] if _old else None,
+                    _old[4] if _old else None,
+                    sampler_params[0],
+                    sampler_params[1],
+                    sampler_params[2],
+                    sampler_params[3],
+                    sampler_params[4],
+                )
+                return False
+
+            # Clear all prefix caches when BatchGenerator changes —
+            # BatchKVCache objects and block tables are tied to their generator instance
+            if self.batch_generator is not None:
+                if self.block_aware_cache is not None:
+                    # Block-aware paged cache stores extracted per-layer state
+                    # and reconstructs fresh cache objects on the scheduler
+                    # worker. It is not sampler-bound, so preserve it across
+                    # BatchGenerator recreation; clearing here creates stale
+                    # hit bookkeeping and destroys legitimate prefix reuse.
+                    logger.debug(
+                        "Preserving paged cache across BatchGenerator recreation"
+                    )
+                elif self.memory_aware_cache is not None:
+                    logger.debug(
+                        "Clearing memory-aware cache: BatchGenerator being recreated"
+                    )
+                    self.memory_aware_cache.clear()
+                    cleared_cache = True
+                elif self.prefix_cache is not None:
+                    logger.debug(
+                        "Clearing prefix cache: BatchGenerator being recreated"
+                    )
+                    self.prefix_cache.clear()
+                    cleared_cache = True
+
+            self.batch_generator = self._create_batch_generator(sampling_params)
+            self._current_sampler_params = sampler_params
+        return cleared_cache
+
+    def _validate_cache(self, cache: Any) -> bool:
+        """
+        Validate that a cache object is usable.
+
+        Supports all mlx-lm cache types: KVCache, RotatingKVCache,
+        QuantizedKVCache, MambaCache, ArraysCache, and CacheList.
+
+        Args:
+            cache: The cache object to validate
+
+        Returns:
+            True if cache is valid and usable
+        """
+        try:
+            from .cache_record_validator import reject_live_cache_or_warn
+            return reject_live_cache_or_warn(cache, source="scheduler-live-cache")
+        except Exception:
+            if cache is None or cache == []:
+                return False
+            if isinstance(cache, list):
+                return all(c is not None for c in cache)
+            return True
+
+    @staticmethod
+    def _cache_reuse_budget_fraction() -> float:
+        """Fraction of currently available RAM allowed for cache merge scratch."""
+        raw = os.environ.get("VMLX_CACHE_REUSE_BUDGET_FRACTION", "0.85")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 0.85
+        return max(0.10, min(0.95, value))
+
+    @staticmethod
+    def _prefix_hit_tail_and_cached_tokens(
+        *,
+        fetch_tokens: List[int],
+        remaining: List[int],
+        gen_prompt_suffix: List[int],
+    ) -> Tuple[List[int], int]:
+        """Return prefill tail + cached-token count for an N-1 prefix hit.
+
+        Prefix-cache payloads store KV state through ``len(fetch_tokens) - 1``.
+        On an exact key hit the cache layer may report ``remaining=[]`` because
+        its key matched the full stripped prompt, but the scheduler must still
+        re-feed the last stripped prompt token before any generation-prompt
+        suffix. Otherwise thinking/chat-template suffixes get processed without
+        the final user token in cache context.
+        """
+        key_tokens = list(fetch_tokens or [])
+        cache_remaining = list(remaining or [])
+        suffix = list(gen_prompt_suffix or [])
+        if suffix and not cache_remaining and key_tokens:
+            cache_remaining = [key_tokens[-1]]
+        if not cache_remaining and key_tokens:
+            cached_tokens = max(len(key_tokens) - 1, 0)
+        else:
+            cached_tokens = max(len(key_tokens) - len(cache_remaining), 0)
+        return cache_remaining + suffix, cached_tokens
+
+    def _cache_selection_hot_advantage_threshold(self) -> int:
+        raw = os.environ.get("VMLINUX_CACHE_SELECTION_HOT_ADVANTAGE_TOKENS", "64")
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 64
+
+    def _paged_cold_block_tokens(self, block_table: Any) -> int:
+        if self.block_aware_cache is None or not block_table:
+            return 0
+        paged_cache = getattr(self.block_aware_cache, "paged_cache", None)
+        blocks = getattr(paged_cache, "allocated_blocks", {}) or {}
+        total = 0
+        for block_id in getattr(block_table, "block_ids", []) or []:
+            block = blocks.get(block_id)
+            if block is not None and getattr(block, "cache_data_from_disk", False):
+                total += max(0, int(getattr(block, "token_count", 0) or 0))
+        return total
+
+    def _warm_prefix_alternative(
+        self,
+        fetch_tokens: List[int],
+        gen_prompt_suffix: List[int],
+    ) -> Tuple[Any | None, List[int], int, str | None]:
+        cache = None
+        remaining: List[int] = []
+        detail: str | None = None
+        if self.memory_aware_cache is not None:
+            cache, raw_remaining = self.memory_aware_cache.fetch(fetch_tokens)
+            if cache:
+                remaining, cached_tokens = self._prefix_hit_tail_and_cached_tokens(
+                    fetch_tokens=fetch_tokens,
+                    remaining=raw_remaining or [],
+                    gen_prompt_suffix=gen_prompt_suffix,
+                )
+                return cache, remaining, cached_tokens, "memory"
+        if self.prefix_cache is not None:
+            cache, raw_remaining = self.prefix_cache.fetch_cache(fetch_tokens)
+            if cache:
+                remaining, cached_tokens = self._prefix_hit_tail_and_cached_tokens(
+                    fetch_tokens=fetch_tokens,
+                    remaining=raw_remaining or [],
+                    gen_prompt_suffix=gen_prompt_suffix,
+                )
+                return cache, remaining, cached_tokens, "prefix"
+        return None, [], 0, detail
+
+    def _should_prefer_warm_prefix_over_paged(
+        self,
+        *,
+        paged_cached_tokens: int,
+        paged_cold_tokens: int,
+        warm_cached_tokens: int,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        threshold = self._cache_selection_hot_advantage_threshold()
+        hot_advantage = (
+            max(0, int(paged_cached_tokens or 0))
+            - max(0, int(paged_cold_tokens or 0))
+            - max(0, int(warm_cached_tokens or 0))
+        )
+        decision = {
+            "paged_cached_tokens": max(0, int(paged_cached_tokens or 0)),
+            "paged_cold_tokens": max(0, int(paged_cold_tokens or 0)),
+            "warm_cached_tokens": max(0, int(warm_cached_tokens or 0)),
+            "hot_advantage_tokens": hot_advantage,
+            "hot_advantage_threshold_tokens": threshold,
+        }
+        return warm_cached_tokens > 0 and hot_advantage < threshold, decision
+
+    def _remaining_tokens_after_cached_prefix(
+        self,
+        request: Request,
+        cached_tokens: int,
+    ) -> List[int]:
+        """Return the prefill tail after reusing a possibly-shrunk prefix.
+
+        `add_request()` strips generation-prompt suffix tokens from the cache
+        lookup key, then appends the suffix back to the remaining prefill tail.
+        Memory-pressure shrinking must preserve that contract or thinking /
+        assistant rail suffixes can be accidentally dropped on partial reuse.
+        """
+        prompt_tokens = list(request.prompt_token_ids or [])
+        if not prompt_tokens:
+            return []
+        cached_tokens = max(0, int(cached_tokens or 0))
+        gen_prompt_len = int(getattr(request, "_gen_prompt_len", 0) or 0)
+        if 0 < gen_prompt_len < len(prompt_tokens):
+            fetch_tokens = prompt_tokens[:-gen_prompt_len]
+            suffix = prompt_tokens[-gen_prompt_len:]
+            cached_tokens = min(cached_tokens, len(fetch_tokens))
+            return list(fetch_tokens[cached_tokens:]) + list(suffix)
+        cached_tokens = min(cached_tokens, len(prompt_tokens))
+        return list(prompt_tokens[cached_tokens:])
+
+    def _release_unusable_paged_hit(self, request: Request) -> None:
+        """Drop refs for a fetched paged-cache hit that will not be inserted."""
+        block_table = getattr(request, "block_table", None)
+        if block_table is not None and self.block_aware_cache is not None:
+            try:
+                paged_cache = getattr(self.block_aware_cache, "paged_cache", None)
+                if paged_cache is not None and hasattr(
+                    paged_cache, "release_request_refs"
+                ):
+                    paged_cache.release_request_refs(block_table)
+                if hasattr(self.block_aware_cache, "detach_request"):
+                    self.block_aware_cache.detach_request(request.request_id)
+            except Exception as exc:
+                logger.debug(
+                    "Request %s: failed to release unused paged-cache refs: %s",
+                    request.request_id,
+                    exc,
+                )
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+
+    def _cache_reuse_contract(self) -> str:
+        """Name the active prompt-cache state contract for telemetry/policy."""
+        if self._uses_dsv4_cache:
+            return "deepseek_v4_composite"
+        if self._uses_zaya_cache:
+            return "zaya_cca"
+        if self._is_hybrid:
+            return "hybrid_ssm"
+        try:
+            if self._model_has_mixed_attention(self.model):
+                return "mixed_swa_kv"
+        except Exception:
+            pass
+        if self._tq_active:
+            return "turboquant_kv"
+        return "plain_kv"
+
+    def _memory_fit_target_cached_tokens(
+        self,
+        *,
+        original_cached_tokens: int,
+        cache_bytes: int,
+        available_bytes: int,
+        multiplier: float,
+        block_size: int,
+        budget_fraction: Optional[float] = None,
+    ) -> int:
+        """Compute a block-aligned cached-token target that fits memory budget."""
+        if (
+            original_cached_tokens <= 0
+            or cache_bytes <= 0
+            or available_bytes <= 0
+            or multiplier <= 0
+            or block_size <= 0
+        ):
+            return 0
+        if budget_fraction is None:
+            budget_fraction = self._cache_reuse_budget_fraction()
+        budget_fraction = max(0.10, min(0.95, float(budget_fraction)))
+        bytes_per_token = max(float(cache_bytes) / float(original_cached_tokens), 1.0)
+        cache_budget_bytes = float(available_bytes) * budget_fraction / float(
+            multiplier
+        )
+        target_tokens = int(cache_budget_bytes / bytes_per_token)
+        target_tokens = min(target_tokens, original_cached_tokens - 1)
+        target_tokens = (target_tokens // block_size) * block_size
+        return target_tokens if target_tokens >= block_size else 0
+
+    def _cache_reuse_cache_format(self, cache: Any) -> str:
+        """Describe the actual cache object used for memory-fit accounting."""
+
+        flags: set[str] = set()
+
+        def _visit(obj: Any) -> None:
+            if obj is None:
+                return
+            if isinstance(obj, dict):
+                for value in obj.values():
+                    _visit(value)
+                return
+            if isinstance(obj, (list, tuple)):
+                for item in obj:
+                    _visit(item)
+                return
+
+            cls_name = type(obj).__name__
+            if cls_name == "QuantizedKVCache":
+                flags.add("quantized_kv")
+                return
+            if cls_name == "TurboQuantKVCache":
+                flags.add("turboquant_kv")
+                return
+            if self._is_dsv4_cache_object(obj):
+                local = getattr(obj, "local", None)
+                if type(local).__name__ == "QuantizedKVCache":
+                    flags.add("dsv4_quantized_local")
+                else:
+                    flags.add("dsv4_composite")
+                return
+
+            caches = getattr(obj, "caches", None)
+            if isinstance(caches, (list, tuple)):
+                for item in caches:
+                    _visit(item)
+                return
+
+            if cls_name in ("KVCache", "RotatingKVCache", "BatchKVCache") or (
+                hasattr(obj, "keys") and hasattr(obj, "values")
+            ):
+                flags.add("full_precision_kv")
+            elif cls_name in ("MambaCache", "ArraysCache"):
+                flags.add("state_cache")
+
+        _visit(cache)
+        if not flags:
+            return "unknown"
+        if len(flags) == 1:
+            return next(iter(flags))
+        order = (
+            "turboquant_kv",
+            "quantized_kv",
+            "dsv4_quantized_local",
+            "dsv4_composite",
+            "full_precision_kv",
+            "state_cache",
+        )
+        return "+".join(flag for flag in order if flag in flags)
+
+    def _cache_reuse_quant_bits(self, cache: Any) -> int:
+        """Return the smallest quantized-KV bit width present in a cache tree."""
+
+        bits_seen: list[int] = []
+
+        def _maybe_bits(obj: Any) -> None:
+            if obj is None:
+                return
+            if isinstance(obj, dict):
+                for value in obj.values():
+                    _maybe_bits(value)
+                return
+            if isinstance(obj, (list, tuple)):
+                for item in obj:
+                    _maybe_bits(item)
+                return
+
+            cls_name = type(obj).__name__
+            if cls_name == "QuantizedKVCache":
+                raw_bits = getattr(obj, "bits", None) or getattr(
+                    self,
+                    "_kv_cache_bits",
+                    0,
+                )
+                try:
+                    raw_bits = int(raw_bits or 0)
+                except (TypeError, ValueError):
+                    raw_bits = 0
+                if raw_bits > 0:
+                    bits_seen.append(raw_bits)
+                return
+
+            if self._is_dsv4_cache_object(obj):
+                _maybe_bits(getattr(obj, "local", None))
+                return
+
+            caches = getattr(obj, "caches", None)
+            if isinstance(caches, (list, tuple)):
+                for item in caches:
+                    _maybe_bits(item)
+
+        _maybe_bits(cache)
+        return min(bits_seen) if bits_seen else 0
+
+    def _cache_merge_memory_multiplier(self, cache: Any) -> float:
+        """Scratch-memory multiplier for merging this specific cache object.
+
+        A global q4/q8 setting is not enough here: some fetch paths already
+        dequantize a hit before the memory-fit check. Charging those full
+        precision caches as q4/q8 makes the scheduler drop valid long-prefix
+        hits and full-prefill large prompts.
+        """
+
+        quant_bits = self._cache_reuse_quant_bits(cache)
+        if quant_bits and quant_bits <= 4:
+            return 5.0
+        if quant_bits and quant_bits <= 8:
+            return 3.0
+        return 2.0
+
+    def _hybrid_ssm_fetch_tokens(self, request: Request) -> List[int]:
+        """Return the token key used for hybrid SSM companion cache lookups."""
+        explicit = getattr(request, "_hybrid_ssm_fetch_tokens", None)
+        if explicit is not None:
+            return list(explicit)
+        prompt_tokens = list(request.prompt_token_ids or [])
+        gen_prompt_len = int(getattr(request, "_gen_prompt_len", 0) or 0)
+        if 0 < gen_prompt_len < len(prompt_tokens):
+            return prompt_tokens[:-gen_prompt_len]
+        return prompt_tokens
+
+    def _fetch_block_aligned_ssm_checkpoint(
+        self,
+        request: Request,
+        *,
+        max_len: int,
+        block_size: int,
+    ) -> Optional[Tuple[int, List[Any]]]:
+        """Find a hybrid SSM checkpoint aligned to paged-KV block trimming.
+
+        KV block tables can only be trimmed to whole blocks. SSM state is
+        cumulative, so pairing KV@128 with SSM@150 would corrupt the next
+        forward pass. This helper accepts only checkpoints whose token length
+        equals the block-aligned KV length, or an exact SSM checkpoint at that
+        aligned length.
+        """
+        if (
+            self._ssm_state_cache is None
+            or max_len <= 0
+            or block_size <= 0
+        ):
+            request._cache_reuse_partial_unavailable_reason = "ssm_checkpoint_unavailable"
+            return None
+        fetch_longest = getattr(self._ssm_state_cache, "fetch_longest_prefix", None)
+        fetch_exact = getattr(self._ssm_state_cache, "fetch", None)
+        if fetch_longest is None:
+            request._cache_reuse_partial_unavailable_reason = "ssm_longest_prefix_unavailable"
+            return None
+
+        ssm_tokens = self._hybrid_ssm_fetch_tokens(request)
+        search_len = (int(max_len) // block_size) * block_size
+        while search_len >= block_size:
+            hit = fetch_longest(ssm_tokens, search_len)
+            if hit is None:
+                request._cache_reuse_partial_unavailable_reason = (
+                    "no_block_aligned_ssm_checkpoint"
+                )
+                return None
+            checkpoint_len, states, is_complete = hit
+            checkpoint_len = int(checkpoint_len or 0)
+            if checkpoint_len > search_len:
+                request._cache_reuse_partial_unavailable_reason = (
+                    "invalid_ssm_checkpoint_length"
+                )
+                return None
+            aligned_len = (checkpoint_len // block_size) * block_size
+            if checkpoint_len <= 0 or aligned_len <= 0:
+                request._cache_reuse_partial_unavailable_reason = (
+                    "invalid_ssm_checkpoint_length"
+                )
+                return None
+            if is_complete and checkpoint_len == aligned_len:
+                return checkpoint_len, states
+            if fetch_exact is not None and aligned_len > 0:
+                exact = fetch_exact(ssm_tokens, aligned_len)
+                if exact is not None:
+                    exact_states, exact_complete = exact
+                    if exact_complete:
+                        return aligned_len, exact_states
+            search_len = aligned_len - block_size
+        request._cache_reuse_partial_unavailable_reason = (
+            "no_block_aligned_ssm_checkpoint"
+        )
+        return None
+
+    def _record_cache_reuse_partial(
+        self,
+        *,
+        request: Request,
+        cache_to_use: Any,
+        cache_bytes: int,
+        available_bytes: int,
+        multiplier: float,
+        budget_fraction: float,
+        original_cached_tokens: int,
+        used_cached_tokens: int,
+        remaining_tokens: List[int],
+        cache_contract: str,
+    ) -> None:
+        budget_bytes = float(available_bytes) * float(budget_fraction)
+        if original_cached_tokens > 0 and cache_bytes > 0:
+            used_cache_bytes = float(cache_bytes) * (
+                float(used_cached_tokens) / float(original_cached_tokens)
+            )
+        else:
+            used_cache_bytes = 0.0
+        self._cache_reuse_partial_downgrades += 1
+        self._cache_reuse_partial_tokens += used_cached_tokens
+        self._last_cache_reuse_partial = {
+            "request_id": request.request_id,
+            "reason": "insufficient_memory_for_full_cache_merge",
+            "cache_contract": cache_contract,
+            "cache_format": self._cache_reuse_cache_format(cache_to_use),
+            "original_needed_mb": round((cache_bytes * multiplier) / 1048576, 1),
+            "budget_mb": round(budget_bytes / 1048576, 1),
+            "available_mb": round(available_bytes / 1048576, 1),
+            "original_cache_mb": round(cache_bytes / 1048576, 1),
+            "used_cache_mb": round(used_cache_bytes / 1048576, 1),
+            "used_needed_mb": round((used_cache_bytes * multiplier) / 1048576, 1),
+            "multiplier": multiplier,
+            "budget_fraction": budget_fraction,
+            "kv_cache_bits": getattr(self, "_kv_cache_bits", 0),
+            "original_cached_tokens": original_cached_tokens,
+            "used_cached_tokens": used_cached_tokens,
+            "dropped_cached_tokens": original_cached_tokens - used_cached_tokens,
+            "tail_tokens": len(remaining_tokens),
+            "prompt_tokens": len(request.prompt_token_ids or []),
+            "cache_type": type(cache_to_use).__name__,
+        }
+
+    def _record_cache_reuse_skip(
+        self,
+        *,
+        request: Request,
+        cache_to_use: Any,
+        cache_bytes: int,
+        available_bytes: int,
+        needed_bytes: float,
+        merge_budget_bytes: float,
+        multiplier: float,
+        budget_fraction: float,
+    ) -> None:
+        """Record an all-or-nothing cache-reuse fallback with enough context.
+
+        This path should be rare: `_shrink_paged_cache_for_memory()` gets the
+        first chance to keep a safe block-aligned prefix. When it cannot, the
+        user-facing record must say why partial reuse was unavailable and how
+        much prompt will be fully prefetched, otherwise a 10-minute TTFT looks
+        like a generic cache miss instead of a specific cache-contract failure.
+        """
+        cached_tokens = int(getattr(request, "cached_tokens", 0) or 0)
+        remaining_tokens = len(getattr(request, "remaining_tokens", []) or [])
+        prompt_tokens = len(request.prompt_token_ids or [])
+        partial_reason = getattr(
+            request,
+            "_cache_reuse_partial_unavailable_reason",
+            None,
+        )
+        cache_contract = getattr(
+            request,
+            "_cache_reuse_contract",
+            self._cache_reuse_contract(),
+        )
+        self._cache_reuse_skips += 1
+        self._cache_reuse_skip_tokens += cached_tokens
+        self._last_cache_reuse_skip = {
+            "request_id": request.request_id,
+            "reason": "insufficient_memory_for_cache_merge",
+            "action": "full_prefill",
+            "needed_mb": round(float(needed_bytes) / 1048576, 1),
+            "budget_mb": round(float(merge_budget_bytes) / 1048576, 1),
+            "available_mb": round(float(available_bytes) / 1048576, 1),
+            "cache_mb": round(float(cache_bytes) / 1048576, 1),
+            "multiplier": multiplier,
+            "budget_fraction": budget_fraction,
+            "kv_cache_bits": getattr(self, "_kv_cache_bits", 0),
+            "cached_tokens": cached_tokens,
+            "dropped_cached_tokens": cached_tokens,
+            "remaining_tokens": remaining_tokens,
+            "full_prefill_tokens": prompt_tokens,
+            "prompt_tokens": prompt_tokens,
+            "cache_type": type(cache_to_use).__name__,
+            "cache_contract": cache_contract,
+            "cache_format": self._cache_reuse_cache_format(cache_to_use),
+            "partial_reuse_available": False,
+            "partial_reuse_unavailable_reason": partial_reason,
+        }
+        logger.warning(
+            "Request %s: skipping cache reuse after partial-reuse attempt "
+            "failed (need %.0fMB, budget %.0fMB, available %.0fMB, cached "
+            "%s tokens, contract=%s, format=%s, partial_reason=%s); "
+            "full-prefilling %s prompt tokens",
+            request.request_id,
+            float(needed_bytes) / 1048576,
+            float(merge_budget_bytes) / 1048576,
+            float(available_bytes) / 1048576,
+            cached_tokens,
+            cache_contract,
+            self._cache_reuse_cache_format(cache_to_use),
+            partial_reason or "unknown",
+            prompt_tokens,
+        )
+
+    def _record_scheduled_cache_hit(self, request: Request) -> None:
+        """Record cache-hit tokens after the request is admitted to generation."""
+        try:
+            cached_tokens = int(getattr(request, "cached_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            cached_tokens = 0
+        if cached_tokens <= 0:
+            return
+        detail = str(getattr(request, "_cache_detail", "") or "unknown")
+        if detail != "unknown" and getattr(self, "_tq_active", False) and "+tq" not in detail:
+            detail = f"{detail}+tq"
+            request._cache_detail = detail
+        execution = getattr(request, "_cache_execution", None)
+        if isinstance(execution, dict):
+            execution["cache_detail"] = detail
+            self._last_cache_execution = dict(execution)
+        self._cache_hit_requests += 1
+        self._cache_hit_tokens += cached_tokens
+        self._cache_hit_tokens_by_detail[detail] = (
+            self._cache_hit_tokens_by_detail.get(detail, 0) + cached_tokens
+        )
+
+    def _shrink_hybrid_ssm_paged_cache_for_memory(
+        self,
+        *,
+        request: Request,
+        cache_to_use: Any,
+        cache_bytes: int,
+        available_bytes: int,
+        multiplier: float,
+        budget_fraction: float,
+        original_cached_tokens: int,
+        target_tokens: int,
+        block_size: int,
+    ) -> Tuple[Optional[Any], Optional[List[int]]]:
+        """Memory-fit reuse for hybrid SSM cache with KV/SSM alignment."""
+        checkpoint = self._fetch_block_aligned_ssm_checkpoint(
+            request,
+            max_len=target_tokens,
+            block_size=block_size,
+        )
+        if checkpoint is None:
+            if not hasattr(request, "_cache_reuse_partial_unavailable_reason"):
+                request._cache_reuse_partial_unavailable_reason = (
+                    "no_block_aligned_ssm_checkpoint"
+                )
+            return None, None
+        checkpoint_len, _states = checkpoint
+        trimmed_table = self.block_aware_cache.trim_block_table(
+            request.request_id,
+            checkpoint_len,
+        )
+        if trimmed_table is None or not getattr(trimmed_table, "block_ids", None):
+            request._cache_reuse_partial_unavailable_reason = "kv_trim_failed"
+            return None, None
+        used_cached_tokens = int(getattr(trimmed_table, "num_tokens", 0) or 0)
+        if used_cached_tokens != checkpoint_len:
+            logger.warning(
+                "Request %s: hybrid memory-fit cache rejected because KV trim "
+                "(%s tokens) did not match SSM checkpoint (%s tokens)",
+                request.request_id,
+                used_cached_tokens,
+                checkpoint_len,
+            )
+            request._cache_reuse_partial_unavailable_reason = (
+                "kv_ssm_checkpoint_misaligned"
+            )
+            return None, None
+        try:
+            reconstructed = self.block_aware_cache.reconstruct_cache(trimmed_table)
+        except Exception as exc:
+            logger.warning(
+                "Request %s: failed to reconstruct hybrid memory-fit KV cache "
+                "(target %s/%s tokens): %s",
+                request.request_id,
+                used_cached_tokens,
+                original_cached_tokens,
+                exc,
+            )
+            request._cache_reuse_partial_unavailable_reason = "kv_reconstruct_failed"
+            return None, None
+        if reconstructed is not None and getattr(self, "_kv_cache_bits", 0):
+            reconstructed = self._dequantize_cache_for_use(reconstructed)
+        if reconstructed is None:
+            request._cache_reuse_partial_unavailable_reason = "kv_dequant_failed"
+            return None, None
+
+        request.block_table = trimmed_table
+        request.cached_tokens = used_cached_tokens
+        request.shared_prefix_blocks = len(getattr(trimmed_table, "block_ids", []) or [])
+        request.remaining_tokens = self._remaining_tokens_after_cached_prefix(
+            request,
+            used_cached_tokens,
+        )
+        finalized = self._finalize_hybrid_paged_cache_on_worker(
+            request,
+            reconstructed,
+        )
+        if finalized is None or not self._validate_cache(finalized):
+            request._cache_reuse_partial_unavailable_reason = "hybrid_finalize_failed"
+            return None, None
+        request.prompt_cache = finalized
+        remaining_tokens = request.remaining_tokens or []
+        if len(remaining_tokens) == 0 and request.prompt_token_ids:
+            remaining_tokens = list(request.prompt_token_ids[-1:])
+            request.remaining_tokens = remaining_tokens
+        self._record_cache_reuse_partial(
+            request=request,
+            cache_to_use=finalized,
+            cache_bytes=cache_bytes,
+            available_bytes=available_bytes,
+            multiplier=multiplier,
+            budget_fraction=budget_fraction,
+            original_cached_tokens=original_cached_tokens,
+            used_cached_tokens=used_cached_tokens,
+            remaining_tokens=remaining_tokens,
+            cache_contract="hybrid_ssm",
+        )
+        logger.warning(
+            "Request %s: hybrid SSM cache reuse memory-fit to %s/%s tokens; "
+            "prefilling %s tail tokens (budget %.0fMB, available %.0fMB)",
+            request.request_id,
+            used_cached_tokens,
+            original_cached_tokens,
+            len(remaining_tokens),
+            (available_bytes * budget_fraction) / 1048576,
+            available_bytes / 1048576,
+        )
+        return finalized, remaining_tokens
+
+    def _shrink_paged_cache_for_memory(
+        self,
+        *,
+        request: Request,
+        cache_to_use: Any,
+        cache_bytes: int,
+        available_bytes: int,
+        multiplier: float,
+        budget_fraction: Optional[float] = None,
+    ) -> Tuple[Optional[Any], Optional[List[int]]]:
+        """Shrink a paged-cache hit so cache reuse survives memory pressure.
+
+        The old behavior was all-or-nothing: if a full cached-prefix merge
+        needed more temporary memory than was currently available, the scheduler
+        discarded the entire hit and prefetched the full prompt again. That is
+        catastrophic for long multi-turn chats. For ordinary positional KV/TQ
+        cache we can safely keep a block-aligned prefix, release the trailing
+        request refs, and prefill only the tail.
+
+        Native path-dependent caches are never silently treated as plain KV.
+        Hybrid SSM takes the companion-cache checkpoint path below; DSV4
+        composite and ZAYA CCA remain explicit no-generic-shrink contracts.
+        """
+        if (
+            self.block_aware_cache is None
+            or getattr(request, "block_table", None) is None
+            or not getattr(request.block_table, "block_ids", None)
+        ):
+            request._cache_reuse_contract = self._cache_reuse_contract()
+            request._cache_reuse_partial_unavailable_reason = (
+                "non_paged_cache_no_block_table"
+            )
+            return None, None
+        cache_contract = self._cache_reuse_contract()
+        request._cache_reuse_contract = cache_contract
+        request._cache_reuse_partial_unavailable_reason = None
+
+        original_cached_tokens = int(getattr(request, "cached_tokens", 0) or 0)
+        if original_cached_tokens <= 0 or cache_bytes <= 0 or available_bytes <= 0:
+            return None, None
+        if multiplier <= 0:
+            return None, None
+
+        block_size = int(getattr(self.block_aware_cache, "block_size", 0) or 0)
+        if block_size <= 0:
+            return None, None
+
+        if budget_fraction is None:
+            budget_fraction = self._cache_reuse_budget_fraction()
+        budget_fraction = max(0.10, min(0.95, float(budget_fraction)))
+
+        target_tokens = self._memory_fit_target_cached_tokens(
+            original_cached_tokens=original_cached_tokens,
+            cache_bytes=cache_bytes,
+            available_bytes=available_bytes,
+            multiplier=multiplier,
+            block_size=block_size,
+            budget_fraction=budget_fraction,
+        )
+        if target_tokens <= 0:
+            request._cache_reuse_partial_unavailable_reason = (
+                "memory_budget_below_one_block"
+            )
+            return None, None
+
+        if cache_contract in ("deepseek_v4_composite", "zaya_cca"):
+            terminal_tag = (
+                "deepseek_v4"
+                if cache_contract == "deepseek_v4_composite"
+                else "zaya_cca"
+            )
+            trim_terminal = getattr(
+                self.block_aware_cache,
+                "trim_block_table_to_terminal_state",
+                None,
+            )
+            if not callable(trim_terminal):
+                request._cache_reuse_partial_unavailable_reason = (
+                    "no_terminal_path_dependent_checkpoint"
+                )
+                return None, None
+            trimmed_table = trim_terminal(
+                request.request_id,
+                target_tokens,
+                terminal_tag,
+            )
+            if trimmed_table is None or not getattr(trimmed_table, "block_ids", None):
+                request._cache_reuse_partial_unavailable_reason = (
+                    "no_terminal_path_dependent_checkpoint"
+                )
+                return None, None
+
+            used_cached_tokens = int(getattr(trimmed_table, "num_tokens", 0) or 0)
+            if used_cached_tokens <= 0 or used_cached_tokens >= original_cached_tokens:
+                request._cache_reuse_partial_unavailable_reason = (
+                    "terminal_trim_did_not_reduce_cache"
+                )
+                return None, None
+
+            try:
+                trimmed_cache = self.block_aware_cache.reconstruct_cache(trimmed_table)
+            except Exception as exc:
+                logger.warning(
+                    "Request %s: failed to reconstruct terminal memory-fit "
+                    "%s cache (target %s/%s tokens): %s",
+                    request.request_id,
+                    cache_contract,
+                    used_cached_tokens,
+                    original_cached_tokens,
+                    exc,
+                )
+                request._cache_reuse_partial_unavailable_reason = (
+                    "terminal_reconstruct_failed"
+                )
+                return None, None
+
+            if not self._validate_cache(trimmed_cache):
+                request._cache_reuse_partial_unavailable_reason = (
+                    "terminal_validate_failed"
+                )
+                return None, None
+
+            remaining_tokens = self._remaining_tokens_after_cached_prefix(
+                request,
+                used_cached_tokens,
+            )
+            if len(remaining_tokens) == 0 and request.prompt_token_ids:
+                remaining_tokens = list(request.prompt_token_ids[-1:])
+
+            request.block_table = trimmed_table
+            request.cached_tokens = used_cached_tokens
+            request.shared_prefix_blocks = len(
+                getattr(trimmed_table, "block_ids", []) or []
+            )
+            request.remaining_tokens = remaining_tokens
+            request.prompt_cache = trimmed_cache
+
+            self._record_cache_reuse_partial(
+                request=request,
+                cache_to_use=trimmed_cache,
+                cache_bytes=cache_bytes,
+                available_bytes=available_bytes,
+                multiplier=multiplier,
+                budget_fraction=budget_fraction,
+                original_cached_tokens=original_cached_tokens,
+                used_cached_tokens=used_cached_tokens,
+                remaining_tokens=remaining_tokens,
+                cache_contract=cache_contract,
+            )
+            logger.warning(
+                "Request %s: full %s cache reuse needs %.0fMB but only %.0fMB "
+                "is budgeted (%.0fMB available); using terminal-safe partial "
+                "prefix cache %s/%s tokens and prefilling %s tail tokens",
+                request.request_id,
+                cache_contract,
+                (cache_bytes * multiplier) / 1048576,
+                (available_bytes * budget_fraction) / 1048576,
+                available_bytes / 1048576,
+                used_cached_tokens,
+                original_cached_tokens,
+                len(remaining_tokens),
+            )
+            return trimmed_cache, remaining_tokens
+
+        if cache_contract == "hybrid_ssm":
+            return self._shrink_hybrid_ssm_paged_cache_for_memory(
+                request=request,
+                cache_to_use=cache_to_use,
+                cache_bytes=cache_bytes,
+                available_bytes=available_bytes,
+                multiplier=multiplier,
+                budget_fraction=budget_fraction,
+                original_cached_tokens=original_cached_tokens,
+                target_tokens=target_tokens,
+                block_size=block_size,
+            )
+
+        trimmed_table = self.block_aware_cache.trim_block_table(
+            request.request_id,
+            target_tokens,
+        )
+        if trimmed_table is None or not getattr(trimmed_table, "block_ids", None):
+            request._cache_reuse_partial_unavailable_reason = "kv_trim_failed"
+            return None, None
+
+        used_cached_tokens = int(getattr(trimmed_table, "num_tokens", 0) or 0)
+        if used_cached_tokens <= 0 or used_cached_tokens >= original_cached_tokens:
+            request._cache_reuse_partial_unavailable_reason = (
+                "kv_trim_did_not_reduce_cache"
+            )
+            return None, None
+
+        try:
+            trimmed_cache = self.block_aware_cache.reconstruct_cache(trimmed_table)
+        except Exception as exc:
+            logger.warning(
+                "Request %s: failed to reconstruct memory-fit partial cache "
+                "(target %s/%s tokens): %s",
+                request.request_id,
+                used_cached_tokens,
+                original_cached_tokens,
+                exc,
+            )
+            request._cache_reuse_partial_unavailable_reason = "kv_reconstruct_failed"
+            return None, None
+
+        if not self._validate_cache(trimmed_cache):
+            logger.warning(
+                "Request %s: memory-fit partial cache failed validation "
+                "(target %s/%s tokens)",
+                request.request_id,
+                used_cached_tokens,
+                original_cached_tokens,
+            )
+            request._cache_reuse_partial_unavailable_reason = "kv_validate_failed"
+            return None, None
+
+        remaining_tokens = self._remaining_tokens_after_cached_prefix(
+            request,
+            used_cached_tokens,
+        )
+        if len(remaining_tokens) == 0 and request.prompt_token_ids:
+            remaining_tokens = list(request.prompt_token_ids[-1:])
+
+        request.block_table = trimmed_table
+        request.cached_tokens = used_cached_tokens
+        request.shared_prefix_blocks = len(getattr(trimmed_table, "block_ids", []) or [])
+        request.remaining_tokens = remaining_tokens
+        request.prompt_cache = trimmed_cache
+
+        self._record_cache_reuse_partial(
+            request=request,
+            cache_to_use=trimmed_cache,
+            cache_bytes=cache_bytes,
+            available_bytes=available_bytes,
+            multiplier=multiplier,
+            budget_fraction=budget_fraction,
+            original_cached_tokens=original_cached_tokens,
+            used_cached_tokens=used_cached_tokens,
+            remaining_tokens=remaining_tokens,
+            cache_contract=cache_contract,
+        )
+        logger.warning(
+            "Request %s: full cache reuse needs %.0fMB but only %.0fMB is "
+            "budgeted (%.0fMB available); using partial prefix cache %s/%s "
+            "tokens and prefilling %s tail tokens instead of falling back to "
+            "a full prefill",
+            request.request_id,
+            (cache_bytes * multiplier) / 1048576,
+            (available_bytes * budget_fraction) / 1048576,
+            available_bytes / 1048576,
+            used_cached_tokens,
+            original_cached_tokens,
+            len(remaining_tokens),
+        )
+        return trimmed_cache, remaining_tokens
+
+    @staticmethod
+    def _validate_single_cache(layer_cache: Any) -> bool:
+        """Validate a single cache layer object."""
+        try:
+            from .cache_record_validator import reject_live_cache_or_warn
+            return reject_live_cache_or_warn(
+                [layer_cache], source="scheduler-live-cache-layer"
+            )
+        except Exception:
+            return layer_cache is not None
+
+    @staticmethod
+    def _truncate_cache_to_prompt_length(
+        raw_cache: List[Any], prompt_len: int
+    ) -> Optional[List[Any]]:
+        """
+        Truncate extracted cache objects to prompt_len - 1 tokens.
+
+        After generation, KVCache objects contain state for prompt+output.
+        We truncate to prompt_len - 1 (not prompt_len) because on cache hit
+        the scheduler feeds the LAST prompt token for generation kickoff.
+        If the cache already contains that last token's KV state, the model
+        would see it twice, producing wrong output.
+
+        By storing prompt_len - 1 tokens of KV state:
+        - On exact match: remaining=[], scheduler feeds last token,
+          model processes it against the N-1 cached KV states → correct
+        - On forward prefix match: remaining has extra tokens including
+          the Nth token → model processes them normally → correct
+
+        MambaCache/ArraysCache layers are cumulative and cannot be
+        truncated to an exact token boundary.  When encountered, they are
+        passed through unchanged so that KV layers can still be truncated
+        and stored in the block cache — avoiding a full re-prefill that
+        would otherwise dominate post-generation latency on hybrid models.
+
+        Args:
+            raw_cache: List of cache layer objects from BatchGenerator
+            prompt_len: Number of prompt tokens
+
+        Returns:
+            Truncated cache list, or None if truncation not possible.
+            For hybrid models, SSM layers are included unchanged (callers
+            should skip L2 disk writes when self._is_hybrid is True).
+        """
+        # We store N-1 tokens so the last token can be re-fed on cache hit
+        target_len = prompt_len - 1
+        if not raw_cache or target_len <= 0:
+            return None
+
+        # Metal safety: sync all pending ops before slicing post-generation arrays.
+        # Lazy MLX slices can corrupt Metal command buffers when later evaluated.
+        # Convert through numpy to fully decouple from Metal.
+        try:
+            import mlx.core as mx
+            import numpy as np
+
+            mx.synchronize()
+        except ImportError:
+            pass
+
+        def _to_numpy(arr):
+            """Convert an evaluated MLX array to numpy (safe CPU memcpy).
+
+            bf16 goes through float32 (not float16): fp16 has only 5 exponent
+            bits vs bf16's 8, so the downcast silently clips attention KV
+            values and corrupts cached state enough to produce word loops
+            on sensitive models (e.g. Gemma 4 JANG multi-turn rep_pen basin).
+            """
+            try:
+                if arr.dtype == mx.bfloat16:
+                    return np.array(arr.astype(mx.float32))
+                return np.array(arr)
+            except Exception:
+                return arr
+
+        def _from_numpy(arr, orig_dtype=None):
+            """Convert numpy back to MLX, restoring original dtype if needed."""
+            try:
+                result = mx.array(arr)
+                if orig_dtype is not None and orig_dtype == mx.bfloat16:
+                    result = result.astype(mx.bfloat16)
+                return result
+            except Exception:
+                return arr
+
+        truncated = []
+        for layer_cache in raw_cache:
+            # Guard: skip dicts (extracted state dicts, not live cache objects).
+            # dict.keys is a builtin_function_or_method that matches hasattr
+            # but has no .ndim, causing "'builtin_function_or_method' object
+            # has no attribute 'ndim'" crashes.
+            if isinstance(layer_cache, dict):
+                truncated.append(layer_cache)
+                continue
+            cls_name = type(layer_cache).__name__
+            if Scheduler._is_dsv4_cache_class_name(cls_name):
+                try:
+                    from jang_tools.dsv4.mlx_model import DeepseekV4Cache
+
+                    local = getattr(layer_cache, "local", None)
+                    sliding_window = int(getattr(local, "max_size", 128) or 128)
+                    compress_ratio = getattr(layer_cache, "compress_ratio", None)
+                    current_len = int(getattr(layer_cache, "offset", 0) or 0)
+                    to_trim = max(0, current_len - target_len)
+
+                    # SAFETY: DeepseekV4Cache is a composite of THREE
+                    # attention components (SWA + CSA + HCA), each with
+                    # its own rewind constraint. Trimming a post-
+                    # generation live cache back to the prompt boundary
+                    # is unsafe in all three:
+                    #
+                    # (1) SWA local — RotatingKVCache as `self.local`.
+                    #     Cannot be rewound after the circular buffer
+                    #     wraps (offset > max_size). _idx goes negative
+                    #     and replay applies output-side tokens at wrong
+                    #     positions → looping decode (verified live
+                    #     2026-05-05 with prompt 29 + output 600,
+                    #     sliding_window=128 → offset=629, idx=-501).
+                    #     Same constraint as plain RotatingKVCache at
+                    #     scheduler.py:72 (`_rebuild_meta_state_after_
+                    #     truncation` returns None when wrapped). The
+                    #     DSV4 branch was bypassing that check.
+                    #
+                    # (2) CSA compressor pool — cumulative buffer of
+                    #     `pooled` rows summarizing every `compress_ratio`
+                    #     raw positions. After generation, pool contains
+                    #     prompt-side AND output-side rows interleaved
+                    #     by the compressor's chunk boundaries.
+                    #     `trim(n)` drops `max(1, n // ratio)` trailing
+                    #     rows (jang_tools dsv4/mlx_model.py:527) but
+                    #     the boundary often does NOT align with the
+                    #     prompt/output split. Even an aligned trim
+                    #     leaves the kept rows whose `key/value` were
+                    #     computed from a window that may have included
+                    #     output tokens — semantically wrong.
+                    #
+                    # (3) HCA/indexer pool — same cumulative behavior
+                    #     and same trim approximation as CSA. Wrong
+                    #     indexer state mis-routes attention sparsely
+                    #     across output rather than prompt.
+                    #
+                    # The clean fix is to capture a prompt-boundary
+                    # snapshot BEFORE decode starts (or async re-derive
+                    # after the request completes). Until that path
+                    # exists, refuse ALL post-generation DSV4 cache
+                    # stores. Caller falls through to full prefill on
+                    # next turn, which is correct.
+                    #
+                    # Override: VMLX_DSV4_TRUST_TRIMMED_CACHE=1 to keep
+                    # the (broken) v1.5.13 store-always behavior for
+                    # benchmarking. NOT recommended for production.
+                    _trust_trim = os.environ.get(
+                        "VMLX_DSV4_TRUST_TRIMMED_CACHE", "0"
+                    ) in ("1", "true", "yes")
+                    if to_trim > 0 and not _trust_trim:
+                        logger.info(
+                            f"DSV4 prompt cache store SKIPPED: "
+                            f"current_len={current_len}, "
+                            f"target_len={target_len}, "
+                            f"to_trim={to_trim} tokens. "
+                            f"DeepseekV4Cache (SWA+CSA+HCA composite) "
+                            f"cannot be safely rewound from post-"
+                            f"generation state — SWA RotatingKVCache "
+                            f"wraps at offset>{sliding_window} and "
+                            f"CSA/HCA pool buffers are cumulative "
+                            f"across the entire window. Returning None "
+                            f"forces clean full prefill on next turn. "
+                            f"Override: VMLX_DSV4_TRUST_TRIMMED_CACHE=1 "
+                            f"(NOT recommended)."
+                        )
+                        return None
+
+                    new_cache = DeepseekV4Cache(
+                        sliding_window=sliding_window,
+                        compress_ratio=compress_ratio,
+                    )
+                    new_cache.state = layer_cache.state
+                    try:
+                        new_cache.meta_state = layer_cache.meta_state
+                    except Exception:
+                        pass
+                    if to_trim:
+                        new_cache.trim(to_trim)
+                    truncated.append(new_cache)
+                    continue
+                except Exception as e:
+                    logger.debug(
+                        f"DeepseekV4Cache prompt truncation failed: {e}"
+                    )
+                    return None
+            if hasattr(layer_cache, "keys") and layer_cache.keys is not None:
+                # Positional cache: truncate to target length
+                try:
+                    k = layer_cache.keys
+                    v = layer_cache.values
+                    # Guard: k must be a tensor with .ndim (not a method or other object)
+                    if not hasattr(k, "ndim"):
+                        truncated.append(layer_cache)
+                        continue
+
+                    if isinstance(k, tuple):
+                        # QuantizedKVCache: keys/values are tuples of 3 arrays
+                        # (data_uint32, scales, zeros) each with seq axis at dim -2
+                        try:
+                            from mlx_lm.models.cache import QuantizedKVCache
+                        except ImportError:
+                            return None
+                        safe_target = min(target_len, k[0].shape[-2])
+                        if safe_target <= 0:
+                            return None
+                        new_cache = QuantizedKVCache(
+                            group_size=layer_cache.group_size,
+                            bits=layer_cache.bits,
+                        )
+                        new_cache.keys = tuple(
+                            _from_numpy(_to_numpy(t)[..., :safe_target, :], t.dtype)
+                            for t in k
+                        )
+                        new_cache.values = tuple(
+                            _from_numpy(_to_numpy(t)[..., :safe_target, :], t.dtype)
+                            for t in v
+                        )
+                        new_cache.offset = safe_target
+                        truncated.append(new_cache)
+                    else:
+                        # Standard KVCache / RotatingKVCache: keys/values are tensors
+                        from mlx_lm.models.cache import KVCache
+
+                        if "Rotating" in cls_name:
+                            try:
+                                from mlx_lm.models.cache import RotatingKVCache
+
+                                max_size = getattr(layer_cache, "max_size", target_len)
+                                keep = getattr(layer_cache, "keep", 0)
+                                offset = getattr(layer_cache, "offset", 0)
+                                _idx = getattr(layer_cache, "_idx", 0)
+
+                                if offset > max_size:
+                                    # Circular buffer has wrapped — slots are NOT in
+                                    # chronological order. Naive slice gives wrong tokens.
+                                    # Skip caching for this layer rather than corrupt.
+                                    return None
+
+                                new_cache = RotatingKVCache(
+                                    max_size=max_size,
+                                    keep=keep,
+                                )
+                            except ImportError:
+                                new_cache = KVCache()
+                        else:
+                            new_cache = KVCache()
+                        ndim = k.ndim
+                        # Convert PARENT arrays to numpy BEFORE slicing.
+                        # Slicing in numpy avoids the Metal command buffer
+                        # bug entirely — no lazy MLX ops, no GPU involvement.
+                        if ndim == 4:
+                            safe_target = min(target_len, k.shape[2])
+                            np_k, np_v = _to_numpy(k), _to_numpy(v)
+                            new_cache.keys = _from_numpy(
+                                np_k[:, :, :safe_target, :], k.dtype
+                            )
+                            new_cache.values = _from_numpy(
+                                np_v[:, :, :safe_target, :], v.dtype
+                            )
+                        elif ndim == 3:
+                            safe_target = min(target_len, k.shape[1])
+                            np_k, np_v = _to_numpy(k), _to_numpy(v)
+                            new_cache.keys = _from_numpy(
+                                np_k[:, :safe_target, :], k.dtype
+                            )
+                            new_cache.values = _from_numpy(
+                                np_v[:, :safe_target, :], v.dtype
+                            )
+                        else:
+                            return None
+                        new_cache.offset = min(target_len, safe_target)
+                        # Restore _idx for RotatingKVCache — use original _idx clamped to truncated length
+                        if "Rotating" in cls_name and hasattr(new_cache, "_idx"):
+                            new_cache._idx = min(_idx, safe_target)
+                        truncated.append(new_cache)
+                except ImportError:
+                    return None
+            elif hasattr(layer_cache, "caches") and isinstance(
+                getattr(layer_cache, "caches", None), (list, tuple)
+            ):
+                # CacheList (DeepSeek V3.2, Falcon H1): contains sub-caches.
+                # Recursively truncate each sub-cache.
+                sub_result = Scheduler._truncate_cache_to_prompt_length(
+                    layer_cache.caches, prompt_len
+                )
+                if sub_result is None:
+                    return None
+                try:
+                    from mlx_lm.models.cache import CacheList
+
+                    new_cache_list = CacheList.__new__(CacheList)
+                    new_cache_list.caches = tuple(sub_result)
+                    truncated.append(new_cache_list)
+                except ImportError:
+                    return None
+            elif hasattr(layer_cache, "cache") and isinstance(
+                getattr(layer_cache, "cache", None), list
+            ):
+                # MambaCache/ArraysCache: cumulative state — cannot truncate
+                # to an exact token boundary.  Pass through unchanged so KV
+                # layers are still truncated and stored in the block cache.
+                # The SSM state includes output-token effects, so it should
+                # NOT be persisted to the L2 disk cache.
+                truncated.append(layer_cache)
+            else:
+                # Unknown cache type
+                return None
+
+        return truncated
+
+    def _extract_cache_states(self, raw_cache: List[Any]) -> List[Dict[str, Any]]:
+        """
+        Extract actual tensor state from each layer cache.
+
+        This extracts the real KV data using mlx-lm's cache.state property,
+        allowing the data to be stored and reconstructed later even after
+        the BatchGenerator is recreated.
+
+        Args:
+            raw_cache: List of KVCache objects from mlx-lm
+
+        Returns:
+            List of dicts with {state: (keys, values), meta_state: (offset,), class_name: str}
+        """
+        if not raw_cache:
+            return []
+
+        extracted = []
+        failed = 0
+        class_counts: Dict[str, int] = {}
+        for i, layer_cache in enumerate(raw_cache):
+            try:
+                # CacheList (MoE models like DeepSeek V3.2, Falcon H1):
+                # wrapper with .caches attribute containing sub-caches.
+                # Extract each sub-cache's state and store as a list.
+                if hasattr(layer_cache, "caches") and isinstance(
+                    getattr(layer_cache, "caches", None), (list, tuple)
+                ):
+                    sub_states = []
+                    all_ok = True
+                    for j, sub_cache in enumerate(layer_cache.caches):
+                        if hasattr(sub_cache, "state") and hasattr(
+                            sub_cache, "meta_state"
+                        ):
+                            sub_state = sub_cache.state
+                            # Normalize GQA head inflation in sub-caches too
+                            # (handles both plain tensors and quantized tuples)
+                            if (
+                                isinstance(sub_state, tuple)
+                                and len(sub_state) == 2
+                            ):
+                                sk, sv = sub_state
+                                if (
+                                    hasattr(sk, "shape")
+                                    and len(sk.shape) == 4
+                                ):
+                                    target_h = self._cache_head_slice_target(
+                                        type(sub_cache).__name__,
+                                        int(sk.shape[1]),
+                                    )
+                                    if target_h > 0:
+                                        sub_state = (
+                                            sk[:, :target_h, :, :],
+                                            sv[:, :target_h, :, :],
+                                        )
+                                elif (
+                                    isinstance(sk, (tuple, list))
+                                    and len(sk) >= 1
+                                    and hasattr(sk[0], "shape")
+                                    and len(sk[0].shape) == 4
+                                ):
+                                    target_h = self._cache_head_slice_target(
+                                        type(sub_cache).__name__,
+                                        int(sk[0].shape[1]),
+                                    )
+                                    if target_h > 0:
+                                        sub_state = (
+                                            tuple(t[:, :target_h, :, :] for t in sk),
+                                            tuple(t[:, :target_h, :, :] for t in sv),
+                                        )
+                            sub_states.append(
+                                {
+                                    "state": sub_state,
+                                    "meta_state": sub_cache.meta_state,
+                                    "class_name": type(sub_cache).__name__,
+                                }
+                            )
+                        else:
+                            logger.debug(
+                                f"Layer {i} CacheList sub-cache {j} "
+                                f"({type(sub_cache).__name__}) lacks state/meta_state"
+                            )
+                            all_ok = False
+                            break
+                    if all_ok and sub_states:
+                        cls_name = "CacheList"
+                        class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                        extracted.append(
+                            {
+                                "state": None,
+                                "meta_state": None,
+                                "class_name": cls_name,
+                                "sub_caches": sub_states,
+                            }
+                        )
+                    else:
+                        failed += 1
+                elif type(layer_cache).__name__ == "ZayaNoStateCache":
+                    cls_name = type(layer_cache).__name__
+                    class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                    extracted.append(
+                        {
+                            "state": (),
+                            "meta_state": (),
+                            "class_name": cls_name,
+                            "no_state": True,
+                        }
+                    )
+                # MambaCache/ArraysCache: cumulative state (SSM layers in hybrid models).
+                # Cannot be sliced by token position, but CAN be stored as cumulative
+                # state in the last block.  _extract_block_tensor_slice() tags these as
+                # ("cumulative", ...) for last blocks and ("skip",) for earlier blocks.
+                # This allows prefix cache to restore the full hybrid cache (KV + SSM)
+                # on exact prefix matches, avoiding the forced miss that previously
+                # disabled prefix caching for all hybrid SSM models (Nemotron, etc.).
+                elif hasattr(layer_cache, "cache") and isinstance(
+                    getattr(layer_cache, "cache", None), list
+                ):
+                    if hasattr(layer_cache, "state") and hasattr(
+                        layer_cache, "meta_state"
+                    ):
+                        cls_name = type(layer_cache).__name__
+                        class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                        extracted.append(
+                            {
+                                "state": layer_cache.state,
+                                "meta_state": layer_cache.meta_state,
+                                "class_name": cls_name,
+                            }
+                        )
+                    else:
+                        # SSM layer without state/meta_state — include placeholder
+                        # so layer indices stay aligned with model layers
+                        cls_name = type(layer_cache).__name__
+                        class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                        extracted.append(
+                            {
+                                "state": None,
+                                "meta_state": None,
+                                "class_name": cls_name,
+                            }
+                        )
+                    continue
+                elif hasattr(layer_cache, "state") and hasattr(
+                    layer_cache, "meta_state"
+                ):
+                    state = layer_cache.state  # (keys, values) MLX arrays
+                    meta = layer_cache.meta_state  # (offset,) as strings
+                    cls_name = type(layer_cache).__name__
+                    if self._is_dsv4_cache_class_name(cls_name):
+                        # DSV4 may store q4/q8-compressed local SWA KV inside
+                        # the composite cache. In that case .meta_state belongs
+                        # to QuantizedKVCache, not the real RotatingKVCache.
+                        # Use the saved rotating metadata for reconstruction
+                        # and carry quant metadata separately in cache_meta.
+                        saved_rot_meta = getattr(
+                            layer_cache, "_vmlx_dsv4_local_meta_state", None
+                        )
+                        if saved_rot_meta:
+                            meta = tuple(saved_rot_meta)
+
+                    # Normalize GQA head inflation from BatchKVCache.merge().
+                    # merge() broadcasts H to max across all caches in the batch,
+                    # but the true KV head count is smaller for GQA/MQA models.
+                    # Slice away the inflated heads before storing.
+                    # Handles both standard KVCache (plain tensors) and
+                    # QuantizedKVCache (tuple-of-tuples: (data, scales, zeros)).
+                    if isinstance(state, tuple) and len(state) == 2:
+                        keys, values = state
+                        if hasattr(keys, "shape") and len(keys.shape) == 4:
+                            # Standard KVCache: keys/values are 4D tensors.
+                            target_h = self._cache_head_slice_target(
+                                cls_name,
+                                int(keys.shape[1]),
+                            )
+                            if target_h > 0:
+                                orig_h = keys.shape[1]
+                                keys = keys[:, :target_h, :, :]
+                                values = values[:, :target_h, :, :]
+                                state = (keys, values)
+                                if i == 0:
+                                    logger.debug(
+                                        f"GQA head normalization: sliced H "
+                                        f"{orig_h} → {target_h}"
+                                    )
+                        elif isinstance(keys, (tuple, list)) and len(keys) >= 1:
+                            # QuantizedKVCache: keys/values are tuples of
+                            # (data, scales, zeros) — check first component.
+                            first_k = keys[0]
+                            if hasattr(first_k, "shape") and len(first_k.shape) == 4:
+                                target_h = self._cache_head_slice_target(
+                                    cls_name,
+                                    int(first_k.shape[1]),
+                                )
+                                if target_h > 0:
+                                    orig_h = first_k.shape[1]
+                                    keys = tuple(t[:, :target_h, :, :] for t in keys)
+                                    values = tuple(t[:, :target_h, :, :] for t in values)
+                                    state = (keys, values)
+                                    if i == 0:
+                                        logger.debug(
+                                            f"GQA head normalization (quantized): "
+                                            f"sliced H {orig_h} → {target_h}"
+                                        )
+
+                    # Ensure QuantizedKVCache meta includes group_size and bits.
+                    # meta_state from QuantizedKVCache is ('offset', 'group_size', 'bits')
+                    # but if the cache was quantized post-extraction, meta may only have
+                    # ('offset',). Pad with actual values to prevent wrong defaults on reconstruct.
+                    if (
+                        cls_name == "QuantizedKVCache"
+                        and isinstance(meta, (tuple, list))
+                        and len(meta) < 3
+                    ):
+                        g = getattr(layer_cache, "group_size", 64)
+                        b = getattr(layer_cache, "bits", 8)
+                        meta = (meta[0] if meta else "0", str(g), str(b))
+
+                    class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                    entry = {
+                        "state": state,
+                        "meta_state": meta,
+                        "class_name": cls_name,
+                    }
+                    if self._is_dsv4_cache_class_name(cls_name):
+                        entry["compress_ratio"] = getattr(
+                            layer_cache, "compress_ratio", None
+                        )
+                        local_quant_meta = getattr(
+                            layer_cache, "_vmlx_dsv4_local_quant_meta", None
+                        )
+                        if local_quant_meta:
+                            entry["local_quant_meta"] = tuple(local_quant_meta)
+                        try:
+                            entry["sliding_window"] = getattr(
+                                getattr(layer_cache, "local", None),
+                                "max_size",
+                                None,
+                            )
+                        except Exception:
+                            entry["sliding_window"] = None
+                        if entry["sliding_window"] is None:
+                            entry["sliding_window"] = getattr(
+                                layer_cache, "_vmlx_dsv4_sliding_window", None
+                            )
+                        entry["pool_quant"] = False
+                    extracted.append(entry)
+                else:
+                    logger.debug(
+                        f"Layer {i} ({type(layer_cache).__name__}) lacks state/meta_state"
+                    )
+                    failed += 1
+            except Exception as e:
+                logger.warning(f"Failed to extract state from layer {i}: {e}")
+                cls_name = type(layer_cache).__name__
+                class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                extracted.append(
+                    {
+                        "state": None,
+                        "meta_state": None,
+                        "class_name": cls_name,
+                    }
+                )
+                failed += 1
+
+        if failed > 0:
+            logger.warning(
+                f"Cache extraction: {len(extracted)}/{len(raw_cache)} layers succeeded, "
+                f"{failed} failed"
+            )
+
+        # Log extraction summary for debugging hybrid model issues
+        if extracted:
+            counts_str = ", ".join(f"{k}={v}" for k, v in class_counts.items())
+            logger.debug(
+                f"Cache extraction: {len(extracted)}/{len(raw_cache)} layers "
+                f"({counts_str})"
+            )
+
+        # Return what we got - partial extraction is better than nothing
+        # The reconstruction logic handles missing layers gracefully
+        return extracted
+
+    def add_request(self, request: Request) -> None:
+        """
+        Add a new request to the scheduler.
+
+        Args:
+            request: The request to add
+        """
+        if request.request_id in self.requests:
+            raise ValueError(f"Request {request.request_id} already exists")
+
+        # Reset PLD auto-tune window on each new request — each generation
+        # is a different workload, so cwnd from the previous request is
+        # irrelevant.  But only reset if PLD was actively running; if
+        # auto-tune disabled it, respect that decision (the probe will
+        # re-enable periodically to check if conditions changed).
+        if self._pld_spec_enabled and self._pld_auto_enabled:
+            self._pld_at_window = 1
+            self._pld_summary_next = 1
+
+        # Tokenize if needed
+        if request.prompt_token_ids is None:
+            if isinstance(request.prompt, str):
+                add_special_tokens = getattr(request, "_encode_add_special_tokens", None)
+                # Handle both tokenizers and processors (for MLLM models)
+                if hasattr(self.tokenizer, "encode"):
+                    request.prompt_token_ids = self._encode_prompt_text(
+                        self.tokenizer,
+                        request.prompt,
+                        add_special_tokens,
+                    )
+                elif hasattr(self.tokenizer, "tokenizer") and hasattr(
+                    self.tokenizer.tokenizer, "encode"
+                ):
+                    # Processor wraps tokenizer (e.g., Qwen3VLProcessor)
+                    request.prompt_token_ids = self._encode_prompt_text(
+                        self.tokenizer.tokenizer,
+                        request.prompt,
+                        add_special_tokens,
+                    )
+                else:
+                    raise AttributeError(
+                        f"Tokenizer {type(self.tokenizer)} has no 'encode' method. "
+                        "Continuous batching requires a tokenizer with encode support."
+                    )
+            else:
+                request.prompt_token_ids = list(request.prompt)
+            request.num_prompt_tokens = len(request.prompt_token_ids)
+
+        # Reject empty prompts — they would spin forever in the scheduler
+        # since there are no tokens to prefill and the request never finishes
+        if not request.prompt_token_ids or len(request.prompt_token_ids) == 0:
+            raise ValueError(
+                f"Request {request.request_id} has empty prompt tokens. "
+                "Cannot schedule a request with no input tokens."
+            )
+
+        max_prompt_tokens = int(getattr(request, "_max_prompt_tokens", 0) or 0)
+        if max_prompt_tokens > 0 and len(request.prompt_token_ids) > max_prompt_tokens:
+            raise PromptTooLongError(
+                len(request.prompt_token_ids),
+                max_prompt_tokens,
+                source="tokenized prompt",
+                request_id=request.request_id,
+            )
+
+        if self._uses_dsv4_cache:
+            try:
+                _dsv4_max_prefill = int(os.environ.get("DSV4_MAX_PREFILL_TOKENS", "32768"))
+            except (TypeError, ValueError):
+                _dsv4_max_prefill = 32768
+            if _dsv4_max_prefill > 0 and len(request.prompt_token_ids) > _dsv4_max_prefill:
+                raise ValueError(
+                    "DeepSeek V4 Flash JANGTQ long-prefill guard: prompt has "
+                    f"{len(request.prompt_token_ids)} tokens, max safe prefill is "
+                    f"{_dsv4_max_prefill}. The Python DSV4 path defaults to bounded "
+                    "prefill chunks for SWA+CSA/HCA memory safety after installed-app "
+                    "cache-hit validation; legacy single-shot remains available with "
+                    "DSV4_PREFILL_STEP_SIZE=0 for diagnostics. Very large prompts still scale with "
+                    "accumulated compressor/indexer pool work. "
+                    "Set DSV4_MAX_PREFILL_TOKENS=0 to disable this production "
+                    "guard after validating the workload on this machine."
+                )
+
+        # Per-request cache bypass (from cache_salt / skip_prefix_cache on the
+        # API request). When set, skip EVERY prefix cache lookup below AND
+        # ensure no store happens at the end. This is the hard guarantee that
+        # benchmark runs need to avoid pollution from prior requests.
+        _bypass = bool(getattr(request, "_bypass_prefix_cache", False))
+        if _bypass:
+            logger.debug(
+                f"Request {request.request_id}: _bypass_prefix_cache=True, "
+                "skipping paged / memory-aware / legacy prefix / SSM companion cache lookups"
+            )
+            request.remaining_tokens = request.prompt_token_ids
+
+        # Check prefix cache for cached KV state.
+        # Strip gen_prompt_len from fetch key to match store (which also strips).
+        # The suffix is re-attached to `remaining` so the model still sees the
+        # template trailer (e.g. `<|im_start|>assistant\n<think>\n`) during prefill.
+        _full_tokens_list = list(request.prompt_token_ids)
+        _gpl_fetch = getattr(request, "_gen_prompt_len", 0) or 0
+        if 0 < _gpl_fetch < len(_full_tokens_list):
+            _fetch_tokens = _full_tokens_list[:-_gpl_fetch]
+            _gpl_suffix_tokens = _full_tokens_list[-_gpl_fetch:]
+        else:
+            _fetch_tokens = _full_tokens_list
+            _gpl_suffix_tokens = []
+
+        if self.block_aware_cache is not None and not _bypass:
+            # Use paged cache
+            request._paged_disk_hit = False
+            try:
+                _paged_disk_hits_before = int(
+                    getattr(
+                        getattr(self.block_aware_cache.paged_cache, "stats", None),
+                        "disk_hits",
+                        0,
+                    )
+                    or 0
+                )
+            except Exception:
+                _paged_disk_hits_before = 0
+            block_table, remaining = self.block_aware_cache.fetch_cache(
+                request.request_id,
+                _fetch_tokens,
+            )
+            try:
+                _paged_disk_hits_after = int(
+                    getattr(
+                        getattr(self.block_aware_cache.paged_cache, "stats", None),
+                        "disk_hits",
+                        0,
+                    )
+                    or 0
+                )
+                request._paged_disk_hit = (
+                    _paged_disk_hits_after > _paged_disk_hits_before
+                )
+            except Exception:
+                request._paged_disk_hit = False
+            # Re-append gpl suffix to remaining so model sees template trailer.
+            if _gpl_suffix_tokens:
+                remaining = list(remaining or []) + list(_gpl_suffix_tokens)
+            if block_table and block_table.num_tokens > 0:
+                paged_cold_tokens = self._paged_cold_block_tokens(block_table)
+                warm_cache = None
+                warm_remaining: List[int] = []
+                warm_cached_tokens = 0
+                warm_detail: str | None = None
+                # Paged/TurboQuant hits with cold/disk-promoted blocks can have
+                # worse TTFT than a smaller hot prefix hit. Compare a conservative
+                # hot-token advantage before committing to reconstruction.
+                if (
+                    (paged_cold_tokens > 0 or getattr(self, "_tq_active", False))
+                    and not self._uses_dsv4_cache
+                    and not self._uses_zaya_cache
+                ):
+                    (
+                        warm_cache,
+                        warm_remaining,
+                        warm_cached_tokens,
+                        warm_detail,
+                    ) = self._warm_prefix_alternative(
+                        _fetch_tokens,
+                        _gpl_suffix_tokens,
+                    )
+                prefer_warm, selection = self._should_prefer_warm_prefix_over_paged(
+                    paged_cached_tokens=int(getattr(block_table, "num_tokens", 0) or 0),
+                    paged_cold_tokens=paged_cold_tokens,
+                    warm_cached_tokens=warm_cached_tokens,
+                )
+                if prefer_warm and warm_cache is not None and warm_detail is not None:
+                    try:
+                        self.block_aware_cache.paged_cache.release_request_refs(
+                            block_table
+                        )
+                        self.block_aware_cache.paged_cache.detach_request(
+                            request.request_id
+                        )
+                    except Exception:
+                        pass
+                    request.prompt_cache = warm_cache
+                    request.cached_tokens = warm_cached_tokens
+                    request.remaining_tokens = warm_remaining
+                    request._cache_detail = warm_detail
+                    request.block_table = None
+                    request.shared_prefix_blocks = 0
+                    request._paged_block_table_needs_worker_reconstruct = False
+                    if getattr(self, "_kv_cache_bits", 0):
+                        request._prompt_cache_needs_worker_dequant = True
+                    selection.update(
+                        {
+                            "selected": warm_detail,
+                            "rejected": "paged",
+                            "reason": "cold_paged_reconstruction_cost",
+                        }
+                    )
+                    request._cache_selection = selection
+                    self._last_cache_selection = selection
+                    logger.info(
+                        "Request %s: selected %s cache over paged hit "
+                        "(paged_cached=%d, cold_paged=%d, warm_cached=%d, "
+                        "hot_advantage=%d < threshold=%d)",
+                        request.request_id,
+                        warm_detail,
+                        selection["paged_cached_tokens"],
+                        selection["paged_cold_tokens"],
+                        selection["warm_cached_tokens"],
+                        selection["hot_advantage_tokens"],
+                        selection["hot_advantage_threshold_tokens"],
+                    )
+                else:
+                    paged_selection_reason = (
+                        "paged_hot_advantage_sufficient"
+                        if warm_detail is not None
+                        else "no_warm_prefix_alternative"
+                    )
+                    selection.update(
+                        {
+                            "selected": "paged",
+                            "rejected": warm_detail,
+                            "reason": paged_selection_reason,
+                        }
+                    )
+                    request._cache_selection = selection
+                    self._last_cache_selection = selection
+                    # Defer reconstruction to the scheduler llm-worker. Both
+                    # in-RAM block tensors and SSM companion tensors are MLX arrays
+                    # created on that worker stream; reconstructing them in
+                    # add_request() on the API thread causes fake misses or stream
+                    # errors. L2 disk promotion also creates MLX arrays, so keeping
+                    # one reconstruction path avoids thread-dependent behavior.
+                    request.block_table = block_table
+                    request.cached_tokens = block_table.num_tokens
+                    request.shared_prefix_blocks = len(block_table.block_ids)
+                    request.remaining_tokens = remaining
+                    request._paged_block_table_needs_worker_reconstruct = True
+                    if (
+                        self._is_hybrid
+                        and not self._uses_dsv4_cache
+                        and not self._uses_zaya_cache
+                    ):
+                        request._hybrid_prompt_cache_needs_worker_ssm = True
+                        request._hybrid_ssm_fetch_tokens = list(_fetch_tokens)
+                    if getattr(self, "_kv_cache_bits", 0):
+                        request._prompt_cache_needs_worker_dequant = True
+                    if self._uses_dsv4_cache:
+                        request._cache_detail = "paged+dsv4"
+                    elif self._uses_zaya_cache:
+                        request._cache_detail = "paged+zaya_cca"
+                    else:
+                        request._cache_detail = (
+                            "paged+disk"
+                            if getattr(request, "_paged_disk_hit", False)
+                            else "paged"
+                        )
+                    logger.info(
+                        f"Request {request.request_id}: paged cache hit, "
+                        f"{request.cached_tokens} tokens in "
+                        f"{request.shared_prefix_blocks} blocks, "
+                        f"{len(remaining)} remaining to process "
+                        f"(worker reconstruct pending)"
+                    )
+            else:
+                request.remaining_tokens = request.prompt_token_ids
+                logger.info(
+                    f"Request {request.request_id}: paged cache miss, "
+                    f"processing all {len(request.prompt_token_ids)} tokens"
+                )
+        elif self.memory_aware_cache is not None and not _bypass:
+            # Use memory-aware prefix cache (gpl-stripped fetch; suffix re-attached)
+            cache, remaining = self.memory_aware_cache.fetch(_fetch_tokens)
+            remaining, cached_tokens = self._prefix_hit_tail_and_cached_tokens(
+                fetch_tokens=_fetch_tokens,
+                remaining=remaining or [],
+                gen_prompt_suffix=_gpl_suffix_tokens,
+            )
+            if cache:
+                # Dequantize for BatchGenerator compatibility
+                if getattr(self, "_kv_cache_bits", 0):
+                    # Dequantization creates/evaluates MLX arrays. add_request()
+                    # runs on the API thread, while live decode runs on the
+                    # scheduler's llm-worker; doing this here can leave tensors
+                    # tied to the API thread's Stream(gpu, 0). Defer stored
+                    # q4/q8 cache dequant to _schedule_waiting() on the worker.
+                    request._prompt_cache_needs_worker_dequant = True
+                if cache is None:
+                    # Dequantization failed — treat as cache miss
+                    request.remaining_tokens = request.prompt_token_ids
+                    logger.info(
+                        f"Request {request.request_id}: dequantization failed, "
+                        f"treating as cache miss"
+                    )
+                else:
+                    request.prompt_cache = cache
+                    request.cached_tokens = cached_tokens
+                    request.remaining_tokens = remaining
+                    request._cache_detail = "memory"
+                    logger.info(
+                        f"Request {request.request_id}: cache hit, "
+                        f"{request.cached_tokens} tokens cached, "
+                        f"{len(remaining)} remaining to process"
+                    )
+            else:
+                request.remaining_tokens = request.prompt_token_ids
+                logger.info(
+                    f"Request {request.request_id}: cache miss, "
+                    f"processing all {len(request.prompt_token_ids)} tokens"
+                )
+        elif self.prefix_cache is not None and not _bypass:
+            # Use legacy prefix cache (gpl-stripped fetch; suffix re-attached)
+            cache, remaining = self.prefix_cache.fetch_cache(_fetch_tokens)
+            remaining, cached_tokens = self._prefix_hit_tail_and_cached_tokens(
+                fetch_tokens=_fetch_tokens,
+                remaining=remaining or [],
+                gen_prompt_suffix=_gpl_suffix_tokens,
+            )
+            if cache:
+                # Dequantize for BatchGenerator compatibility
+                if getattr(self, "_kv_cache_bits", 0):
+                    # Defer q4/q8 cache dequant to the scheduler worker. See
+                    # the memory-aware branch above for the thread-stream reason.
+                    request._prompt_cache_needs_worker_dequant = True
+                if cache is None:
+                    # Dequantization failed — treat as cache miss
+                    request.remaining_tokens = request.prompt_token_ids
+                    logger.info(
+                        f"Request {request.request_id}: dequantization failed, "
+                        f"treating as cache miss"
+                    )
+                else:
+                    request.prompt_cache = cache
+                    request.cached_tokens = cached_tokens
+                    request.remaining_tokens = remaining
+                    request._cache_detail = "prefix"
+                    logger.debug(
+                        f"Request {request.request_id}: cache hit, "
+                        f"{request.cached_tokens} tokens cached, "
+                        f"{len(remaining)} tokens remaining"
+                    )
+            else:
+                request.remaining_tokens = request.prompt_token_ids
+        else:
+            request.remaining_tokens = request.prompt_token_ids
+
+        # L2: Disk cache fallback when in-memory cache missed.
+        # Strip gen_prompt_len from the fetch key to match the store key.
+        # Thinking models append generation-prompt tokens that change between
+        # turns — the cache key must exclude them for consistent SHA-256 matching.
+        # Bypass: if the request set _bypass_prefix_cache, skip the disk L2
+        # fallback too (otherwise we'd service the request with stale state).
+        if (
+            request.prompt_cache is None
+            and self.disk_cache is not None
+            and not _bypass
+            and not getattr(request, "_paged_block_table_needs_worker_reconstruct", False)
+        ):
+            _disk_fetch_tokens = list(request.prompt_token_ids)
+            _gpl = getattr(request, "_gen_prompt_len", 0) or 0
+            if _gpl > 0 and _gpl < len(_disk_fetch_tokens):
+                _disk_fetch_tokens = _disk_fetch_tokens[:-_gpl]
+                _disk_suffix_tokens = list(request.prompt_token_ids[-_gpl:])
+            else:
+                _disk_suffix_tokens = []
+            disk_cache = self.disk_cache.fetch(_disk_fetch_tokens)
+            if disk_cache is not None:
+                # Disk cache stores full-precision N-1 tokens (last prompt token re-fed on hit)
+                # Dequantize if KV cache quantization is active (disk stores full precision
+                # but may have been quantized before storage in some paths)
+                _disk_needs_worker_dequant = False
+                if getattr(self, "_kv_cache_bits", 0):
+                    # As with L1 memory/prefix hits, do not create/evaluate
+                    # dequantized MLX arrays on the API thread. Worker-side
+                    # scheduling owns the stream-safe replay path.
+                    request._prompt_cache_needs_worker_dequant = True
+                    _disk_needs_worker_dequant = True
+                if disk_cache is None:
+                    # Dequantization failed — treat as full cache miss
+                    logger.info(
+                        f"Request {request.request_id}: disk cache dequantization "
+                        f"failed, treating as cache miss"
+                    )
+                else:
+                    request.prompt_cache = disk_cache
+                    remaining, cached_tokens = self._prefix_hit_tail_and_cached_tokens(
+                        fetch_tokens=_disk_fetch_tokens,
+                        remaining=[],
+                        gen_prompt_suffix=_disk_suffix_tokens,
+                    )
+                    request.cached_tokens = cached_tokens
+                    request.remaining_tokens = remaining
+                    # Annotate cache_detail: "disk+tq" for TQ-native 26x-compressed
+                    # files, "disk" for standard float16 format.
+                    _tq_disk = (
+                        hasattr(self.disk_cache, "_last_fetch_tq_native")
+                        and self.disk_cache._last_fetch_tq_native
+                    )
+                    request._cache_detail = "disk+tq" if _tq_disk else "disk"
+                    # Recover the original cache_type so the L1 backfill keeps
+                    # the same priority (system entries stay pinned across the
+                    # disk roundtrip — F3).
+                    _l1_type = getattr(
+                        self.disk_cache, "_last_fetch_cache_type", "assistant"
+                    )
+                    # Also populate L1 memory cache for faster subsequent hits.
+                    # Quantize for L1 if KV quant is enabled (disk stores full precision).
+                    l1_data = disk_cache
+                    if getattr(self, "_kv_cache_bits", 0) and not _disk_needs_worker_dequant:
+                        try:
+                            l1_data = self._quantize_cache_for_storage(disk_cache)
+                        except Exception:
+                            pass  # Store full-precision on quant failure
+                    if self.block_aware_cache is not None and not _disk_needs_worker_dequant:
+                        try:
+                            extracted = self._extract_cache_states(l1_data)
+                            if extracted:
+                                # Prompt-level disk L2 stores the cache under the
+                                # full prompt key but the cache payload itself is
+                                # prompt_len - 1, because the last prompt token is
+                                # re-fed to obtain first-token logits. Mirror that
+                                # N-1 key when backfilling the block cache. Then
+                                # route the current request through the paged path
+                                # so memory pressure can shrink the hit instead of
+                                # discarding it and full-prefilling a huge prompt.
+                                _block_store_tokens = (
+                                    _disk_fetch_tokens[:-1]
+                                    if len(_disk_fetch_tokens) > 1
+                                    else list(_disk_fetch_tokens)
+                                )
+                                _block_table = self.block_aware_cache.store_cache(
+                                    request.request_id,
+                                    _block_store_tokens,
+                                    extracted,
+                                    cache_type=_l1_type,
+                                )
+                                if _block_table is not None:
+                                    request.prompt_cache = None
+                                    request.block_table = _block_table
+                                    request.cached_tokens = int(
+                                        getattr(_block_table, "num_tokens", 0) or 0
+                                    )
+                                    request.shared_prefix_blocks = len(
+                                        getattr(_block_table, "block_ids", []) or []
+                                    )
+                                    request.remaining_tokens = (
+                                        self._remaining_tokens_after_cached_prefix(
+                                            request,
+                                            request.cached_tokens,
+                                        )
+                                    )
+                                    request._paged_block_table_needs_worker_reconstruct = True
+                                    request._cache_detail = (
+                                        "paged+disk+tq" if _tq_disk else "paged+disk"
+                                    )
+                                else:
+                                    # Clean up request table entry. Release request
+                                    # refs so blocks become cached-but-free.
+                                    _entry = self.block_aware_cache._request_tables.pop(
+                                        request.request_id, None
+                                    )
+                                    self.block_aware_cache.paged_cache.release_request_refs(
+                                        _entry.block_table if _entry else None
+                                    )
+                                    self.block_aware_cache.paged_cache.detach_request(
+                                        request.request_id
+                                    )
+                        except Exception:
+                            pass
+                    elif self.memory_aware_cache is not None and not _disk_needs_worker_dequant:
+                        try:
+                            _l1_store_tokens = (
+                                _disk_fetch_tokens[:-1]
+                                if len(_disk_fetch_tokens) > 1
+                                else list(_disk_fetch_tokens)
+                            )
+                            self.memory_aware_cache.store(
+                                _l1_store_tokens,
+                                l1_data,
+                                cache_type=_l1_type,
+                            )
+                        except Exception:
+                            pass
+                    elif self.prefix_cache is not None and not _disk_needs_worker_dequant:
+                        try:
+                            _l1_store_tokens = (
+                                _disk_fetch_tokens[:-1]
+                                if len(_disk_fetch_tokens) > 1
+                                else list(_disk_fetch_tokens)
+                            )
+                            self.prefix_cache.store_cache(
+                                _l1_store_tokens,
+                                l1_data,
+                                cache_type=_l1_type,
+                            )
+                        except Exception:
+                            pass
+                    logger.info(
+                        f"Request {request.request_id}: disk cache hit (L2), "
+                        f"{request.cached_tokens} tokens restored from disk"
+                    )
+
+        # Add to tracking
+        self.requests[request.request_id] = request
+        self.waiting.append(request)
+
+        logger.debug(
+            f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
+        )
+
+    def abort_request(self, request_id: str) -> bool:
+        """
+        Abort a request, cleaning up all associated resources.
+
+        This is the primary cleanup method for ALL request lifecycle paths:
+        normal completion, client disconnect, engine errors, and explicit
+        cancellation. It cleans up: waiting queue, running dict, BatchGenerator
+        UIDs, paged cache tracking, extracted KV cache refs, detokenizer state,
+        Metal memory cache, and the master requests registry.
+
+        IMPORTANT: BatchGenerator removal is DEFERRED to the next step() call.
+        Client disconnects can happen while Metal command buffers are in-flight.
+        Calling batch_generator.remove() immediately would touch cache tensors
+        mid-computation, triggering Metal assertion failures that crash the
+        process. The deferred approach lets the current Metal computation
+        complete before cleanup.
+
+        Safe to call multiple times (idempotent) — returns False on repeat calls.
+
+        Args:
+            request_id: The request ID to abort
+
+        Returns:
+            True if request was found and aborted, False otherwise
+        """
+        request = self.requests.pop(request_id, None)
+        if request is None:
+            return False
+
+        # Remove from waiting queue (safe — no Metal involvement)
+        if request.status == RequestStatus.WAITING:
+            try:
+                self.waiting.remove(request)
+            except ValueError:
+                pass
+
+        # DEFER BatchGenerator removal to step() — see docstring above.
+        # Only defer if the request is actually in the batch generator.
+        if request.request_id in self.request_id_to_uid:
+            self._pending_aborts.add(request.request_id)
+
+        # Clean up per-request stop tokens from shared BatchGenerator
+        # Must happen BEFORE removing from running, so we can still check
+        # which tokens are still needed by surviving requests.
+        added_stops = getattr(request, "_added_stop_tokens", None)
+        if added_stops and self.batch_generator is not None:
+            # Only remove tokens not needed by other running requests
+            surviving_stops = set()
+            for rid, req in self.running.items():
+                if rid != request.request_id:
+                    surviving_stops.update(getattr(req, "_added_stop_tokens", set()))
+            removable = added_stops - surviving_stops
+            if removable:
+                self.batch_generator.stop_tokens -= removable
+
+        # Remove from running (BatchGenerator) — DEFERRED.
+        # The actual batch_generator.remove() happens in _process_pending_aborts()
+        # which runs at the start of step() after Metal has synchronized.
+        # UID cleanup also deferred — done in _process_pending_aborts().
+
+        # Clean up paged cache tracking (prevent block table leaks)
+        # Use delete_block_table (not detach_request) so ref_counts are
+        # decremented — aborted requests don't store blocks in prefix cache,
+        # so detach would orphan them with permanently elevated ref_count.
+        if self.block_aware_cache is not None:
+            self.block_aware_cache._request_tables.pop(request_id, None)
+            self.block_aware_cache.paged_cache.delete_block_table(request_id)
+
+        # Clear extracted cache reference to help GC
+        if hasattr(request, "_extracted_cache"):
+            request._extracted_cache = None
+
+        # Clean up streaming detokenizer
+        self._cleanup_detokenizer(request_id)
+
+        if request_id in self.running:
+            del self.running[request_id]
+
+        # Mark as aborted
+        request.set_finished(RequestStatus.FINISHED_ABORTED)
+        self.finished_req_ids.add(request_id)
+
+        # Clear Metal memory cache if no other requests are running
+        if not self.running:
+            clear_mlx_memory_cache(log=logger)
+
+        logger.debug(f"Aborted request {request_id}")
+        return True
+
+    def _process_pending_aborts(self) -> None:
+        """Process deferred abort requests.
+
+        Called at the start of step() after the previous batch_generator.next()
+        has completed. At this point Metal has synchronized and it's safe to
+        call batch_generator.remove() without risking assertion failures on
+        in-flight command buffers.
+        """
+        aborts = list(self._pending_aborts)
+        self._pending_aborts.clear()
+        for request_id in aborts:
+            uid = self.request_id_to_uid.pop(request_id, None)
+            if uid is not None:
+                unregister_generation_logprobs(self.model, uid)
+                if self.batch_generator is not None:
+                    try:
+                        self.batch_generator.remove([uid])
+                    except Exception as e:
+                        logger.warning(
+                            f"Deferred abort remove failed for {request_id}: {e}"
+                        )
+                self.uid_to_request_id.pop(uid, None)
+            logger.debug(f"Processed deferred abort for {request_id}")
+
+    def has_requests(self) -> bool:
+        """Check if there are any pending or running requests."""
+        return bool(self.waiting or self.running)
+
+    def get_num_waiting(self) -> int:
+        """Get number of waiting requests."""
+        return len(self.waiting)
+
+    def get_num_running(self) -> int:
+        """Get number of running requests."""
+        return len(self.running)
+
+    def shutdown(self) -> None:
+        """Shutdown the scheduler and flush disk caches. Idempotent."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+
+        # Flush prompt-level disk cache (DiskCacheManager)
+        if getattr(self, "disk_cache", None) is not None:
+            logger.info("Shutting down prompt disk cache...")
+            self.disk_cache.shutdown()
+            logger.info("Prompt disk cache shutdown complete")
+
+        # Flush block-level disk cache (BlockDiskStore)
+        if hasattr(self, "paged_cache_manager") and self.paged_cache_manager:
+            disk_store = getattr(self.paged_cache_manager, "_disk_store", None)
+            if disk_store is not None:
+                logger.info("Shutting down block disk cache...")
+                disk_store.shutdown()
+                logger.info("Block disk cache shutdown complete")
+
+    def _finalize_hybrid_paged_cache_on_worker(
+        self,
+        request: Request,
+        reconstructed: List[Any],
+    ) -> Optional[List[Any]]:
+        """Attach SSM companion state to a paged KV hit on the llm-worker."""
+        block_table = getattr(request, "block_table", None)
+        fetch_num = getattr(block_table, "num_tokens", 0) if block_table else 0
+        ssm_tokens = list(
+            getattr(request, "_hybrid_ssm_fetch_tokens", None)
+            or request.prompt_token_ids
+            or []
+        )
+        request._hybrid_prompt_cache_needs_worker_ssm = False
+
+        if (
+            not self._is_hybrid
+            or self._uses_dsv4_cache
+            or self._uses_zaya_cache
+            or self._ssm_state_cache is None
+            or self.block_aware_cache is None
+            or block_table is None
+            or fetch_num <= 0
+        ):
+            return reconstructed
+
+        logger.info(
+            "SSM companion worker fetch: req=%s fetch_num=%d cache_size=%d "
+            "tokens_tail=%s",
+            request.request_id,
+            fetch_num,
+            len(getattr(self._ssm_state_cache, "_store", {})),
+            ssm_tokens[max(0, fetch_num - 8):fetch_num],
+        )
+
+        ssm_states = None
+        try:
+            entry = self._ssm_state_cache.fetch(ssm_tokens, fetch_num)
+        except Exception as e:
+            logger.debug(
+                "SSM companion worker fetch failed for %s: %s",
+                request.request_id,
+                e,
+            )
+            entry = None
+
+        if entry is not None:
+            ssm_states, is_complete = entry
+            if not is_complete:
+                logger.info(
+                    f"SSM companion for {request.request_id}: "
+                    "is_complete=False (gpl-contaminated), rejecting hit — "
+                    "full prefill"
+                )
+                ssm_states = None
+
+        # vmlx#91 RESUME: exact SSM miss, but a shorter complete companion may
+        # still be a valid prefix. Trim KV blocks to that checkpoint and re-run
+        # only the tail.
+        if not ssm_states:
+            resume_disabled = os.environ.get("VMLX_DISABLE_SSM_PREFIX_RESUME") in (
+                "1",
+                "true",
+                "True",
+                "yes",
+                "on",
+            )
+            missed_ck = None
+            block_size = int(getattr(self.block_aware_cache, "block_size", 0) or 0)
+            if not resume_disabled and block_size > 0:
+                try:
+                    missed_ck = self._fetch_block_aligned_ssm_checkpoint(
+                        request,
+                        max_len=fetch_num,
+                        block_size=block_size,
+                    )
+                except Exception:
+                    missed_ck = None
+            if missed_ck is not None:
+                ck_len, ck_states = missed_ck
+                trimmed = self.block_aware_cache.trim_block_table(
+                    request.request_id, ck_len
+                )
+                if (
+                    trimmed is not None
+                    and trimmed.num_tokens > 0
+                    and trimmed.num_tokens == ck_len
+                ):
+                    rereconstructed = self.block_aware_cache.reconstruct_cache(trimmed)
+                    if rereconstructed is not None and getattr(self, "_kv_cache_bits", 0):
+                        rereconstructed = self._dequantize_cache_for_use(
+                            rereconstructed
+                        )
+                    if rereconstructed is not None:
+                        block_table = trimmed
+                        request.block_table = trimmed
+                        request.cached_tokens = trimmed.num_tokens
+                        request.shared_prefix_blocks = len(trimmed.block_ids)
+                        reconstructed = rereconstructed
+                        ssm_states = ck_states
+                        request.remaining_tokens = self._remaining_tokens_after_cached_prefix(
+                            request,
+                            trimmed.num_tokens,
+                        )
+                        logger.info(
+                            f"Request {request.request_id}: vmlx#91 RESUME — "
+                            f"trimmed KV to {trimmed.num_tokens} tokens "
+                            f"(block-aligned with SSM checkpoint), "
+                            f"prefill tail: {len(request.remaining_tokens)} tokens"
+                        )
+                elif trimmed is not None:
+                    logger.info(
+                        "Request %s: vmlx#91 RESUME skipped — KV trim (%s) "
+                        "did not match SSM checkpoint (%s)",
+                        request.request_id,
+                        getattr(trimmed, "num_tokens", 0),
+                        ck_len,
+                    )
+
+        if not ssm_states and fetch_num > 0 and len(ssm_tokens) >= fetch_num:
+            boundary_tokens = list(ssm_tokens[:fetch_num])
+            try:
+                clean_cache = self._prefill_for_prompt_only_cache(boundary_tokens)
+                if clean_cache is not None:
+                    kv_set = set(self._hybrid_kv_positions or [])
+                    derived_states = []
+                    for layer_idx, c in enumerate(clean_cache):
+                        if layer_idx in kv_set:
+                            continue
+                        if hasattr(c, "cache") and isinstance(c.cache, list):
+                            from copy import deepcopy
+                            import mlx.core as mx
+
+                            cloned = deepcopy(c)
+                            cloned.cache = [
+                                mx.contiguous(mx.array(a))
+                                if a is not None
+                                else None
+                                for a in c.cache
+                            ]
+                            derived_states.append(cloned)
+                        else:
+                            derived_states.append(c)
+                    if derived_states:
+                        ssm_states = derived_states
+                        try:
+                            self._ssm_state_cache.store(
+                                boundary_tokens,
+                                fetch_num,
+                                derived_states,
+                            )
+                        except Exception:
+                            pass
+                        logger.info(
+                            "Request %s: synchronously derived SSM companion "
+                            "for block-aligned paged hit (%d tokens, %d layers)",
+                            request.request_id,
+                            fetch_num,
+                            len(derived_states),
+                        )
+                    del clean_cache
+                    clear_mlx_memory_cache(log=logger)
+            except Exception as e:
+                logger.info(
+                    "Request %s: synchronous SSM companion derive failed for "
+                    "%d-token paged hit: %s",
+                    request.request_id,
+                    fetch_num,
+                    e,
+                )
+
+        if not ssm_states:
+            try:
+                boundary_tokens = list(ssm_tokens[:fetch_num])
+                if (
+                    boundary_tokens
+                    and self._ssm_state_cache is not None
+                    and len(getattr(self._ssm_state_cache, "_store", {}))
+                    < self._ssm_state_cache.max_entries
+                ):
+                    if not hasattr(self, "_ssm_rederive_queue"):
+                        self._ssm_rederive_queue = []
+                    if (
+                        (boundary_tokens, fetch_num, request.request_id)
+                        not in self._ssm_rederive_queue
+                    ):
+                        if len(self._ssm_rederive_queue) >= SSM_REDERIVE_QUEUE_CAP:
+                            self._ssm_rederive_queue.pop(0)
+                        self._ssm_rederive_queue.append(
+                            (boundary_tokens, fetch_num, request.request_id)
+                        )
+                        logger.info(
+                            "SSM companion: queued block-boundary re-derive "
+                            "for %s (%d cache-key tokens after hybrid miss)",
+                            request.request_id,
+                            fetch_num,
+                        )
+            except Exception as e:
+                logger.debug(
+                    "SSM companion: failed to queue block-boundary re-derive "
+                    "for %s: %s",
+                    request.request_id,
+                    e,
+                )
+            logger.info(
+                f"Request {request.request_id}: hybrid paged MISS — "
+                f"{fetch_num} KV tokens cached but no usable SSM companion, "
+                "full prefill (blocks kept cached for future sessions)"
+            )
+            try:
+                self.block_aware_cache.detach_request(request.request_id)
+            except Exception:
+                pass
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            return None
+
+        full_cache = _fix_hybrid_cache(
+            reconstructed,
+            self.model,
+            kv_positions=self._hybrid_kv_positions,
+            num_model_layers=self._hybrid_num_layers,
+        )
+        if full_cache is None:
+            logger.warning(
+                f"Request {request.request_id}: hybrid cache expansion failed"
+            )
+            try:
+                self.block_aware_cache.release_cache(request.request_id)
+            except Exception:
+                pass
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            return None
+
+        kv_set = set(self._hybrid_kv_positions or [])
+        ssm_idx = 0
+        for layer_i in range(len(full_cache)):
+            if layer_i not in kv_set and ssm_idx < len(ssm_states):
+                full_cache[layer_i] = ssm_states[ssm_idx]
+                ssm_idx += 1
+        request.prompt_cache = full_cache
+        request._cache_detail = (
+            "paged+ssm+disk"
+            if getattr(request, "_paged_disk_hit", False)
+            else "paged+ssm"
+        )
+        request._cache_detail_ssm_layers = ssm_idx
+        logger.info(
+            f"Request {request.request_id}: hybrid paged HIT — "
+            f"{getattr(request.block_table, 'num_tokens', fetch_num)} tokens "
+            f"(KV + {ssm_idx} SSM layers)"
+        )
+        return full_cache
+
+    def _schedule_waiting(self) -> List[Request]:
+        """
+        Move requests from waiting queue to running.
+
+        Returns:
+            List of requests that were scheduled
+        """
+        scheduled = []
+
+        while self.waiting and len(self.running) < self.config.max_num_seqs:
+            # Memory-pressure guard: don't admit new requests if GPU memory is critically low
+            try:
+                import mlx.core as mx
+
+                # vmlx#94: prefer mx.* top-level APIs, fall back to mx.metal.*
+                active_mem, max_mem = get_effective_metal_working_set_bytes(mx)
+                guard_threshold = get_metal_ws_guard_threshold()
+                if max_mem > 0 and active_mem > 0 and len(self.running) > 0:
+                    if active_mem / max_mem * 100.0 >= guard_threshold:
+                        logger.debug(
+                            "Memory pressure (%.1fGB / %.1fGB = %.0f%%), "
+                            "deferring new request admission",
+                            active_mem / 1e9,
+                            max_mem / 1e9,
+                            active_mem / max_mem * 100.0,
+                        )
+                        break
+            except Exception:
+                pass  # Metal API not available — skip check
+
+            request = self.waiting.popleft()
+
+            # Ensure we have a batch generator
+            _cache_cleared = self._ensure_batch_generator(request.sampling_params)
+
+            if self.batch_generator is None:
+                # Put back and try again later
+                self.waiting.appendleft(request)
+                break
+
+            if _cache_cleared and (
+                request.prompt_cache is not None
+                or getattr(request, "_paged_block_table_needs_worker_reconstruct", False)
+            ):
+                logger.info(
+                    "Request %s: prefix cache hit invalidated by BatchGenerator "
+                    "recreation; falling back to full prefill",
+                    request.request_id,
+                )
+                request.prompt_cache = None
+                request.block_table = None
+                request.cached_tokens = 0
+                request.shared_prefix_blocks = 0
+                request.remaining_tokens = request.prompt_token_ids
+                request._cache_detail = None
+                request._paged_block_table_needs_worker_reconstruct = False
+                request._hybrid_prompt_cache_needs_worker_ssm = False
+                request._prompt_cache_needs_worker_dequant = False
+
+            # Track first-schedule time for TTFT (only set once per request)
+            if not hasattr(request, "_schedule_time"):
+                request._schedule_time = time.perf_counter()
+
+            # Determine tokens to process and cache to use
+            # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
+            # is falsy in Python. For exact cache match, remaining_tokens=[] but we should
+            # pass just the last token so BatchGenerator can start generation.
+            if (
+                request.remaining_tokens is not None
+                and len(request.remaining_tokens) == 0
+            ):
+                # Exact cache match - pass only last token for generation kickoff
+                tokens_to_process = request.prompt_token_ids[-1:]
+            elif request.remaining_tokens:
+                tokens_to_process = request.remaining_tokens
+            else:
+                tokens_to_process = request.prompt_token_ids
+            cache_to_use = request.prompt_cache  # May be None
+            cache_execution: Optional[Dict[str, Any]] = None
+            if (
+                getattr(request, "cached_tokens", 0)
+                or getattr(request, "_cache_detail", None)
+                or getattr(request, "_paged_block_table_needs_worker_reconstruct", False)
+                or getattr(request, "_prompt_cache_needs_worker_dequant", False)
+            ):
+                _block_table_for_stats = getattr(request, "block_table", None)
+                cache_execution = {
+                    "request_id": request.request_id,
+                    "cache_detail": getattr(request, "_cache_detail", None),
+                    "cached_tokens": int(getattr(request, "cached_tokens", 0) or 0),
+                    "blocks": len(getattr(_block_table_for_stats, "block_ids", []) or []),
+                    "selection": getattr(request, "_cache_selection", None),
+                    "reconstructed": False,
+                    "dequantized": False,
+                    "reconstruction_seconds": 0.0,
+                    "dequantization_seconds": 0.0,
+                    "total_worker_cache_seconds": 0.0,
+                }
+                _cache_worker_start = time.perf_counter()
+            else:
+                _cache_worker_start = 0.0
+
+            if getattr(request, "_paged_block_table_needs_worker_reconstruct", False):
+                block_table = getattr(request, "block_table", None)
+                _t_reconstruct = time.perf_counter()
+                cache_to_use = (
+                    self.block_aware_cache.reconstruct_cache(block_table)
+                    if self.block_aware_cache is not None and block_table is not None
+                    else None
+                )
+                self._dsv4_trace_timing(
+                    "reconstruct_cache",
+                    _t_reconstruct,
+                    request.request_id,
+                    cached_tokens=getattr(block_table, "num_tokens", 0) if block_table else 0,
+                    blocks=len(getattr(block_table, "block_ids", []) or []) if block_table else 0,
+                    ok=cache_to_use is not None,
+                )
+                if cache_execution is not None:
+                    cache_execution["reconstruction_seconds"] = round(
+                        time.perf_counter() - _t_reconstruct,
+                        6,
+                    )
+                    cache_execution["reconstructed"] = cache_to_use is not None
+                    cache_execution["reconstruction_ok"] = cache_to_use is not None
+                request._paged_block_table_needs_worker_reconstruct = False
+                if cache_to_use is None:
+                    # mlxstudio#73: a failed reconstruct follows a fetch that
+                    # owns block refs; release them before falling back.
+                    logger.info(
+                        f"Request {request.request_id}: worker-side paged cache "
+                        "reconstruction failed, treating as cache miss"
+                    )
+                    # mlxstudio#73: release fetched block refs before full-prefill fallback.
+                    try:
+                        if self.block_aware_cache is not None:
+                            self.block_aware_cache.release_cache(request.request_id)
+                    except Exception as _rel_err:
+                        logger.debug(
+                            f"release_cache after worker reconstruct failure "
+                            f"threw ({type(_rel_err).__name__}): {_rel_err}"
+                        )
+                    request.prompt_cache = None
+                    request.cached_tokens = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                    tokens_to_process = request.prompt_token_ids
+                    request._hybrid_prompt_cache_needs_worker_ssm = False
+                    request._prompt_cache_needs_worker_dequant = False
+                else:
+                    request.prompt_cache = cache_to_use
+
+            # DSV4 q4/q8 prefix cache restore must happen on the llm-worker
+            # that owns the MLX stream. add_request() runs on the API/event
+            # loop thread, so only block lookup and lightweight object
+            # reconstruction are allowed there.
+            if (
+                cache_to_use is not None
+                and getattr(request, "_prompt_cache_needs_worker_dequant", False)
+            ):
+                _t_dequant = time.perf_counter()
+                cache_to_use = self._dequantize_cache_for_use(cache_to_use)
+                if cache_execution is not None:
+                    cache_execution["dequantization_seconds"] = round(
+                        time.perf_counter() - _t_dequant,
+                        6,
+                    )
+                    cache_execution["dequantized"] = cache_to_use is not None
+                    cache_execution["dequantization_ok"] = cache_to_use is not None
+                if cache_to_use is None:
+                    logger.info(
+                        f"Request {request.request_id}: worker-side DSV4 cache "
+                        f"dequantization failed, treating as cache miss"
+                    )
+                    self._release_unusable_paged_hit(request)
+                    request.prompt_cache = None
+                    request.cached_tokens = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                    tokens_to_process = request.prompt_token_ids
+                else:
+                    request.prompt_cache = cache_to_use
+                    request._prompt_cache_needs_worker_dequant = False
+
+            if (
+                cache_to_use is not None
+                and getattr(request, "_hybrid_prompt_cache_needs_worker_ssm", False)
+            ):
+                cache_to_use = self._finalize_hybrid_paged_cache_on_worker(
+                    request, cache_to_use
+                )
+                tokens_to_process = (
+                    request.remaining_tokens
+                    if request.remaining_tokens is not None
+                    else request.prompt_token_ids
+                )
+                if len(tokens_to_process) == 0:
+                    tokens_to_process = request.prompt_token_ids[-1:]
+
+            # Validate cache before using it
+            if cache_to_use is not None:
+                if not self._validate_cache(cache_to_use):
+                    logger.warning(
+                        f"Request {request.request_id}: invalid cache, "
+                        f"proceeding without cache"
+                    )
+                    self._release_unusable_paged_hit(request)
+                    cache_to_use = None
+                    request.prompt_cache = None
+                    request.cached_tokens = 0
+                    request.remaining_tokens = request.prompt_token_ids
+                    tokens_to_process = request.prompt_token_ids
+                else:
+                    # Check memory: _merge_caches doubles cache memory temporarily
+                    # Skip cache if available memory is tight
+                    try:
+                        from .memory_cache import estimate_kv_cache_memory
+
+                        cache_bytes = estimate_kv_cache_memory(cache_to_use)
+                        import psutil
+
+                        avail = psutil.virtual_memory().available
+                        # Memory amplification during merge depends on the cache
+                        # object we are about to insert, not just the configured
+                        # q4/q8 storage mode. Some fetch paths already dequantize
+                        # before reaching this point.
+                        multiplier = self._cache_merge_memory_multiplier(cache_to_use)
+                        needed = cache_bytes * multiplier
+                        budget_fraction = self._cache_reuse_budget_fraction()
+                        merge_budget = avail * budget_fraction
+                        if needed > merge_budget:
+                            (
+                                partial_cache,
+                                partial_tokens_to_process,
+                            ) = self._shrink_paged_cache_for_memory(
+                                request=request,
+                                cache_to_use=cache_to_use,
+                                cache_bytes=cache_bytes,
+                                available_bytes=avail,
+                                multiplier=multiplier,
+                                budget_fraction=budget_fraction,
+                            )
+                            if partial_cache is not None:
+                                cache_to_use = partial_cache
+                                tokens_to_process = partial_tokens_to_process or (
+                                    request.remaining_tokens
+                                    if request.remaining_tokens is not None
+                                    else request.prompt_token_ids
+                                )
+                                if len(tokens_to_process) == 0:
+                                    tokens_to_process = request.prompt_token_ids[-1:]
+                            else:
+                                self._record_cache_reuse_skip(
+                                    request=request,
+                                    cache_to_use=cache_to_use,
+                                    cache_bytes=cache_bytes,
+                                    available_bytes=avail,
+                                    needed_bytes=needed,
+                                    merge_budget_bytes=merge_budget,
+                                    multiplier=multiplier,
+                                    budget_fraction=budget_fraction,
+                                )
+                                self._release_unusable_paged_hit(request)
+                                cache_to_use = None
+                                request.prompt_cache = None
+                                request.cached_tokens = 0
+                                request.remaining_tokens = request.prompt_token_ids
+                                tokens_to_process = request.prompt_token_ids
+                    except ImportError:
+                        pass  # psutil is a required dep but handle gracefully
+                    except Exception as e:
+                        logger.debug(f"Memory check failed, skipping: {e}")
+
+            # Insert into BatchGenerator with optional cache.
+            # Wrapped in try/except to prevent lost requests — if insert fails
+            # completely, put the request back in the waiting queue.
+            try:
+                try:
+                    insert_kwargs = {}
+                    if (
+                        self.batch_generator.__class__.__name__
+                        == "DSV4BatchGenerator"
+                    ):
+                        # DSV4's custom generator applies repetition penalty
+                        # itself during its pinned-stream decode loop. Pass the
+                        # full original prompt so prefix-cache hit paths and
+                        # normal prefill paths use the same logits-processor
+                        # context instead of only the re-fed tail token. The
+                        # processor itself must still use generate_step
+                        # semantics: final prompt token plus generated output,
+                        # not the full user prompt. Exact-copy/code prompts put
+                        # target identifiers in the prompt; penalizing that
+                        # entire prompt corrupts valid repeats.
+                        insert_kwargs["all_tokens"] = [request.prompt_token_ids]
+                        request_processors = self._request_logits_processors(
+                            request, list(request.prompt_token_ids)
+                        )
+                        if request_processors is not None:
+                            insert_kwargs["logits_processors"] = [
+                                request_processors
+                            ]
+                    else:
+                        request_processors = self._request_logits_processors(
+                            request, list(tokens_to_process)
+                        )
+                        if request_processors is not None:
+                            insert_kwargs["logits_processors"] = [
+                                request_processors
+                            ]
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process],
+                        max_tokens=[request.sampling_params.max_tokens],
+                        caches=[cache_to_use] if cache_to_use else None,
+                        **insert_kwargs,
+                    )
+                except Exception as e:
+                    # Cache-related insertion failure - retry without cache
+                    if cache_to_use is not None:
+                        logger.warning(
+                            f"Request {request.request_id}: cache insertion failed "
+                            f"({type(e).__name__}: {e}), retrying without cache"
+                        )
+                        cache_to_use = None
+                        request.prompt_cache = None
+                        request.cached_tokens = 0
+                        request.remaining_tokens = request.prompt_token_ids
+                        tokens_to_process = request.prompt_token_ids
+                        insert_kwargs = {}
+                        if (
+                            self.batch_generator.__class__.__name__
+                            == "DSV4BatchGenerator"
+                        ):
+                            insert_kwargs["all_tokens"] = [request.prompt_token_ids]
+                            request_processors = self._request_logits_processors(
+                                request, list(request.prompt_token_ids)
+                            )
+                            if request_processors is not None:
+                                insert_kwargs["logits_processors"] = [
+                                    request_processors
+                                ]
+                        else:
+                            request_processors = self._request_logits_processors(
+                                request, list(tokens_to_process)
+                            )
+                            if request_processors is not None:
+                                insert_kwargs["logits_processors"] = [
+                                    request_processors
+                                ]
+                        uids = self.batch_generator.insert(
+                            [tokens_to_process],
+                            max_tokens=[request.sampling_params.max_tokens],
+                            caches=None,
+                            **insert_kwargs,
+                        )
+                    else:
+                        raise
+            except Exception as e:
+                # Both insert attempts failed — put request back to avoid permanent loss
+                logger.error(
+                    f"Request {request.request_id}: insert failed completely "
+                    f"({type(e).__name__}: {e}), returning to waiting queue"
+                )
+                self.waiting.appendleft(request)
+                break
+
+            if uids:
+                uid = uids[0]
+                self.request_id_to_uid[request.request_id] = uid
+                self.uid_to_request_id[uid] = request.request_id
+                request.batch_uid = uid
+                if request.sampling_params.logprobs:
+                    register_generation_logprobs(self.model, uid)
+                request.status = RequestStatus.RUNNING
+                if cache_execution is not None and request.cached_tokens > 0:
+                    cache_execution["total_worker_cache_seconds"] = round(
+                        max(0.0, time.perf_counter() - _cache_worker_start),
+                        6,
+                    )
+                    request._cache_execution = {
+                        key: value
+                        for key, value in cache_execution.items()
+                        if value is not None
+                    }
+                    self._last_cache_execution = dict(request._cache_execution)
+                self.running[request.request_id] = request
+                scheduled.append(request)
+
+                # H1 parity: Add per-request stop tokens to shared batch generator
+                # Track additions so they can be removed on cleanup
+                if (
+                    request.sampling_params.stop_token_ids
+                    and self.batch_generator is not None
+                ):
+                    new_tokens = set(request.sampling_params.stop_token_ids)
+                    self.batch_generator.stop_tokens.update(new_tokens)
+                    request._added_stop_tokens = new_tokens
+
+                self.total_prompt_tokens += request.num_prompt_tokens
+                self._record_scheduled_cache_hit(request)
+                cache_info = (
+                    f", {request.cached_tokens} cached"
+                    if request.cached_tokens > 0
+                    else ""
+                )
+                logger.debug(
+                    f"Scheduled request {request.request_id} (uid={uid}) "
+                    f"with {request.num_prompt_tokens} tokens{cache_info}"
+                )
+
+        return scheduled
+
+    def _process_batch_responses(
+        self, responses: List[Any]
+    ) -> Tuple[List[RequestOutput], Set[str]]:
+        """
+        Process responses from BatchGenerator.
+
+        Args:
+            responses: List of BatchGenerator.Response objects
+
+        Returns:
+            Tuple of (outputs, finished_request_ids)
+        """
+        outputs = []
+        finished_ids = set()
+
+        for response in responses:
+            request_id = self.uid_to_request_id.get(response.uid)
+            if request_id is None:
+                continue
+
+            request = self.running.get(request_id)
+            if request is None:
+                continue
+
+            # Append token to request
+            if hasattr(response, "token"):
+                is_first_token = request.num_computed_tokens == 0
+                request.append_output_token(response.token)
+                if is_first_token and hasattr(request, "_schedule_time"):
+                    ttft = time.perf_counter() - request._schedule_time
+                    self._ewma_ttft = (
+                        self._ttft_alpha * ttft
+                        + (1 - self._ttft_alpha) * self._ewma_ttft
+                    )
+            else:
+                continue
+
+            # ── Prompt Lookup Decoding — measurement (Phase 1) ──────────────
+            # Retrospectively check whether the previous draft prediction was
+            # correct, then generate a new draft for the next position.
+            # Zero effect on generation output; pure stat collection.
+            # Gated on _pld_spec_enabled to avoid find_draft_tokens overhead
+            # on servers not using PLD.
+            if self._pld_spec_enabled:
+                try:
+                    current_idx = (
+                        request.num_output_tokens - 1
+                    )  # 0-based, just appended
+                    pending = self._pld_pending.get(request_id)
+                    if pending is not None:
+                        draft_tokens, start_idx, hit_count = pending
+                        pos = current_idx - start_idx
+                        if 0 <= pos < len(draft_tokens):
+                            if response.token == draft_tokens[pos]:
+                                hit_count += 1
+                                if pos == 0:
+                                    pld_stats.first_hit += 1
+                                pld_stats.total_hit_depth += 1
+                                self._pld_pending[request_id] = (
+                                    draft_tokens,
+                                    start_idx,
+                                    hit_count,
+                                )
+                            else:
+                                # Miss — record completed sequence and clear
+                                pld_stats.completed_seqs += 1
+                                del self._pld_pending[request_id]
+                        else:
+                            pld_stats.completed_seqs += 1
+                            del self._pld_pending[request_id]
+
+                    if request_id not in self._pld_pending:
+                        full_tokens = list(request.prompt_token_ids) + list(
+                            request.output_token_ids
+                        )
+                        drafts = find_draft_tokens(full_tokens)
+                        if drafts:
+                            pld_stats.draft_found += 1
+                            self._pld_pending[request_id] = (
+                                drafts,
+                                request.num_output_tokens,
+                                0,
+                            )
+
+                    pld_stats.total_tokens += 1
+                    if pld_stats.total_tokens % 200 == 0:
+                        pld_stats.log_summary()
+                except Exception:
+                    pass  # Never let measurement break generation
+            # ── end PLD measurement ──────────────────────────────────────────
+
+            # ── PLD Phase 2: speculative extension ───────────────────────────
+            # Attempt to accept K draft tokens + bonus in one forward pass.
+            # spec_tokens = [d1, ..., d_M, bonus_token] if any accepted; else []
+            # Any stop token in spec_tokens truncates the list at that point.
+            spec_tokens: List[int] = []
+            spec_hit_stop = False
+            _step_t0 = time.perf_counter()
+            if (
+                self._pld_spec_enabled
+                and self._pld_auto_enabled
+                and not request.sampling_params.logprobs
+                and response.finish_reason is None
+                and self.batch_generator is not None
+            ):
+                try:
+                    _pld_t0 = time.perf_counter()
+                    raw_spec = self._try_speculative_decode(
+                        request_id, request, response.token
+                    )
+                    self._pld_win_cycle_wall_s += time.perf_counter() - _pld_t0
+                    _spec_stops = self.stop_tokens | set(
+                        request.sampling_params.stop_token_ids or []
+                    )
+                    for tok in raw_spec:
+                        if tok in _spec_stops:
+                            spec_hit_stop = True
+                            break
+                        spec_tokens.append(tok)
+                        request.append_output_token(tok)
+                except Exception:
+                    spec_tokens = []  # never let speculative break generation
+            # ── end PLD Phase 2 ───────────────────────────────────────────────
+
+            # Use streaming detokenizer for correct multi-byte char handling
+            detok = self._get_detokenizer(request_id)
+
+            # Check if finished BEFORE adding token to detokenizer
+            # so stop tokens (e.g. <|im_end|>) don't leak into new_text
+            is_stop = response.finish_reason == "stop" or spec_hit_stop
+            string_stop_truncate = -1  # >=0 when string stop matched
+
+            if not is_stop:
+                # Capture text start so we can diff after adding all tokens
+                text_before = detok.text
+                detok.add_token(response.token)
+                for tok in spec_tokens:
+                    detok.add_token(tok)
+                new_text = detok.text[len(text_before) :]
+
+                # Advance the per-request reasoning state machine on every
+                # emitted token. No-op when no reasoning parser is registered
+                # or `_use_sm_stops` is disabled. See decisions.md D-A2-005,
+                # D-A2-006.
+                self._advance_request_state_machine(
+                    request, [response.token, *spec_tokens]
+                )
+
+                # Post-decode string stop sequence check.
+                # BatchGenerator only handles integer stop_token_ids;
+                # string stop sequences need decoded-text matching.
+                # Skip matching inside reasoning blocks — reasoning content
+                # should not trigger user-specified stop sequences.
+                if request.sampling_params.stop:
+                    full_text = detok.text
+                    # Prefer the token-level state machine when the parser
+                    # provided tag tokens. Fall back to the legacy substring
+                    # scan for parsers without tag-token support (e.g.
+                    # `Gemma4ReasoningParser`, `GptOssReasoningParser`)
+                    # so behaviour matches the pre-Phase-3c baseline for
+                    # those models.
+                    if self._reasoning_sm is not None:
+                        in_think = self._is_request_in_reasoning(request)
+                    else:
+                        in_think = (
+                            "<think>" in full_text
+                            and "</think>" not in full_text.split("<think>")[-1]
+                        )
+                    if not in_think:
+                        max_stop_len = max(len(s) for s in request.sampling_params.stop)
+                        search_start = max(
+                            0, len(full_text) - len(new_text) - max_stop_len + 1
+                        )
+                        last_think_end = full_text.rfind("</think>")
+                        if last_think_end >= 0:
+                            search_start = max(
+                                search_start, last_think_end + len("</think>")
+                            )
+                        for stop_str in request.sampling_params.stop:
+                            idx = full_text.find(stop_str, search_start)
+                            if idx >= 0:
+                                string_stop_truncate = idx
+                                new_text = ""
+                                break
+            else:
+                # Stop token: don't decode it, just flush any buffered text
+                new_text = ""
+
+            # Create output — include cache_detail and base token + any accepted spec tokens
+            if request.sampling_params.logprobs:
+                token_logprobs = _format_token_logprobs_for_output(
+                    response.token,
+                    getattr(response, "logprobs", None),
+                    request.sampling_params.top_logprobs,
+                )
+                if token_logprobs is not None:
+                    request.output_logprobs.append(token_logprobs)
+
+            _detail = getattr(request, "_cache_detail", "")
+            # Annotate TQ if active (skip if already annotated, e.g. "disk+tq")
+            if _detail and getattr(self, "_tq_active", False) and "+tq" not in _detail:
+                _detail += "+tq"
+            execution = getattr(request, "_cache_execution", None)
+            if isinstance(execution, dict) and _detail:
+                execution["cache_detail"] = _detail
+                request._cache_execution = dict(execution)
+                self._last_cache_execution = dict(request._cache_execution)
+            output = RequestOutput(
+                request_id=request_id,
+                new_token_ids=[response.token] + spec_tokens,
+                new_text=new_text,
+                output_token_ids=list(request.output_token_ids),
+                prompt_tokens=request.num_prompt_tokens,
+                completion_tokens=request.num_output_tokens,
+                cached_tokens=request.cached_tokens,
+                cache_detail=_detail,
+                logprobs=(
+                    list(request.output_logprobs)
+                    if request.sampling_params.logprobs
+                    else None
+                ),
+            )
+
+            # Determine effective finish reason (string stop or spec stop override)
+            finish_reason = response.finish_reason
+            if spec_hit_stop:
+                finish_reason = "stop"
+            if string_stop_truncate >= 0:
+                finish_reason = "stop"
+
+            # Check if finished
+            if finish_reason is not None:
+                if finish_reason == "stop":
+                    request.set_finished(RequestStatus.FINISHED_STOPPED)
+                elif finish_reason == "length":
+                    request.set_finished(RequestStatus.FINISHED_LENGTH_CAPPED)
+
+                output.finished = True
+                output.finish_reason = finish_reason
+                finished_ids.add(request_id)
+
+                # Finalize detokenizer and use its complete text
+                detok.finalize()
+                if string_stop_truncate >= 0:
+                    output.output_text = detok.text[:string_stop_truncate]
+                else:
+                    output.output_text = detok.text
+                request.output_text = output.output_text
+
+                # For string stop: tell BatchGenerator to stop generating
+                if string_stop_truncate >= 0 and self.batch_generator is not None:
+                    uid = self.request_id_to_uid.get(request_id)
+                    if uid is not None:
+                        try:
+                            self.batch_generator.remove([uid])
+                        except Exception:
+                            pass
+
+                # Extract cache for future reuse
+                if (
+                    hasattr(response, "prompt_cache")
+                    and not getattr(request, "_bypass_prefix_cache", False)
+                ):
+                    try:
+                        # CLEAN PROMPT-BOUNDARY SNAPSHOT (DSV4 fast path).
+                        #
+                        # DSV4BatchGenerator captures a deep-copy of the
+                        # cache state IMMEDIATELY after prefill — before
+                        # decode mutates the live cache. That snapshot is
+                        # the *correct* prompt-boundary state for prefix
+                        # cache + L2 disk store, free of SWA wrap and
+                        # CSA/HCA pool drift. When present, prefer it
+                        # over the live `prompt_cache` and skip the
+                        # truncation guard entirely.
+                        snapshot_cache = getattr(
+                            response, "prompt_cache_snapshot", None
+                        )
+
+                        # prompt_cache may be callable or direct attribute
+                        if callable(response.prompt_cache):
+                            raw_cache = response.prompt_cache()
+                        else:
+                            raw_cache = response.prompt_cache
+
+                        if raw_cache:
+                            request._extracted_cache_from_prompt_snapshot = False
+                            # For paged cache, extract actual tensor states
+                            # This allows cache to survive BatchGenerator recreation
+                            if self.block_aware_cache is not None:
+                                # Skip re-extraction for full cache-hit requests.
+                                # Blocks already exist from the original cold store.
+                                if hasattr(
+                                    request, "cached_tokens"
+                                ) and request.cached_tokens >= len(
+                                    request.prompt_token_ids
+                                ):
+                                    pass  # Already cached, nothing to do
+                                else:
+                                    prompt_len = len(request.prompt_token_ids)
+                                    if snapshot_cache is not None:
+                                        # Snapshot was captured at the
+                                        # prompt boundary — use it
+                                        # DIRECTLY. No truncation, no
+                                        # rewind, no guard.
+                                        snapshot_family = (
+                                            "ZAYA"
+                                            if self._uses_zaya_cache
+                                            else "DSV4"
+                                            if self._uses_dsv4_cache
+                                            else "Path-dependent"
+                                        )
+                                        logger.info(
+                                            f"{snapshot_family} prefix cache store using "
+                                            f"clean prompt-boundary snapshot "
+                                            f"({len(snapshot_cache)} layers, "
+                                            f"prompt_len={prompt_len}). No "
+                                            f"truncation needed."
+                                        )
+                                        cache_for_extract = snapshot_cache
+                                    elif self._uses_dsv4_cache:
+                                        # DSV4 cache-hit kickoff responses can
+                                        # arrive without a generator-captured
+                                        # prompt snapshot. The live cache has
+                                        # then processed the remaining prompt
+                                        # tail plus generated tokens, so
+                                        # trimming it would rewind SWA without
+                                        # proving CSA/HCA pool correctness.
+                                        #
+                                        # If this request already came from a
+                                        # paged-prefix hit, do NOT synchronously
+                                        # re-prefill the whole expanded prompt
+                                        # just to donate a longer prefix. A real
+                                        # live row showed a 7,719-token hit with
+                                        # only 38 remaining tokens still spent
+                                        # ~70s in this post-hit re-prefill
+                                        # before returning. The existing N-1
+                                        # terminal DeepseekV4Cache record is the
+                                        # correctness-safe cache point; later
+                                        # requests can reuse it and re-feed the
+                                        # cheap tail until an async extension
+                                        # store exists.
+                                        if (
+                                            int(
+                                                getattr(
+                                                    request, "cached_tokens", 0
+                                                )
+                                                or 0
+                                            )
+                                            > 0
+                                        ):
+                                            logger.info(
+                                                "DSV4 prefix cache store skipped "
+                                                "for cache-hit request %s "
+                                                "(cached_tokens=%s, prompt_len=%s): "
+                                                "avoiding synchronous full "
+                                                "prompt-boundary re-prefill.",
+                                                request.request_id,
+                                                getattr(request, "cached_tokens", 0),
+                                                len(request.prompt_token_ids),
+                                            )
+                                            cache_for_extract = None
+                                            request._dsv4_cache_hit_store_skipped = True
+                                        else:
+                                            # No snapshot and no prefix hit:
+                                            # re-derive the exact N-1 cache-key
+                                            # state instead of trimming the live
+                                            # post-generation cache.
+                                            dsv4_prompt_tokens = list(
+                                                request.prompt_token_ids
+                                            )
+                                            _gpl_d = (
+                                                getattr(request, "_gen_prompt_len", 0)
+                                                or 0
+                                            )
+                                            if 0 < _gpl_d < len(dsv4_prompt_tokens):
+                                                dsv4_prompt_tokens = dsv4_prompt_tokens[
+                                                    :-_gpl_d
+                                                ]
+                                            dsv4_key_tokens = (
+                                                dsv4_prompt_tokens[:-1]
+                                                if len(dsv4_prompt_tokens) > 1
+                                                else []
+                                            )
+                                            try:
+                                                from .utils.dsv4_batch_generator import (
+                                                    dsv4_prompt_snapshot_min_tokens as _resolve_dsv4_prompt_snapshot_min_tokens,
+                                                )
+
+                                                dsv4_prompt_snapshot_min_tokens = (
+                                                    _resolve_dsv4_prompt_snapshot_min_tokens()
+                                                )
+                                            except Exception:
+                                                dsv4_prompt_snapshot_min_tokens = 256
+                                            if (
+                                                len(dsv4_key_tokens)
+                                                < dsv4_prompt_snapshot_min_tokens
+                                            ):
+                                                logger.info(
+                                                    "DSV4 prefix cache store skipped "
+                                                    "for request %s: prompt below snapshot/store threshold "
+                                                    "(cache_key_tokens=%d < %d).",
+                                                    request.request_id,
+                                                    len(dsv4_key_tokens),
+                                                    dsv4_prompt_snapshot_min_tokens,
+                                                )
+                                                cache_for_extract = None
+                                                request._dsv4_short_prompt_store_skipped = True
+                                            elif dsv4_key_tokens:
+                                                logger.info(
+                                                    "DSV4 prefix cache store using "
+                                                    "clean prompt-boundary re-prefill "
+                                                    "(%d cache-key tokens from %d "
+                                                    "prompt tokens).",
+                                                    len(dsv4_key_tokens),
+                                                    len(dsv4_prompt_tokens),
+                                                )
+                                                cache_for_extract = (
+                                                    self._prefill_for_prompt_only_cache(
+                                                        dsv4_key_tokens
+                                                    )
+                                                )
+                                                if cache_for_extract is not None:
+                                                    request._extracted_cache_key_tokens = (
+                                                        list(dsv4_key_tokens)
+                                                    )
+                                                    request._extracted_cache_from_prompt_snapshot = True
+                                            else:
+                                                cache_for_extract = None
+                                    elif self._uses_zaya_cache:
+                                        # ZAYA CCA cache is path-dependent:
+                                        # CacheList(KVCache, ArraysCache)
+                                        # stores standard KV plus CCA
+                                        # conv_state/prev_hs. The live cache
+                                        # returned after decode has already
+                                        # absorbed generated tokens in the CCA
+                                        # state and cannot be rewound safely.
+                                        #
+                                        # Store the same N-1 key used by the
+                                        # paged-prefix path by running a clean
+                                        # prompt-only prefill for exactly those
+                                        # key tokens. This is slower on cold
+                                        # store but preserves exact typed CCA
+                                        # semantics and enables correct paged/L2
+                                        # reuse on the next identical prefix.
+                                        zaya_prompt_tokens = list(
+                                            request.prompt_token_ids
+                                        )
+                                        _gpl_z = (
+                                            getattr(request, "_gen_prompt_len", 0)
+                                            or 0
+                                        )
+                                        if 0 < _gpl_z < len(zaya_prompt_tokens):
+                                            zaya_prompt_tokens = zaya_prompt_tokens[
+                                                :-_gpl_z
+                                            ]
+                                        zaya_key_tokens = (
+                                            zaya_prompt_tokens[:-1]
+                                            if len(zaya_prompt_tokens) > 1
+                                            else []
+                                        )
+                                        if zaya_key_tokens:
+                                            logger.info(
+                                                "ZAYA prefix cache store using "
+                                                "clean prompt-boundary re-prefill "
+                                                "(%d cache-key tokens from %d "
+                                                "prompt tokens).",
+                                                len(zaya_key_tokens),
+                                                len(zaya_prompt_tokens),
+                                            )
+                                            cache_for_extract = (
+                                                self._prefill_for_prompt_only_cache(
+                                                    zaya_key_tokens
+                                                )
+                                            )
+                                            if cache_for_extract is not None:
+                                                request._extracted_cache_key_tokens = (
+                                                    list(zaya_key_tokens)
+                                                )
+                                                request._extracted_cache_from_prompt_snapshot = True
+                                        else:
+                                            cache_for_extract = None
+                                    elif self._model_has_mixed_attention(self.model):
+                                        # Mixed full/sliding-window attention
+                                        # models (Step3p7, Gemma4, MiMo, etc.)
+                                        # use RotatingKVCache for SWA layers.
+                                        # Once the live cache has advanced
+                                        # through decode, prompt-boundary rewind
+                                        # is unsafe when the rotating window has
+                                        # wrapped. Use the same N-1 clean
+                                        # prompt-boundary prefill contract as
+                                        # other path-dependent cache families
+                                        # instead of trimming live post-decode
+                                        # state.
+                                        mixed_prompt_tokens = list(
+                                            request.prompt_token_ids
+                                        )
+                                        _gpl_mixed = (
+                                            getattr(request, "_gen_prompt_len", 0)
+                                            or 0
+                                        )
+                                        if 0 < _gpl_mixed < len(mixed_prompt_tokens):
+                                            mixed_prompt_tokens = mixed_prompt_tokens[
+                                                :-_gpl_mixed
+                                            ]
+                                        mixed_key_tokens = (
+                                            mixed_prompt_tokens[:-1]
+                                            if len(mixed_prompt_tokens) > 1
+                                            else []
+                                        )
+                                        if mixed_key_tokens:
+                                            logger.info(
+                                                "Mixed-SWA prefix cache store using "
+                                                "clean prompt-boundary re-prefill "
+                                                "(%d cache-key tokens from %d "
+                                                "prompt tokens).",
+                                                len(mixed_key_tokens),
+                                                len(mixed_prompt_tokens),
+                                            )
+                                            cache_for_extract = (
+                                                self._prefill_for_prompt_only_cache(
+                                                    mixed_key_tokens
+                                                )
+                                            )
+                                            if cache_for_extract is not None:
+                                                request._extracted_cache_key_tokens = (
+                                                    list(mixed_key_tokens)
+                                                )
+                                                request._extracted_cache_from_prompt_snapshot = True
+                                        else:
+                                            cache_for_extract = None
+                                    else:
+                                        # Paged cache: truncate to N-1 tokens so the
+                                        # last prompt token can be re-fed on cache hit.
+                                        # Without this, the last token's KV would be
+                                        # duplicated with wrong positional encoding.
+                                        cache_for_extract = (
+                                            self._truncate_cache_to_prompt_length(
+                                                raw_cache, prompt_len
+                                            )
+                                        )
+
+                                    if cache_for_extract is not None:
+                                        # TQ re-wrap: BatchKVCache.extract() always
+                                        # returns plain KVCache objects even for TQ
+                                        # Extract FIRST from original float16 cache.
+                                        # This ensures blocks store original quality
+                                        # data (not TQ-decoded lossy float16).
+                                        # On fetch, TQ recompress is safe because
+                                        # it's a single round of lossy (same as
+                                        # original inference).
+                                        if getattr(self, "_kv_cache_bits", 0):
+                                            cache_for_extract = (
+                                                self._quantize_cache_for_storage(
+                                                    cache_for_extract
+                                                )
+                                            )
+                                        _t_extract = time.perf_counter()
+                                        extracted_cache = self._extract_cache_states(
+                                            cache_for_extract
+                                        )
+                                        self._dsv4_trace_timing(
+                                            "extract_cache_states",
+                                            _t_extract,
+                                            request_id,
+                                            layers=len(extracted_cache or []),
+                                            snapshot=bool(snapshot_cache is not None),
+                                        )
+                                        # L2 disk: TQ recompress a COPY for 26x
+                                        # smaller disk files. The original cache
+                                        # objects are unchanged (extract already ran).
+                                        if (
+                                            self.disk_cache is not None
+                                            and not self._is_hybrid
+                                        ):
+                                            try:
+                                                from .mllm_batch_generator import (
+                                                    _recompress_to_tq,
+                                                )
+
+                                                tq_for_disk = _recompress_to_tq(
+                                                    cache_for_extract, self.model
+                                                )
+                                                _disk_store_tokens = list(
+                                                    request.prompt_token_ids
+                                                )
+                                                _gpl_s = (
+                                                    getattr(
+                                                        request, "_gen_prompt_len", 0
+                                                    )
+                                                    or 0
+                                                )
+                                                if _gpl_s > 0 and _gpl_s < len(
+                                                    _disk_store_tokens
+                                                ):
+                                                    _disk_store_tokens = (
+                                                        _disk_store_tokens[:-_gpl_s]
+                                                    )
+                                                self.disk_cache.store(
+                                                    _disk_store_tokens,
+                                                    tq_for_disk,
+                                                    cache_type=self._pick_cache_type_for_request(
+                                                        request
+                                                    ),
+                                                )
+                                            except Exception as de:
+                                                logger.debug(
+                                                    f"Disk cache store failed for "
+                                                    f"{request_id}: {de}"
+                                                )
+                                        if extracted_cache:
+                                            request._extracted_cache = extracted_cache
+                                            request._extracted_cache_from_prompt_snapshot = bool(
+                                                snapshot_cache is not None
+                                                or getattr(
+                                                    request,
+                                                    "_extracted_cache_from_prompt_snapshot",
+                                                    False,
+                                                )
+                                            )
+                                            logger.info(
+                                                f"Extracted {len(extracted_cache)} "
+                                                f"layer states for request "
+                                                f"{request_id}"
+                                            )
+                                        else:
+                                            logger.warning(
+                                                f"Cache extraction returned empty "
+                                                f"for {request_id}"
+                                            )
+                                    elif getattr(
+                                        request,
+                                        "_dsv4_cache_hit_store_skipped",
+                                        False,
+                                    ):
+                                        pass
+                                    else:
+                                        logger.warning(
+                                            f"Cannot produce prompt-only cache for "
+                                            f"{request_id}, skipping paged cache store"
+                                        )
+                            else:
+                                # Standard cache stores object references
+                                request._extracted_cache = raw_cache
+                        else:
+                            logger.info(
+                                f"No cache returned from BatchGenerator for {request_id}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to extract cache for {request_id}: {e}")
+
+                self.total_completion_tokens += request.num_output_tokens
+                self.num_requests_processed += 1
+
+                logger.debug(
+                    f"Request {request_id} finished: {response.finish_reason}, "
+                    f"{request.num_output_tokens} tokens"
+                )
+
+            # Auto-tune timing: track wall time per step and tokens produced
+            if self._pld_spec_enabled:
+                self._pld_win_step_wall_s += time.perf_counter() - _step_t0
+                self._pld_win_total_tokens += 1 + len(spec_tokens)
+                # Trigger summary/probe based on total tokens, not just PLD
+                # tokens — otherwise auto-disabled PLD never gets probed.
+                if self._pld_win_total_tokens >= self._pld_summary_next:
+                    self._pld_maybe_log_summary()
+
+            outputs.append(output)
+
+        return outputs, finished_ids
+
+    def _cleanup_finished(self, finished_ids: Set[str]) -> None:
+        """Clean up finished requests and store caches for reuse."""
+        # H1 parity: Snapshot stop tokens from requests that will SURVIVE this cleanup.
+        # This prevents removing tokens still needed by other running requests.
+        _surviving_stops = set()
+        for rid, req in self.running.items():
+            if rid not in finished_ids:
+                _surviving_stops.update(getattr(req, "_added_stop_tokens", set()))
+
+        for request_id in finished_ids:
+            # Clean up PLD state
+            self._pld_pending.pop(request_id, None)
+            self._pld_ngram_indices.pop(request_id, None)
+
+            request = self.running.get(request_id)
+
+            # Cacheability is decided by the prompt prefix, not by output
+            # length. Short-output requests still benefit from caching their
+            # prompt KV for the next turn that shares the same prefix —
+            # multi-turn chat with brief replies is the canonical case.
+            # Benchmarks that legitimately want no-store set
+            # ``_bypass_prefix_cache`` explicitly via cache_salt /
+            # skip_prefix_cache below.
+            _output_len = getattr(request, "num_output_tokens", 0) if request else 0
+            _skip_cache_store = False
+            # Hard cache bypass from the API request (cache_salt / skip_prefix_cache).
+            # This overrides all heuristics — the benchmark client asked for
+            # guaranteed fresh execution, so nothing gets stored either.
+            if request is not None and getattr(request, "_bypass_prefix_cache", False):
+                _skip_cache_store = True
+            if (
+                request is not None
+                and self._uses_dsv4_cache
+                and request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+                and not getattr(request, "_extracted_cache_from_prompt_snapshot", False)
+            ):
+                # DSV4 DeepseekV4Cache includes CSA/HCA pool state in addition
+                # to local SWA KV. After a length-capped decode, the live cache
+                # has advanced through generated tokens. Trimming positional KV
+                # back to the prompt boundary is not enough to prove the
+                # compressor/indexer pool state is also at the prompt boundary,
+                # and live exact-repeat tests showed those stores can produce
+                # immediate stop on cache hit. Do not let capped generations
+                # donate prefix blocks. Clean prompt-boundary snapshots captured
+                # before decode are exempt because they are already at N-1 and do
+                # not include generated-token SWA/CSA/HCA drift.
+                _skip_cache_store = True
+            # No DSV4-specific short-prompt skip. Other families store paged
+            # cache at any prompt length and rely on the standard LRU
+            # eviction (max_blocks budget) to bound memory. The earlier
+            # 512-token threshold was based on a gigabyte/entry estimate
+            # that turned out to be wrong — DSV4 composite state per
+            # prompt is tens of MB, not GB, with the v6 nested-state
+            # schema. Treat DSV4 like every other model.
+            if _skip_cache_store and request is not None:
+                logger.debug(
+                    f"Skipping cache store for {request_id}: "
+                    f"output_len={_output_len}, status={request.status.name}"
+                )
+                if hasattr(request, "_extracted_cache"):
+                    request._extracted_cache = None
+
+            # Always clean up paged cache tracking entries regardless of
+            # cache skip, to prevent unbounded memory growth on benchmarks.
+            # Release request refs here so completed-request blocks can enter
+            # the free LRU queue while remaining cache-resident.
+            if self.block_aware_cache is not None:
+                _entry = self.block_aware_cache._request_tables.pop(request_id, None)
+                self.block_aware_cache.paged_cache.release_request_refs(
+                    _entry.block_table if _entry else None
+                )
+                self.block_aware_cache.paged_cache.detach_request(request_id)
+
+            # Hybrid SSM companion state capture.
+            # MUST run BEFORE the paged cache store below, because
+            # the paged store clears request._extracted_cache in its
+            # finally block. If we run after, _extracted_cache is None.
+            # Store SSM layer states keyed by block-aligned prompt tokens
+            # so future prefix cache hits can reconstruct full KV+SSM cache.
+            #
+            # For thinking models (gen_prompt_len > 0), the extracted SSM
+            # state includes gen_prompt + output tokens, placing it at
+            # P+gpl+output instead of P (the KV block boundary). Injecting
+            # that contaminated state causes garbled output, so the branch
+            # below queues a clean prompt-only re-derive instead of storing
+            # post-generation state directly.
+            if (
+                self._is_hybrid
+                and not self._uses_dsv4_cache
+                and not self._uses_zaya_cache
+                and self.config.enable_prefix_cache
+                and self._ssm_state_cache is not None
+                and request is not None
+                and request.prompt_token_ids
+                and not _skip_cache_store
+            ):
+                try:
+                    logger.info(
+                        f"SSM companion: entering store for {request_id} "
+                        f"(hybrid={self._is_hybrid}, has_cache={hasattr(request, '_extracted_cache') and request._extracted_cache is not None})"
+                    )
+                    _gpl = getattr(request, "_gen_prompt_len", 0) or 0
+                    all_tokens = list(request.prompt_token_ids)
+                    if _gpl > 0 and _gpl < len(all_tokens):
+                        all_tokens = all_tokens[:-_gpl]
+                    prompt_len = len(all_tokens)
+                    companion_tokens = (
+                        all_tokens[:-1] if len(all_tokens) > 1 else list(all_tokens)
+                    )
+                    companion_len = len(companion_tokens)
+
+                    # SSM state from _extracted_cache is post-generation:
+                    # it includes gen_prompt + output tokens processing.
+                    # For thinking models (gpl > 0), the extracted SSM
+                    # state is contaminated — storing it causes position
+                    # mismatch on fetch → garbled output. Skip storage;
+                    # KV blocks still provide partial TTFT benefit.
+                    if _gpl > 0:
+                        # Queue deferred SSM re-derive instead of skipping.
+                        # The post-gen SSM state is contaminated by thinking
+                        # tokens, so we can't store it directly. But we CAN
+                        # queue a re-derive that runs during idle time (no
+                        # active requests) — a separate prefill pass on just
+                        # the prompt tokens to capture clean SSM state. This
+                        # doesn't help the CURRENT conversation but ensures
+                        # the NEXT request with the same prompt prefix gets
+                        # a full KV+SSM cache hit instead of re-prefilling.
+                        #
+                        # 2026-04-30 release-gate audit caught a real RAM
+                        # leak via this path: 30 short unique prompts in
+                        # burst grew Nemotron-Omni hybrid RSS by +2964 MB
+                        # because each enqueue triggered a re-derive that
+                        # stored a fresh ~10 MB SSM companion entry in
+                        # `_ssm_state_cache` (LRU cap 50 → ~500 MB worst
+                        # case) PLUS held onto the original token list +
+                        # request_id in the queue PLUS the in-flight
+                        # `clean_cache` from `_prefill_for_prompt_only_cache`
+                        # whose Metal buffers don't always release in time.
+                        # Three guards added below close most of the gap:
+                        #   1. Skip enqueue only when the cache key is shorter
+                        #      than SSM_REDERIVE_MIN_TOKENS. That threshold is
+                        #      intentionally 1: short repeated prompts are
+                        #      still valid cache candidates, and an older
+                        #      64-token floor caused avoidable full-prefill
+                        #      repeats on mid-chat turns.
+                        #   2. Skip enqueue if we've stored ≥ max_entries
+                        #      worth of companions already — the LRU is
+                        #      already saturated, the next eviction would
+                        #      drop a useful entry to store one we're
+                        #      probably going to evict before it's read.
+                        #   3. Drop the queue cap from 20 to 8 so the
+                        #      worst-case footprint shrinks 60%.
+                        if companion_len < SSM_REDERIVE_MIN_TOKENS:
+                            logger.debug(
+                                "SSM companion: skipping re-derive for "
+                                f"{request_id} (cache_key_len={companion_len} < "
+                                f"{SSM_REDERIVE_MIN_TOKENS})"
+                            )
+                        elif (
+                            self._ssm_state_cache is not None
+                            and len(getattr(self._ssm_state_cache, "_store", {}))
+                                >= self._ssm_state_cache.max_entries
+                        ):
+                            logger.debug(
+                                "SSM companion: skipping re-derive for "
+                                f"{request_id} (companion cache saturated, "
+                                f"{self._ssm_state_cache.max_entries} entries)"
+                            )
+                        else:
+                            if not hasattr(self, "_ssm_rederive_queue"):
+                                self._ssm_rederive_queue = []
+                            # Cap queue at SSM_REDERIVE_QUEUE_CAP. Oldest
+                            # entries are the least useful (newer prompts
+                            # are more likely to be re-requested). Was 20.
+                            if len(self._ssm_rederive_queue) >= SSM_REDERIVE_QUEUE_CAP:
+                                self._ssm_rederive_queue.pop(0)
+                            self._ssm_rederive_queue.append(
+                                (list(companion_tokens), companion_len, request_id)
+                            )
+                            logger.info(
+                                f"SSM companion: queued deferred re-derive for "
+                                f"{request_id} (gpl={_gpl}, {companion_len} cache-key "
+                                f"tokens, will run during next idle period)"
+                            )
+                    elif prompt_len > 0:
+                        # gpl=0 (non-thinking) hybrid SSM path. Mirror the
+                        # gpl>0 defer-only pattern above — DO NOT extract
+                        # post-output SSM layers from `_extracted_cache`
+                        # and DO NOT do an immediate `is_complete=False`
+                        # store.
+                        #
+                        # Earlier fix attempted to mark contaminated state
+                        # as `is_complete=False` so the rejection check
+                        # would force re-prefill until async re-derive
+                        # replaced it. That path was correct for
+                        # correctness but caused a Metal-buffer RAM leak
+                        # on Nemotron-Omni JANGTQ2: each request stored
+                        # ~10 MB of `MambaCache.from_state(...)` arrays
+                        # backing post-output Metal command buffers AND
+                        # queued an async re-derive. The contaminated
+                        # entries piled up in `_ssm_state_cache._store`
+                        # (LRU cap holds them past the rejection check)
+                        # while the async re-derive ALSO populated entries
+                        # — doubling resident SSM state per request.
+                        #
+                        # Fetch path with NO companion entry already
+                        # falls back to full prefill (line 2364:
+                        # `if _entry is None: ssm_states = None`), so
+                        # the immediate-store-with-rejection-flag was
+                        # functionally redundant: the next turn re-prefills
+                        # either way. Drop the immediate store; just queue
+                        # the async re-derive (clean-boundary capture
+                        # writes `is_complete=True` directly).
+                        if companion_len < SSM_REDERIVE_MIN_TOKENS:
+                            logger.debug(
+                                "SSM companion (gpl=0): skipping re-derive "
+                                f"for {request_id} (cache_key_len={companion_len} "
+                                f"< {SSM_REDERIVE_MIN_TOKENS})"
+                            )
+                        elif (
+                            self._ssm_state_cache is not None
+                            and len(getattr(self._ssm_state_cache, "_store", {}))
+                                >= self._ssm_state_cache.max_entries
+                        ):
+                            logger.debug(
+                                "SSM companion (gpl=0): skipping re-derive "
+                                f"for {request_id} (companion cache saturated)"
+                            )
+                        else:
+                            if not hasattr(self, "_ssm_rederive_queue"):
+                                self._ssm_rederive_queue = []
+                            if len(self._ssm_rederive_queue) >= SSM_REDERIVE_QUEUE_CAP:
+                                self._ssm_rederive_queue.pop(0)
+                            self._ssm_rederive_queue.append(
+                                (list(companion_tokens), companion_len, request_id)
+                            )
+                            logger.info(
+                                f"SSM companion (gpl=0): queued deferred "
+                                f"re-derive for {request_id} ({companion_len} "
+                                f"cache-key tokens, runs on next idle tick)"
+                            )
+                except Exception as _ssm_e:
+                    logger.warning(
+                        f"SSM companion store failed for {request_id}: {_ssm_e}",
+                        exc_info=True,
+                    )
+
+            # Store cache for future reuse
+            if (
+                request is not None
+                and request.prompt_token_ids
+                and not _skip_cache_store
+            ):
+                if self.block_aware_cache is not None:
+                    # Store in paged cache
+                    # IMPORTANT: Use ONLY prompt tokens for block hashing/indexing.
+                    # Using prompt+output would misalign block boundaries since the
+                    # next request with the same prompt would search for prompt-only
+                    # token hashes, which wouldn't match blocks that span the
+                    # prompt/output boundary.
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
+                        try:
+                            cache_key_override = getattr(
+                                request, "_extracted_cache_key_tokens", None
+                            )
+                            prompt_tokens = list(request.prompt_token_ids)
+                            cache_data = request._extracted_cache
+                            if cache_key_override is not None:
+                                store_tokens = list(cache_key_override)
+                            else:
+                                # Strip generation prompt tokens from cache key.
+                                # Original gen_prompt_len prefix cache fix by Jinho Jang
+                                # (eric@jangq.ai) — vMLX. This solved 100% cache miss for
+                                # all thinking models (Nemotron, Qwen3, DeepSeek-R1, Mistral 4).
+                                # Chat templates append assistant role tokens at the end
+                                # (e.g., <|im_start|>assistant\n<think>\n) which always
+                                # differ on subsequent turns. Including them in the block
+                                # hash causes 100% cache misses in multi-turn conversations.
+                                gen_prompt_len = getattr(request, "_gen_prompt_len", 0)
+                                if gen_prompt_len > 0 and gen_prompt_len < len(
+                                    prompt_tokens
+                                ):
+                                    prompt_tokens = prompt_tokens[:-gen_prompt_len]
+                                    # Also truncate KV cache data to match shortened key.
+                                    # Without this, KV has more tokens than the key,
+                                    # causing duplicate KV entries on cache hit → <unk> flood.
+                                    # cache_data is extracted state dicts (not raw objects),
+                                    # so truncate the tensors within each dict directly.
+                                    target = len(prompt_tokens) - 1  # N-1 for re-feed
+                                    if target > 0:
+                                        truncated_dicts = []
+                                        trunc_ok = True
+                                        for sd in cache_data:
+                                            if not isinstance(sd, dict):
+                                                trunc_ok = False
+                                                break
+                                            state = sd.get("state")
+                                            cls_name = sd.get("class_name", "")
+                                            if self._is_dsv4_cache_class_name(cls_name) and state is not None:
+                                                try:
+                                                    from jang_tools.dsv4.mlx_model import (
+                                                        DeepseekV4Cache,
+                                                    )
+
+                                                    cache = DeepseekV4Cache(
+                                                        sliding_window=int(
+                                                            sd.get("sliding_window")
+                                                            or 128
+                                                        ),
+                                                        compress_ratio=sd.get(
+                                                            "compress_ratio"
+                                                        ),
+                                                    )
+                                                    cache.state = state
+                                                    try:
+                                                        cache.meta_state = sd.get(
+                                                            "meta_state", ()
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                    current_len = int(
+                                                        getattr(cache, "offset", 0) or 0
+                                                    )
+                                                    to_trim = max(0, current_len - target)
+                                                    # SAFETY: gen_prompt_len stripping
+                                                    # also calls cache.trim() on a
+                                                    # reconstructed DeepseekV4Cache. The
+                                                    # same SWA RotatingKVCache wrap
+                                                    # constraint applies here: if the
+                                                    # original prefill exceeded
+                                                    # sliding_window, the SWA buffer has
+                                                    # wrapped and cannot be safely
+                                                    # rewound. Refuse the trim and skip
+                                                    # this cache (caller falls through
+                                                    # to fresh prefill on next-turn).
+                                                    # Symmetric with Fix 1 guard.
+                                                    local = getattr(cache, "local", None)
+                                                    _swa = int(
+                                                        getattr(local, "max_size", 128) or 128
+                                                    )
+                                                    if to_trim > 0 and current_len > _swa:
+                                                        logger.info(
+                                                            f"DSV4 gen_prompt_len strip "
+                                                            f"skipped: current_len="
+                                                            f"{current_len}, target="
+                                                            f"{target}, sliding_window="
+                                                            f"{_swa} → SWA wrapped, "
+                                                            f"trim unsafe."
+                                                        )
+                                                        trunc_ok = False
+                                                        break
+                                                    if to_trim:
+                                                        cache.trim(to_trim)
+                                                    truncated_dicts.append(
+                                                        {
+                                                            **sd,
+                                                            "state": cache.state,
+                                                            "meta_state": cache.meta_state,
+                                                        }
+                                                    )
+                                                    continue
+                                                except Exception:
+                                                    trunc_ok = False
+                                                    break
+                                            if (
+                                                state is None
+                                                or cls_name == "CacheList"
+                                            ):
+                                                # CacheList/skip: pass through
+                                                truncated_dicts.append(sd)
+                                                continue
+                                            if isinstance(state, tuple) and len(state) == 2:
+                                                keys, values = state
+                                                if (
+                                                    hasattr(keys, "shape")
+                                                    and len(keys.shape) >= 3
+                                                ):
+                                                    seq_dim = (
+                                                        2 if len(keys.shape) == 4 else 1
+                                                    )
+                                                    safe = min(target, keys.shape[seq_dim])
+                                                    if safe > 0:
+                                                        if len(keys.shape) == 4:
+                                                            keys = keys[:, :, :safe, :]
+                                                            values = values[:, :, :safe, :]
+                                                        else:
+                                                            keys = keys[:, :safe, :]
+                                                            values = values[:, :safe, :]
+                                                        new_meta = _rebuild_meta_state_after_truncation(
+                                                            cls_name,
+                                                            sd.get("meta_state", ()),
+                                                            safe,
+                                                        )
+                                                        if new_meta is None:
+                                                            # RotatingKVCache with wrapped
+                                                            # buffer: cannot safely truncate.
+                                                            # Skip this store entirely.
+                                                            logger.info(
+                                                                "Skipping paged cache store for %s: "
+                                                                "cannot rebuild %s metadata after "
+                                                                "truncation (target=%d, safe=%d, "
+                                                                "prompt_tokens=%d, gen_prompt_len=%d)",
+                                                                request_id,
+                                                                cls_name,
+                                                                target,
+                                                                safe,
+                                                                len(prompt_tokens),
+                                                                gen_prompt_len,
+                                                            )
+                                                            trunc_ok = False
+                                                            break
+                                                        truncated_dicts.append(
+                                                            {
+                                                                **sd,
+                                                                "state": (keys, values),
+                                                                "meta_state": new_meta,
+                                                            }
+                                                        )
+                                                        continue
+                                                elif (
+                                                    isinstance(keys, (tuple, list))
+                                                    and len(keys) >= 1
+                                                ):
+                                                    # QuantizedKVCache: tuple of (data, scales, zeros)
+                                                    first_k = keys[0]
+                                                    if hasattr(first_k, "shape"):
+                                                        safe = min(
+                                                            target, first_k.shape[-2]
+                                                        )
+                                                        if safe > 0:
+                                                            keys = tuple(
+                                                                t[..., :safe, :]
+                                                                for t in keys
+                                                            )
+                                                            values = tuple(
+                                                                t[..., :safe, :]
+                                                                for t in values
+                                                            )
+                                                            new_meta = _rebuild_meta_state_after_truncation(
+                                                                cls_name,
+                                                                sd.get("meta_state", ()),
+                                                                safe,
+                                                            )
+                                                            if new_meta is None:
+                                                                logger.info(
+                                                                    "Skipping paged cache store for %s: "
+                                                                    "cannot rebuild %s quantized metadata "
+                                                                    "after truncation (target=%d, safe=%d, "
+                                                                    "prompt_tokens=%d, gen_prompt_len=%d)",
+                                                                    request_id,
+                                                                    cls_name,
+                                                                    target,
+                                                                    safe,
+                                                                    len(prompt_tokens),
+                                                                    gen_prompt_len,
+                                                                )
+                                                                trunc_ok = False
+                                                                break
+                                                            truncated_dicts.append(
+                                                                {
+                                                                    **sd,
+                                                                    "state": (keys, values),
+                                                                    "meta_state": new_meta,
+                                                                }
+                                                            )
+                                                            continue
+                                            # Unknown format: pass through
+                                            truncated_dicts.append(sd)
+                                        if trunc_ok and truncated_dicts:
+                                            cache_data = truncated_dicts
+                                # Paged prefix cache entries must be keyed by the
+                                # same token count represented by cache_data:
+                                # prompt_len - 1. The generator re-feeds the last
+                                # prompt token on hit to obtain first-token logits.
+                                store_tokens = (
+                                    prompt_tokens[:-1]
+                                    if len(prompt_tokens) > 1
+                                    else prompt_tokens
+                                )
+                            # Previously this path stored a truncated N-1
+                            # cache under a full-N token hash. Exact hits then
+                            # reported zero remaining tokens; DSV4BatchGenerator
+                            # correctly refused to decode without a kickoff
+                            # token and returned an empty/stop response. This
+                            # is especially visible with block disk L2 because
+                            # full-key stale blocks survive process restarts.
+                            _t_store = time.perf_counter()
+                            self.block_aware_cache.store_cache(
+                                request_id,
+                                store_tokens,
+                                cache_data,
+                                cache_type=self._pick_cache_type_for_request(request),
+                            )
+                            self._dsv4_trace_timing(
+                                "store_cache",
+                                _t_store,
+                                request_id,
+                                tokens=len(store_tokens),
+                                layers=len(cache_data or []),
+                            )
+                            logger.info(
+                                f"Stored paged cache for request {request_id} "
+                                f"({len(store_tokens)} cache-key tokens from "
+                                f"{len(prompt_tokens)} prompt tokens, "
+                                f"{len(request._extracted_cache)} layers, "
+                                f"cache truncated to {max(len(prompt_tokens) - 1, 0)} tokens)"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to store paged cache for {request_id}: {e}"
+                            )
+                        finally:
+                            # Clear extracted cache reference to help GC
+                            request._extracted_cache = None
+                    else:
+                        logger.info(
+                            "Skipping paged cache store for %s: no extracted cache "
+                            "(prompt_tokens=%d, gen_prompt_len=%d, block_cache_enabled=%s)",
+                            request_id,
+                            len(request.prompt_token_ids or []),
+                            int(getattr(request, "_gen_prompt_len", 0) or 0),
+                            self.block_aware_cache is not None,
+                        )
+                    # NOTE: Tracking cleanup (pop + detach) moved above the
+                    # _skip_cache_store guard so it runs unconditionally.
+
+                elif self.memory_aware_cache is not None:
+                    # Store in memory-aware prefix cache
+                    # Key is prompt tokens only. Cache is truncated to prompt_len-1
+                    # so the last token can be re-fed on cache hit for generation.
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
+                        try:
+                            prompt_tokens = list(request.prompt_token_ids)
+                            # Strip gen_prompt_len from store key — symmetric with
+                            # the fetch path (which also strips). Thinking templates
+                            # append role trailer tokens that differ on every turn;
+                            # without this strip, fetches on later turns miss 100%.
+                            _gpl_store = getattr(request, "_gen_prompt_len", 0) or 0
+                            if 0 < _gpl_store < len(prompt_tokens):
+                                prompt_tokens = prompt_tokens[:-_gpl_store]
+                            prompt_len = len(prompt_tokens)
+                            cache_to_store = self._truncate_cache_to_prompt_length(
+                                request._extracted_cache, prompt_len
+                            )
+                            if cache_to_store is None:
+                                logger.debug(
+                                    f"Request {request_id}: cannot truncate cache "
+                                    f"to prompt length (hybrid model), skipping store"
+                                )
+                            else:
+                                cache_key_tokens = (
+                                    prompt_tokens[:-1]
+                                    if prompt_len > 1
+                                    else list(prompt_tokens)
+                                )
+                                # Quantize for storage efficiency
+                                if getattr(self, "_kv_cache_bits", 0):
+                                    cache_to_store = self._quantize_cache_for_storage(
+                                        cache_to_store
+                                    )
+                                stored = self.memory_aware_cache.store(
+                                    cache_key_tokens,
+                                    cache_to_store,
+                                    cache_type=self._pick_cache_type_for_request(
+                                        request
+                                    ),
+                                )
+                                if stored:
+                                    logger.info(
+                                        f"Stored cache for request {request_id} "
+                                        f"({len(cache_key_tokens)} cache-key tokens "
+                                        f"from {prompt_len} prompt tokens, "
+                                        f"KV truncated to {prompt_len - 1})"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Cache store rejected for request {request_id} "
+                                        f"({prompt_len} tokens) — entry too large for budget"
+                                    )
+                                # NOTE: Disk L2 store is handled by the paged
+                                # cache path (Task 1 above). Memory-aware cache
+                                # is mutually exclusive with paged — if we're here,
+                                # paged cache is disabled and disk L2 is not
+                                # available for this configuration.
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to store memory-aware cache for {request_id}: {e}"
+                            )
+                        finally:
+                            # Clear extracted cache reference to help GC
+                            request._extracted_cache = None
+
+                elif self.prefix_cache is not None:
+                    # Store in legacy prefix cache (same truncation as memory-aware)
+                    if (
+                        hasattr(request, "_extracted_cache")
+                        and request._extracted_cache is not None
+                    ):
+                        try:
+                            prompt_tokens = list(request.prompt_token_ids)
+                            # Strip gen_prompt_len from store key (symmetric with fetch).
+                            _gpl_store = getattr(request, "_gen_prompt_len", 0) or 0
+                            if 0 < _gpl_store < len(prompt_tokens):
+                                prompt_tokens = prompt_tokens[:-_gpl_store]
+                            prompt_len = len(prompt_tokens)
+                            cache_to_store = self._truncate_cache_to_prompt_length(
+                                request._extracted_cache, prompt_len
+                            )
+                            if cache_to_store is not None:
+                                cache_key_tokens = (
+                                    prompt_tokens[:-1]
+                                    if prompt_len > 1
+                                    else list(prompt_tokens)
+                                )
+                                # Quantize for storage efficiency
+                                if getattr(self, "_kv_cache_bits", 0):
+                                    cache_to_store = self._quantize_cache_for_storage(
+                                        cache_to_store
+                                    )
+                                # Phase 3d: store with chat-segment cache_type
+                                # awareness when the request carries
+                                # `_segment_boundaries` (populated by API
+                                # gateways during chat-template rendering).
+                                # Falls back to legacy single-store with
+                                # cache_type="assistant" when boundaries are
+                                # absent — zero regression for existing callers.
+                                self._store_cache_with_segments(
+                                    request,
+                                    cache_key_tokens,
+                                    cache_to_store,
+                                )
+                                logger.debug(
+                                    f"Stored cache for request {request_id} "
+                                    f"({len(cache_key_tokens)} cache-key tokens "
+                                    f"from {prompt_len} prompt tokens, "
+                                    f"truncated from {prompt_len + len(request.output_token_ids)})"
+                                )
+                                # NOTE: Disk L2 store is handled by the paged
+                                # cache path. Legacy prefix cache is L1-only.
+                        except Exception as e:
+                            logger.debug(f"Failed to store cache for {request_id}: {e}")
+                        finally:
+                            # Clear extracted cache reference to help GC
+                            request._extracted_cache = None
+
+            # H1 parity: Remove per-request stop tokens from batch generator
+            if (
+                request is not None
+                and self.batch_generator is not None
+                and getattr(request, "_added_stop_tokens", None)
+            ):
+                removable = (
+                    request._added_stop_tokens - _surviving_stops - self.stop_tokens
+                )
+                if removable:
+                    self.batch_generator.stop_tokens -= removable
+
+            # Clean up streaming detokenizer
+            self._cleanup_detokenizer(request_id)
+
+            # Remove from running and requests dict (prevents memory leak)
+            if request_id in self.running:
+                del self.running[request_id]
+            self.requests.pop(request_id, None)
+
+            # Remove UID mappings
+            if request_id in self.request_id_to_uid:
+                uid = self.request_id_to_uid[request_id]
+                unregister_generation_logprobs(self.model, uid)
+                if uid in self.uid_to_request_id:
+                    del self.uid_to_request_id[uid]
+                del self.request_id_to_uid[request_id]
+
+            # Track as finished
+            self.finished_req_ids.add(request_id)
+
+        # Only clear Metal memory cache when no other requests are actively
+        # running. Calling Metal cache cleanup during an active prefill
+        # can interfere with in-flight GPU operations and cause crashes.
+        if finished_ids and not self.running:
+            clear_mlx_memory_cache(log=logger)
+
+    def _is_cache_corruption_error(self, error: Exception) -> bool:
+        """Check if an error indicates cache corruption."""
+        error_str = str(error)
+        return any(pattern in error_str for pattern in CACHE_CORRUPTION_PATTERNS)
+
+    def _recover_from_cache_error(self) -> None:
+        """Recover from cache corruption error."""
+        # Clear batch generator (this is the source of the corruption)
+        try:
+            self.batch_generator.close()
+        except Exception:
+            pass
+        self.batch_generator = None
+        self._current_sampler_params = None
+
+        # Clear caches
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.clear()
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear()
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
+        if self._ssm_state_cache is not None:
+            self._ssm_state_cache.clear()
+
+        # Clear UID mappings
+        self.request_id_to_uid.clear()
+        self.uid_to_request_id.clear()
+
+        logger.info("Cache recovery completed")
+
+    def _reschedule_running_requests(self) -> None:
+        """Move running requests back to waiting queue for retry."""
+        count = len(self.running)
+        for request_id, request in list(self.running.items()):
+            # Reset request state — must clear ALL generation state so the
+            # retried request starts from scratch with correct token budget
+            request.status = RequestStatus.WAITING
+            request.batch_uid = None
+            request.prompt_cache = None
+            request.cached_tokens = 0
+            request.remaining_tokens = request.prompt_token_ids
+            request.output_token_ids = []
+            request.output_text = ""
+            request.num_computed_tokens = 0
+
+            # Clear extracted cache to prevent poisoning paged cache with stale
+            # data from the destroyed BatchGenerator context
+            if hasattr(request, "_extracted_cache"):
+                request._extracted_cache = None
+
+            # Clear stale detokenizer — request will restart from scratch
+            self._cleanup_detokenizer(request_id)
+
+            # Clear PLD state for this request
+            self._pld_pending.pop(request_id, None)
+            self._pld_ngram_indices.pop(request_id, None)
+
+            # Move to waiting queue (at front for priority)
+            self.waiting.appendleft(request)
+            del self.running[request_id]
+
+        if count > 0:
+            logger.info(f"Rescheduled {count} requests for retry")
+
+    def _pld_maybe_log_summary(self) -> None:
+        """Emit a PLD effectiveness summary at INFO level every N tokens.
+
+        Logged when cumulative tokens emitted via spec decode rounds crosses
+        the next summary threshold. Resets window counters after logging so
+        each summary reflects the most recent interval only.
+
+        Metrics:
+          rounds   — spec decode attempts in this window
+          accept   — mean draft tokens accepted per round (max=K=5)
+          full     — % of rounds where all K drafts accepted (best case)
+          zero     — % of rounds where 0 drafts accepted (overhead, no gain)
+          eff      — effective tokens per forward pass: (accepted+rounds) /
+                     (2*rounds). >1.0 means PLD is helping; <1.0 means overhead
+                     exceeds benefit. Baseline (no PLD) = 1.0.
+        """
+        # Trigger on either PLD tokens or total tokens (for disabled-state probe)
+        if (
+            self._pld_win_tokens < self._pld_summary_next
+            and self._pld_win_total_tokens < self._pld_summary_next
+        ):
+            return
+
+        n = self._pld_win_attempts
+        _win_size = self._pld_at_window
+
+        if n == 0:
+            if self._pld_auto_enabled:
+                # PLD was enabled but d0 pre-check filtered every cycle —
+                # no opportunities to help. Disable to avoid per-token
+                # overhead from find_draft_tokens + d0 check.
+                self._pld_auto_enabled = False
+                self._pld_at_window = 1
+                self._pld_at_probe_tokens = 0
+                logger.info(
+                    "[PLD:3b1f] auto-tune — disabled (0 rounds in %d tokens, "
+                    "d0 pre-check filtered all)",
+                    self._pld_win_total_tokens,
+                )
+            else:
+                # Already disabled.  Count toward probe interval.
+                self._pld_at_probe_tokens += self._pld_win_total_tokens
+                if self._pld_at_probe_tokens >= self._pld_summary_interval * 5:
+                    self._pld_auto_enabled = True
+                    self._pld_at_window = 1
+                    self._pld_at_probe_tokens = 0
+                    logger.info(
+                        "[PLD:3b1f] auto-tune probe — re-enabling with window=%d",
+                        self._pld_at_window,
+                    )
+            self._pld_win_total_tokens = 0
+            self._pld_win_step_wall_s = 0.0
+            self._pld_win_cycle_wall_s = 0.0
+            self._pld_summary_next = self._pld_at_window
+            return
+
+        accepted = self._pld_win_accepted
+        full_pct = 100 * self._pld_win_full / n
+        zero_pct = 100 * self._pld_win_zero / n
+        avg_accept = accepted / n
+        eff = (accepted + n) / (2 * n)
+
+        # Auto-tune: compare PLD window throughput vs estimated baseline.
+        _autotune_msg = ""
+        base_time = self._pld_win_step_wall_s - self._pld_win_cycle_wall_s
+        base_tok = self._pld_win_total_tokens - self._pld_win_tokens
+        if base_time > 0 and base_tok >= 1 and self._pld_win_step_wall_s > 0:
+            baseline_tok_s = base_tok / base_time
+            window_tok_s = self._pld_win_total_tokens / self._pld_win_step_wall_s
+            ratio = window_tok_s / baseline_tok_s if baseline_tok_s > 0 else 1.0
+
+            if ratio < 0.95:
+                # Congestion: PLD is hurting. Disable and reset window.
+                self._pld_auto_enabled = False
+                self._pld_at_window = 1  # reset cwnd for next probe
+                self._pld_at_probe_tokens = 0
+                _autotune_msg = (
+                    f" — AUTO-DISABLED cwnd={_win_size} "
+                    f"(window {window_tok_s:.0f} tok/s "
+                    f"< baseline {baseline_tok_s:.0f} tok/s × 0.95)"
+                )
+            else:
+                # No congestion: grow window (TCP slow start).
+                old_window = self._pld_at_window
+                self._pld_at_window = min(
+                    self._pld_at_window * 2, self._pld_summary_interval
+                )
+                _autotune_msg = (
+                    f"  cwnd={old_window}→{self._pld_at_window} "
+                    f"wallclock={window_tok_s:.0f}/{baseline_tok_s:.0f} tok/s"
+                )
+
+        logger.info(
+            "[PLD:3b1f] summary over last %d tokens — "
+            "rounds=%d  accept=%.1f/%d  full=%.0f%%  zero=%.0f%%  "
+            "d0_skip=%d  eff=%.2f tok/pass%s",
+            self._pld_win_tokens,
+            n,
+            avg_accept,
+            self._pld_num_drafts,
+            full_pct,
+            zero_pct,
+            self._pld_win_d0_skip,
+            eff,
+            _autotune_msg,
+        )
+
+        # Reset window counters
+        self._pld_win_attempts = 0
+        self._pld_win_accepted = 0
+        self._pld_win_full = 0
+        self._pld_win_zero = 0
+        self._pld_win_tokens = 0
+        self._pld_win_d0_skip = 0
+        self._pld_win_cycle_wall_s = 0.0
+        self._pld_win_step_wall_s = 0.0
+        self._pld_win_total_tokens = 0
+        self._pld_summary_next = self._pld_at_window
+
+    def _try_speculative_decode(
+        self,
+        request_id: str,
+        request: Request,
+        last_token: int,
+    ) -> List[int]:
+        """
+        Prompt Lookup Decoding — Phase 2/3: batched speculative verification.
+
+        After BatchGenerator emits token `last_token`, this method:
+          1. Peeks at active_batch.logprobs[e] BEFORE remove() to get
+             forward_logprobs — the model's prediction for what comes after
+             last_token.  (response.logprobs is the distribution that GENERATED
+             last_token, one step behind what we need.)
+          2. Extracts the KV cache by removing the request from BatchGenerator.
+             Cache is at offset N — last_token is already in it.
+          3. Finds K draft tokens via n-gram lookup in the full token sequence.
+          4. Runs ONE forward pass: model([d0, ..., d_{K-1}], cache).
+             forward_logprobs is used for d0 acceptance; no last_token prefix
+             in verify_input means no pre-trim and no SSM offset accumulation.
+          5. Accepts the prefix up to the first mismatch (M <= K tokens).
+          6. Trims the cache to the accepted prefix.
+          7. Re-inserts the request into BatchGenerator with the bonus token.
+          8. Updates uid maps so subsequent step() calls find the request.
+
+        Returns extra tokens to append: [d0, ..., d_M, bonus_token].
+        On any failure returns [] — generation continues normally.
+        A guaranteed finally block ensures the request is never orphaned.
+
+        Phase 2 (temp≈0): greedy acceptance, argmax bonus.
+        Phase 3 (temp>0): probabilistic acceptance — accept d_i with probability
+        p(d_i | context); on rejection sample a correction token with d_i
+        excluded. Bonus is always sampled (not argmax). This provably preserves
+        the original sampling distribution (Leviathan et al., 2023).
+
+        NOTE — concurrent request interaction (open question #5):
+        The remove/re-insert cycle pulls this request out of the active decode
+        batch for the duration of the verify forward pass. Under concurrent
+        load (batch_size > 1) this reduces decode-phase batch occupancy for
+        one step per spec decode round. Throughput impact at batch_size > 1
+        is unmeasured. PLD is safe and correct at any concurrency level but
+        may hurt aggregate throughput when multiple requests are in flight.
+        """
+        import mlx.core as mx
+        import numpy as _np
+
+        try:
+            from mlx_lm.models.cache import CacheList as _CacheList
+        except ImportError:
+            _CacheList = None
+
+        temp = request.sampling_params.temperature
+        if temp > self._pld_spec_max_temp:
+            return []
+
+        # vmlx#92: PLD verify-and-reinsert only works on MLLMBatchGenerator
+        # which exposes `.active_batch` (for forward-logprobs peek) and
+        # `remove(..., return_prompt_caches=True)` returning trimmable
+        # caches. On pure text / non-MLLM paths the generator is mlx-lm's
+        # plain BatchGenerator, which has neither.
+        #
+        # Before this guard the attribute access at `active_batch` raised
+        # AttributeError; the try/except + finally path re-inserted a
+        # malformed cache; and the next step() crashed with `<class 'list'>
+        # does not yet support batching with history`, forcing the scheduler
+        # to clear the entire paged cache. Every PLD-enabled server hitting
+        # a text model corrupted itself within the first few tokens.
+        #
+        # Short-circuit cleanly here — the retrospective n-gram analyzer in
+        # prompt_lookup.py still runs inline on every decode step, so
+        # PLD telemetry / theoretical-speedup stats stay accurate; only
+        # the batched verify-and-reinsert cycle is gated off.
+        if not hasattr(self.batch_generator, "active_batch"):
+            return []
+
+        full_tokens = list(request.prompt_token_ids) + list(request.output_token_ids)
+        ngram_idx = self._pld_ngram_indices.get(request_id)
+        if ngram_idx is None:
+            ngram_idx = NgramIndex()
+            self._pld_ngram_indices[request_id] = ngram_idx
+        drafts = ngram_idx.find_drafts(
+            full_tokens, num_draft_tokens=5, max_ngram_size=3
+        )
+        if not drafts:
+            return []
+
+        remaining = request.sampling_params.max_tokens - request.num_output_tokens
+        if remaining <= 1:
+            return []
+        drafts = drafts[: min(len(drafts), remaining - 1)]
+
+        uid = self.request_id_to_uid.get(request_id)
+        if uid is None:
+            return []
+
+        self._pld_spec_attempts += 1
+        old_uid = uid
+        kv_cache = None
+        removed = False
+
+        try:
+            # 1. Peek at forward logprobs BEFORE removing from BatchGenerator.
+            #
+            #    In BatchGenerator._next():
+            #      y, logprobs = batch.y, batch.logprobs  ← OLD tokens/logprobs
+            #      batch.y, batch.logprobs = _step(y)     ← NEW (forward) logprobs
+            #      response = Response(uid, y[e], logprobs[e], ...)
+            #
+            #    So response.logprobs = OLD logprobs (the distribution that
+            #    generated last_token, argmax==last_token at T=0).
+            #    active_batch.logprobs[e] = NEW logprobs = prediction AFTER
+            #    last_token — exactly what we need for d0 acceptance.
+            ab = self.batch_generator.active_batch
+            if ab is None or not (
+                ab.has_uid(uid) if hasattr(ab, "has_uid") else uid in ab.uids
+            ):
+                raise RuntimeError(
+                    "uid not in active_batch — cannot get forward logprobs"
+                )
+            ab_idx = (
+                ab.index_of(uid)
+                if hasattr(ab, "index_of")
+                else ab.uids.index(uid)
+            )
+            forward_logprobs = ab.logprobs[ab_idx]
+
+            # 1b. d0 pre-check: avoid the expensive remove/verify/insert cycle
+            #     when the first draft token has negligible acceptance probability.
+            #     forward_logprobs are already materialized by BatchGenerator.
+            if temp <= 1.67e-6:
+                # Greedy: exact check — if argmax != d0, acceptance is zero.
+                d0_check = int(mx.argmax(forward_logprobs).item())
+                if d0_check != drafts[0]:
+                    self._pld_win_d0_skip += 1
+                    return []
+            else:
+                # T>0: skip if d0 logprob below threshold.  forward_logprobs
+                # are already log(softmax(logits)) — a single index lookup is
+                # far cheaper than recomputing softmax over the full vocab.
+                # Threshold -2.0 ≈ p>13% at T=1; at T=0.3 the effective
+                # probability is higher, so this is conservative.
+                _lp_d0 = forward_logprobs[drafts[0]].item()
+                if _lp_d0 < -2.0:
+                    self._pld_win_d0_skip += 1
+                    return []
+
+            # Trim to configured K (dynamic K=3 was tested and regressed —
+            # on hybrid models, p(full_accept) drops with K and any miss
+            # forces full rewind, so K=2 remains the sweet spot).
+            drafts = drafts[: self._pld_num_drafts]
+
+            # 2. Extract KV cache — removes request from BatchGenerator
+            cache_dict = self.batch_generator.remove([uid], return_prompt_caches=True)
+            removed = True
+            kv_cache = cache_dict.get(uid)
+            if kv_cache is None:
+                raise RuntimeError("remove() returned no cache")
+
+            # 2b. Save ArraysCache state before verification so we can restore
+            #     it on partial rejection (hybrid models only).
+            #     The slice arrays from extract_cache() are kept alive by
+            #     Python's reference counting regardless of batch.filter().
+            saved_array_caches: dict = {}
+            for i, c in enumerate(kv_cache):
+                if not c.is_trimmable():
+                    saved_array_caches[i] = list(c.cache)
+
+            # 2. Single batched verification forward pass
+            # Input:   [d0, ..., d_{K-1}]  — K tokens (no last_token prefix)
+            # Cache:   holds t0...t_N  (last_token already in cache at offset N)
+            # forward_logprobs: model's prediction after last_token (from batch gen)
+            # logits[i] predicts what comes after d_i:
+            #   forward_logprobs  → should equal d0   (prediction after last_token)
+            #   logits[0]      → should equal d1   (prediction after d0)
+            #   logits[i]      → should equal d_{i+1}
+            #   logits[K-1]    → bonus token (free prediction after d_{K-1})
+            num_drafts = len(drafts)
+            verify_input = mx.array([drafts])  # (1, K)
+
+            with mx.stream(generation_stream):
+                logits = self.model(verify_input, cache=kv_cache)
+                if temp <= 1.67e-6:
+                    # Greedy: argmax forces the full forward pass
+                    predicted = mx.argmax(logits[0], axis=-1)  # (K,)
+                    mx.eval(predicted)
+                else:
+                    # Phase 3: evaluate full logits to force the forward pass
+                    mx.eval(logits)
+
+            # 3. Accept prefix — greedy (temp≈0) or probabilistic (Phase 3)
+            if temp <= 1.67e-6:
+                predicted = predicted.tolist()  # length K
+                # d0: check forward_logprobs (prediction after last_token)
+                d0_predicted = int(mx.argmax(forward_logprobs).item())
+                num_accept = 0
+                if d0_predicted == drafts[0]:
+                    num_accept = 1
+                    # d1..d_{K-1}: check logits[0, i-1] (prediction after d_{i-1})
+                    for i in range(1, num_drafts):
+                        if predicted[i - 1] == drafts[i]:
+                            num_accept += 1
+                        else:
+                            break
+                # bonus: prediction at position num_accept
+                if num_accept == 0:
+                    bonus_token = (
+                        d0_predicted  # correction: model's actual pred at pos N
+                    )
+                else:
+                    bonus_token = predicted[
+                        num_accept - 1
+                    ]  # pred after d_{num_accept-1}
+
+            else:
+                # Phase 3: accept d_i with prob p(d_i | context).
+                # Scalar log-probability instead of full-vocab softmax:
+                # log p_T(d) = logprobs[d]/T - logsumexp(logprobs/T)
+                # logsumexp is O(V) but produces a scalar — avoids
+                # materializing the full 150K probability vector.
+                import math
+
+                _lp_scaled = forward_logprobs / temp
+                _log_p_d0 = _lp_scaled[drafts[0]] - mx.logsumexp(_lp_scaled)
+                mx.eval(_log_p_d0)
+
+                num_accept = 0
+                if random.random() < math.exp(_log_p_d0.item()):
+                    num_accept = 1
+                    # d1..d_{K-1}: accept from logits[0, i-1], lazy per-position
+                    for i in range(1, num_drafts):
+                        _lp_i = logits[0, i - 1] / temp
+                        _log_p_di = _lp_i[drafts[i]] - mx.logsumexp(_lp_i)
+                        if random.random() < math.exp(_log_p_di.item()):
+                            num_accept += 1
+                        else:
+                            break
+
+                # Correction/bonus: sample at the first un-accepted position.
+                # On rejection exclude the rejected token so it cannot be
+                # re-drawn (preserves the conditional distribution).
+                #
+                # make_sampler expects log-probabilities (not raw logits) —
+                # apply_top_p calls mx.exp() internally.
+                sampler = make_sampler(
+                    temp=temp,
+                    top_p=request.sampling_params.top_p,
+                    min_p=request.sampling_params.min_p,
+                    top_k=request.sampling_params.top_k,
+                )
+                if num_accept == 0:
+                    # d0 rejected: correction from forward_logprobs, excluding d0
+                    bonus_logprobs = mx.where(
+                        mx.arange(forward_logprobs.shape[-1]) == drafts[0],
+                        mx.full(
+                            forward_logprobs.shape,
+                            float("-inf"),
+                            dtype=forward_logprobs.dtype,
+                        ),
+                        forward_logprobs,
+                    )
+                else:
+                    # bonus/correction: prediction after d_{num_accept-1}
+                    bonus_raw = logits[0, num_accept - 1]
+                    bonus_logprobs = bonus_raw - mx.logsumexp(
+                        bonus_raw, axis=-1, keepdims=True
+                    )
+                    if num_accept < num_drafts:
+                        rejected_tok = drafts[num_accept]
+                        bonus_logprobs = mx.where(
+                            mx.arange(bonus_logprobs.shape[-1]) == rejected_tok,
+                            mx.full(
+                                bonus_logprobs.shape,
+                                float("-inf"),
+                                dtype=bonus_logprobs.dtype,
+                            ),
+                            bonus_logprobs,
+                        )
+                bonus_token = sampler(bonus_logprobs).item()
+
+            # 4. Roll back cache to the accepted prefix.
+            #
+            #    After the forward pass every layer is advanced by K positions.
+            #    Three cases:
+            #
+            #    a) All K drafts accepted (num_to_trim == 0):
+            #       KVCache and ArraysCache are both correctly at N+K.
+            #       Nothing to do.
+            #
+            #    b) Partial/full rejection AND model has ArraysCache layers:
+            #       Trimming KVCache works but ArraysCache cannot be rewound.
+            #       Restoring ArraysCache to its pre-verification state (N) and
+            #       rewinding KVCache by K (back to offset N) keeps both caches
+            #       consistent at zero offset.  A correction token is computed
+            #       from forward_logprobs and returned to the client.
+            #
+            #    c) Partial/full rejection, pure KV-cache model:
+            #       Trim KVCache by (K - num_accept) positions.  The existing
+            #       partial-trim logic applies; ArraysCache restore is skipped.
+            #
+            #    Standard KVCache grows by concatenation — trim() only adjusts
+            #    offset, which update_and_fetch() immediately overwrites with
+            #    keys.shape[-2].  We must slice the arrays directly.
+            #    QuantizedKVCache uses offset as a write pointer, so setting
+            #    offset alone is sufficient.
+            num_to_trim = num_drafts - num_accept
+
+            if num_to_trim == 0:
+                # Case (a): full accept — both caches consistent, nothing to do.
+                pass
+
+            elif saved_array_caches:
+                # Case (b): rejection on hybrid model — restore ArraysCache,
+                # rewind KVCache to pre-verify offset (N), emit correction token.
+                #
+                # verify_input = [d0..d_{K-1}] advanced both caches by K steps.
+                # Restoring both to N keeps SSM/KV offset at zero.  Accepted
+                # drafts (if any) are discarded — we cannot advance KVCache to
+                # N+j while rewinding ArraysCache to N.
+                #
+                # Compute correction at position N (after last_token in cache):
+                if temp <= 1.67e-6:
+                    correction_token = d0_predicted
+                else:
+                    cb_logprobs = forward_logprobs
+                    if num_accept == 0:
+                        cb_logprobs = mx.where(
+                            mx.arange(forward_logprobs.shape[-1]) == drafts[0],
+                            mx.full(
+                                forward_logprobs.shape,
+                                float("-inf"),
+                                dtype=forward_logprobs.dtype,
+                            ),
+                            forward_logprobs,
+                        )
+                    cb_sampler = make_sampler(
+                        temp=temp,
+                        top_p=request.sampling_params.top_p,
+                        min_p=request.sampling_params.min_p,
+                        top_k=request.sampling_params.top_k,
+                    )
+                    correction_token = cb_sampler(cb_logprobs).item()
+
+                for i, c in enumerate(kv_cache):
+                    if i in saved_array_caches:
+                        c.cache = saved_array_caches[i]
+                for c in kv_cache:
+                    if not c.is_trimmable() or c.offset == 0:
+                        continue
+                    pre_verify_offset = max(0, c.offset - num_drafts)  # N+K - K = N
+                    if _CacheList is not None and isinstance(c, _CacheList):
+                        c.trim(num_drafts)
+                        continue
+                    if isinstance(c.keys, mx.array):
+                        # Numpy roundtrip: materialize before slicing to avoid
+                        # Metal command buffer corruption from lazy MLX ops.
+                        # bfloat16 → float16 for numpy (no native bf16 support).
+                        _kd, _vd = c.keys.dtype, c.values.dtype
+                        _ka = (
+                            c.keys.astype(mx.float16)
+                            if "bfloat16" in str(_kd)
+                            else c.keys
+                        )
+                        _va = (
+                            c.values.astype(mx.float16)
+                            if "bfloat16" in str(_vd)
+                            else c.values
+                        )
+                        _k, _v = _np.array(_ka), _np.array(_va)
+                        c.keys = mx.array(_k[..., :pre_verify_offset, :]).astype(_kd)
+                        c.values = mx.array(_v[..., :pre_verify_offset, :]).astype(_vd)
+                    c.offset = pre_verify_offset
+                    if hasattr(c, "_idx"):  # RotatingKVCache: sync write pointer
+                        c._idx = pre_verify_offset
+                new_uids = self.batch_generator.insert(
+                    [[correction_token]],
+                    max_tokens=[max(1, remaining - 1)],
+                    caches=[kv_cache],
+                )
+                removed = False
+                new_uid = new_uids[0]
+                del self.uid_to_request_id[old_uid]
+                self.request_id_to_uid[request_id] = new_uid
+                self.uid_to_request_id[new_uid] = request_id
+                self._pld_spec_wasted += num_drafts
+                self._pld_win_attempts += 1
+                self._pld_win_accepted += num_accept
+                if num_accept == 0:
+                    self._pld_win_zero += 1
+                self._pld_win_tokens += 1  # only correction token emitted
+                self._pld_maybe_log_summary()
+                logger.debug(
+                    "[PLD-spec] hybrid partial reject: rewound %d/%d, correction=%d",
+                    num_accept,
+                    num_drafts,
+                    correction_token,
+                )
+                return [correction_token]
+
+            else:
+                # Case (c): rejection on pure KV-cache model — partial trim.
+                for c in kv_cache:
+                    if not c.is_trimmable() or c.offset == 0:
+                        continue
+                    accepted_offset = max(0, c.offset - num_to_trim)
+                    if _CacheList is not None and isinstance(c, _CacheList):
+                        c.trim(num_to_trim)
+                        continue
+                    if isinstance(c.keys, mx.array):
+                        _kd, _vd = c.keys.dtype, c.values.dtype
+                        _ka = (
+                            c.keys.astype(mx.float16)
+                            if "bfloat16" in str(_kd)
+                            else c.keys
+                        )
+                        _va = (
+                            c.values.astype(mx.float16)
+                            if "bfloat16" in str(_vd)
+                            else c.values
+                        )
+                        _k, _v = _np.array(_ka), _np.array(_va)
+                        c.keys = mx.array(_k[..., :accepted_offset, :]).astype(_kd)
+                        c.values = mx.array(_v[..., :accepted_offset, :]).astype(_vd)
+                    c.offset = accepted_offset
+                    if hasattr(c, "_idx"):  # RotatingKVCache: sync write pointer
+                        c._idx = accepted_offset
+
+            # 5. Re-insert with bonus token (next to-be-processed token)
+            new_remaining = max(1, remaining - num_accept - 1)
+            new_uids = self.batch_generator.insert(
+                [[bonus_token]],
+                max_tokens=[new_remaining],
+                caches=[kv_cache],
+            )
+            removed = False  # re-inserted successfully
+
+            # 6. Update uid maps
+            new_uid = new_uids[0]
+            del self.uid_to_request_id[old_uid]
+            self.request_id_to_uid[request_id] = new_uid
+            self.uid_to_request_id[new_uid] = request_id
+
+            # 7. Accumulate stats
+            self._pld_spec_accepted += num_accept
+            self._pld_spec_wasted += num_drafts - num_accept
+
+            self._pld_win_attempts += 1
+            self._pld_win_accepted += num_accept
+            if num_accept == num_drafts:
+                self._pld_win_full += 1
+            if num_accept == 0:
+                self._pld_win_zero += 1
+            tokens_this_round = num_accept + 1  # accepted drafts + bonus
+            self._pld_win_tokens += tokens_this_round
+            self._pld_maybe_log_summary()
+
+            extra = list(drafts[:num_accept]) + [bonus_token]
+            logger.debug(
+                "[PLD-spec] accepted=%d/%d bonus=%d",
+                num_accept,
+                num_drafts,
+                bonus_token,
+            )
+            return extra
+
+        except Exception as exc:
+            logger.warning(
+                "[PLD-spec] Failed for %s: %s", request_id, exc, exc_info=False
+            )
+            return []
+
+        finally:
+            # Guarantee: if removed but not re-inserted, do an emergency
+            # re-insert so the request is never orphaned in self.running.
+            if removed:
+                try:
+                    cache_arg = [kv_cache] if kv_cache is not None else None
+                    em_uids = self.batch_generator.insert(
+                        [[last_token]],
+                        max_tokens=[max(1, remaining - 1)],
+                        caches=cache_arg,
+                    )
+                    em_uid = em_uids[0]
+                    self.uid_to_request_id.pop(old_uid, None)
+                    self.request_id_to_uid[request_id] = em_uid
+                    self.uid_to_request_id[em_uid] = request_id
+                    logger.warning(
+                        "[PLD-spec] Emergency re-insert for %s (uid %d→%d)",
+                        request_id,
+                        old_uid,
+                        em_uid,
+                    )
+                except Exception as em_exc:
+                    logger.error(
+                        "[PLD-spec] Emergency re-insert failed for %s: %s — "
+                        "request may stall",
+                        request_id,
+                        em_exc,
+                    )
+                    self.uid_to_request_id.pop(old_uid, None)
+
+    def step(self, max_retries: int = 2) -> SchedulerOutput:
+        """
+        Execute one scheduling step with automatic error recovery.
+
+        This method:
+        1. Schedules waiting requests into the batch
+        2. Runs one generation step via BatchGenerator
+        3. Processes outputs and handles finished requests
+        4. Automatically recovers from cache/batch errors
+
+        Cache error recovery only applies to BatchGenerator.next() and
+        response processing — scheduling errors propagate immediately.
+
+        Args:
+            max_retries: Number of times to retry on cache errors (default 2)
+
+        Returns:
+            SchedulerOutput with results of this step
+        """
+        output = SchedulerOutput()
+
+        # Process deferred aborts FIRST — these are requests where the
+        # client disconnected mid-generation. We deferred the
+        # batch_generator.remove() call to avoid touching Metal command
+        # buffers that were still in-flight. Now that we're at the top
+        # of step(), the previous batch_generator.next() has completed
+        # and Metal has synchronized, so it's safe to remove.
+        if self._pending_aborts:
+            self._process_pending_aborts()
+
+        # Schedule waiting requests (errors here propagate immediately —
+        # these are logic errors, not cache corruption)
+        scheduled = self._schedule_waiting()
+        output.scheduled_request_ids = [r.request_id for r in scheduled]
+        output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+
+        # Run generation step with cache error recovery
+        if self.batch_generator is not None and self.running:
+            for attempt in range(max_retries + 1):
+                try:
+                    responses = self.batch_generator.next()
+                    output.has_work = True
+
+                    if responses:
+                        if isinstance(responses, tuple):
+                            # mlx_lm >= 0.31.2 returns
+                            # (prompt_responses, generation_responses).
+                            # PromptProcessingBatch.Response objects have no
+                            # .token and must not drive the request lifecycle.
+                            # Only forward generation responses that carry a
+                            # .token attribute to _process_batch_responses().
+                            flat_responses = []
+                            for r in responses:
+                                if isinstance(r, list):
+                                    flat_responses.extend(r)
+                                elif r is not None:
+                                    flat_responses.append(r)
+                            responses = [
+                                r for r in flat_responses if hasattr(r, "token")
+                            ]
+
+                        outputs, finished_ids = self._process_batch_responses(responses)
+                        output.outputs = outputs
+                        output.finished_request_ids = finished_ids
+                        self._cleanup_finished(finished_ids)
+
+                    # Success - break out of retry loop
+                    break
+
+                except Exception as e:
+                    # Recover from cache/batch corruption or GPU errors.
+                    # Pattern matching checks error message content.
+                    # IndexError/TypeError during generation are *likely* cache-related
+                    # (stale offsets, type mismatches from dequantized data) — treat as
+                    # recoverable but log the full traceback for debugging.
+                    is_pattern_match = self._is_cache_corruption_error(e)
+                    is_gen_type_error = isinstance(e, (IndexError, TypeError))
+                    is_cache_error = is_pattern_match or is_gen_type_error
+                    if is_gen_type_error:
+                        logger.warning(
+                            f"Treating {type(e).__name__} as potential cache error "
+                            f"(may indicate a real bug): {e}",
+                            exc_info=True,
+                        )
+                    if is_cache_error and attempt < max_retries:
+                        logger.warning(
+                            f"Batch generation error (attempt {attempt + 1}/{max_retries + 1}): "
+                            f"{type(e).__name__}: {e} — recovering with cache clear"
+                        )
+                        self._recover_from_cache_error()
+                        self._reschedule_running_requests()
+                        # Re-schedule after recovery
+                        self._schedule_waiting()
+                    else:
+                        logger.error(f"Error in batch generation step: {e}")
+                        raise
+
+        # Clear finished tracking for next step
+        self.finished_req_ids.clear()
+
+        # Periodic Metal memory cache cleanup during sustained traffic.
+        # When requests are always running, _cleanup_finished never calls
+        # idle cleanup never triggers. This timer ensures periodic cleanup
+        # to prevent Metal's internal allocator cache from growing unbounded.
+        now = time.monotonic()
+        if now - self._last_metal_gc_time > self._metal_gc_interval:
+            self._last_metal_gc_time = now
+            if clear_mlx_memory_cache(log=logger):
+                logger.debug("Periodic Metal memory cache cleanup")
+
+        # ── Deferred SSM re-derive (idle-time processing) ── vmlx#103
+        # For thinking models (gen_prompt_len > 0), the SSM companion store
+        # queues a re-derive task instead of skipping entirely. We run the
+        # re-derive here ONLY when the scheduler is fully idle — no running
+        # requests, no waiting requests, and no unprocessed-prefill
+        # requests. The forward pass uses the Metal GPU so it can't overlap
+        # with active or queued work; without these guards the re-derive
+        # could starve queued requests by holding the GPU for a full second
+        # prefill while they wait for their first token (vmlx#103).
+        # The re-derive runs a separate prefill pass on just the prompt
+        # tokens (no thinking/output contamination) and stores the clean
+        # SSM state for future prefix cache hits.
+        _has_unprocessed = bool(getattr(self, "unprocessed_requests", []))
+        _has_waiting = bool(getattr(self, "waiting", []))
+        if (
+            self._is_hybrid
+            and not self._uses_zaya_cache
+            and self.config.enable_prefix_cache
+            and not self.running
+            and not _has_waiting
+            and not _has_unprocessed
+            and hasattr(self, "_ssm_rederive_queue")
+            and self._ssm_rederive_queue
+            and self._ssm_state_cache is not None
+        ):
+            # Process ONE task per step to avoid long GPU stalls
+            tokens, prompt_len, orig_request_id = self._ssm_rederive_queue.pop(0)
+            try:
+                logger.info(
+                    f"SSM re-derive: running deferred prefill for "
+                    f"{orig_request_id} ({prompt_len} prompt tokens, "
+                    f"{len(self._ssm_rederive_queue)} remaining in queue)"
+                )
+                clean_cache = self._prefill_for_prompt_only_cache(tokens)
+                if clean_cache is not None:
+                    # Extract SSM layers from the clean cache.
+                    kv_set = set(self._hybrid_kv_positions or [])
+                    ssm_layers = []
+                    for layer_idx, c in enumerate(clean_cache):
+                        if layer_idx not in kv_set:
+                            if hasattr(c, "cache") and isinstance(c.cache, list):
+                                from copy import deepcopy
+                                import mlx.core as mx
+
+                                cloned = deepcopy(c)
+                                cloned.cache = [
+                                    mx.contiguous(mx.array(a))
+                                    if a is not None
+                                    else None
+                                    for a in c.cache
+                                ]
+                                ssm_layers.append(cloned)
+                            else:
+                                ssm_layers.append(c)
+                    if ssm_layers:
+                        self._ssm_state_cache.store(tokens, prompt_len, ssm_layers)
+                        logger.info(
+                            f"SSM re-derive: stored clean companion for "
+                            f"{orig_request_id}: {len(ssm_layers)} SSM layers, "
+                            f"{prompt_len}-token key (next fetch will hit)"
+                        )
+                    del clean_cache
+                    clear_mlx_memory_cache(log=logger)
+            except Exception as e:
+                logger.warning(f"SSM re-derive failed for {orig_request_id}: {e}")
+
+        return output
+
+    def get_request(self, request_id: str) -> Optional[Request]:
+        """Get a request by ID."""
+        return self.requests.get(request_id)
+
+    def remove_finished_request(self, request_id: str) -> Optional[Request]:
+        """Remove a finished request from tracking."""
+        return self.requests.pop(request_id, None)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get scheduler statistics."""
+        generator_cls = (
+            self.batch_generator.__class__.__name__
+            if self.batch_generator is not None
+            else None
+        )
+        if generator_cls == "SingleBatchGenerator":
+            generator_path = "single_active"
+        elif generator_cls == "DSV4BatchGenerator":
+            generator_path = "dsv4"
+        elif generator_cls == "BatchGenerator":
+            generator_path = "batched"
+        else:
+            generator_path = "none" if generator_cls is None else "custom"
+        now = time.time()
+
+        def _request_lifecycle_detail(request: Request) -> Dict[str, Any]:
+            schedule_time = getattr(request, "_schedule_time", None)
+            detail = {
+                "request_id": request.request_id,
+                "status": getattr(request.status, "name", str(request.status)),
+                "age_seconds": round(max(0.0, now - request.arrival_time), 3),
+                "scheduled_age_seconds": (
+                    round(max(0.0, time.perf_counter() - schedule_time), 3)
+                    if isinstance(schedule_time, (int, float))
+                    else None
+                ),
+                "prompt_tokens": int(getattr(request, "num_prompt_tokens", 0) or 0),
+                "output_tokens": int(getattr(request, "num_output_tokens", 0) or 0),
+                "cached_tokens": int(getattr(request, "cached_tokens", 0) or 0),
+                "max_tokens": int(getattr(request, "max_tokens", 0) or 0),
+                "batch_uid": getattr(request, "batch_uid", None),
+                "cache_detail": getattr(request, "_cache_detail", None),
+                "cache_execution": getattr(request, "_cache_execution", None),
+                "finish_reason": getattr(request, "finish_reason", None),
+            }
+            return {k: v for k, v in detail.items() if v is not None}
+
+        running_ids = list(self.running)
+        waiting_ids = [request.request_id for request in self.waiting]
+        stats = {
+            "num_waiting": len(self.waiting),
+            "num_running": len(self.running),
+            "waiting_request_ids": waiting_ids,
+            "running_request_ids": running_ids,
+            "pending_abort_request_ids": sorted(self._pending_aborts),
+            "running_requests": [
+                _request_lifecycle_detail(request)
+                for request in self.running.values()
+            ],
+            "num_requests_processed": self.num_requests_processed,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "ewma_ttft_seconds": round(self._ewma_ttft, 3),
+            "cache_hit_requests": self._cache_hit_requests,
+            "cache_hit_tokens": self._cache_hit_tokens,
+            "cache_hit_tokens_by_detail": dict(self._cache_hit_tokens_by_detail),
+            "cache_reuse_skips": self._cache_reuse_skips,
+            "cache_reuse_skip_tokens": self._cache_reuse_skip_tokens,
+            "last_cache_reuse_skip": self._last_cache_reuse_skip,
+            "cache_reuse_partial_downgrades": self._cache_reuse_partial_downgrades,
+            "cache_reuse_partial_tokens": self._cache_reuse_partial_tokens,
+            "last_cache_reuse_partial": self._last_cache_reuse_partial,
+            "last_cache_selection": self._last_cache_selection,
+            "last_cache_execution": self._last_cache_execution,
+            "engine_path": generator_path,
+            "batch_generator": {
+                "class": generator_cls,
+                "path": generator_path,
+                "single_active_decode": generator_path == "single_active",
+                "max_num_seqs": self.config.max_num_seqs,
+            },
+        }
+        # Include cache stats
+        if self.block_aware_cache is not None:
+            stats["paged_cache"] = self.block_aware_cache.get_stats()
+        elif self.memory_aware_cache is not None:
+            stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
+        elif self.prefix_cache is not None:
+            stats["prefix_cache"] = self.prefix_cache.get_stats()
+        ssm_stats = self._get_ssm_cache_stats()
+        if ssm_stats is not None:
+            stats["ssm_companion_cache"] = ssm_stats
+        return stats
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        """Get cache statistics."""
+        base: Optional[Dict[str, Any]] = None
+        if self.block_aware_cache is not None:
+            base = self.block_aware_cache.get_stats()
+        elif self.memory_aware_cache is not None:
+            base = self.memory_aware_cache.get_stats()
+        elif self.prefix_cache is not None:
+            base = self.prefix_cache.get_stats()
+        ssm_stats = self._get_ssm_cache_stats()
+        if base is not None and ssm_stats is not None:
+            base = dict(base)
+            base["ssm_companion_cache"] = ssm_stats
+        # Surface L2 prompt disk cache (hits / misses / entries / TQ-native counters)
+        # under a dedicated sub-key. This is the prompt-level disk cache manager
+        # (`DiskCacheManager`), separate from the block-level L2 disk store tracked
+        # by paged_cache's own `disk_hits` counter. Before this fix, prompt-level
+        # L2 restores worked but weren't visible in `/v1/cache/stats`, so users
+        # mistook the counter gap for a functional regression.
+        if self.disk_cache is not None:
+            try:
+                disk_stats = self.disk_cache.stats()
+                if base is None:
+                    base = {}
+                else:
+                    base = dict(base)
+                base["disk_cache"] = disk_stats
+            except Exception:
+                pass
+        if base is not None:
+            generator_cls = (
+                self.batch_generator.__class__.__name__
+                if self.batch_generator is not None
+                else None
+            )
+            if generator_cls == "SingleBatchGenerator":
+                engine_path = "single_active"
+            elif generator_cls == "DSV4BatchGenerator":
+                engine_path = "dsv4"
+            elif generator_cls == "BatchGenerator":
+                engine_path = "batched"
+            else:
+                engine_path = "none" if generator_cls is None else "custom"
+            base = dict(base)
+            base["engine_path"] = engine_path
+            base["batch_generator"] = {
+                "class": generator_cls,
+                "path": engine_path,
+                "single_active_decode": engine_path == "single_active",
+                "max_num_seqs": self.config.max_num_seqs,
+            }
+        return base
+
+    def _get_ssm_cache_stats(self) -> Optional[Dict[str, Any]]:
+        """A3→A1-001: surface SSM companion cache footprint so users see the
+        real cache memory cost on hybrid models. Without this, Nemotron 120B
+        can silently consume ~32 GB of SSM state beyond the prefix-cache
+        budget — a hidden OOM on small-memory machines.
+
+        Returns None if no SSM cache exists. Otherwise reports entries,
+        max_entries, and approximate bytes (sum of layer cache nbytes across
+        all stored entries — best-effort, since the SSM companion stores
+        deepcopied per-layer state).
+        """
+        cache = getattr(self, "_ssm_state_cache", None)
+        if cache is None:
+            return None
+        try:
+            store = getattr(cache, "_store", None)
+            entries = len(store) if store is not None else 0
+            max_entries = getattr(cache, "_max_entries", None) or getattr(
+                cache, "max_entries", 0
+            )
+            nbytes = int(getattr(cache, "total_nbytes", 0) or 0)
+            if nbytes <= 0 and store is not None:
+                for v in store.values():
+                    states = v[0] if isinstance(v, tuple) and v else v
+                    if isinstance(states, list):
+                        for layer in states:
+                            arrs = getattr(layer, "cache", None)
+                            if isinstance(arrs, list):
+                                for a in arrs:
+                                    nb = getattr(a, "nbytes", 0)
+                                    if isinstance(nb, int):
+                                        nbytes += nb
+
+                            # Add sizes for lengths array and legacy state arrays
+                            lens = getattr(layer, "lengths", None)
+                            if lens is not None:
+                                nb = getattr(lens, "nbytes", 0)
+                                if isinstance(nb, int):
+                                    nbytes += nb
+
+                            state = getattr(layer, "state", None)
+                            if isinstance(state, (list, tuple)):
+                                for s in state:
+                                    nb = getattr(s, "nbytes", 0)
+                                    if isinstance(nb, int):
+                                        nbytes += nb
+            result = {
+                "entries": entries,
+                "max_entries": int(max_entries) if max_entries else 0,
+                "max_bytes": getattr(cache, "max_bytes", None),
+                "max_bytes_mb": (
+                    round(cache.max_bytes / (1024 * 1024), 2)
+                    if getattr(cache, "max_bytes", None) is not None
+                    else None
+                ),
+                "nbytes": nbytes,
+                "nbytes_mb": round(nbytes / (1024 * 1024), 2),
+            }
+            disk = getattr(cache, "_disk", None)
+            result["disk_enabled"] = disk is not None
+            if disk is not None:
+                try:
+                    result["disk"] = disk.stats()
+                except Exception as _disk_e:
+                    result["disk"] = {
+                        "enabled": True,
+                        "error": str(_disk_e),
+                    }
+            return result
+        except Exception as _e:
+            return {"entries": 0, "max_entries": 0, "nbytes": 0, "error": str(_e)}
+
+    def reset(self) -> None:
+        """Reset the scheduler state."""
+        # Abort all requests
+        for request_id in list(self.requests.keys()):
+            self.abort_request(request_id)
+
+        self.waiting.clear()
+        self.running.clear()
+        self.requests.clear()
+        self.finished_req_ids.clear()
+        self.request_id_to_uid.clear()
+        self.uid_to_request_id.clear()
+        try:
+            self.batch_generator.close()
+        except Exception:
+            pass
+        self.batch_generator = None
+        self._current_sampler_params = None
+        self._detokenizer_pool.clear()
+
+        # Clear caches
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.clear()
+        if self.memory_aware_cache is not None:
+            self.memory_aware_cache.clear()
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
+
+    def deep_reset(self) -> None:
+        """
+        Deep reset that clears ALL cache state including model-level caches.
+
+        This is more aggressive than reset() and should be used when
+        switching engines or recovering from errors.
+        """
+        # Standard reset first
+        self.reset()
+
+        # Invalidate cached model config values so they are re-detected
+        # if the scheduler is ever reused with a different model
+        if hasattr(self, "_n_kv_heads_cached"):
+            del self._n_kv_heads_cached
+
+        # Clear any model-level cache state
+        # MLX models may have internal cache references
+        if hasattr(self.model, "cache"):
+            self.model.cache = None
+
+        # Some MLX models store cache in layers
+        if hasattr(self.model, "layers"):
+            for layer in self.model.layers:
+                if hasattr(layer, "cache"):
+                    layer.cache = None
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "cache"):
+                    layer.self_attn.cache = None
+
+        # Drop the per-process state machine factory LRU so a subsequent
+        # model load doesn't accidentally serve a stale matcher built for
+        # the previous model's tokenizer / parser id pair (audit
+        # 2026-04-08, ISSUE-A2-002 — was previously dead code).
+        try:
+            from .state_machine import reset_factory_cache
+
+            reset_factory_cache()
+        except Exception:
+            pass
+
+        # Force garbage collection of any lingering cache objects
+        import gc
+
+        gc.collect()
+
+        logger.info("Deep reset completed - all caches cleared")

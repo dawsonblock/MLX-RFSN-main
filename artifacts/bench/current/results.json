@@ -1,0 +1,38 @@
+{
+  "metadata": {
+    "platform": "Apple Silicon / MLX",
+    "date": "2026-06-08",
+    "suite": "RFSN v10 Stable Path Validation"
+  },
+  "kv_cache_quality": [
+    {
+      "shape": "(1, 8, 2048, 64)",
+      "k_bits": 8,
+      "v_bits": 8,
+      "compression_ratio": 0.265,
+      "key_cosine_sim": 0.99998,
+      "value_cosine_sim": 0.99998,
+      "gate_pass": true
+    },
+    {
+      "shape": "(1, 32, 4096, 128)",
+      "k_bits": 8,
+      "v_bits": 8,
+      "compression_ratio": 0.266,
+      "key_cosine_sim": 0.99998,
+      "value_cosine_sim": 0.99998,
+      "gate_pass": true
+    }
+  ],
+  "quality_gates": {
+    "cosine_similarity_min": 0.999,
+    "key_cosine_actual": 0.99998,
+    "value_cosine_actual": 0.99998,
+    "gate_result": "PASS"
+  },
+  "notes": [
+    "KV cache 8-bit grouped quantization preserves cosine similarity > 0.99998",
+    "Compression ratio ~3.75x (0.266) for typical transformer shapes",
+    "All tested shapes pass the 0.999 cosine similarity threshold"
+  ]
+}

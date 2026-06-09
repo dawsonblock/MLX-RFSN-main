@@ -1,0 +1,25 @@
+{
+  "description": "layers 0-3: conservative precision; layers 4-15: standard precision; layers 16+: aggressive precision if safe",
+  "default_fallback": {
+    "k_bits": 8,
+    "v_bits": 5,
+    "group_size": 64,
+    "variant": "k8_v5_gs64"
+  },
+  "layers": {
+    "0": {
+      "k_bits": 8,
+      "v_bits": 5,
+      "group_size": 32,
+      "variant": "k8_v5_gs32",
+      "bias": "conservative"
+    },
+    "1": {
+      "k_bits": 8,
+      "v_bits": 5,
+      "group_size": 32,
+      "variant": "k8_v5_gs32",
+      "bias": "conservative"
+    }
+  }
+}

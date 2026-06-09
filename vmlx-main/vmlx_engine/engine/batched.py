@@ -1,0 +1,2114 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Batched engine for continuous batching with multiple concurrent users.
+
+This engine wraps AsyncEngineCore to provide continuous batching
+for better throughput when serving multiple concurrent requests.
+
+For MLLM models, this engine supports a hybrid approach:
+- Text-only requests: Use BatchGenerator for continuous batching
+- Multimodal requests (with images/videos): Fall back to MLLM.chat() for correct processing
+
+This is necessary because BatchGenerator only supports token IDs, not pixel_values.
+"""
+
+import asyncio
+import hashlib
+import logging
+import os
+import tempfile
+from urllib.parse import unquote, urlparse
+from collections.abc import AsyncIterator
+from typing import Any
+
+from ..api.tool_calling import check_and_inject_fallback_tools, convert_tools_for_template
+from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..errors import (
+    PromptTooLongError,
+    UnsupportedMediaModalityError,
+    VLMImagePrefillBudgetError,
+)
+from ..model_config_registry import get_model_config_registry
+from ..utils.chat_template_kwargs import (
+    build_chat_template_kwargs,
+    ensure_thinking_off_sentinel,
+)
+from ..utils.multi_eos import collect_multi_eos_ids
+from .base import BaseEngine, GenerationOutput
+
+logger = logging.getLogger(__name__)
+
+
+def _raise_prompt_too_long_from_output(output: Any) -> None:
+    """Convert structured scheduler prefill errors back into API-level errors."""
+    if getattr(output, "error_code", None) == "prompt_too_long":
+        raise PromptTooLongError(
+            int(getattr(output, "error_prompt_tokens", 0) or 0),
+            int(getattr(output, "error_max_prompt_tokens", 0) or 0),
+            source=getattr(output, "error_source", None) or "tokenized prompt",
+            request_id=getattr(output, "request_id", None),
+        )
+    if getattr(output, "error_code", None) == VLMImagePrefillBudgetError.code:
+        detail = str(getattr(output, "error", None) or "VLM image prefill too large")
+        prefix = f"{VLMImagePrefillBudgetError.__name__}: "
+        if detail.startswith(prefix):
+            detail = detail[len(prefix):]
+        raise VLMImagePrefillBudgetError(
+            detail,
+            request_id=getattr(output, "request_id", None),
+        )
+    if getattr(output, "error_code", None) == UnsupportedMediaModalityError.code:
+        detail = str(getattr(output, "error", None) or "unsupported media modality")
+        prefix = f"{UnsupportedMediaModalityError.__name__}: "
+        if detail.startswith(prefix):
+            detail = detail[len(prefix):]
+        raise UnsupportedMediaModalityError(
+            getattr(output, "error_modality", None) or "media",
+            detail,
+            family=getattr(output, "error_family", None),
+            request_id=getattr(output, "request_id", None),
+        )
+    error = getattr(output, "error", None)
+    if error:
+        raise RuntimeError(str(error))
+
+
+class MLLMModelWrapper:
+    """
+    Wrapper for MLLM models to make them compatible with BatchGenerator.
+
+    BatchGenerator expects model output to be subscriptable (logits array),
+    but MLLM models return LanguageModelOutput objects. This wrapper extracts
+    the logits from the output.
+
+        Also handles Gemma 3's required pixel_values argument by injecting None
+    for text-only requests.
+    """
+
+    def __init__(self, model, model_name: str = ""):
+        self._model = model
+        # Use registry to check if model needs pixel_values injection
+        self._inject_pixel_values = False
+        if model_name:
+            registry = get_model_config_registry()
+            hints = registry.get_architecture_hints(model_name)
+            self._inject_pixel_values = hints.get("inject_pixel_values", False)
+        if not self._inject_pixel_values:
+            # Fallback: detect from model_type attribute
+            _mt = str(getattr(model, "model_type", "")).lower()
+            self._inject_pixel_values = (
+                hasattr(model, "model_type")
+                and _mt in ("gemma3", "gemma3n")
+            )
+
+    def __call__(self, *args, **kwargs):
+        """Call the model and extract logits from LanguageModelOutput."""
+        # Some models (e.g., Gemma 3, MedGemma) require pixel_values as a
+        # positional arg. Inject pixel_values=None for text-only requests.
+        if self._inject_pixel_values and "pixel_values" not in kwargs:
+            kwargs["pixel_values"] = None
+
+        output = self._model(*args, **kwargs)
+        # If output has logits attribute, return just the logits
+        if hasattr(output, "logits"):
+            return output.logits
+        return output
+
+    def __getattr__(self, name):
+        """Forward all other attributes to the wrapped model."""
+        return getattr(self._model, name)
+
+
+class BatchedEngine(BaseEngine):
+    """
+    Batched engine for continuous batching.
+
+    This engine provides better throughput when serving multiple
+    concurrent users by batching requests together.
+
+    For MLLM (multimodal) models, this engine uses MLLMScheduler
+    which handles images and videos alongside text generation.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        trust_remote_code: bool = True,
+        scheduler_config: Any | None = None,
+        stream_interval: int = 1,
+        force_mllm: bool = False,
+    ):
+        """
+        Initialize the batched engine.
+
+        Args:
+            model_name: HuggingFace model name or local path
+            trust_remote_code: Whether to trust remote code
+            scheduler_config: Optional scheduler configuration
+            stream_interval: Tokens to batch before streaming (1=every token)
+            force_mllm: Force loading as MLLM even if not auto-detected
+        """
+        self._model_name = model_name
+        self._trust_remote_code = trust_remote_code
+        self._scheduler_config = scheduler_config
+        self._stream_interval = stream_interval
+        self._is_mllm = is_mllm_model(model_name, force_mllm=force_mllm)
+
+        self._model = None
+        self._processor = None  # For MLLM
+        self._tokenizer = None  # For LLM
+        self._engine = None  # AsyncEngineCore for LLM
+        self._mllm_scheduler = None  # MLLMScheduler for MLLM
+        self._mllm_instance = None  # MLXMultimodalLM instance
+        self._loaded = False
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name."""
+        return self._model_name
+
+    def _model_family_name(self) -> str | None:
+        try:
+            return get_model_config_registry().lookup(self._model_name).family_name
+        except Exception:
+            return None
+
+    def _model_tool_parser_name(self) -> str | None:
+        try:
+            return get_model_config_registry().lookup(self._model_name).tool_parser
+        except Exception:
+            return None
+
+    def _use_simple_mllm_media_fallback(
+        self,
+        *,
+        images: list[str],
+        videos: list[str],
+    ) -> bool:
+        if not self._is_mllm or not (images or videos):
+            return False
+        if os.environ.get("VMLINUX_DISABLE_MLLM_MEDIA_SIMPLE_FALLBACK") == "1":
+            return False
+        # Gemma4 media is coherent through MLXMultimodalLM.chat(), while the
+        # current batched MLLM scheduler path can produce corrupted visible
+        # image output after a valid vision prefill. Keep text-only Gemma4 on
+        # the optimized scheduler/cache path; only media turns use the proven
+        # simple VLM forward until batched media prefill parity is fixed.
+        return self._model_family_name() == "gemma4"
+
+    async def _simple_mllm_chat_output(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        tools: list[dict] | None,
+        kwargs: dict[str, Any],
+    ) -> GenerationOutput:
+        if self._mllm_instance is None:
+            raise RuntimeError("MLLM instance is not loaded")
+        call_kwargs = dict(kwargs)
+        call_kwargs.pop("request_id", None)
+        call_kwargs["top_p"] = top_p
+        if tools:
+            call_kwargs["tools"] = convert_tools_for_template(tools)
+        executor = getattr(self._mllm_scheduler, "_step_executor", None)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            executor,
+            lambda: self._mllm_instance.chat(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **call_kwargs,
+            ),
+        )
+        text = clean_output_text(getattr(result, "text", "") or "")
+        return GenerationOutput(
+            text=text,
+            new_text=text,
+            raw_text=getattr(result, "text", "") or text,
+            prompt_tokens=int(getattr(result, "prompt_tokens", 0) or 0),
+            completion_tokens=int(getattr(result, "completion_tokens", 0) or 0),
+            finish_reason=getattr(result, "finish_reason", None) or "stop",
+            finished=True,
+        )
+
+    def _messages_are_text_only(self, messages: list[dict[str, Any]]) -> bool:
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, str) or content is None:
+                continue
+            if not isinstance(content, list):
+                return False
+            for part in content:
+                if isinstance(part, str):
+                    continue
+                if not isinstance(part, dict):
+                    return False
+                part_type = str(part.get("type", "") or "").lower()
+                if part_type and part_type != "text":
+                    return False
+                if any(
+                    key in part
+                    for key in (
+                        "image",
+                        "image_url",
+                        "video",
+                        "video_url",
+                        "audio",
+                        "audio_url",
+                    )
+                ):
+                    return False
+        return True
+
+    @staticmethod
+    def _extract_audio_content(messages: list[dict[str, Any]]) -> list[Any]:
+        """Extract OpenAI-style audio parts without changing message shape."""
+        audios: list[Any] = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                item = part
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    item = {k: v for k, v in item.dict().items() if v is not None}
+                if not isinstance(item, dict):
+                    continue
+                part_type = str(item.get("type", "") or "").lower()
+                if part_type not in {"input_audio", "audio", "audio_url"} and not any(
+                    key in item for key in ("input_audio", "audio", "audio_url")
+                ):
+                    continue
+                source = (
+                    item.get("input_audio")
+                    or item.get("audio")
+                    or item.get("audio_url")
+                    or item.get("url")
+                    or item.get("path")
+                    or item.get("data")
+                )
+                if source is None:
+                    continue
+                audios.append(source)
+        return audios
+
+    @staticmethod
+    def _collapse_text_only_content_lists(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                normalized.append(message)
+                continue
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif isinstance(part, dict):
+                    text_parts.append(str(part.get("text") or part.get("content") or ""))
+                else:
+                    text_parts.append(str(part))
+            collapsed = dict(message)
+            collapsed["content"] = "".join(text_parts)
+            normalized.append(collapsed)
+        return normalized
+
+    @staticmethod
+    def _fold_leading_system_into_first_user(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        leading_system_parts: list[str] = []
+        folded: list[dict[str, Any]] = []
+        folded_into_user = False
+        for message in messages:
+            role = str(message.get("role") or "").lower()
+            if not folded and role in {"system", "developer"}:
+                text = str(message.get("content") or "").strip()
+                if text:
+                    leading_system_parts.append(text)
+                continue
+            if leading_system_parts and not folded_into_user and role == "user":
+                combined = dict(message)
+                user_text = str(combined.get("content") or "").strip()
+                combined["content"] = "\n\n".join(
+                    part for part in [*leading_system_parts, user_text] if part
+                )
+                folded.append(combined)
+                folded_into_user = True
+                continue
+            folded.append(message)
+        if leading_system_parts and not folded_into_user:
+            folded.insert(
+                0,
+                {"role": "user", "content": "\n\n".join(leading_system_parts)},
+            )
+        return folded
+
+    @staticmethod
+    def _normalize_tool_call_arguments_for_template(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return messages whose assistant tool-call arguments are mappings."""
+        normalized: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                normalized.append(message)
+                continue
+            msg = dict(message)
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                copied_calls: list[Any] = []
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        copied_calls.append(tool_call)
+                        continue
+                    copied_call = dict(tool_call)
+                    function = copied_call.get("function")
+                    if isinstance(function, dict):
+                        copied_function = dict(function)
+                        arguments = copied_function.get("arguments")
+                        if isinstance(arguments, str):
+                            try:
+                                import json
+
+                                parsed = json.loads(arguments)
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                parsed = {}
+                            copied_function["arguments"] = (
+                                parsed if isinstance(parsed, dict) else {}
+                            )
+                        copied_call["function"] = copied_function
+                    copied_calls.append(copied_call)
+                msg["tool_calls"] = copied_calls
+            normalized.append(msg)
+        return normalized
+
+    def _mimo_text_only_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        *,
+        enable_thinking: bool,
+        extra_template_kwargs: dict | None,
+        skip_generation_prompt: bool,
+    ) -> str:
+        """Render MiMo text-only chats with the native request thinking mode.
+
+        Continuous batching still routes text-only MiMo through the language
+        model for cache and memory reasons, but it must not rewrite
+        ``enable_thinking=false`` to the thinking-on template rail. Live JANG_2L
+        proof showed that the rewrite leaks reasoning-style text into visible
+        content; any first-token EOS issue is handled by the MiMo logits policy.
+        """
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        processor = self._processor or getattr(self._model, "processor", None)
+        if processor is None:
+            raise RuntimeError("MiMo text-only batching requires a processor")
+
+        template_kwargs = dict(extra_template_kwargs or {})
+        if enable_thinking is not None:
+            template_kwargs["enable_thinking"] = enable_thinking
+        if tools:
+            template_kwargs["tools"] = tools
+
+        rendered_messages = self._fold_leading_system_into_first_user(
+            self._collapse_text_only_content_lists(messages)
+        )
+        rendered_messages = self._normalize_tool_call_arguments_for_template(
+            rendered_messages
+        )
+        prompt = get_chat_template(
+            processor,
+            rendered_messages,
+            add_generation_prompt=not skip_generation_prompt,
+            **template_kwargs,
+        )
+        return check_and_inject_fallback_tools(
+            prompt,
+            rendered_messages,
+            tools,
+            processor,
+            dict(template_kwargs, tokenize=False, add_generation_prompt=not skip_generation_prompt),
+            tool_parser_id=self._model_tool_parser_name(),
+        )
+
+    def _video_frame_fallback_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        video_fps: float | None = None,
+        video_max_frames: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Route selected VLM video turns through sampled image frames.
+
+        Current upstream Qwen3.5/3.6 native video tensors can return coherent
+        API responses while misreading simple colors. The image path is stable
+        for the same bundles, so use real sampled frames as image parts until
+        native ``pixel_values_videos`` is proven coherent.
+
+        Gemma4 unified currently has a stable image path and source-owned
+        video placeholder expansion, but the OpenAI ``video_url`` API shape can
+        otherwise fall through to native video processing with a raw ``file://``
+        URL. Route it through the same frame-image path for API parity.
+
+        Step3.7 Flash bundles are image/VL artifacts with no native video
+        processor metadata. For those bundles, video support is intentionally
+        a frame-fallback path rather than native video tensors.
+        """
+        family = self._model_family_name()
+        if family not in {"qwen3_5", "qwen3_5_moe", "step3p7", "gemma4", "gemma4_unified"}:
+            return messages
+
+        try:
+            from ..models.mllm import (
+                DEFAULT_FPS,
+                MAX_FRAMES,
+                extract_video_frames_smart,
+                process_video_input,
+                save_frames_to_temp,
+            )
+        except Exception:
+            return messages
+
+        fps = video_fps or DEFAULT_FPS
+        max_frames = video_max_frames or MAX_FRAMES
+        rewritten: list[dict[str, Any]] = []
+        changed = False
+
+        def _normalize_video_source(src: Any) -> Any:
+            if not isinstance(src, str) or not src.startswith("file://"):
+                return src
+            parsed = urlparse(src)
+            if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+                return src
+            return unquote(parsed.path)
+
+        def _dedup_video_frames(
+            frame_paths: list[str],
+            *,
+            cache_key: str | None = None,
+        ) -> list[str]:
+            if family not in {"step3p7", "gemma4", "gemma4_unified"} or len(frame_paths) <= 1:
+                return frame_paths
+            try:
+                from PIL import Image, ImageDraw
+
+                raw_images = [
+                    (path, Image.open(path).convert("RGB"))
+                    for path in frame_paths
+                ]
+                kept_paths = []
+                images = []
+                prev_avg = None
+                for path, img in raw_images:
+                    avg = img.resize((1, 1)).getpixel((0, 0))
+                    if prev_avg is not None:
+                        delta = sum(abs(int(a) - int(b)) for a, b in zip(avg, prev_avg))
+                        if delta < 24:
+                            continue
+                    kept_paths.append(path)
+                    images.append(img)
+                    prev_avg = avg
+                if not images:
+                    return frame_paths
+                if family in {"gemma4", "gemma4_unified"}:
+                    return kept_paths
+                thumb_w = max(1, min(384, max(img.width for img in images)))
+                thumbs = []
+                for idx, img in enumerate(images, start=1):
+                    scale = thumb_w / max(1, img.width)
+                    thumb_h = max(1, int(img.height * scale))
+                    thumb = img.resize((thumb_w, thumb_h))
+                    draw = ImageDraw.Draw(thumb)
+                    draw.rectangle((0, 0, 72, 28), fill=(0, 0, 0))
+                    draw.text((8, 7), f"frame {idx}", fill=(255, 255, 255))
+                    thumbs.append(thumb)
+                sheet_w = thumb_w * len(thumbs)
+                sheet_h = max(thumb.height for thumb in thumbs)
+                sheet = Image.new("RGB", (sheet_w, sheet_h), (255, 255, 255))
+                x = 0
+                for thumb in thumbs:
+                    sheet.paste(thumb, (x, 0))
+                    x += thumb.width
+                digest = hashlib.sha256(
+                    (cache_key or "|".join(frame_paths)).encode("utf-8", "ignore")
+                ).hexdigest()[:20]
+                cache_dir = os.path.join(tempfile.gettempdir(), "vmlx_video_fallback")
+                os.makedirs(cache_dir, exist_ok=True)
+                sheet_path = os.path.join(
+                    cache_dir,
+                    f"{digest}_step_video_contact_sheet.png",
+                )
+                if not os.path.exists(sheet_path):
+                    sheet.save(sheet_path)
+                return [sheet_path]
+            except Exception as exc:
+                logger.warning(
+                    "%s video contact-sheet fallback failed; using frame list: %s",
+                    family or "VLM",
+                    exc,
+                )
+                return frame_paths
+
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                rewritten.append(msg)
+                continue
+
+            new_content: list[Any] = []
+            for part in content:
+                item = part
+                if hasattr(item, "model_dump"):
+                    item = item.model_dump(exclude_none=True)
+                elif hasattr(item, "dict"):
+                    item = {
+                        k: v for k, v in item.dict().items()
+                        if v is not None
+                    }
+
+                if not isinstance(item, dict):
+                    new_content.append(item)
+                    continue
+
+                item_type = item.get("type")
+                if item_type not in {"video_url", "video", "input_video"}:
+                    new_content.append(item)
+                    continue
+
+                src = item.get("video_url") or item.get("video") or item.get("url") or item.get("file_id")
+                if isinstance(src, dict):
+                    src = src.get("url") or src.get("path") or src.get("video_url")
+                if not src:
+                    new_content.append(item)
+                    continue
+                src = _normalize_video_source(src)
+
+                try:
+                    video_path = process_video_input(src)
+                    try:
+                        stat = os.stat(video_path)
+                        fallback_cache_key = (
+                            f"{family}|{video_path}|{stat.st_size}|{stat.st_mtime_ns}|"
+                            f"{fps}|{max_frames}"
+                        )
+                    except Exception:
+                        fallback_cache_key = f"{family}|{video_path}|{fps}|{max_frames}"
+                    frames = extract_video_frames_smart(
+                        video_path,
+                        fps=fps,
+                        max_frames=max_frames,
+                    )
+                    frame_paths = save_frames_to_temp(frames)
+                    frame_paths = _dedup_video_frames(
+                        frame_paths,
+                        cache_key=fallback_cache_key,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "%s video frame fallback failed; using native video path: %s",
+                        family or "VLM",
+                        exc,
+                    )
+                    new_content.append(item)
+                    continue
+
+                for frame_path in frame_paths:
+                    new_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": frame_path},
+                        }
+                    )
+                changed = True
+
+            if changed:
+                out_msg = dict(msg)
+                out_msg["content"] = new_content
+                rewritten.append(out_msg)
+            else:
+                rewritten.append(msg)
+
+        return rewritten if changed else messages
+
+    def _qwen_video_frame_fallback_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        video_fps: float | None = None,
+        video_max_frames: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._video_frame_fallback_messages(
+            messages,
+            video_fps=video_fps,
+            video_max_frames=video_max_frames,
+        )
+
+    @property
+    def is_mllm(self) -> bool:
+        """Check if this is a multimodal model."""
+        return self._is_mllm
+
+    @property
+    def tokenizer(self) -> Any:
+        """Get the tokenizer."""
+        if self._is_mllm and self._processor:
+            return getattr(self._processor, "tokenizer", self._processor)
+        return self._tokenizer
+
+    async def start(self) -> None:
+        """Start the engine (load model if not loaded)."""
+        if self._loaded:
+            return
+
+        if self._is_mllm:
+            await self._start_mllm()
+        else:
+            await self._start_llm()
+
+        self._loaded = True
+        logger.info(f"BatchedEngine loaded: {self._model_name} (mllm={self._is_mllm})")
+
+    async def _start_mllm(self) -> None:
+        """Start the MLLM engine with MLLMScheduler (continuous batching).
+
+        Forwards ALL cache settings from the user's SchedulerConfig to
+        MLLMSchedulerConfig for full LLM/MLLM cache parity. This includes
+        paged cache, memory-aware cache, legacy prefix cache, disk L2,
+        block disk store, and KV cache quantization settings.
+        """
+        from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from ..scheduler import SchedulerConfig
+        from ..models.mllm import MLXMultimodalLM
+
+        # Load the MLLM model on the SAME thread that will later run
+        # step()/prefill — see `MLLMScheduler._step_executor` for the
+        # JANGTQ Metal kernel stream-isolation rationale. Without this,
+        # Stream(gpu, 1) created during load on MainThread is invisible
+        # to the worker thread that runs prefill, and JANGTQ-VL bundles
+        # crash with "RuntimeError: There is no Stream(gpu, 1) in current
+        # thread."  We instantiate a temporary scheduler-aligned executor
+        # here, load the model on it, then hand the same executor to the
+        # scheduler below so step() runs on the exact same worker.
+        from concurrent.futures import ThreadPoolExecutor
+        loader_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mllm-worker"
+        )
+        self._mllm_instance = MLXMultimodalLM(
+            self._model_name,
+            trust_remote_code=self._trust_remote_code,
+        )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(loader_executor, self._mllm_instance.load)
+
+        self._model = self._mllm_instance.model
+        self._processor = self._mllm_instance.processor
+
+        # Create MLLM scheduler config with batch generator support
+        default_scheduler = SchedulerConfig()
+        if self._scheduler_config and hasattr(self._scheduler_config, "max_num_seqs"):
+            max_num_seqs = self._scheduler_config.max_num_seqs
+        else:
+            max_num_seqs = default_scheduler.max_num_seqs
+
+        # Get batch sizes from config if available
+        prefill_batch_size = getattr(
+            self._scheduler_config,
+            "prefill_batch_size",
+            default_scheduler.prefill_batch_size,
+        )
+        completion_batch_size = getattr(
+            self._scheduler_config,
+            "completion_batch_size",
+            default_scheduler.completion_batch_size,
+        )
+
+        mllm_config = MLLMSchedulerConfig(
+            max_num_seqs=max_num_seqs,
+            prefill_batch_size=prefill_batch_size,
+            completion_batch_size=completion_batch_size,
+            prefill_step_size=getattr(
+                self._scheduler_config,
+                "prefill_step_size",
+                default_scheduler.prefill_step_size,
+            ),
+            enable_vision_cache=True,
+            vision_cache_size=16,
+            # Propagate cache settings from user's SchedulerConfig
+            enable_prefix_cache=getattr(self._scheduler_config, "enable_prefix_cache", True),
+            use_paged_cache=getattr(self._scheduler_config, "use_paged_cache", True),
+            paged_cache_block_size=getattr(self._scheduler_config, "paged_cache_block_size", 64),
+            max_cache_blocks=getattr(self._scheduler_config, "max_cache_blocks", 1000),
+            kv_cache_quantization=getattr(self._scheduler_config, "kv_cache_quantization", "none"),
+            kv_cache_group_size=getattr(self._scheduler_config, "kv_cache_group_size", 64),
+            kv_cache_quantization_explicit=getattr(
+                self._scheduler_config, "kv_cache_quantization_explicit", False
+            ),
+            # Memory-aware cache settings
+            use_memory_aware_cache=getattr(self._scheduler_config, "use_memory_aware_cache", True),
+            cache_memory_mb=getattr(self._scheduler_config, "cache_memory_mb", None),
+            cache_memory_percent=getattr(self._scheduler_config, "cache_memory_percent", 0.20),
+            cache_ttl_minutes=getattr(self._scheduler_config, "cache_ttl_minutes", 0),
+            # Legacy prefix cache
+            prefix_cache_size=getattr(self._scheduler_config, "prefix_cache_size", 100),
+            # Disk cache L2
+            enable_disk_cache=getattr(self._scheduler_config, "enable_disk_cache", False),
+            disk_cache_dir=getattr(self._scheduler_config, "disk_cache_dir", None),
+            disk_cache_max_gb=getattr(self._scheduler_config, "disk_cache_max_gb", 10.0),
+            # Block-level disk cache L2
+            enable_block_disk_cache=getattr(self._scheduler_config, "enable_block_disk_cache", False),
+            block_disk_cache_dir=getattr(self._scheduler_config, "block_disk_cache_dir", None),
+            block_disk_cache_max_gb=getattr(self._scheduler_config, "block_disk_cache_max_gb", 10.0),
+            # Model path for disk cache scoping
+            model_path=getattr(self._scheduler_config, "model_path", None) or self._model_name,
+            # Hybrid SSM companion cache budget
+            ssm_state_cache_size=getattr(self._scheduler_config, "ssm_state_cache_size", 8),
+            ssm_state_cache_max_mb=getattr(
+                self._scheduler_config, "ssm_state_cache_max_mb", 512
+            ),
+            # Hand the loader executor to the scheduler so step() runs on
+            # the same worker thread as the load (JANGTQ Metal kernel
+            # stream-isolation fix).
+            step_executor=loader_executor,
+        )
+
+        # Create and start MLLM scheduler
+        self._mllm_scheduler = MLLMScheduler(
+            model=self._model,
+            processor=self._processor,
+            config=mllm_config,
+        )
+        await self._mllm_scheduler.start()
+
+        logger.info(
+            f"MLLM Scheduler started with continuous batching: "
+            f"max_num_seqs={self._mllm_scheduler.config.max_num_seqs}, "
+            f"prefill_batch={self._mllm_scheduler.config.prefill_batch_size}, "
+            f"completion_batch={self._mllm_scheduler.config.completion_batch_size}"
+        )
+
+    async def _start_llm(self) -> None:
+        """Start the LLM engine with AsyncEngineCore."""
+        from ..engine_core import AsyncEngineCore, EngineConfig
+        from ..scheduler import SchedulerConfig
+        from ..utils.tokenizer import load_model_with_fallback
+
+        # Build tokenizer config with registry-based EOS overrides
+        tokenizer_config = {"trust_remote_code": self._trust_remote_code}
+
+        registry = get_model_config_registry()
+        model_config = registry.lookup(self._model_name)
+        if model_config.eos_tokens:
+            tokenizer_config["eos_token"] = model_config.eos_tokens[0]
+
+        # JANGTQ Metal stream isolation (mlxstudio#96/#97 root cause,
+        # 2026-04-28). MLX streams are thread-local; load + every
+        # subsequent forward must run on the same thread or JANGTQ
+        # kernels crash with `Stream(gpu, N) in current thread`. The
+        # MLLM path has had this since 2026-04-25; this wires the
+        # equivalent dedicated executor for the LLM path so JANGTQ
+        # text bundles (Qwen3.6-A3B JANGTQ4, MiniMax-M2.7 JANGTQ,
+        # Kimi K2.6 JANGTQ, etc.) work via /v1/chat/completions.
+        from concurrent.futures import ThreadPoolExecutor
+        loader_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="llm-worker"
+        )
+        loop = asyncio.get_running_loop()
+
+        # GH#138/#156: only explicit `--kv-cache-quantization {q4,q8,none}`
+        # disables TurboQuant patching. In auto mode the scheduler may still
+        # use q4 for stored prefix-cache entries, while compatible JANG/JANGTQ
+        # bundles keep TurboQuantKVCache for the live decode cache.
+        _kvq = getattr(self._scheduler_config, "kv_cache_quantization", None)
+        _kvq_explicit = getattr(
+            self._scheduler_config, "kv_cache_quantization_explicit", False
+        )
+        _skip_tq = _kvq_explicit and _kvq in ("q4", "q8", "none")
+
+        def _load():
+            # Pre-warm MLX internal streams on this worker thread BEFORE
+            # the model load. MLX C++ kernels lazily allocate internal
+            # streams (Stream(gpu, 1), Stream(gpu, 2), ...) when they
+            # first run a kernel; those streams get bound to the calling
+            # thread. Without this pre-warm, the first internal stream
+            # is allocated on whichever thread runs the first kernel —
+            # sometimes MainThread before the worker even starts — and
+            # subsequent kernel invocations from the worker fail with
+            # `RuntimeError: There is no Stream(gpu, N) in current thread.`
+            # on DSV4-Flash + JANGTQ bundles. Forcing a no-op kernel and
+            # synchronize here binds those internal streams to the worker.
+            try:
+                import mlx.core as _mx_pre
+                _a = _mx_pre.zeros((2, 2))
+                _b = _mx_pre.matmul(_a, _a)
+                # mx.synchronize() forces all pending ops to finish,
+                # which materialises any lazily-allocated internal
+                # streams on the calling thread. Avoids using mx.eval
+                # so we don't perturb the active stream context.
+                if hasattr(_mx_pre, "synchronize"):
+                    _mx_pre.synchronize()
+            except Exception:
+                pass
+            return load_model_with_fallback(
+                self._model_name,
+                tokenizer_config=tokenizer_config,
+                skip_turboquant=_skip_tq,
+            )
+
+        self._model, self._tokenizer = await loop.run_in_executor(
+            loader_executor, _load
+        )
+
+        # ─────────────────────────────────────────────────────────────────
+        # UNIVERSAL multi-eos stop set installation (port of the hook in
+        # `vmlx_engine/models/llm.py:102-217`). Without this here, every
+        # batched-mode load (panel default + `--continuous-batching`)
+        # ships only a singleton EOS even when the bundle/registry declares
+        # a multi-stop list. Symptom on DSV4-Flash: model emits
+        # `<｜end▁of▁sentence｜>` (id 1) → singleton stop hits → fine, but
+        # also rolls into `<｜User｜>` (id 128803) on multi-turn chat
+        # because the registry's defensive stop never made it into the
+        # tokenizer wrapper. mlx_lm's `stream_generate` re-wraps with
+        # `TokenizerWrapper(tok)` (no eos_token_ids) → singleton fallback
+        # → control-character output past natural turn boundary on
+        # /v1/chat/completions. The pre-wrap with full id list survives
+        # `isinstance(tokenizer, TokenizerWrapper)` short-circuit in
+        # mlx_lm so the list isn't collapsed.
+        try:
+            from mlx_lm.tokenizer_utils import TokenizerWrapper as _TW
+            logger.info(
+                f"BatchedEngine multi-eos hook: family={model_config.family_name}, "
+                f"registry eos_tokens={model_config.eos_tokens}, "
+                f"tokenizer_class={type(self._tokenizer).__name__}, "
+                f"primary={getattr(self._tokenizer, 'eos_token_id', None)}"
+            )
+            resolved, unresolved = collect_multi_eos_ids(
+                self._tokenizer,
+                self._model_name,
+                registry_eos_tokens=model_config.eos_tokens,
+                reasoning_parser=model_config.reasoning_parser,
+                use_rust_tokenizer=True,
+            )
+            if len(resolved) > 1:
+                if isinstance(self._tokenizer, _TW):
+                    for tid in resolved:
+                        try:
+                            self._tokenizer.add_eos_token(tid)
+                        except Exception:
+                            pass
+                    logger.info(
+                        f"{model_config.family_name}: BatchedEngine extended "
+                        f"existing TokenizerWrapper; "
+                        f"eos_token_ids={getattr(self._tokenizer, '_eos_token_ids', None)}"
+                    )
+                else:
+                    self._tokenizer = _TW(self._tokenizer, eos_token_ids=resolved)
+                    logger.info(
+                        f"{model_config.family_name}: BatchedEngine pre-wrapped "
+                        f"with eos_token_ids={resolved}"
+                    )
+            if unresolved:
+                logger.warning(
+                    f"{model_config.family_name}: unresolved eos strings {unresolved} "
+                    "(not in vocab as single tokens) — fix registry or tokenizer_config"
+                )
+        except Exception as _eos_err:
+            logger.warning(
+                f"BatchedEngine multi-eos hook failed for "
+                f"{model_config.family_name}: {_eos_err}"
+            )
+
+        # Wrap model so BatchGenerator gets raw logits tensors.
+        # Some models (nemotron_h, etc.) return LanguageModelOutput objects
+        # instead of plain tensors. MLLMModelWrapper extracts .logits when
+        # present and is a no-op passthrough for models returning tensors.
+        self._model = MLLMModelWrapper(self._model, model_name=self._model_name)
+
+        # Create engine config — forward the loader executor so EngineCore
+        # dispatches every scheduler.step() to the same worker thread.
+        scheduler_config = self._scheduler_config or SchedulerConfig()
+        scheduler_config.step_executor = loader_executor
+        engine_config = EngineConfig(
+            model_name=self._model_name,
+            scheduler_config=scheduler_config,
+            stream_interval=self._stream_interval,
+        )
+
+        # Create async engine
+        self._engine = AsyncEngineCore(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            config=engine_config,
+        )
+
+        await self._engine.engine.start()
+
+    async def stop(self) -> None:
+        """Stop the engine and cleanup resources."""
+        if self._mllm_scheduler:
+            await self._mllm_scheduler.stop()
+            self._mllm_scheduler = None
+
+        if self._engine:
+            await self._engine.stop()
+            # close() handles scheduler.shutdown() + deep_reset() + collector cleanup.
+            # stop() already called scheduler.shutdown(), but close() is idempotent
+            # and handles additional cleanup (model ownership, deep_reset).
+            self._engine.engine.close()
+            self._engine = None
+
+        self._model = None
+        self._tokenizer = None
+        self._processor = None
+        self._mllm_instance = None
+        self._loaded = False
+        logger.info("BatchedEngine stopped")
+
+    def _inject_fallback_chat_template(self, tokenizer) -> str | None:
+        """Best-effort attach a chat_template to a tokenizer that's missing one.
+
+        Why this exists (GH issue #66 part 2): mlx-community quants ship the
+        chat template as a SEPARATE ``chat_template.jinja`` file alongside
+        the tokenizer instead of baking it into ``tokenizer_config.json``.
+        Stock HF transformers raises ``tokenizer.chat_template is not set``
+        on first use. Falling back here lets the user run those quants
+        without re-downloading a JANG variant just to get a working prompt.
+
+        Resolution order:
+          1. ``chat_template.jinja`` in the model directory (most common)
+          2. ``chat_template.json`` (alternate format)
+          3. The model_configs registry's ``chat_template_custom`` field
+             (Harmony fallback for GLM/GPT-OSS-style models)
+
+        Returns the source description (e.g. ``"chat_template.jinja"``) on
+        success, ``None`` if no fallback was found. Mutates ``tokenizer``
+        in place by setting ``tokenizer.chat_template``.
+        """
+        if not hasattr(tokenizer, "chat_template"):
+            return None
+        try:
+            from pathlib import Path
+            model_dir = Path(self._model_name) if self._model_name else None
+            if model_dir and model_dir.is_dir():
+                # 1. chat_template.jinja
+                jinja_path = model_dir / "chat_template.jinja"
+                if jinja_path.is_file():
+                    tokenizer.chat_template = jinja_path.read_text(encoding="utf-8")
+                    return str(jinja_path.name)
+                # 2. chat_template.json
+                json_path = model_dir / "chat_template.json"
+                if json_path.is_file():
+                    import json as _json
+                    data = _json.loads(json_path.read_text(encoding="utf-8"))
+                    tpl = data.get("chat_template") if isinstance(data, dict) else None
+                    if isinstance(tpl, str):
+                        tokenizer.chat_template = tpl
+                        return str(json_path.name)
+        except Exception as e:
+            logger.debug(f"chat_template file probe failed: {e}")
+
+        # 3. Registry fallback by family (chat_template_custom)
+        mc = None
+        try:
+            from ..model_config_registry import get_model_config_registry
+            mc = get_model_config_registry().lookup(self._model_name or "")
+            tpl = getattr(mc, "chat_template_custom", None)
+            if isinstance(tpl, str) and tpl.strip():
+                tokenizer.chat_template = tpl
+                return f"registry:{mc.family_name}"
+        except Exception as e:
+            logger.debug(f"registry chat_template lookup failed: {e}")
+
+        # 4. Bundled chat-template fallback keyed by family.
+        # vmlx#80 (Flor1an-B, 2026-04-15): mlx-community/gemma-4-31b-8bit
+        # ships NO chat_template (no sidecar, not in tokenizer_config,
+        # no registry chat_template_custom). Bundle a canonical copy
+        # at vmlx_engine/chat_templates/{family}.jinja and fall back
+        # to it as the last resort.
+        if mc is not None:
+            try:
+                from pathlib import Path as _P
+                family = getattr(mc, "family_name", None)
+                if family:
+                    pkg_dir = _P(__file__).parent.parent  # vmlx_engine/
+                    bundled = pkg_dir / "chat_templates" / f"{family}.jinja"
+                    if bundled.is_file():
+                        tokenizer.chat_template = bundled.read_text(encoding="utf-8")
+                        return f"bundled:{family}.jinja"
+            except Exception as e:
+                logger.debug(f"bundled chat_template lookup failed: {e}")
+
+        return None
+
+    def _compute_gen_prompt_len(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        num_images: int,
+        enable_thinking: bool,
+        extra_template_kwargs: dict | None,
+        prompt_with_gen: str,
+        num_videos: int = 0,
+    ) -> int:
+        """Compute the number of tokens added by add_generation_prompt=True.
+
+        This is used by the prefix cache to strip generation prompt tokens
+        from the cache key, preventing 100% cache misses in multi-turn
+        conversations for thinking models (where the generation prompt
+        includes <think> which differs each turn).
+
+        Args:
+            messages: Chat messages
+            tools: Tool definitions
+            num_images: Number of images
+            enable_thinking: Whether thinking is enabled
+            extra_template_kwargs: Extra template kwargs
+            prompt_with_gen: The already-rendered prompt WITH generation prompt
+
+        Returns:
+            Number of tokens in the generation prompt suffix
+        """
+        try:
+            prompt_without_gen = self._apply_chat_template(
+                messages,
+                tools,
+                num_images=num_images,
+                num_videos=num_videos,
+                enable_thinking=enable_thinking,
+                extra_template_kwargs=extra_template_kwargs,
+                skip_generation_prompt=True,
+            )
+            tokenizer = self._tokenizer or self._processor
+            if tokenizer is None:
+                return 0
+
+            # Use the tokenizer's encode method
+            if hasattr(tokenizer, "encode"):
+                enc = tokenizer.encode
+            elif hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "encode"):
+                enc = tokenizer.tokenizer.encode
+            else:
+                return 0
+
+            tokens_with = self._encode_rendered_prompt(enc, prompt_with_gen)
+            tokens_without = self._encode_rendered_prompt(enc, prompt_without_gen)
+            gen_len = len(tokens_with) - len(tokens_without)
+            if gen_len > 0:
+                logger.debug(f"Gen prompt len: {gen_len} tokens")
+            return max(gen_len, 0)
+        except Exception as e:
+            logger.debug(f"Failed to compute gen_prompt_len: {e}")
+            return 0
+
+    @staticmethod
+    def _encode_rendered_prompt(enc, prompt: str) -> list[int]:
+        """Encode an already-rendered chat template without adding BOS/EOS."""
+        try:
+            return enc(prompt, add_special_tokens=False)
+        except TypeError:
+            return enc(prompt)
+
+    def _compute_segment_boundaries(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None,
+        num_images: int,
+        enable_thinking: bool,
+        extra_template_kwargs: dict | None,
+        num_videos: int = 0,
+    ) -> list[tuple[int, str]]:
+        """Compute (token_offset, role) boundaries for the chat history.
+
+        Phase 5 audit fix (F11, 2026-04-08): the LLM scheduler reads
+        ``request._segment_boundaries`` to drive Agent 1's PrefixCacheManager
+        cache_type-priority LRU (system pinned > user > assistant). Without
+        this helper, no API gateway populates the field, and every request
+        gets stored under the default ``cache_type='assistant'`` — defeating
+        cross-session prefix sharing for system prompts entirely.
+
+        We compute boundaries by re-rendering the chat template incrementally
+        for each prefix of messages (without ``add_generation_prompt``) and
+        tokenizing the result. The token-count delta between successive
+        renders gives each segment's end offset.
+
+        Returns:
+            List of ``(token_offset, role)`` tuples in increasing offset
+            order. ``role`` is the role of the message ending at that
+            offset (e.g. ``"system"`` after the system message).
+            Empty list on any failure — the caller falls back to
+            single-store under ``cache_type='assistant'``.
+        """
+        # Skip the work for trivial conversations: 1 message has no boundary,
+        # 0 messages is degenerate.
+        if not messages or len(messages) < 2:
+            return []
+        # Skip if no system or non-uniform structure — only valuable when at
+        # least one message can be pinned with a role > "assistant" priority.
+        roles = {m.get("role") for m in messages}
+        if not (roles & {"system", "user"}):
+            return []
+        try:
+            tokenizer = self._tokenizer or self._processor
+            if tokenizer is None:
+                return []
+            if hasattr(tokenizer, "encode"):
+                enc = tokenizer.encode
+            elif hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "encode"):
+                enc = tokenizer.tokenizer.encode
+            else:
+                return []
+
+            boundaries: list[tuple[int, str]] = []
+            prev_count = 0
+            for i in range(1, len(messages) + 1):
+                try:
+                    rendered = self._apply_chat_template(
+                        messages[:i],
+                        tools if i == len(messages) else None,
+                        num_images=num_images if i == len(messages) else 0,
+                        num_videos=num_videos if i == len(messages) else 0,
+                        enable_thinking=enable_thinking,
+                        extra_template_kwargs=extra_template_kwargs,
+                        skip_generation_prompt=True,
+                    )
+                    cur_count = len(self._encode_rendered_prompt(enc, rendered))
+                except Exception:
+                    # Re-rendering can fail for partial histories on some
+                    # templates (e.g. assistant-prefix-only). Skip this
+                    # boundary, keep going.
+                    continue
+                if cur_count <= prev_count:
+                    continue
+                role = messages[i - 1].get("role") or "assistant"
+                # Normalise unknown roles to "assistant" so they hit the
+                # default eviction priority bucket.
+                if role not in ("system", "user", "assistant"):
+                    role = "assistant"
+                boundaries.append((cur_count, role))
+                prev_count = cur_count
+            return boundaries
+        except Exception as e:
+            logger.debug(f"Failed to compute segment boundaries: {e}")
+            return []
+
+    def _apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        num_images: int = 0,
+        num_videos: int = 0,
+        enable_thinking: bool = True,
+        extra_template_kwargs: dict | None = None,
+        skip_generation_prompt: bool = False,
+    ) -> str:
+        """Apply chat template to messages."""
+        tokenizer = self.tokenizer
+
+        # Normalize native tool-history turns before any template renderer sees
+        # them. OpenAI permits assistant tool-call turns with content=null, but
+        # strict HF templates (Mistral 4/Pixtral-style) often accept the
+        # tool_calls and then still call `|length` on `content`. Empty string is
+        # semantically equivalent for a tool-call-only assistant turn and keeps
+        # those templates from failing with len(None).
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and msg.get("content") is None
+            ):
+                msg["content"] = ""
+
+        # Count non-system messages to detect multi-turn conversations
+        non_system_msgs = sum(1 for m in messages if m.get("role") != "system")
+
+        mllm_model_type = None
+        if self._is_mllm and self._processor:
+            try:
+                model_config = getattr(self._model, "config", None)
+                mllm_model_type = (
+                    model_config.get("model_type") if isinstance(model_config, dict)
+                    else getattr(model_config, "model_type", None)
+                )
+            except Exception:
+                mllm_model_type = None
+
+        if (
+            self._is_mllm
+            and self._model_family_name() == "mimo_v2"
+            and num_images == 0
+            and num_videos == 0
+            and self._messages_are_text_only(messages)
+        ):
+            return self._mimo_text_only_chat_template(
+                messages,
+                tools,
+                enable_thinking=enable_thinking,
+                extra_template_kwargs=extra_template_kwargs,
+                skip_generation_prompt=skip_generation_prompt,
+            )
+
+        if (
+            self._is_mllm
+            and self._processor
+            and (
+                num_images > 0
+                or num_videos > 0
+                or mllm_model_type == "zaya1_vl"
+                or (
+                    mllm_model_type == "mimo_v2"
+                    and bool(self._extract_audio_content(messages))
+                )
+            )
+        ):
+            # Use mlx_vlm for MLLM when actual images are present (any turn count).
+            # Text-only VL conversations still use the standard tokenizer path,
+            # ensuring consistent cache keys across text-only turns. Local
+            # adapters with list-aware templates (currently ZAYA1-VL) need the
+            # processor path even for text-only prompts, otherwise the raw
+            # string content is ignored by the template's content-part filters.
+            try:
+                from mlx_vlm.prompt_utils import apply_chat_template
+                from mlx_vlm.utils import load_config
+
+                config = getattr(self._model, "config", None)
+                if config is None:
+                    config = load_config(self._model_name)
+
+                tpl_kwargs = build_chat_template_kwargs(
+                    enable_thinking=enable_thinking,
+                    extra=extra_template_kwargs,
+                    tokenize=False,
+                    add_generation_prompt=not skip_generation_prompt,
+                )
+                if tools:
+                    tpl_kwargs["tools"] = tools
+
+                def _normalize_processor_messages(messages_arg):
+                    try:
+                        from ..models.mllm import MLXMultimodalLM
+
+                        direct_messages, _, _, _ = (
+                            MLXMultimodalLM._extract_multimodal_messages(messages_arg)
+                        )
+                        if (
+                            mllm_model_type == "zaya1_vl"
+                            and num_images == 0
+                            and num_videos == 0
+                        ):
+                            normalizer = MLXMultimodalLM.__new__(MLXMultimodalLM)
+                            normalizer.config = {"model_type": "zaya1_vl"}
+                            direct_messages = normalizer._normalize_text_only_messages_for_processor(
+                                direct_messages,
+                                has_media=False,
+                            )
+                        if mllm_model_type == "mimo_v2":
+                            normalizer = MLXMultimodalLM.__new__(MLXMultimodalLM)
+                            normalizer.config = getattr(self._model, "config", None)
+                            normalizer.processor = self._processor
+                            direct_messages = normalizer._normalize_mimo_audio_messages_for_template(
+                                direct_messages,
+                            )
+                        if direct_messages:
+                            return direct_messages
+                    except Exception:
+                        pass
+                    return messages_arg
+
+                def _processor_template(messages_arg):
+                    try:
+                        prompt = self._processor.apply_chat_template(
+                            messages_arg, **tpl_kwargs
+                        )
+                    except TypeError:
+                        # Processor doesn't support enable_thinking — fall back
+                        # without it, then close any forced reasoning rail below.
+                        fallback_kwargs = dict(tpl_kwargs)
+                        fallback_kwargs.pop("enable_thinking", None)
+                        prompt = self._processor.apply_chat_template(
+                            messages_arg, **fallback_kwargs
+                        )
+                        if enable_thinking is False and not tools:
+                            last_think = prompt.rfind("<think>")
+                            if last_think >= 0:
+                                after = prompt[last_think + 7:]
+                                if "</think>" not in after:
+                                    prompt = prompt[:last_think + 7] + "</think>\n"
+                    return prompt
+
+                def _inject_processor_tool_fallback(prompt: str, messages_arg) -> str:
+                    return check_and_inject_fallback_tools(
+                        prompt,
+                        messages_arg,
+                        tools,
+                        self._processor,
+                        dict(tpl_kwargs),
+                        tool_parser_id=self._model_tool_parser_name(),
+                    )
+
+                if num_images > 0:
+                    # Two-step pipeline:
+                    # 1. Build messages with image tokens via mlx_vlm
+                    #    (return_messages=True)
+                    # 2. Apply template via processor with enable_thinking support
+                    try:
+                        built_messages = apply_chat_template(
+                            self._processor,
+                            config,
+                            messages,
+                            num_images=num_images,
+                            return_messages=True,
+                        )
+                    except Exception as build_err:
+                        # Local adapters may have a real processor/template
+                        # before upstream mlx_vlm knows their model_type.
+                        # ZAYA1-VL is one example: normalize OpenAI
+                        # ``image_url`` parts to SimpleEngine-style
+                        # ``{"type": "image"}`` entries, otherwise the
+                        # template sees no image placeholders and the processor
+                        # later receives images with no matching token.
+                        direct_messages = _normalize_processor_messages(messages)
+                        try:
+                            prompt = _processor_template(direct_messages)
+                            return _inject_processor_tool_fallback(
+                                prompt,
+                                direct_messages,
+                            )
+                        except Exception as direct_err:
+                            raise RuntimeError(
+                                "MLLM chat-template builder failed "
+                                f"({build_err}); direct processor template failed "
+                                f"({direct_err})"
+                            ) from direct_err
+                else:
+                    built_messages = _normalize_processor_messages(messages)
+
+                try:
+                    # Apply template with enable_thinking via the processor directly.
+                    # mlx_vlm's get_chat_template doesn't forward enable_thinking,
+                    # causing thinking models to always use thinking-OFF format.
+                    prompt = _processor_template(built_messages)
+                    prompt = _inject_processor_tool_fallback(prompt, built_messages)
+                    return prompt
+                except ValueError as template_err:
+                    msg = str(template_err)
+                    if "does not have a chat template" not in msg:
+                        raise
+                    return apply_chat_template(
+                        self._processor,
+                        config,
+                        messages,
+                        num_images=num_images,
+                        add_generation_prompt=not skip_generation_prompt,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to apply MLLM chat template: {e}")
+                # Fall through to standard template
+
+        if hasattr(tokenizer, "apply_chat_template"):
+            # Ensure tool_calls arguments are dicts, not JSON strings.
+            # Chat templates (Qwen3, Llama, etc.) call .items() on arguments.
+            for msg in messages:
+                for tc in msg.get("tool_calls") or []:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            import json
+                            fn["arguments"] = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            fn["arguments"] = {}
+
+            template_kwargs = build_chat_template_kwargs(
+                enable_thinking=enable_thinking,
+                extra=extra_template_kwargs,
+                tokenize=False,
+                add_generation_prompt=not skip_generation_prompt,
+            )
+            if tools:
+                template_kwargs["tools"] = tools
+
+            prompt = None
+            try:
+                prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+            except Exception as template_err:
+                # GH#66 part 2 — mlx-community quants (e.g. mlx-community/
+                # gemma-4-31b-8bit) often DON'T bake `chat_template` into
+                # tokenizer_config.json, so HF transformers raises
+                # `ValueError: tokenizer.chat_template is not set`. The
+                # template is usually shipped as a separate file in the
+                # model dir (`chat_template.jinja` or `chat_template.json`).
+                # Load it once, attach it to the tokenizer, and retry —
+                # avoids forcing the user to re-download a JANG variant
+                # just to get a working prompt.
+                _err_msg = str(template_err)
+                if "chat_template is not set" in _err_msg or "no template argument" in _err_msg:
+                    _injected = self._inject_fallback_chat_template(tokenizer)
+                    if _injected:
+                        try:
+                            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+                            logger.info(
+                                f"Chat template injected from {_injected} for {self._model_name}"
+                            )
+                        except Exception as retry_err:
+                            template_err = retry_err
+                            prompt = None
+
+                if prompt is None:
+                    # Progressively strip non-essential kwargs to preserve tools/thinking
+                    # when only extra kwargs (e.g. thinking_budget) cause failures.
+                    # Strip order: extra kwargs first, then tools, then enable_thinking.
+                    strip_order = [
+                        k for k in template_kwargs
+                        if k not in ("tokenize", "add_generation_prompt")
+                    ]
+                    # Reverse so we strip least important first (extra kwargs added last)
+                    for key in reversed(strip_order):
+                        del template_kwargs[key]
+                        try:
+                            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+                            stripped = [k for k in strip_order if k not in template_kwargs]
+                            logger.warning(
+                                f"Chat template succeeded after stripping: {stripped} "
+                                f"(original error: {template_err})"
+                            )
+                            break
+                        except Exception:
+                            continue
+                if prompt is None:
+                    # All kwargs stripped and still failing — last resort (will raise)
+                    prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+
+            prompt = check_and_inject_fallback_tools(
+                prompt,
+                messages,
+                tools,
+                tokenizer,
+                template_kwargs,
+                tool_parser_id=self._model_tool_parser_name(),
+            )
+
+            # When thinking is OFF, close any unclosed <think> when the family
+            # needs an explicit empty thought sentinel. The helper deliberately
+            # leaves most tool turns untouched; LFM2 is the known exception.
+            if enable_thinking is False:
+                prompt = ensure_thinking_off_sentinel(
+                    prompt,
+                    family_name=self._model_family_name(),
+                    model_name=self._model_name,
+                    tools_present=bool(tools),
+                )
+            return prompt
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+            return prompt + "\nassistant:"
+
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        audio: list[Any] | None = None,
+        **kwargs,
+    ) -> GenerationOutput:
+        """
+        Generate a complete response (non-streaming).
+
+        Args:
+            prompt: Input text
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            stop: Stop sequences
+            images: Optional image URLs/paths (for MLLM)
+            videos: Optional video URLs/paths (for MLLM)
+            audio: Optional audio inputs (for MLLM)
+            **kwargs: Additional model-specific parameters
+
+        Returns:
+            GenerationOutput with complete text
+        """
+        if not self._loaded:
+            await self.start()
+
+        # Cache-bypass flag from the server gateway layer. Forwarded by every
+        # chat/completion handler when the API request carried cache_salt or
+        # skip_prefix_cache=true. Engine pops it out of kwargs so it doesn't
+        # leak downstream and attaches it to the internal Request object so
+        # the scheduler can gate EVERY lookup and store site on it.
+        bypass_prefix_cache = bool(kwargs.pop("_bypass_prefix_cache", False))
+        request_id = kwargs.pop("request_id", None)
+        max_prompt_tokens = int(kwargs.pop("max_prompt_tokens", 0) or 0)
+
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all requests (text-only and multimodal)
+            # MLLM models only initialize _mllm_scheduler, not _engine
+            output = await self._mllm_scheduler.generate(
+                prompt=prompt,
+                images=images,
+                videos=videos,
+                audio=audio,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                top_k=kwargs.get("top_k", 0),
+                min_p=kwargs.get("min_p", 0.0),
+                repetition_penalty=kwargs.get("repetition_penalty", 1.0),
+                video_fps=kwargs.get("video_fps"),
+                video_max_frames=kwargs.get("video_max_frames"),
+                num_messages=kwargs.get("num_messages", 1),
+                gen_prompt_len=kwargs.get("gen_prompt_len", 0),
+                enable_thinking=kwargs.get("enable_thinking"),
+                bypass_prefix_cache=bypass_prefix_cache,
+                request_id=request_id,
+                max_prompt_tokens=max_prompt_tokens,
+                _vmlx_tools_present=bool(kwargs.get("_vmlx_tools_present")),
+                _vmlx_template_tools=kwargs.get("_vmlx_template_tools"),
+                _vmlx_tool_choice=kwargs.get("tool_choice"),
+            )
+            _raise_prompt_too_long_from_output(output)
+
+            # Preserve raw (pre-clean) output so reasoning parsers on the
+            # non-stream path can still see Gemma 4 `<|channel>thought\n...
+            # <channel|>` markers + Qwen 3.6 `<think>` tokens that
+            # clean_output_text strips for display. Server chooses `raw_text
+            # or text` when calling extract_reasoning.
+            return GenerationOutput(
+                text=clean_output_text(output.output_text),
+                raw_text=output.output_text,
+                tokens=list(getattr(output, "output_token_ids", []) or []),
+                logprobs=getattr(output, "logprobs", None),
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                cached_tokens=getattr(output, "cached_tokens", 0),
+                cache_detail=getattr(output, "cache_detail", "") or "",
+                finish_reason=output.finish_reason,
+            )
+
+        # Use LLM engine for text-only
+        from ..request import SamplingParams
+
+        gen_prompt_len = kwargs.pop("gen_prompt_len", 0)
+        segment_boundaries = kwargs.pop("segment_boundaries", None)
+        encode_add_special_tokens = kwargs.pop("encode_add_special_tokens", None)
+
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=kwargs.get("top_k", 0),
+            min_p=kwargs.get("min_p", 0.0),
+            repetition_penalty=kwargs.get("repetition_penalty", 1.0),
+            stop=stop or [],
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=int(kwargs.get("top_logprobs", 0) or 0),
+        )
+
+        output = await self._engine.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            gen_prompt_len=gen_prompt_len,
+            num_messages=kwargs.get("num_messages", 1),
+            segment_boundaries=segment_boundaries,
+            bypass_prefix_cache=bypass_prefix_cache,
+            encode_add_special_tokens=encode_add_special_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+        )
+
+        raw = output.output_text
+        text = clean_output_text(raw)
+
+        return GenerationOutput(
+            text=text,
+            raw_text=raw,
+            tokens=list(getattr(output, "output_token_ids", []) or []),
+            logprobs=getattr(output, "logprobs", None),
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            cached_tokens=getattr(output, "cached_tokens", 0),
+            cache_detail=getattr(output, "cache_detail", "") or "",
+            finish_reason=output.finish_reason,
+        )
+
+    async def stream_generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: list[str] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        audio: list[Any] | None = None,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """
+        Stream generation token by token.
+
+        Args:
+            prompt: Input text
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            stop: Stop sequences
+            images: Optional image URLs/paths (for MLLM)
+            videos: Optional video URLs/paths (for MLLM)
+            audio: Optional audio inputs (for MLLM)
+            request_id: Optional custom request ID for cancellation support
+            **kwargs: Additional model-specific parameters
+
+        Yields:
+            GenerationOutput with incremental text
+        """
+        if not self._loaded:
+            await self.start()
+
+        # Per-request cache bypass (forwarded from server gateway — see
+        # BatchedEngine.chat for details). Pop out of kwargs so it doesn't
+        # collide with downstream positional arguments.
+        bypass_prefix_cache = bool(kwargs.pop("_bypass_prefix_cache", False))
+        max_prompt_tokens = int(kwargs.pop("max_prompt_tokens", 0) or 0)
+
+        if self._is_mllm and self._mllm_scheduler:
+            # Use MLLM scheduler for all requests (text-only and multimodal)
+            # MLLM models only initialize _mllm_scheduler, not _engine
+            request_id = await self._mllm_scheduler.add_request_async(
+                prompt=prompt,
+                images=images,
+                videos=videos,
+                audio=audio,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                request_id=request_id,
+                stop=stop,
+                top_k=kwargs.get("top_k", 0),
+                min_p=kwargs.get("min_p", 0.0),
+                repetition_penalty=kwargs.get("repetition_penalty", 1.0),
+                video_fps=kwargs.get("video_fps"),
+                video_max_frames=kwargs.get("video_max_frames"),
+                num_messages=kwargs.get("num_messages", 1),
+                gen_prompt_len=kwargs.get("gen_prompt_len", 0),
+                enable_thinking=kwargs.get("enable_thinking"),
+                bypass_prefix_cache=bypass_prefix_cache,
+                max_prompt_tokens=max_prompt_tokens,
+                _vmlx_tools_present=bool(kwargs.get("_vmlx_tools_present")),
+                _vmlx_template_tools=kwargs.get("_vmlx_template_tools"),
+                _vmlx_tool_choice=kwargs.get("tool_choice"),
+            )
+
+            async for output in self._mllm_scheduler.stream_outputs(request_id):
+                _raise_prompt_too_long_from_output(output)
+                yield GenerationOutput(
+                    text=clean_output_text(output.output_text),
+                    new_text=output.new_text,
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    cached_tokens=getattr(output, "cached_tokens", 0),
+                    cache_detail=getattr(output, "cache_detail", "") or "",
+                    finished=output.finished,
+                    finish_reason=output.finish_reason,
+                )
+            return
+
+        # Use LLM engine for text-only
+        from ..request import SamplingParams
+
+        gen_prompt_len = kwargs.pop("gen_prompt_len", 0)
+        segment_boundaries = kwargs.pop("segment_boundaries", None)
+        encode_add_special_tokens = kwargs.pop("encode_add_special_tokens", None)
+
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=kwargs.get("top_k", 0),
+            min_p=kwargs.get("min_p", 0.0),
+            repetition_penalty=kwargs.get("repetition_penalty", 1.0),
+            stop=stop or [],
+            logprobs=bool(kwargs.get("logprobs", False)),
+            top_logprobs=int(kwargs.get("top_logprobs", 0) or 0),
+        )
+
+        request_id = await self._engine.add_request(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=request_id,
+            gen_prompt_len=gen_prompt_len,
+            num_messages=kwargs.get("num_messages", 1),
+            segment_boundaries=segment_boundaries,
+            bypass_prefix_cache=bypass_prefix_cache,
+            encode_add_special_tokens=encode_add_special_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+        )
+
+        async for output in self._engine.stream_outputs(request_id):
+            text = clean_output_text(output.output_text)
+
+            yield GenerationOutput(
+                text=text,
+                logprobs=getattr(output, "logprobs", None),
+                new_text=output.new_text,
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                cached_tokens=getattr(output, "cached_tokens", 0),
+                cache_detail=getattr(output, "cache_detail", "") or "",
+                finished=output.finished,
+                finish_reason=output.finish_reason,
+            )
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        audio: list[Any] | None = None,
+        **kwargs,
+    ) -> GenerationOutput:
+        """
+        Chat completion (non-streaming).
+
+        For MLLM models with images/videos, uses the native MLLM.chat() method
+        which properly processes multimodal content through the vision encoder.
+        For text-only requests, uses BatchGenerator for continuous batching.
+
+        Args:
+            messages: List of chat messages (OpenAI format)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            tools: Optional tool definitions
+            images: Optional image URLs/paths
+            videos: Optional video URLs/paths
+            audio: Optional audio inputs
+            **kwargs: Additional model-specific parameters
+
+        Returns:
+            GenerationOutput with assistant response
+        """
+        if not self._loaded:
+            await self.start()
+
+        messages = self._video_frame_fallback_messages(
+            messages,
+            video_fps=kwargs.get("video_fps"),
+            video_max_frames=kwargs.get("video_max_frames"),
+        )
+
+        # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
+        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+        extracted_audio = self._extract_audio_content(messages)
+        all_images = (images or []) + extracted_images
+        all_videos = (videos or []) + extracted_videos
+        all_audio = (audio or []) + extracted_audio
+
+        # Convert tools for template
+        template_tools = convert_tools_for_template(tools) if tools else None
+
+        if self._use_simple_mllm_media_fallback(
+            images=all_images,
+            videos=all_videos,
+        ):
+            logger.info(
+                "Using simple MLLM media fallback for %s with %d image(s), %d video(s)",
+                self._model_family_name(),
+                len(all_images),
+                len(all_videos),
+            )
+            return await self._simple_mllm_chat_output(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                kwargs=kwargs,
+            )
+
+        # Apply chat template — pop reasoning_effort and merge into template kwargs
+        # so it reaches tokenizer.apply_chat_template() for models that support it
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+        extra_tpl = kwargs.pop("chat_template_kwargs", None)
+        prompt_suffix = kwargs.pop("prompt_suffix", None)
+        skip_gen_prompt = kwargs.pop("skip_generation_prompt", False)
+        if reasoning_effort:
+            extra_tpl = extra_tpl or {}
+            extra_tpl["reasoning_effort"] = reasoning_effort
+
+        thinking_enabled = kwargs.pop("enable_thinking", True)
+
+        prompt = self._apply_chat_template(
+            messages,
+            template_tools,
+            num_images=len(all_images),
+            num_videos=len(all_videos),
+            enable_thinking=thinking_enabled,
+            extra_template_kwargs=extra_tpl,
+            skip_generation_prompt=skip_gen_prompt,
+        )
+
+        # Compute gen_prompt_len for prefix cache key stripping.
+        # Enables multi-turn prefix cache hits for thinking models by
+        # stripping generation prompt tokens (e.g., <|im_start|>assistant\n<think>\n)
+        # from the cache key. Works for both LLM and MLLM paths.
+        gen_prompt_len = 0
+        if not skip_gen_prompt:
+            gen_prompt_len = self._compute_gen_prompt_len(
+                messages, template_tools, len(all_images),
+                thinking_enabled, extra_tpl, prompt,
+                num_videos=len(all_videos),
+            )
+
+        # Phase 5 audit fix (F11, 2026-04-08): compute per-segment boundaries
+        # so the LLM scheduler can store cache entries with the correct
+        # cache_type (system / user / assistant). This is what activates
+        # Agent 1's PrefixCacheManager priority LRU breakthrough — without
+        # it, every entry was stored as 'assistant' and system prompts could
+        # not be pinned across sessions.
+        segment_boundaries = self._compute_segment_boundaries(
+            messages, template_tools, len(all_images),
+            thinking_enabled, extra_tpl,
+            num_videos=len(all_videos),
+        )
+
+        # Append prompt suffix (e.g. Harmony analysis prefix for GPT-OSS)
+        if prompt_suffix:
+            prompt += prompt_suffix
+
+        # Pass message count for cache skip heuristic (Phase 2 optimization).
+        # Single-turn API requests (1-2 messages: system+user) with short output
+        # skip cache storage to reduce per-request overhead.
+        kwargs["num_messages"] = len(messages)
+        if template_tools:
+            kwargs["_vmlx_tools_present"] = True
+            kwargs["_vmlx_template_tools"] = template_tools
+        if segment_boundaries:
+            kwargs["segment_boundaries"] = segment_boundaries
+
+        return await self.generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            images=all_images if all_images else None,
+            videos=all_videos if all_videos else None,
+            audio=all_audio if all_audio else None,
+            gen_prompt_len=gen_prompt_len,
+            encode_add_special_tokens=False,
+            enable_thinking=thinking_enabled,
+            **kwargs,
+        )
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        tools: list[dict] | None = None,
+        images: list[str] | None = None,
+        videos: list[str] | None = None,
+        audio: list[Any] | None = None,
+        request_id: str | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """
+        Stream chat completion token by token.
+
+        For MLLM models with images/videos, uses the native MLLM.stream_chat() method
+        which properly processes multimodal content through the vision encoder.
+        For text-only requests, uses BatchGenerator for continuous batching.
+
+        Args:
+            messages: List of chat messages (OpenAI format)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            tools: Optional tool definitions
+            images: Optional image URLs/paths
+            videos: Optional video URLs/paths
+            audio: Optional audio inputs
+            request_id: Optional custom request ID for cancellation support
+            **kwargs: Additional model-specific parameters
+
+        Yields:
+            GenerationOutput with incremental text
+        """
+        if not self._loaded:
+            await self.start()
+
+        messages = self._video_frame_fallback_messages(
+            messages,
+            video_fps=kwargs.get("video_fps"),
+            video_max_frames=kwargs.get("video_max_frames"),
+        )
+
+        # Extract images/videos from messages (OpenAI multimodal format)
+        # Note: We only use extracted media here, messages are already processed by server
+        _, extracted_images, extracted_videos = extract_multimodal_content(messages)
+        extracted_audio = self._extract_audio_content(messages)
+        all_images = (images or []) + extracted_images
+        all_videos = (videos or []) + extracted_videos
+        all_audio = (audio or []) + extracted_audio
+
+        # Convert tools for template
+        template_tools = convert_tools_for_template(tools) if tools else None
+
+        if self._use_simple_mllm_media_fallback(
+            images=all_images,
+            videos=all_videos,
+        ):
+            logger.info(
+                "Using simple MLLM media streaming fallback for %s with %d image(s), %d video(s)",
+                self._model_family_name(),
+                len(all_images),
+                len(all_videos),
+            )
+            yield await self._simple_mllm_chat_output(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                kwargs={**kwargs, "request_id": request_id},
+            )
+            return
+
+        # Apply chat template — pop reasoning_effort and merge into template kwargs
+        # so it reaches tokenizer.apply_chat_template() for models that support it
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+        extra_tpl = kwargs.pop("chat_template_kwargs", None)
+        prompt_suffix = kwargs.pop("prompt_suffix", None)
+        skip_gen_prompt = kwargs.pop("skip_generation_prompt", False)
+        if reasoning_effort:
+            extra_tpl = extra_tpl or {}
+            extra_tpl["reasoning_effort"] = reasoning_effort
+
+        thinking_enabled = kwargs.pop("enable_thinking", True)
+
+        prompt = self._apply_chat_template(
+            messages,
+            template_tools,
+            num_images=len(all_images),
+            num_videos=len(all_videos),
+            enable_thinking=thinking_enabled,
+            extra_template_kwargs=extra_tpl,
+            skip_generation_prompt=skip_gen_prompt,
+        )
+
+        # Compute gen_prompt_len for prefix cache key stripping.
+        # Enables multi-turn prefix cache hits for thinking models by
+        # stripping generation prompt tokens (e.g., <|im_start|>assistant\n<think>\n)
+        # from the cache key. Works for both LLM and MLLM paths.
+        gen_prompt_len = 0
+        if not skip_gen_prompt:
+            gen_prompt_len = self._compute_gen_prompt_len(
+                messages, template_tools, len(all_images),
+                thinking_enabled, extra_tpl, prompt,
+                num_videos=len(all_videos),
+            )
+
+        # F11 (audit 2026-04-08): per-segment boundaries for cache_type LRU.
+        # Mirrors the non-streaming chat() path so the priority eviction
+        # breakthrough fires for streaming requests too.
+        segment_boundaries = self._compute_segment_boundaries(
+            messages, template_tools, len(all_images),
+            thinking_enabled, extra_tpl,
+            num_videos=len(all_videos),
+        )
+
+        # Append prompt suffix (e.g. Harmony analysis prefix for GPT-OSS)
+        if prompt_suffix:
+            prompt += prompt_suffix
+
+        # Pass message count for cache skip heuristic (Phase 2 optimization).
+        kwargs["num_messages"] = len(messages)
+        if template_tools:
+            kwargs["_vmlx_tools_present"] = True
+            kwargs["_vmlx_template_tools"] = template_tools
+        if segment_boundaries:
+            kwargs["segment_boundaries"] = segment_boundaries
+
+        async for output in self.stream_generate(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            images=all_images if all_images else None,
+            videos=all_videos if all_videos else None,
+            audio=all_audio if all_audio else None,
+            request_id=request_id,
+            gen_prompt_len=gen_prompt_len,
+            encode_add_special_tokens=False,
+            enable_thinking=thinking_enabled,
+            **kwargs,
+        ):
+            yield output
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get engine statistics."""
+        stats = {
+            "engine_type": "batched",
+            "model_name": self._model_name,
+            "is_mllm": self._is_mllm,
+            "loaded": self._loaded,
+            "stream_interval": self._stream_interval,
+        }
+
+        if self._mllm_scheduler:
+            stats["mllm_scheduler"] = self._mllm_scheduler.get_stats()
+        elif self._engine:
+            stats.update(self._engine.get_stats())
+
+        return stats
+
+    def get_cache_stats(self) -> dict[str, Any] | None:
+        """Get cache statistics."""
+        if self._mllm_scheduler:
+            stats = {}
+            # Vision cache stats
+            if self._mllm_scheduler.batch_generator:
+                stats.update(
+                    self._mllm_scheduler.batch_generator.get_vision_cache_stats()
+                )
+            # Paged cache stats
+            if self._mllm_scheduler.block_aware_cache is not None:
+                paged_stats = self._mllm_scheduler.block_aware_cache.get_stats()
+                stats.update(paged_stats)
+            return stats if stats else None
+        elif self._engine:
+            return self._engine.get_cache_stats()
+        return None
+
+    async def abort_request(self, request_id: str) -> bool:
+        """
+        Abort an ongoing request.
+
+        Args:
+            request_id: Request ID to abort
+
+        Returns:
+            True if request was found and aborted, False otherwise
+        """
+        if self._mllm_scheduler:
+            return self._mllm_scheduler.abort_request(request_id)
+        elif self._engine:
+            return await self._engine.abort_request(request_id)
+        return False

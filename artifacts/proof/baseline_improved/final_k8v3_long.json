@@ -1,0 +1,138 @@
+{
+  "release": "main27",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    {
+      "tokens": 512,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 2797.571582999808,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000037252903,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "k8_v3_gs64",
+          "k_bits": 8,
+          "v_bits": 3,
+          "group_size": 64,
+          "avg_nll_delta": -6.449939348840417e-05,
+          "latency_ms": 3468.9573750001728,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.998835320584476,
+          "logit_cosine_min": 0.9955531358718872,
+          "logit_max_abs_diff": 0.8153641074895859,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.99375,
+          "kl_divergence_mean": 1.4293500196771447e-05,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 1024,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 2896.357417001127,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 0.9999999823048711,
+          "logit_cosine_min": 0.9999998211860657,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "k8_v3_gs64",
+          "k_bits": 8,
+          "v_bits": 3,
+          "group_size": 64,
+          "avg_nll_delta": 0.0003426394941925537,
+          "latency_ms": 4137.953250003193,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9977154992520809,
+          "logit_cosine_min": 0.9658297896385193,
+          "logit_max_abs_diff": 1.036294643767178,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.934375,
+          "kl_divergence_mean": 0.00018145924568813143,
+          "token_positions_evaluated": 64,
+          "status": "fail",
+          "oom": false
+        }
+      ]
+    },
+    {
+      "tokens": 2048,
+      "configs": [
+        {
+          "name": "baseline_fp16",
+          "k_bits": 16,
+          "v_bits": 16,
+          "group_size": 64,
+          "avg_nll_delta": 0.0,
+          "latency_ms": 3637.4071250029374,
+          "route_used": "baseline_fp16",
+          "logit_cosine_mean": 1.0000000027939677,
+          "logit_cosine_min": 0.9999998807907104,
+          "logit_max_abs_diff": 0.0,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 1.0,
+          "kl_divergence_mean": 0.0,
+          "token_positions_evaluated": 64,
+          "status": "reference",
+          "oom": false
+        },
+        {
+          "name": "k8_v3_gs64",
+          "k_bits": 8,
+          "v_bits": 3,
+          "group_size": 64,
+          "avg_nll_delta": -1.7211568092534435e-05,
+          "latency_ms": 33403.422583000065,
+          "route_used": "retrieve",
+          "logit_cosine_mean": 0.9992483835667372,
+          "logit_cosine_min": 0.9976351261138916,
+          "logit_max_abs_diff": 0.6593730244785547,
+          "top1_match_rate": 1.0,
+          "top5_overlap_mean": 0.98125,
+          "kl_divergence_mean": 3.6348194880631013e-06,
+          "token_positions_evaluated": 64,
+          "status": "pass",
+          "oom": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "best_quality_config": "",
+    "best_memory_config_passing_all_contexts": "",
+    "recommended_default": "baseline_fp16",
+    "rejected_configs": [
+      "k8_v3_gs64"
+    ],
+    "production_ready": false
+  }
+}

@@ -1,0 +1,1346 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Tests for MLLM (Multimodal Language Model) continuous batching.
+
+These tests verify that the MLLM batch generator and scheduler work correctly
+for batching multiple multimodal requests together.
+
+Test Cases:
+- Single MLLM request works correctly
+- 2, 4, 8 concurrent requests with batching
+- Vision cache hits/misses
+- Streaming with batching
+- Mixed text-only and multimodal requests
+"""
+
+import base64
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+# Skip all tests if MLX is not available
+try:
+    import mlx.core as mx
+
+    HAS_MLX = True
+except ImportError:
+    HAS_MLX = False
+
+pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+
+
+# Test image (small PNG)
+TEST_IMAGE_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+
+
+def test_decode_token_eval_uses_async_by_default(monkeypatch):
+    from vmlx_engine import mllm_batch_generator as mod
+
+    calls = []
+    monkeypatch.delenv("VMLINUX_MLLM_DECODE_SYNC_EVAL", raising=False)
+    monkeypatch.setattr(mod.mx, "async_eval", lambda *values: calls.append(("async", values)))
+    monkeypatch.setattr(mod.mx, "eval", lambda *values: calls.append(("eval", values)))
+
+    token = object()
+    mod._submit_decode_token_eval(token)
+
+    assert calls == [("async", (token,))]
+
+
+def test_decode_token_eval_can_use_explicit_sync_diagnostic(monkeypatch):
+    from vmlx_engine import mllm_batch_generator as mod
+
+    calls = []
+    monkeypatch.setenv("VMLINUX_MLLM_DECODE_SYNC_EVAL", "1")
+    monkeypatch.setattr(mod.mx, "async_eval", lambda *values: calls.append(("async", values)))
+    monkeypatch.setattr(mod.mx, "eval", lambda *values: calls.append(("eval", values)))
+
+    token = object()
+    mod._submit_decode_token_eval(token)
+
+    assert calls == [("eval", (token,))]
+
+
+def create_test_image(path: str, size: tuple = (32, 32)) -> str:
+    """Create a test image file."""
+    try:
+        from PIL import Image
+        import numpy as np
+
+        img = Image.fromarray(np.random.randint(0, 255, (*size, 3), dtype=np.uint8))
+        img.save(path)
+        return path
+    except ImportError:
+        # Fallback: write a minimal valid PNG
+        png_data = base64.b64decode(TEST_IMAGE_B64)
+        with open(path, "wb") as f:
+            f.write(png_data)
+        return path
+
+
+class TestMLLMBatchRequest:
+    """Tests for MLLMBatchRequest dataclass."""
+
+    def test_create_request(self):
+        """Test creating a basic request."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="test-1",
+            prompt="What's in this image?",
+            images=["test.jpg"],
+            max_tokens=100,
+        )
+
+        assert req.uid == 0
+        assert req.request_id == "test-1"
+        assert req.prompt == "What's in this image?"
+        assert req.images == ["test.jpg"]
+        assert req.max_tokens == 100
+        assert req.num_tokens == 0
+        assert req.vision_encoded is False
+
+    def test_request_defaults(self):
+        """Test default values."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchRequest
+
+        req = MLLMBatchRequest(
+            uid=1,
+            request_id="test-2",
+            prompt="Hello",
+        )
+
+        assert req.images is None
+        assert req.videos is None
+        assert req.max_tokens == 256
+        assert req.temperature == 0.7
+        assert req.top_p == 0.9
+        assert req.output_tokens == []
+
+
+def test_mimo_batched_thinking_off_sampler_suppresses_tags_and_first_eos():
+    """MiMo continuous-batching path must mirror SimpleEngine thinking-off policy."""
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from vmlx_engine.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+    class _Tokenizer:
+        eos_token_id = 9
+
+        def encode(self, text, add_special_tokens=False):
+            if text == "<think>":
+                return [1]
+            if text == "</think>":
+                return [2]
+            if text == "<|im_end|>":
+                return [9]
+            return [3]
+
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    generator._model_type = "mimo_v2"
+    generator.processor = SimpleNamespace(tokenizer=_Tokenizer())
+
+    req = MLLMBatchRequest(
+        uid=0,
+        request_id="mimo",
+        prompt="prompt",
+        temperature=0.0,
+        enable_thinking=False,
+    )
+    req.input_ids = mx.array([[101, 102]])
+
+    sampler = generator._make_request_sampler(req)
+    logits = mx.zeros((1, 10))
+    logits = logits.at[:, 1].add(50.0)
+    logits = logits.at[:, 2].add(60.0)
+    logits = logits.at[:, 9].add(70.0)
+    logits = logits.at[:, 4].add(10.0)
+
+    first = sampler(logits)
+    assert int(first.item()) == 4
+
+    req.output_tokens.append(4)
+    second_logits = mx.zeros((1, 10))
+    second_logits = second_logits.at[:, 9].add(70.0)
+    second = sampler(second_logits)
+    assert int(second.item()) == 9
+
+
+def test_mimo_batched_thinking_on_sampler_does_not_suppress_eos():
+    """The MiMo EOS policy is only for explicit API thinking-off requests."""
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from vmlx_engine.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+    class _Tokenizer:
+        eos_token_id = 9
+
+        def encode(self, text, add_special_tokens=False):
+            if text == "<think>":
+                return [1]
+            if text == "</think>":
+                return [2]
+            if text == "<|im_end|>":
+                return [9]
+            return [3]
+
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    generator._model_type = "mimo_v2"
+    generator.processor = SimpleNamespace(tokenizer=_Tokenizer())
+
+    req = MLLMBatchRequest(
+        uid=0,
+        request_id="mimo",
+        prompt="prompt",
+        temperature=0.0,
+        enable_thinking=True,
+    )
+    req.input_ids = mx.array([[101, 102]])
+
+    sampler = generator._make_request_sampler(req)
+    logits = mx.zeros((1, 10))
+    logits = logits.at[:, 9].add(70.0)
+
+    assert int(sampler(logits).item()) == 9
+
+
+def test_mimo_required_tool_sampler_forces_xml_function_prefix():
+    """MiMo required tools should constrain only the native XML scaffold."""
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from vmlx_engine.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+    target = "<tool_call>\n<function=record_fact>\n<parameter=value>"
+    target_ids = [5, 6, 7]
+
+    class _Tokenizer:
+        eos_token_id = 99
+
+        def encode(self, text, add_special_tokens=False):
+            if text == target:
+                return list(target_ids)
+            if text == "<think>":
+                return [1]
+            if text == "</think>":
+                return [2]
+            if text == "<|im_end|>":
+                return [99]
+            return [3]
+
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    generator._model_type = "mimo_v2"
+    generator.processor = SimpleNamespace(tokenizer=_Tokenizer())
+
+    req = MLLMBatchRequest(
+        uid=0,
+        request_id="mimo-tool",
+        prompt="prompt",
+        temperature=0.0,
+        enable_thinking=False,
+    )
+    req.input_ids = mx.array([[101, 102]])
+    req.extra_kwargs = {
+        "_vmlx_tool_choice": "required",
+        "_vmlx_template_tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "record_fact",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            }
+        ],
+    }
+
+    sampler = generator._make_request_sampler(req)
+    logits = mx.zeros((1, 120))
+    logits = logits.at[:, 42].add(100.0)
+    assert int(sampler(logits).item()) == 5
+
+    req._sampler_current_input_token = 5
+    logits = mx.zeros((1, 120))
+    logits = logits.at[:, 42].add(100.0)
+    assert int(sampler(logits).item()) == 6
+
+    req.output_tokens.append(5)
+    req.output_tokens.extend([6, 7])
+    req._sampler_current_input_token = None
+    logits = mx.zeros((1, 120))
+    logits = logits.at[:, 42].add(100.0)
+    assert int(sampler(logits).item()) == 42
+
+
+def test_mimo_auto_tool_sampler_does_not_force_xml_prefix():
+    """MiMo XML prefix forcing is only for tool_choice=required."""
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from vmlx_engine.mllm_batch_generator import MLLMBatchGenerator, MLLMBatchRequest
+
+    class _Tokenizer:
+        eos_token_id = 99
+
+        def encode(self, text, add_special_tokens=False):
+            if text.startswith("<tool_call>"):
+                return [5, 6, 7]
+            if text == "<think>":
+                return [1]
+            if text == "</think>":
+                return [2]
+            if text == "<|im_end|>":
+                return [99]
+            return [3]
+
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    generator._model_type = "mimo_v2"
+    generator.processor = SimpleNamespace(tokenizer=_Tokenizer())
+
+    req = MLLMBatchRequest(
+        uid=0,
+        request_id="mimo-auto-tool",
+        prompt="prompt",
+        temperature=0.0,
+        enable_thinking=False,
+    )
+    req.input_ids = mx.array([[101, 102]])
+    req.extra_kwargs = {
+        "tool_choice": "auto",
+        "_vmlx_template_tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "record_fact",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            }
+        ],
+    }
+
+    sampler = generator._make_request_sampler(req)
+    logits = mx.zeros((1, 120))
+    logits = logits.at[:, 42].add(100.0)
+    assert int(sampler(logits).item()) == 42
+
+
+def test_mllm_prefill_keeps_extra_kwargs_for_decode_processors():
+    """Request policy metadata must survive prefill into decode sampling."""
+    import inspect
+
+    from vmlx_engine.mllm_batch_generator import MLLMBatchGenerator
+
+    source = inspect.getsource(MLLMBatchGenerator._process_prompts)
+    cleanup_index = source.index("req.pixel_values = None")
+    sampler_index = source.index("req_sampler = self._make_request_sampler(req)")
+    normal_prefill_cleanup = source[cleanup_index:sampler_index]
+    assert "req.extra_kwargs = {}" not in normal_prefill_cleanup
+    assert "_vmlx_tool_choice" in normal_prefill_cleanup
+
+
+class TestMLLMBatchResponse:
+    """Tests for MLLMBatchResponse dataclass."""
+
+    def test_create_response(self):
+        """Test creating a response."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchResponse
+
+        logprobs = mx.array([0.1, 0.2, 0.3])
+
+        resp = MLLMBatchResponse(
+            uid=0,
+            request_id="test-1",
+            token=42,
+            logprobs=logprobs,
+            finish_reason=None,
+        )
+
+        assert resp.uid == 0
+        assert resp.request_id == "test-1"
+        assert resp.token == 42
+        assert resp.finish_reason is None
+
+    def test_finished_response(self):
+        """Test response with finish reason."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchResponse
+
+        resp = MLLMBatchResponse(
+            uid=0,
+            request_id="test-1",
+            token=2,  # EOS
+            logprobs=mx.array([0.1]),
+            finish_reason="stop",
+        )
+
+        assert resp.finish_reason == "stop"
+
+
+class TestMLLMBatch:
+    """Tests for MLLMBatch class."""
+
+    def test_batch_length(self):
+        """Test batch length calculation."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+
+        requests = [
+            MLLMBatchRequest(uid=i, request_id=f"req-{i}", prompt=f"prompt {i}")
+            for i in range(3)
+        ]
+
+        batch = MLLMBatch(
+            uids=[0, 1, 2],
+            request_ids=["req-0", "req-1", "req-2"],
+            y=mx.array([100, 200, 300]),
+            logprobs=[mx.array([0.1]), mx.array([0.2]), mx.array([0.3])],
+            max_tokens=[100, 100, 100],
+            num_tokens=[0, 0, 0],
+            cache=[],
+            requests=requests,
+        )
+
+        assert len(batch) == 3
+
+
+class TestMLLMBatchFastNoLogprobs:
+    """Batched VLM decode should not materialize unsupported logprobs."""
+
+    def test_step_samples_from_logits_without_full_vocab_logsumexp(self, monkeypatch):
+        from vmlx_engine import mllm_batch_generator as mbg
+        from vmlx_engine.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        class DummyLanguageModel:
+            def __call__(self, input_tokens, cache=None):
+                batch = input_tokens.shape[0]
+                return mx.array([[[0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0]]] * batch)
+
+        def fail_logsumexp(*args, **kwargs):
+            raise AssertionError("MLLM fast path must not compute full-vocab logprobs")
+
+        monkeypatch.setattr(mbg.mx, "logsumexp", fail_logsumexp)
+
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="req-1",
+            prompt="hello",
+            temperature=0.0,
+        )
+        generator = MLLMBatchGenerator(
+            model=DummyLanguageModel(),
+            processor=object(),
+            enable_prefix_cache=False,
+        )
+        generator.active_batch = MLLMBatch(
+            uids=[0],
+            request_ids=["req-1"],
+            y=mx.array([1]),
+            logprobs=[None],
+            max_tokens=[16],
+            num_tokens=[0],
+            cache=[],
+            requests=[req],
+        )
+
+        sampled, logprobs = generator._step(mx.array([1]), [])
+
+        assert sampled.tolist() == [5]
+        assert logprobs == [None]
+
+    def test_cache_hit_absolute_positions_seed_qwen_rope_delta_for_decode(self):
+        from vmlx_engine.mllm_batch_generator import _seed_text_rope_delta_for_decode
+
+        class DummyLanguageModel:
+            _rope_deltas = None
+            _position_ids = mx.array([1, 2, 3])
+
+        lm = DummyLanguageModel()
+        input_ids = mx.array([[10, 11, 12]])
+
+        _seed_text_rope_delta_for_decode(lm, input_ids)
+
+        assert lm._position_ids is None
+        assert lm._rope_deltas.tolist() == [[0]]
+
+    def test_decode_step_passes_position_ids_for_qwen_cache_decode(self):
+        from vmlx_engine.mllm_batch_generator import (
+            MLLMBatch,
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        class OffsetCache:
+            offset = 9
+
+        class InnerModel:
+            fa_idx = 0
+
+        class QwenLikeLanguageModel:
+            model = InnerModel()
+            seen_position_ids = None
+
+            def __call__(self, input_tokens, cache=None, position_ids=None):
+                if cache is not None and position_ids is None:
+                    raise AssertionError("cached Qwen decode needs position_ids")
+                self.seen_position_ids = position_ids
+                batch = input_tokens.shape[0]
+                return mx.array([[[0.0, 0.0, 9.0]]] * batch)
+
+        lm = QwenLikeLanguageModel()
+        req = MLLMBatchRequest(
+            uid=0,
+            request_id="req-qwen",
+            prompt="hello",
+            temperature=0.0,
+        )
+        generator = MLLMBatchGenerator(
+            model=lm,
+            processor=object(),
+            enable_prefix_cache=False,
+        )
+        generator.active_batch = MLLMBatch(
+            uids=[0],
+            request_ids=["req-qwen"],
+            y=mx.array([1]),
+            logprobs=[None],
+            max_tokens=[16],
+            num_tokens=[0],
+            cache=[OffsetCache()],
+            requests=[req],
+        )
+
+        sampled, logprobs = generator._step(mx.array([42]), [OffsetCache()])
+
+        assert sampled.tolist() == [2]
+        assert logprobs == [None]
+        assert lm.seen_position_ids is not None
+        assert lm.seen_position_ids.shape == (3, 1, 1)
+        assert lm.seen_position_ids[0, 0].tolist() == [9]
+
+    def test_text_only_lm_fast_paths_seed_qwen_rope_delta_when_cache_exists(self):
+        import inspect
+        from vmlx_engine.mllm_batch_generator import MLLMBatchGenerator
+
+        source = inspect.getsource(MLLMBatchGenerator._run_vision_encoding_inner)
+
+        assert "if cache is not None:\n                    _seed_text_rope_delta_for_decode(lm, input_ids)" in source
+
+    def test_batch_filter(self):
+        """Test filtering a batch."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+
+        requests = [
+            MLLMBatchRequest(uid=i, request_id=f"req-{i}", prompt=f"prompt {i}")
+            for i in range(4)
+        ]
+
+        batch = MLLMBatch(
+            uids=[0, 1, 2, 3],
+            request_ids=["req-0", "req-1", "req-2", "req-3"],
+            y=mx.array([100, 200, 300, 400]),
+            logprobs=[
+                mx.array([0.1]),
+                mx.array([0.2]),
+                mx.array([0.3]),
+                mx.array([0.4]),
+            ],
+            max_tokens=[100, 100, 100, 100],
+            num_tokens=[0, 0, 0, 0],
+            cache=[],
+            requests=requests,
+        )
+
+        # Keep only indices 1 and 3
+        batch.filter([1, 3])
+
+        assert len(batch) == 2
+        assert batch.uids == [1, 3]
+        assert batch.request_ids == ["req-1", "req-3"]
+
+
+class TestMLLMBatchStats:
+    """Tests for MLLMBatchStats."""
+
+    def test_stats_initialization(self):
+        """Test stats initialization."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchStats
+
+        stats = MLLMBatchStats()
+
+        assert stats.prompt_tokens == 0
+        assert stats.generation_tokens == 0
+        assert stats.prompt_time == 0
+        assert stats.generation_time == 0
+        assert stats.num_images_processed == 0
+
+    def test_tps_calculation(self):
+        """Test tokens per second calculation."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchStats
+
+        stats = MLLMBatchStats()
+        stats.prompt_tokens = 100
+        stats.prompt_time = 2.0
+        stats.generation_tokens = 50
+        stats.generation_time = 1.0
+
+        assert stats.prompt_tps == 50.0
+        assert stats.generation_tps == 50.0
+
+    def test_tps_zero_time(self):
+        """Test TPS with zero time."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchStats
+
+        stats = MLLMBatchStats()
+
+        assert stats.prompt_tps == 0
+        assert stats.generation_tps == 0
+
+    def test_cache_execution_timing_surfaces_in_stats(self):
+        """MLLM cache-hit diagnostics must preserve reconstruction/dequant timing."""
+        from vmlx_engine.mllm_batch_generator import MLLMBatchStats
+
+        stats = MLLMBatchStats()
+        execution = {
+            "request_id": "req-cache",
+            "cache_detail": "paged+disk+tq",
+            "cached_tokens": 128,
+            "reconstructed": True,
+            "dequantized": True,
+            "reconstruction_seconds": 0.01,
+            "dequantization_seconds": 0.02,
+            "total_worker_cache_seconds": 0.03,
+        }
+        stats.last_cache_execution = execution
+
+        assert stats.to_dict()["last_cache_execution"] == execution
+
+    def test_prefill_trace_records_named_segments_and_stats_surface(self, monkeypatch):
+        """MLLM prefill diagnostics must expose segment timing when enabled."""
+        import time
+
+        import vmlx_engine.mllm_batch_generator as mbg
+        from vmlx_engine.mllm_batch_generator import MLLMBatchStats
+
+        monkeypatch.setenv("VMLINUX_MLLM_PREFILL_TRACE", "1")
+        monkeypatch.setattr(mbg, "_mllm_prefill_trace_sync", lambda: None)
+        ticks = iter([10.0, 10.010, 10.020, 10.030, 10.060, 10.060])
+        monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
+
+        trace = mbg._MLLMPrefillTrace(
+            request_id="req-trace",
+            prompt_tokens=32,
+            has_images=False,
+            is_hybrid=True,
+            native_mtp=True,
+            prefix_cache_enabled=False,
+        )
+        trace.start("preprocess")
+        trace.stop("preprocess")
+        trace.start("forward")
+        trace.stop("forward")
+        trace.set(cached_tokens=0, cache_detail="none")
+
+        data = trace.to_dict()
+        stats = MLLMBatchStats()
+        stats.last_prefill_trace = data
+
+        assert data["request_id"] == "req-trace"
+        assert data["prompt_tokens"] == 32
+        assert data["has_images"] is False
+        assert data["is_hybrid"] is True
+        assert data["native_mtp"] is True
+        assert data["prefix_cache_enabled"] is False
+        assert data["preprocess_ms"] == 10.0
+        assert data["forward_ms"] == 30.0
+        assert data["total_ms"] == 60.0
+        assert stats.to_dict()["last_prefill_trace"] == data
+
+    def test_prefill_trace_records_language_model_route_metadata(self, monkeypatch):
+        """Qwen VLM speed artifacts must expose the model-call route under test."""
+        import vmlx_engine.mllm_batch_generator as mbg
+
+        monkeypatch.setenv("VMLINUX_MLLM_PREFILL_TRACE", "1")
+        monkeypatch.setattr(mbg, "_mllm_prefill_trace_sync", lambda: None)
+
+        trace = mbg._MLLMPrefillTrace(
+            request_id="req-route",
+            prompt_tokens=64,
+            has_images=False,
+            is_hybrid=True,
+            native_mtp=True,
+            prefix_cache_enabled=True,
+            language_model_class="mlx_vlm.models.qwen3_5.language.LanguageModel",
+            force_text_rope_1d=True,
+            supports_return_logits=True,
+        )
+
+        data = trace.to_dict()
+
+        assert data["language_model_class"] == "mlx_vlm.models.qwen3_5.language.LanguageModel"
+        assert data["force_text_rope_1d"] is True
+        assert data["supports_return_logits"] is True
+
+    def test_prefill_trace_uses_existing_native_mtp_head_detector(self):
+        """Diagnostics must not reference non-existent generator runtime fields."""
+        source = Path("vmlx_engine/mllm_batch_generator.py").read_text()
+
+        assert "_native_mtp_runtime" not in source
+        assert "native_mtp=_native_mtp_model_has_head(self.language_model)" in source
+
+    def test_qwen_mtp_patches_support_prefix_without_lm_head(self):
+        """Qwen native-MTP text/VL wrappers must let MLLM prefill skip prefix lm_head."""
+        sources = [
+            Path("vmlx_engine/patches/mlx_lm_mtp/qwen35_model.py").read_text(),
+            Path("vmlx_engine/patches/mlx_vlm_mtp/qwen35_vl.py").read_text(),
+        ]
+
+        for source in sources:
+            assert "return_logits: bool = True" in source
+            assert "if not return_logits:" in source
+            assert "return hidden" in source
+
+    def test_text_only_hybrid_short_prefill_avoids_full_prompt_logits(self, monkeypatch):
+        """Short text-only hybrid MLLM prompts should not materialize lm_head for every prompt token."""
+        from mlx_lm.models.cache import KVCache
+
+        from vmlx_engine.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        monkeypatch.setenv("VMLX_ALLOW_HYBRID_CHUNKED_PREFILL", "1")
+
+        class DummySSMCache:
+            def __init__(self):
+                self.state = mx.array([0])
+                self.cache = [mx.array([0])]
+
+        class DummyLanguageModel:
+            def __init__(self):
+                self.calls = []
+
+            def make_cache(self):
+                return [KVCache(), DummySSMCache()]
+
+            def __call__(self, input_ids, *, return_logits=True, **kwargs):
+                self.calls.append(
+                    {
+                        "tokens": int(input_ids.shape[1]),
+                        "return_logits": return_logits,
+                    }
+                )
+                return mx.zeros((input_ids.shape[0], input_ids.shape[1], 8))
+
+        class DummyVLM:
+            def __init__(self):
+                self.language_model = DummyLanguageModel()
+
+        model = DummyVLM()
+        generator = MLLMBatchGenerator(
+            model=model,
+            processor=object(),
+            prefill_step_size=2048,
+            enable_prefix_cache=False,
+        )
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="short-hybrid",
+            prompt="",
+            input_ids=mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32),
+            temperature=0.0,
+        )
+
+        output = generator._run_vision_encoding_inner(
+            request,
+            cache=model.language_model.make_cache(),
+        )
+
+        assert output.shape == (1, 1, 8)
+        assert model.language_model.calls == [
+            {"tokens": 5, "return_logits": False},
+            {"tokens": 1, "return_logits": True},
+        ]
+
+    def test_default_native_mtp_hybrid_text_prefill_stays_on_full_prompt_logits(self, monkeypatch):
+        """Native-MTP hybrid split is diagnostic-only until live equivalence is proven."""
+        from mlx_lm.models.cache import KVCache
+
+        from vmlx_engine.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        monkeypatch.delenv("VMLX_ALLOW_HYBRID_CHUNKED_PREFILL", raising=False)
+        monkeypatch.delenv("VMLINUX_ALLOW_HYBRID_CHUNKED_PREFILL", raising=False)
+        monkeypatch.delenv("VMLX_ENABLE_NATIVE_MTP_HYBRID_TEXT_SPLIT", raising=False)
+        monkeypatch.delenv("VMLINUX_ENABLE_NATIVE_MTP_HYBRID_TEXT_SPLIT", raising=False)
+
+        class DummySSMCache:
+            def __init__(self):
+                self.state = mx.array([0])
+                self.cache = [mx.array([0])]
+
+        class DummyNativeMTPHead:
+            pass
+
+        class DummyLanguageModel:
+            def __init__(self):
+                self.calls = []
+                self.mtp = DummyNativeMTPHead()
+
+            def make_cache(self):
+                return [KVCache(), DummySSMCache()]
+
+            def make_mtp_cache(self):
+                return []
+
+            def mtp_forward(self, *args, **kwargs):
+                return mx.zeros((1, 1, 8)), mx.zeros((1, 1, 8))
+
+            def __call__(self, input_ids, *, return_logits=True, **kwargs):
+                self.calls.append(
+                    {
+                        "tokens": int(input_ids.shape[1]),
+                        "return_logits": return_logits,
+                    }
+                )
+                return mx.zeros((input_ids.shape[0], input_ids.shape[1], 8))
+
+        class DummyVLM:
+            def __init__(self):
+                self.language_model = DummyLanguageModel()
+
+        model = DummyVLM()
+        generator = MLLMBatchGenerator(
+            model=model,
+            processor=object(),
+            prefill_step_size=2048,
+            enable_prefix_cache=False,
+        )
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="default-native-mtp-hybrid",
+            prompt="",
+            input_ids=mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32),
+            temperature=0.0,
+        )
+
+        output = generator._run_vision_encoding_inner(
+            request,
+            cache=model.language_model.make_cache(),
+        )
+
+        assert output.shape == (1, 6, 8)
+        assert model.language_model.calls == [
+            {"tokens": 6, "return_logits": True},
+        ]
+
+    def test_opt_in_native_mtp_hybrid_prefix_split_materializes_cache_before_final_logits(self, monkeypatch):
+        """Prefix-only native-MTP hybrid work must not remain lazy until final logits eval."""
+        from vmlx_engine.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+        import vmlx_engine.mllm_batch_generator as mllm_mod
+
+        monkeypatch.delenv("VMLX_ALLOW_HYBRID_CHUNKED_PREFILL", raising=False)
+        monkeypatch.delenv("VMLINUX_ALLOW_HYBRID_CHUNKED_PREFILL", raising=False)
+        monkeypatch.setenv("VMLINUX_ENABLE_NATIVE_MTP_HYBRID_TEXT_SPLIT", "1")
+        eval_calls = []
+
+        def fake_eval(*items):
+            eval_calls.append(items)
+
+        monkeypatch.setattr(mllm_mod.mx, "eval", fake_eval)
+
+        class DummyKVCache:
+            def __init__(self):
+                self.keys = None
+                self.values = None
+
+        class DummySSMCache:
+            def __init__(self):
+                self.state = mx.array([0])
+                self.cache = [mx.array([0])]
+
+        class DummyNativeMTPHead:
+            pass
+
+        class DummyLanguageModel:
+            def __init__(self):
+                self.calls = []
+                self.mtp = DummyNativeMTPHead()
+
+            def make_cache(self):
+                return [DummyKVCache(), DummySSMCache()]
+
+            def make_mtp_cache(self):
+                return []
+
+            def mtp_forward(self, *args, **kwargs):
+                return mx.zeros((1, 1, 8)), mx.zeros((1, 1, 8))
+
+            def __call__(self, input_ids, *, cache=None, return_logits=True, **kwargs):
+                self.calls.append(
+                    {
+                        "tokens": int(input_ids.shape[1]),
+                        "return_logits": return_logits,
+                    }
+                )
+                if cache is not None:
+                    cache[0].keys = mx.array([[11]])
+                    cache[0].values = mx.array([[12]])
+                    cache[1].cache = [mx.array([[13]])]
+                return mx.zeros((input_ids.shape[0], input_ids.shape[1], 8))
+
+        class DummyVLM:
+            def __init__(self):
+                self.language_model = DummyLanguageModel()
+
+        model = DummyVLM()
+        generator = MLLMBatchGenerator(
+            model=model,
+            processor=object(),
+            prefill_step_size=2048,
+            enable_prefix_cache=False,
+        )
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="default-native-mtp-hybrid-materialize",
+            prompt="",
+            input_ids=mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32),
+            temperature=0.0,
+        )
+
+        generator._run_vision_encoding_inner(
+            request,
+            cache=model.language_model.make_cache(),
+        )
+
+        assert model.language_model.calls[0] == {"tokens": 5, "return_logits": False}
+        assert any(len(items) >= 3 for items in eval_calls)
+
+    def test_opt_in_native_mtp_hybrid_long_text_prefill_uses_chunked_prefix_split(self, monkeypatch):
+        """Native-MTP hybrid text prompts above the short threshold must not fall back to one-shot logits."""
+        from mlx_lm.models.cache import KVCache
+
+        from vmlx_engine.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        monkeypatch.delenv("VMLX_ALLOW_HYBRID_CHUNKED_PREFILL", raising=False)
+        monkeypatch.delenv("VMLINUX_ALLOW_HYBRID_CHUNKED_PREFILL", raising=False)
+        monkeypatch.setenv("VMLINUX_ENABLE_NATIVE_MTP_HYBRID_TEXT_SPLIT", "1")
+
+        class DummySSMCache:
+            def __init__(self):
+                self.state = mx.array([0])
+                self.cache = [mx.array([0])]
+
+        class DummyNativeMTPHead:
+            pass
+
+        class DummyLanguageModel:
+            def __init__(self):
+                self.calls = []
+                self.mtp = DummyNativeMTPHead()
+
+            def make_cache(self):
+                return [KVCache(), DummySSMCache()]
+
+            def make_mtp_cache(self):
+                return []
+
+            def mtp_forward(self, *args, **kwargs):
+                return mx.zeros((1, 1, 8)), mx.zeros((1, 1, 8))
+
+            def __call__(self, input_ids, *, return_logits=True, **kwargs):
+                self.calls.append(
+                    {
+                        "tokens": int(input_ids.shape[1]),
+                        "return_logits": return_logits,
+                    }
+                )
+                return mx.zeros((input_ids.shape[0], input_ids.shape[1], 8))
+
+        class DummyVLM:
+            def __init__(self):
+                self.language_model = DummyLanguageModel()
+
+        model = DummyVLM()
+        generator = MLLMBatchGenerator(
+            model=model,
+            processor=object(),
+            prefill_step_size=2,
+            enable_prefix_cache=False,
+        )
+        request = MLLMBatchRequest(
+            uid=0,
+            request_id="default-native-mtp-hybrid-long",
+            prompt="",
+            input_ids=mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32),
+            temperature=0.0,
+        )
+
+        output = generator._run_vision_encoding_inner(
+            request,
+            cache=model.language_model.make_cache(),
+        )
+
+        assert output.shape == (1, 1, 8)
+        assert model.language_model.calls == [
+            {"tokens": 2, "return_logits": False},
+            {"tokens": 2, "return_logits": False},
+            {"tokens": 1, "return_logits": False},
+            {"tokens": 1, "return_logits": True},
+        ]
+
+
+class TestMLLMSchedulerConfig:
+    """Tests for MLLMSchedulerConfig."""
+
+    def test_default_config(self):
+        """Test default configuration."""
+        from vmlx_engine.mllm_scheduler import MLLMSchedulerConfig
+
+        config = MLLMSchedulerConfig()
+
+        assert config.max_num_seqs == 1
+        assert config.prefill_batch_size == 512
+        assert config.prefill_step_size == 2048
+        assert config.completion_batch_size == 512
+        assert config.enable_vision_cache is True
+        # Vision embedding cache remains conservative; text batch sizing is separate.
+        assert config.vision_cache_size == 16
+
+    def test_batched_engine_mllm_fallback_uses_scheduler_defaults(self):
+        """Programmatic MLLM startup must not keep stale low-batch fallbacks."""
+        source = Path("vmlx_engine/engine/batched.py").read_text()
+
+        assert "default_scheduler = SchedulerConfig()" in source
+        assert '"prefill_batch_size",\n            default_scheduler.prefill_batch_size' in source
+        assert '"completion_batch_size",\n            default_scheduler.completion_batch_size' in source
+        assert '"prefill_step_size",\n                default_scheduler.prefill_step_size' in source
+        assert '"prefill_batch_size", 4' not in source
+        assert '"completion_batch_size", 16' not in source
+
+    def test_custom_config(self):
+        """Test custom configuration."""
+        from vmlx_engine.mllm_scheduler import MLLMSchedulerConfig
+
+        config = MLLMSchedulerConfig(
+            max_num_seqs=8,
+            prefill_batch_size=2,
+            completion_batch_size=8,
+            enable_vision_cache=False,
+        )
+
+        assert config.max_num_seqs == 8
+        assert config.prefill_batch_size == 2
+        assert config.completion_batch_size == 8
+        assert config.enable_vision_cache is False
+
+
+class TestMLLMRequest:
+    """Tests for MLLMRequest dataclass."""
+
+    def test_create_request(self):
+        """Test creating an MLLM request."""
+        from vmlx_engine.mllm_scheduler import MLLMRequest
+        from vmlx_engine.request import RequestStatus
+
+        req = MLLMRequest(
+            request_id="req-1",
+            prompt="Describe this image",
+            images=["image.jpg"],
+        )
+
+        assert req.request_id == "req-1"
+        assert req.prompt == "Describe this image"
+        assert req.images == ["image.jpg"]
+        assert req.status == RequestStatus.WAITING
+        assert req.output_text == ""
+
+
+class TestMLLMSchedulerOutput:
+    """Tests for MLLMSchedulerOutput."""
+
+    def test_empty_output(self):
+        """Test empty scheduler output."""
+        from vmlx_engine.mllm_scheduler import MLLMSchedulerOutput
+
+        output = MLLMSchedulerOutput()
+
+        assert output.scheduled_request_ids == []
+        assert output.num_scheduled_tokens == 0
+        assert output.finished_request_ids == set()
+        assert output.outputs == []
+        assert output.has_work is False
+
+    def test_scheduler_trace_aggregates_step_executor_and_dispatch_time(self, caplog):
+        import logging
+
+        from vmlx_engine.mllm_scheduler import MLLMScheduler, MLLMSchedulerOutput
+        from vmlx_engine.request import RequestOutput
+
+        scheduler = MLLMScheduler.__new__(MLLMScheduler)
+        scheduler._scheduler_trace_timings = {}
+
+        first = MLLMSchedulerOutput(
+            outputs=[
+                RequestOutput(
+                    request_id="trace-req",
+                    new_token_ids=[1],
+                    finished=False,
+                )
+            ],
+            trace_timings={
+                "total_s": 0.011,
+                "schedule_s": 0.001,
+                "batch_next_s": 0.008,
+                "process_cleanup_s": 0.002,
+                "process_responses_s": 0.0015,
+                "cleanup_finished_s": 0.0005,
+            },
+        )
+        second = MLLMSchedulerOutput(
+            outputs=[
+                RequestOutput(
+                    request_id="trace-req",
+                    new_token_ids=[2, 3],
+                    finished=True,
+                )
+            ],
+            trace_timings={
+                "total_s": 0.021,
+                "schedule_s": 0.001,
+                "batch_next_s": 0.018,
+                "process_cleanup_s": 0.002,
+                "process_responses_s": 0.0005,
+                "cleanup_finished_s": 0.0015,
+            },
+        )
+
+        with caplog.at_level(logging.INFO, logger="vmlx_engine.mllm_scheduler"):
+            scheduler._record_scheduler_trace(first, executor_s=0.01, dispatch_s=0.001)
+            scheduler._record_scheduler_trace(second, executor_s=0.02, dispatch_s=0.002)
+
+        assert "VMLINUX_MLLM_SCHEDULER_TRACE request_id=trace-req" in caplog.text
+        assert "steps=2" in caplog.text
+        assert "output_tokens=3" in caplog.text
+        assert "executor_ms=30.000" in caplog.text
+        assert "dispatch_ms=3.000" in caplog.text
+        assert "step_ms=32.000" in caplog.text
+        assert "batch_next_ms=26.000" in caplog.text
+        assert "process_cleanup_ms=4.000" in caplog.text
+        assert "process_responses_ms=2.000" in caplog.text
+        assert "cleanup_finished_ms=2.000" in caplog.text
+        assert scheduler._scheduler_trace_timings == {}
+
+
+class TestVisionCache:
+    """Tests for VLM cache functionality."""
+
+    def test_cache_creation(self):
+        """Test VLM cache creation."""
+        from vmlx_engine.mllm_cache import MLLMCacheManager
+
+        cache = MLLMCacheManager(max_entries=10)
+
+        assert len(cache) == 0
+        assert cache.max_size == 10
+
+    def test_cache_miss(self):
+        """Test cache miss."""
+        from vmlx_engine.mllm_cache import MLLMCacheManager
+
+        cache = MLLMCacheManager()
+
+        result, hit = cache.fetch_cache(["image.jpg"], "prompt")
+
+        assert result is None
+        assert hit is False
+        assert cache.stats.misses == 1
+
+    def test_cache_store_and_fetch(self):
+        """Test storing and fetching from cache."""
+        from vmlx_engine.mllm_cache import MLLMCacheManager
+
+        cache = MLLMCacheManager()
+
+        # Store cache
+        test_cache = [{"key": "value"}]
+        cache.store_cache(["image.jpg"], "prompt", test_cache, num_tokens=100)
+
+        # Fetch cache
+        result, hit = cache.fetch_cache(["image.jpg"], "prompt")
+
+        assert result is not None
+        assert hit is True
+        assert cache.stats.hits == 1
+        assert cache.stats.tokens_saved == 100
+
+    def test_cache_eviction(self):
+        """Test cache eviction when full."""
+        from vmlx_engine.mllm_cache import MLLMCacheManager
+
+        cache = MLLMCacheManager(max_entries=2)
+
+        # Fill cache
+        cache.store_cache(["img1.jpg"], "prompt1", [1], num_tokens=10)
+        cache.store_cache(["img2.jpg"], "prompt2", [2], num_tokens=20)
+
+        assert len(cache) == 2
+
+        # Add one more (should evict oldest)
+        cache.store_cache(["img3.jpg"], "prompt3", [3], num_tokens=30)
+
+        assert len(cache) == 2
+        assert cache.stats.evictions == 1
+
+        # img1 should be evicted
+        _, hit = cache.fetch_cache(["img1.jpg"], "prompt1")
+        assert hit is False
+
+
+# Integration tests (require model loading)
+@pytest.mark.slow
+@pytest.mark.skipif(not os.environ.get("RUN_SLOW_TESTS"), reason="Slow tests disabled")
+class TestMLLMSchedulerIntegration:
+    """Integration tests for MLLMScheduler with real models."""
+
+    @pytest.fixture
+    def test_image_path(self):
+        """Create a test image."""
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            path = create_test_image(f.name)
+            yield path
+            os.unlink(path)
+
+    async def test_single_request(self, test_image_path):
+        """Test single MLLM request."""
+        from vmlx_engine.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from mlx_vlm import load
+
+        # Load a small model
+        model, processor = load("mlx-community/Qwen3-VL-4B-Instruct-3bit")
+
+        config = MLLMSchedulerConfig(max_num_seqs=4)
+        scheduler = MLLMScheduler(model, processor, config)
+
+        await scheduler.start()
+
+        try:
+            request_id = scheduler.add_request(
+                prompt="What's in this image?",
+                images=[test_image_path],
+                max_tokens=50,
+            )
+
+            # Run until complete
+            while scheduler.has_requests():
+                output = scheduler.step()
+                if request_id in output.finished_request_ids:
+                    break
+
+            # Check result
+            request = scheduler.get_request(request_id)
+            assert request is not None
+            assert len(request.output_tokens) > 0
+
+        finally:
+            await scheduler.stop()
+
+    async def test_concurrent_requests(self, test_image_path):
+        """Test multiple concurrent MLLM requests."""
+        from vmlx_engine.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from mlx_vlm import load
+
+        model, processor = load("mlx-community/Qwen3-VL-4B-Instruct-3bit")
+
+        config = MLLMSchedulerConfig(max_num_seqs=4)
+        scheduler = MLLMScheduler(model, processor, config)
+
+        await scheduler.start()
+
+        try:
+            # Add multiple requests
+            request_ids = []
+            for i in range(4):
+                req_id = scheduler.add_request(
+                    prompt=f"Describe image {i}",
+                    images=[test_image_path],
+                    max_tokens=30,
+                )
+                request_ids.append(req_id)
+
+            # Run until all complete
+            finished = set()
+            while len(finished) < len(request_ids):
+                output = scheduler.step()
+                finished.update(output.finished_request_ids)
+
+            # Check all completed
+            assert len(finished) == 4
+
+            # Check stats show batching
+            stats = scheduler.get_stats()
+            assert stats["num_requests_processed"] == 4
+
+        finally:
+            await scheduler.stop()
+
+    async def test_streaming(self, test_image_path):
+        """Test streaming MLLM generation."""
+        from vmlx_engine.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from mlx_vlm import load
+
+        model, processor = load("mlx-community/Qwen3-VL-4B-Instruct-3bit")
+
+        config = MLLMSchedulerConfig()
+        scheduler = MLLMScheduler(model, processor, config)
+
+        await scheduler.start()
+
+        try:
+            request_id = await scheduler.add_request_async(
+                prompt="Describe this image briefly",
+                images=[test_image_path],
+                max_tokens=30,
+            )
+
+            tokens_received = 0
+            async for output in scheduler.stream_outputs(request_id):
+                tokens_received += len(output.new_token_ids)
+                if output.finished:
+                    break
+
+            assert tokens_received > 0
+
+        finally:
+            await scheduler.stop()
+
+
+# Run tests
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

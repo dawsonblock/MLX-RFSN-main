@@ -1,0 +1,59 @@
+version: '3.8'
+
+# NOTE: RFSN v10 inference server mode.
+# This compose file runs the FastAPI server with torch backend.
+# It requires real_model dependencies and a valid HuggingFace model ID.
+# For healthcheck-only validation, use docker-compose.yml instead.
+
+services:
+  rfsn:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: rfsn-v10-server
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./results:/app/results
+      - rfsn_cache:/app/.cache
+    command: ["python", "-m", "rfsn_v10.server"]
+    environment:
+      - RFSN_LOG_LEVEL=INFO
+      - RFSN_CACHE_DIR=/app/.cache
+      - RFSN_METRICS_ENABLED=true
+      - RFSN_BACKEND=torch
+      - RFSN_MODEL_ID=${RFSN_MODEL_ID:?RFSN_MODEL_ID is required. Set a HuggingFace model ID.}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD is required. Set it in a .env file.}
+    ports:
+      - "8000:8000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "rfsn_v10", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: rfsn-clickhouse
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=rfsn
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD is required. Set it in a .env file.}
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  rfsn_cache:
+    driver: local
+  clickhouse_data:
+    driver: local

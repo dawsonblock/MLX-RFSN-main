@@ -1,0 +1,86 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.0, pytest-9.0.2, pluggy-1.6.0 -- /Users/dawsonblock/.pyenv/versions/3.12.0/bin/python3.12
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /Users/dawsonblock/rfsn_v10_corrected_full
+configfile: pytest.ini (WARNING: ignoring pytest config in pyproject.toml!)
+plugins: anyio-4.12.1, astropy-0.11.0, mock-3.15.1, remotedata-0.4.1, xdist-3.8.0, timeout-2.4.0, filter-subpackage-0.2.0, hypothesis-6.151.4, astropy-header-0.2.2, asyncio-1.3.0, doctestplus-1.7.1, arraydiff-0.6.1, cov-7.0.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 74 items
+
+tests/test_fused_kernel_mlx.py::test_fused_kernel_source_route_exists PASSED
+tests/test_fused_kernel_mlx.py::test_fused_output_matches_sequential_reference[3-shape0] PASSED
+tests/test_fused_kernel_mlx.py::test_fused_output_matches_sequential_reference[3-shape1] PASSED
+tests/test_fused_kernel_mlx.py::test_fused_output_matches_sequential_reference[3-shape2] PASSED
+tests/test_fused_kernel_mlx.py::test_fused_output_matches_sequential_reference[8-shape0] PASSED
+tests/test_fused_kernel_mlx.py::test_fused_output_matches_sequential_reference[8-shape1] PASSED
+tests/test_fused_kernel_mlx.py::test_fused_output_matches_sequential_reference[8-shape2] PASSED
+tests/test_fused_kernel_mlx.py::test_kv_manager_uses_fused_route_when_requested PASSED
+tests/test_fused_kernel_mlx.py::test_strict_fused_failure_raises_not_fallback PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_hash_sign_is_self_inverse PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape0-False-False-metal_multikernel_dequant] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape0-True-False-metal_multikernel_dequant_wht] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape0-False-True-metal_multikernel_dequant_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape0-True-True-metal_multikernel_dequant_wht_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape1-False-False-metal_multikernel_dequant] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape1-True-False-metal_multikernel_dequant_wht] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape1-False-True-metal_multikernel_dequant_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape1-True-True-metal_multikernel_dequant_wht_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape2-False-False-metal_multikernel_dequant] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape2-True-False-metal_multikernel_dequant_wht] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape2-False-True-metal_multikernel_dequant_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_metal_reconstruction_matches_reference[shape2-True-True-metal_multikernel_dequant_wht_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape0-False-False-metal_multikernel_dequant] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape0-True-False-metal_multikernel_dequant_wht] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape0-False-True-metal_multikernel_dequant_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape0-True-True-metal_multikernel_dequant_wht_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape1-False-False-metal_multikernel_dequant] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape1-True-False-metal_multikernel_dequant_wht] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape1-False-True-metal_multikernel_dequant_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape1-True-True-metal_multikernel_dequant_wht_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape2-False-False-metal_multikernel_dequant] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape2-True-False-metal_multikernel_dequant_wht] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape2-False-True-metal_multikernel_dequant_sign] PASSED
+tests/test_kernel_equivalence_mlx.py::test_strict_metal_uses_metal_route[shape2-True-True-metal_multikernel_dequant_wht_sign] PASSED
+tests/test_kv_manager.py::test_store_retrieve_various_shapes[shape0] PASSED
+tests/test_kv_manager.py::test_store_retrieve_various_shapes[shape1] PASSED
+tests/test_kv_manager.py::test_store_retrieve_various_shapes[shape2] PASSED
+tests/test_kv_manager.py::test_store_retrieve_various_shapes[shape3] PASSED
+tests/test_kv_manager.py::test_store_retrieve_various_shapes[shape4] PASSED
+tests/test_kv_manager.py::test_normal_distribution PASSED
+tests/test_kv_manager.py::test_small_magnitude PASSED
+tests/test_kv_manager.py::test_large_magnitude PASSED
+tests/test_kv_manager.py::test_all_zeros PASSED
+tests/test_kv_manager.py::test_alternating_signs PASSED
+tests/test_kv_manager.py::test_use_incoherent_false PASSED
+tests/test_kv_manager.py::test_different_k_v_bits PASSED
+tests/test_kv_manager.py::test_split_transform_flags_roundtrip[False-False] PASSED
+tests/test_kv_manager.py::test_split_transform_flags_roundtrip[False-True] PASSED
+tests/test_kv_manager.py::test_split_transform_flags_roundtrip[True-False] PASSED
+tests/test_kv_manager.py::test_split_transform_flags_roundtrip[True-True] PASSED
+tests/test_kv_manager.py::test_out_dtype_float16 PASSED
+tests/test_kv_manager.py::test_corruption_wrong_scale_count PASSED
+tests/test_kv_manager.py::test_corruption_wrong_format_version PASSED
+tests/test_kv_manager.py::test_corruption_wrong_k_bits PASSED
+tests/test_kv_manager.py::test_store_replaces_existing_entry PASSED
+tests/test_kv_manager.py::test_estimate_compressed_bytes_for_shape_is_positive PASSED
+tests/test_kv_manager.py::test_estimate_compressed_bytes_reduces_with_higher_bits_for_packing PASSED
+tests/test_kv_manager.py::test_sign_cache_is_instance_scoped PASSED
+tests/test_kv_manager.py::test_sign_cache_is_thread_safe PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_basic PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_equivalence_vs_full PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_empty_raises PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_out_of_range_raises PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_not_found PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_rejects_negative_indices PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_rejects_zero_block_size PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_rejects_negative_block_size PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_rejects_out_of_range_index PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_deduplicates_and_sorts_indices PASSED
+tests/test_retrieve_blocks.py::TestRetrieveBlocks::test_retrieve_blocks_shape_for_non_contiguous_blocks PASSED
+tests/test_sparse_safety_gate.py::test_sparse_disabled_by_default PASSED
+tests/test_sparse_safety_gate.py::test_bad_sparse_audit_disables_sparse PASSED
+tests/test_sparse_safety_gate.py::test_clean_audit_streak_can_lower_topk PASSED
+tests/test_sparse_safety_gate.py::test_unsafe_profile_forces_dense PASSED
+
+============================== 74 passed in 1.92s ==============================

@@ -1,0 +1,65 @@
+name: Proof Regression Gate
+
+env:
+  PROOF_PROFILE: main10
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  proof-regression:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Generate proof artifacts
+        run: |
+          ./scripts/run_proof_artifacts.sh "artifacts/proof/${PROOF_PROFILE}" 3 "${PROOF_PROFILE}"
+
+      - name: Compare proof trend
+        run: |
+          python3 scripts/compare_proof_runs.py \
+            --profile "${PROOF_PROFILE}" \
+            --baseline-dir "benchmarks/proof_baselines/${PROOF_PROFILE}" \
+            --current-dir "artifacts/proof/${PROOF_PROFILE}" \
+            --strict-missing \
+            --output-json "artifacts/proof/${PROOF_PROFILE}/trend_report.json" \
+            --output-md "artifacts/proof/${PROOF_PROFILE}/trend_report.md"
+
+      - name: Enforce proof regression gate
+        run: |
+          python3 scripts/check_proof_regression.py \
+            --profile "${PROOF_PROFILE}" \
+            --baseline-dir "benchmarks/proof_baselines/${PROOF_PROFILE}" \
+            --current-dir "artifacts/proof/${PROOF_PROFILE}" \
+            --strict-missing \
+            --output-json "artifacts/proof/${PROOF_PROFILE}/regression_report.json" \
+            --output-md "artifacts/proof/${PROOF_PROFILE}/regression_report.md"
+
+      - name: Upload proof reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-reports
+          path: |
+            artifacts/proof/${{ env.PROOF_PROFILE }}/proof_summary.md
+            artifacts/proof/${{ env.PROOF_PROFILE }}/trend_report.json
+            artifacts/proof/${{ env.PROOF_PROFILE }}/trend_report.md
+            artifacts/proof/${{ env.PROOF_PROFILE }}/regression_report.json
+            artifacts/proof/${{ env.PROOF_PROFILE }}/regression_report.md
+            results/plots/*.png
+            results/plots/*.txt

@@ -1,0 +1,23 @@
+{
+  "release": "main28",
+  "generated_at": "2026-06-04T03:33:53.984313+00:00",
+  "artifacts": {
+    "kernel_benchmark_json": "kernel_benchmark.json",
+    "fused_kernel_benchmark_json": "fused_kernel_benchmark.json",
+    "optimization_benchmark_json": "optimization_benchmark.json",
+    "real_model_validation_json": "real_model_validation.json",
+    "long_context_validation_json": "long_context_validation.json",
+    "generation_smoke_json": "generation_smoke.json",
+    "generation_throughput_json": "generation_throughput.json",
+    "proof_summary_md": "proof_summary.md",
+    "mlx_test_summary_md": "mlx_test_summary.md",
+    "mlx_pytest_raw_log": "mlx_pytest_raw.log",
+    "mlx_pytest_junit_xml": "mlx_pytest_junit.xml",
+    "main28_release_manifest_json": "main28_release_manifest.json"
+  },
+  "status": "partial",
+  "missing_optional": [
+    "per_layer_sensitivity.json",
+    "targeted_layer_protection.json"
+  ]
+}

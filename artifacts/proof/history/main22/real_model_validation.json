@@ -1,0 +1,74 @@
+{
+  "status": "run",
+  "validation_class": "tiny_random_model_smoke_test",
+  "not_production_quality_evidence": true,
+  "model": "hf-internal-testing-tiny-random-LlamaForCausalLM",
+  "tokens_tested": 50,
+  "modes": [
+    {
+      "mode": "fp16_baseline",
+      "logit_cosine": 1.0,
+      "logit_max_abs_diff": 0.0,
+      "top1_token_match_rate": 1.0,
+      "top5_overlap": 1.0,
+      "perplexity_delta": 0.0
+    },
+    {
+      "mode": "compressed_kv",
+      "logit_cosine": 0.9999690055847168,
+      "logit_max_abs_diff": 0.002777099609375,
+      "top1_token_match_rate": 1.0,
+      "top5_overlap": 1.0,
+      "perplexity_delta": 3.736328125
+    },
+    {
+      "mode": "compressed_kv_sparse",
+      "logit_cosine": 0.9999690055847168,
+      "logit_max_abs_diff": 0.002777099609375,
+      "top1_token_match_rate": 1.0,
+      "top5_overlap": 1.0,
+      "perplexity_delta": 3.736328125
+    }
+  ],
+  "model_path": "/Users/dawsonblock/Downloads/hf_models/hf-internal-testing-tiny-random-LlamaForCausalLM",
+  "device": "mps",
+  "mode_results": [
+    {
+      "mode": "fp16_baseline",
+      "tokens_tested": 50,
+      "logit_cosine": 1.0,
+      "logit_max_abs_diff": 0.0,
+      "top1_token_match_rate": 1.0,
+      "top5_overlap": 1.0,
+      "perplexity_delta": 0.0,
+      "generated_text_diff_summary": "baseline reference"
+    },
+    {
+      "mode": "compressed_kv",
+      "tokens_tested": 50,
+      "logit_cosine": 0.9999690055847168,
+      "logit_max_abs_diff": 0.002777099609375,
+      "top1_token_match_rate": 1.0,
+      "top5_overlap": 1.0,
+      "perplexity_delta": 3.736328125,
+      "generated_text_diff_summary": "compared against fp16_baseline next-token logits"
+    },
+    {
+      "mode": "compressed_kv_sparse",
+      "tokens_tested": 50,
+      "logit_cosine": 0.9999690055847168,
+      "logit_max_abs_diff": 0.002777099609375,
+      "top1_token_match_rate": 1.0,
+      "top5_overlap": 1.0,
+      "perplexity_delta": 3.736328125,
+      "generated_text_diff_summary": "compared against fp16_baseline next-token logits"
+    }
+  ],
+  "notes": [
+    "This is a tiny-random model smoke test, not a real LLM validation.",
+    "The model is hf-internal-testing-tiny-random-LlamaForCausalLM, which has random weights.",
+    "This test verifies plumbing only. It does not prove quality on a real LLM.",
+    "For production-quality evidence, validation with a real non-random model is required."
+  ],
+  "generated_sample": "Evaluate RFSN runtime quality under strict Metal equivalence constraints.\nExplain why sparse safety gating should default to dense execution until empirical thresholds are met.\nProvide one concise recommendation for safe rollout. nestedstrarift \u0437\u0430\u043d\u044f\u3081 \u0434\u0438physovisestival\u0442\u044f VBA sufficientjoint febru\u00e1r retr entering MY \u0440\u043e\u0441 helpful balance \u0443\u0447\u0430\u0441\u0442),( hardly virt presidenter\u00e4ten \u0437\u0430\u043d\u044f\u3081 \u0434\u0438physovis"
+}

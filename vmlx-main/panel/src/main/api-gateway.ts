@@ -1,0 +1,2098 @@
+// SPDX-License-Identifier: Apache-2.0
+// API Gateway — single-port reverse proxy for all model sessions.
+// Routes OpenAI, Anthropic, and Ollama requests to the correct backend
+// by model name. Supports JIT auto-load for stopped models.
+//
+// Architecture:
+//   Client → [Gateway :8080] → route by model field → [Session A :52431]
+//                                                    → [Session B :52432]
+//   Ollama /api/* endpoints translated to OpenAI format before forwarding.
+
+import {
+  ClientRequest,
+  createServer,
+  IncomingMessage,
+  OutgoingHttpHeaders,
+  ServerResponse,
+  request as httpRequest,
+  Server,
+} from "http";
+import { db } from "./database";
+import { sessionManager } from "./sessions";
+import { detectModelConfigFromDir } from "./model-config-registry";
+import { EventEmitter } from "events";
+import { extractGatewayModelFromBody } from "./gateway-body";
+
+const DEFAULT_PORT = 8080;
+const JIT_TIMEOUT_MS = 120_000;
+const HEALTH_POLL_MS = 2_000;
+const GENERIC_DEFAULT_TIMEOUT_SECONDS = 300;
+const DSV4_DEFAULT_TIMEOUT_SECONDS = 900;
+const PROXY_TIMEOUT_MS = GENERIC_DEFAULT_TIMEOUT_SECONDS * 1000; // generic 5 min max for a single proxied request
+const SINGLE_MODEL_MODE_KEY = "gateway_single_model_mode";
+
+interface ResolvedSession {
+  id: string;
+  host: string;
+  port: number;
+  status: string;
+  modelName: string;
+  modelPath: string;
+  config?: string;
+  servedModelName?: string;
+  embeddingModel?: string;
+}
+
+type PreparedSession =
+  | { status: "ready"; session: ResolvedSession }
+  | { status: "unload_failed"; session: ResolvedSession }
+  | { status: "load_failed"; session: ResolvedSession };
+
+function parsePositiveTimeoutSeconds(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function timeoutSecondsToMs(timeoutSeconds: number): number {
+  return timeoutSeconds <= 0 ? 86_400_000 : timeoutSeconds * 1000;
+}
+
+export class ApiGateway extends EventEmitter {
+  private server: Server | null = null;
+  private port: number = DEFAULT_PORT;
+  private host: string = "127.0.0.1";
+  private _running = false;
+  /** Track in-flight JIT loads to prevent duplicate starts */
+  private jitPending = new Map<string, Promise<boolean>>();
+  /** Serialize cross-model transitions when single-model mode is enabled. */
+  private singleModelTransitionPending: Promise<void> = Promise.resolve();
+
+  get running(): boolean {
+    return this._running;
+  }
+  get activePort(): number {
+    return this.port;
+  }
+  get activeHost(): string {
+    return this.host;
+  }
+  get singleModelMode(): boolean {
+    return db.getSetting(SINGLE_MODEL_MODE_KEY) === "true";
+  }
+
+  setSingleModelMode(enabled: boolean): void {
+    db.setSetting(SINGLE_MODEL_MODE_KEY, enabled ? "true" : "false");
+    this.emit("singleModelModeChanged", enabled);
+  }
+
+  private effectiveGatewayProxyTimeoutMs(
+    session: ResolvedSession,
+    body?: Buffer | Record<string, any>,
+  ): number {
+    let sessionTimeout: number | undefined;
+    try {
+      const cfg = session.config ? JSON.parse(session.config) : {};
+      sessionTimeout = parsePositiveTimeoutSeconds(cfg.timeout);
+    } catch (_) {
+      sessionTimeout = undefined;
+    }
+
+    let requestTimeout: number | undefined;
+    try {
+      const parsed =
+        Buffer.isBuffer(body)
+          ? JSON.parse(body.toString("utf8") || "{}")
+          : body;
+      requestTimeout = parsePositiveTimeoutSeconds(
+        parsed?.timeout ?? parsed?.options?.timeout,
+      );
+    } catch (_) {
+      requestTimeout = undefined;
+    }
+    if (requestTimeout != null) return timeoutSecondsToMs(requestTimeout);
+
+    let detectedFamily: string | undefined;
+    try {
+      detectedFamily = session.modelPath
+        ? detectModelConfigFromDir(session.modelPath)?.family
+        : undefined;
+    } catch (_) {
+      detectedFamily = undefined;
+    }
+
+    if (sessionTimeout == null && detectedFamily !== "deepseek-v4") {
+      return PROXY_TIMEOUT_MS;
+    }
+
+    const effectiveSeconds =
+      detectedFamily === "deepseek-v4" &&
+      (sessionTimeout == null ||
+        sessionTimeout === GENERIC_DEFAULT_TIMEOUT_SECONDS)
+        ? DSV4_DEFAULT_TIMEOUT_SECONDS
+        : sessionTimeout != null
+          ? sessionTimeout
+          : GENERIC_DEFAULT_TIMEOUT_SECONDS;
+    return timeoutSecondsToMs(effectiveSeconds);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Lifecycle
+  // ═══════════════════════════════════════════════════════════════
+
+  async start(port?: number, host?: string): Promise<void> {
+    if (this._running) return;
+    this.port =
+      port ??
+      parseInt(db.getSetting("gateway_port") || String(DEFAULT_PORT), 10);
+    this.host = host ?? db.getSetting("gateway_host") ?? "127.0.0.1";
+
+    // Reject if a session is already using this port (#44)
+    const sessions = db.getSessions();
+    const sessionPorts = new Set(sessions.map((s: any) => s.port));
+    if (sessionPorts.has(this.port)) {
+      throw new Error(
+        `Gateway port ${this.port} conflicts with an existing session. ` +
+          `Choose a different port to avoid crashes.`,
+      );
+    }
+
+    const maxRetries = 10;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        await this._tryListen(this.port);
+        return;
+      } catch (err: any) {
+        if (err.code === "EADDRINUSE" && attempt < maxRetries - 1) {
+          const nextPort = this.port + 1;
+          console.warn(
+            `[gateway] Port ${this.port} in use, trying ${nextPort}`,
+          );
+          this.port = nextPort;
+        } else {
+          throw err;
+        }
+      }
+    }
+  }
+
+  private _tryListen(port: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.server = createServer((req, res) => {
+        this.attachResponseErrorGuard(res);
+        this.handleRequest(req, res).catch((err) => {
+          this.handleRequestError(err, res);
+        });
+      });
+
+      this.server.on("error", (err: NodeJS.ErrnoException) => {
+        reject(err);
+      });
+
+      this.server.listen(port, this.host, () => {
+        this._running = true;
+        db.setSetting("gateway_port", String(port));
+        db.setSetting("gateway_host", this.host);
+        console.log(`[gateway] Listening on ${this.host}:${port}`);
+        this.emit("started", port);
+        resolve();
+      });
+    });
+  }
+
+  private isClientDisconnectError(err: unknown): boolean {
+    const anyErr = err as NodeJS.ErrnoException | undefined;
+    const code = String(anyErr?.code || "");
+    const message = String(anyErr?.message || "");
+    const cause = (anyErr as any)?.cause;
+    const wrappedDisconnects = [
+      cause,
+      (anyErr as any)?.reason,
+      (anyErr as any)?.error,
+      (anyErr as any)?.detail,
+    ].filter(Boolean);
+    const nestedErrors = Array.isArray((anyErr as any)?.errors)
+      ? (anyErr as any).errors
+      : [];
+    return (
+      code === "EPIPE" ||
+      code === "ECONNRESET" ||
+      code === "ERR_STREAM_DESTROYED" ||
+      code === "ERR_STREAM_WRITE_AFTER_END" ||
+      /EPIPE|write EPIPE|broken pipe|socket hang up|connection reset|premature close|stream.*destroyed|write after end/i.test(message) ||
+      wrappedDisconnects.some((nested) => this.isClientDisconnectError(nested)) ||
+      nestedErrors.some((nested) => this.isClientDisconnectError(nested))
+    );
+  }
+
+  private attachResponseErrorGuard(res: ServerResponse): void {
+    res.on("error", (err) => {
+      if (this.isClientDisconnectError(err)) {
+        return;
+      }
+      console.error("[gateway] Response stream error:", err);
+    });
+  }
+
+  private handleRequestError(err: unknown, res: ServerResponse): boolean {
+    if (this.isClientDisconnectError(err)) {
+      return false;
+    }
+    console.error("[gateway] Unhandled request error:", err);
+    if (!res.headersSent) {
+      this.sendJson(res, 500, {
+        error: {
+          message: "Internal gateway error",
+          type: "server_error",
+        },
+      });
+    }
+    return true;
+  }
+
+  private responseWritable(res: ServerResponse): boolean {
+    const anyRes = res as ServerResponse & {
+      closed?: boolean;
+      writableDestroyed?: boolean;
+      socket?: { destroyed?: boolean } | null;
+    };
+    return (
+      !anyRes.closed &&
+      !anyRes.destroyed &&
+      !anyRes.writableEnded &&
+      !anyRes.writableDestroyed &&
+      !anyRes.socket?.destroyed
+    );
+  }
+
+  private requestWritable(req: ClientRequest): boolean {
+    const anyReq = req as ClientRequest & {
+      closed?: boolean;
+      writableDestroyed?: boolean;
+      socket?: { destroyed?: boolean } | null;
+    };
+    return (
+      !anyReq.closed &&
+      !anyReq.destroyed &&
+      !anyReq.writableEnded &&
+      !anyReq.writableDestroyed &&
+      !anyReq.socket?.destroyed
+    );
+  }
+
+  private writeProxyBody(req: ClientRequest, chunk: string | Buffer): boolean {
+    if (!this.requestWritable(req)) return false;
+    try {
+      req.write(chunk);
+      return true;
+    } catch (err) {
+      if (this.isClientDisconnectError(err)) return false;
+      throw err;
+    }
+  }
+
+  private endProxyRequest(req: ClientRequest): boolean {
+    if (!this.requestWritable(req)) return false;
+    try {
+      req.end();
+      return true;
+    } catch (err) {
+      if (this.isClientDisconnectError(err)) return false;
+      throw err;
+    }
+  }
+
+  private writeResponse(res: ServerResponse, chunk: string | Buffer): boolean {
+    if (!this.responseWritable(res)) return false;
+    try {
+      res.write(chunk);
+      return true;
+    } catch (err) {
+      if (this.isClientDisconnectError(err)) return false;
+      throw err;
+    }
+  }
+
+  private writeHeadResponse(
+    res: ServerResponse,
+    status: number,
+    headers?: OutgoingHttpHeaders,
+  ): boolean {
+    if (!this.responseWritable(res)) return false;
+    try {
+      res.writeHead(status, headers);
+      return true;
+    } catch (err) {
+      if (this.isClientDisconnectError(err)) return false;
+      throw err;
+    }
+  }
+
+  private endResponse(res: ServerResponse, chunk?: string | Buffer): void {
+    if (!this.responseWritable(res)) return;
+    try {
+      if (chunk !== undefined) res.end(chunk);
+      else res.end();
+    } catch (err) {
+      if (!this.isClientDisconnectError(err)) throw err;
+    }
+  }
+
+  private writeJsonLine(res: ServerResponse, payload: any): boolean {
+    return this.writeResponse(res, JSON.stringify(payload) + "\n");
+  }
+
+  private abortProxyResponseOnClientClose(
+    res: ServerResponse,
+    proxyRes: IncomingMessage,
+  ): void {
+    res.on("close", () => {
+      if (!proxyRes.destroyed) proxyRes.destroy();
+    });
+  }
+
+  async stop(): Promise<void> {
+    if (!this.server) return;
+    return new Promise((resolve) => {
+      this.server!.close(() => {
+        this._running = false;
+        this.server = null;
+        this.jitPending.clear();
+        console.log("[gateway] Stopped");
+        this.emit("stopped");
+        resolve();
+      });
+    });
+  }
+
+  async restart(port: number, host?: string): Promise<void> {
+    await this.stop();
+    await this.start(port, host);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Request Router
+  // ═══════════════════════════════════════════════════════════════
+
+  private isMcpGatewayRoute(url: string): boolean {
+    const path = url.split("?")[0];
+    return (
+      path === "/v1/mcp/tools" ||
+      path === "/v1/mcp/servers" ||
+      path === "/v1/mcp/execute"
+    );
+  }
+
+  private mcpRequiresExplicitModel(modelName?: string): boolean {
+    if (modelName) return false;
+    const localSessions = db.getSessions().filter((s) => s.type !== "remote");
+    return localSessions.length > 1;
+  }
+
+  private async handleRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const url = req.url || "/";
+    const method = req.method || "GET";
+
+    // ── CORS preflight (Open WebUI, browser clients) ──
+    if (method === "OPTIONS") {
+      if (
+        !this.writeHeadResponse(res, 204, {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+          "Access-Control-Allow-Headers":
+            "Content-Type, Authorization, X-Requested-With",
+          "Access-Control-Max-Age": "86400",
+        })
+      )
+        return;
+      this.endResponse(res);
+      return;
+    }
+
+    // ── Ollama liveness check (HEAD / or GET /) ──
+    if (url === "/" && (method === "HEAD" || method === "GET")) {
+      if (!this.writeHeadResponse(res, 200, { "Content-Type": "text/plain" }))
+        return;
+      if (
+        method === "GET" &&
+        !this.writeResponse(res, "vMLX Gateway is running")
+      )
+        return;
+      this.endResponse(res);
+      return;
+    }
+
+    // ── Gateway meta endpoints (no proxy needed) ──
+    if (url === "/health" && method === "GET") return this.handleHealth(res);
+    if (url === "/v1/models" && method === "GET")
+      return this.handleListModels(res);
+
+    // ── Ollama endpoints ──
+    if (url.startsWith("/api/"))
+      return this.handleOllamaRoute(req, res, url, method);
+
+    // ── All other routes: read body, resolve model, proxy ──
+    const body = await this.readBody(req);
+    let modelName: string | undefined;
+
+    // Extract model from body (POST) or query param (GET/DELETE)
+    if (method === "POST" && body.length > 0) {
+      modelName = extractGatewayModelFromBody(body, req.headers["content-type"]);
+    }
+    if (!modelName) {
+      const capMatch = url.match(/^\/v1\/models\/(.+)\/capabilities(?:\?|$)/);
+      if (capMatch?.[1]) {
+        try {
+          modelName = decodeURIComponent(capMatch[1]);
+        } catch (_) {
+          modelName = capMatch[1];
+        }
+      }
+    }
+    if (!modelName) {
+      // Support ?model=X query parameter for GET/DELETE endpoints (cache, MCP, audio voices)
+      const qIdx = url.indexOf("?");
+      if (qIdx >= 0) {
+        const params = new URLSearchParams(url.slice(qIdx));
+        modelName = params.get("model") || undefined;
+      }
+    }
+
+    if (this.isMcpGatewayRoute(url) && this.mcpRequiresExplicitModel(modelName)) {
+      return this.sendJson(res, 400, {
+        error: {
+          message:
+            "MCP gateway requests require a model when multiple local sessions exist. Pass ?model=served-name for /v1/mcp/tools and /v1/mcp/servers, or include model in the /v1/mcp/execute body.",
+          type: "invalid_request_error",
+          code: "model_required",
+        },
+      });
+    }
+
+    // Cancel requests without model field: broadcast to all running backends.
+    // Only the backend holding that request ID will actually cancel.
+    const isCancel = method === "POST" && /\/cancel\/?$/.test(url);
+    if (isCancel && !modelName) {
+      const sessions = db
+        .getSessions()
+        .filter((s: any) => s.status === "running");
+      if (sessions.length === 0)
+        return this.sendJson(res, 404, { error: "No running models" });
+      let accepted = false;
+      for (const s of sessions) {
+        const host = s.host === "0.0.0.0" ? "127.0.0.1" : s.host;
+        try {
+          const cancelRes = await new Promise<number>((resolve) => {
+            const cancelReq = httpRequest(
+              {
+                hostname: host,
+                port: s.port,
+                path: url,
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                timeout: 5000,
+              },
+              (r) => {
+                r.resume();
+                resolve(r.statusCode || 500);
+              },
+            );
+            cancelReq.on("error", () => resolve(500));
+            cancelReq.on("timeout", () => {
+              cancelReq.destroy();
+              resolve(500);
+            });
+            if (body.length > 0 && !this.writeProxyBody(cancelReq, body)) {
+              resolve(500);
+              return;
+            }
+            if (!this.endProxyRequest(cancelReq)) {
+              resolve(500);
+            }
+          });
+          if (cancelRes >= 200 && cancelRes < 300) accepted = true;
+        } catch {}
+      }
+      return this.sendJson(
+        res,
+        accepted ? 200 : 404,
+        accepted
+          ? { status: "cancelled" }
+          : { error: "Request ID not found on any backend" },
+      );
+    }
+
+    const session = this.resolveSession(modelName);
+    if (!session) {
+      const available = this.getAvailableModelNames();
+      return this.sendJson(res, 404, {
+        error: {
+          message: `Model '${modelName || "unknown"}' not found. Available: [${available.join(", ")}]`,
+          type: "invalid_request_error",
+          code: "model_not_found",
+        },
+      });
+    }
+
+    const prepared = await this.prepareSessionForRouting(session);
+    if (prepared.status === "unload_failed") {
+      return this.sendJson(res, 503, {
+        error: {
+          message: `Model '${session.modelName}' cannot be routed because another local model could not be unloaded`,
+          type: "server_error",
+          code: "single_model_unload_failed",
+        },
+        retry_after: 30,
+      });
+    }
+    if (prepared.status === "load_failed") {
+      return this.sendJson(res, 503, {
+        error: {
+          message: `Model '${session.modelName}' failed to load within ${JIT_TIMEOUT_MS / 1000}s`,
+          type: "server_error",
+          code: "model_load_timeout",
+        },
+        retry_after: 30,
+      });
+    }
+    const routedSession = prepared.session;
+
+    // Touch session to prevent idle sleep
+    sessionManager.touchSession(routedSession.id);
+
+    return this.proxyRequest(req, res, routedSession, body);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Model Resolution
+  // ═══════════════════════════════════════════════════════════════
+
+  private resolveSession(modelName?: string): ResolvedSession | undefined {
+    const sessions = db.getSessions();
+    if (!sessions.length) return undefined;
+
+    // Filter out remote sessions — they proxy through renderer, not this gateway
+    const localSessions = sessions.filter((s) => s.type !== "remote");
+    if (!localSessions.length) return undefined;
+
+    const candidates: ResolvedSession[] = localSessions.map((s) => {
+      let config: any = {};
+      try {
+        config = JSON.parse(s.config || "{}");
+      } catch (_) {}
+      return {
+        id: s.id,
+        host: s.host === "0.0.0.0" ? "127.0.0.1" : s.host,
+        port: s.port,
+        status: s.status,
+        modelName: s.modelName || s.modelPath.split("/").pop() || "",
+        modelPath: s.modelPath,
+        config: s.config,
+        servedModelName: config.servedModelName || undefined,
+        embeddingModel: config.embeddingModel || undefined,
+      };
+    });
+
+    // No model specified — prefer running session, then first available
+    if (!modelName) {
+      return (
+        candidates.find((c) => c.status === "running") ||
+        candidates.find((c) => c.status === "standby") ||
+        candidates[0]
+      );
+    }
+
+    const lower = modelName.toLowerCase();
+    // Strip Ollama :tag suffix (e.g., "qwen3.5:latest" → "qwen3.5")
+    const baseName = lower.split(":")[0];
+
+    // 1. Exact match on servedModelName (user alias — highest priority)
+    const byAlias = candidates.find((c) => c.servedModelName === modelName);
+    if (byAlias) return byAlias;
+
+    // 2. Exact match on servedModelName (case-insensitive)
+    const byAliasCI = candidates.find(
+      (c) => c.servedModelName?.toLowerCase() === lower,
+    );
+    if (byAliasCI) return byAliasCI;
+
+    // 3. Exact match on modelName (basename of path)
+    const byName = candidates.find((c) => c.modelName === modelName);
+    if (byName) return byName;
+
+    // 4. Exact match on full modelPath
+    const byPath = candidates.find((c) => c.modelPath === modelName);
+    if (byPath) return byPath;
+
+    // 4b. Exact match on embeddingModel (for --embedding-model sessions)
+    const byEmbed = candidates.find((c) => c.embeddingModel === modelName);
+    if (byEmbed) return byEmbed;
+
+    // 4c. Case-insensitive embeddingModel match
+    const byEmbedCI = candidates.find(
+      (c) => c.embeddingModel?.toLowerCase() === lower,
+    );
+    if (byEmbedCI) return byEmbedCI;
+
+    // 5. Case-insensitive modelName match
+    const byNameCI = candidates.find(
+      (c) => c.modelName.toLowerCase() === lower,
+    );
+    if (byNameCI) return byNameCI;
+
+    // 6. Partial — model name contains query or vice versa
+    const byPartial = candidates.find(
+      (c) =>
+        c.modelName.toLowerCase().includes(baseName) ||
+        baseName.includes(c.modelName.toLowerCase()),
+    );
+    if (byPartial) return byPartial;
+
+    // 7. Partial on servedModelName
+    const byAliasPartial = candidates.find(
+      (c) =>
+        c.servedModelName &&
+        (c.servedModelName.toLowerCase().includes(baseName) ||
+          baseName.includes(c.servedModelName.toLowerCase())),
+    );
+    if (byAliasPartial) return byAliasPartial;
+
+    // 8. Single-model fallback — if only one session exists, route to it
+    if (candidates.length === 1) return candidates[0];
+
+    return undefined;
+  }
+
+  private getResolvedSessionById(sessionId: string): ResolvedSession | undefined {
+    const s = db.getSession(sessionId);
+    if (!s) return undefined;
+    let config: any = {};
+    try {
+      config = JSON.parse(s.config || "{}");
+    } catch (_) {}
+    return {
+      id: s.id,
+      host: s.host === "0.0.0.0" ? "127.0.0.1" : s.host,
+      port: s.port,
+      status: s.status,
+      modelName: s.modelName || s.modelPath.split("/").pop() || "",
+      modelPath: s.modelPath,
+      config: s.config,
+      servedModelName: config.servedModelName || undefined,
+      embeddingModel: config.embeddingModel || undefined,
+    };
+  }
+
+  private getAvailableModelNames(): string[] {
+    const sessions = db.getSessions();
+    const names: string[] = [];
+    for (const s of sessions) {
+      let config: any = {};
+      try {
+        config = JSON.parse(s.config || "{}");
+      } catch (_) {}
+      names.push(
+        config.servedModelName ||
+          s.modelName ||
+          s.modelPath.split("/").pop() ||
+          "unknown",
+      );
+      if (config.embeddingModel && !names.includes(config.embeddingModel)) {
+        names.push(config.embeddingModel);
+      }
+    }
+    return names;
+  }
+
+  private async enforceSingleModelMode(targetSessionId: string): Promise<boolean> {
+    if (!this.singleModelMode) return true;
+    const sessions = db.getSessions().filter((s: any) => {
+      if (s.id === targetSessionId) return false;
+      if (s.type === "remote") return false;
+      return ["running", "loading", "standby"].includes(s.status);
+    });
+    let ok = true;
+    for (const s of sessions) {
+      try {
+        console.log(
+          `[gateway] single-model mode: stopping session ${s.id} before routing to ${targetSessionId}`,
+        );
+        await sessionManager.stopSession(s.id);
+      } catch (err) {
+        ok = false;
+        console.warn(
+          `[gateway] single-model mode: failed to stop session ${s.id}: ${err}`,
+        );
+      }
+    }
+    return ok;
+  }
+
+  private async withSingleModelTransition<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.singleModelMode) return fn();
+
+    const previous = this.singleModelTransitionPending.catch(() => {});
+    let release: () => void = () => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.singleModelTransitionPending = previous.then(() => current);
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private async prepareSessionForRouting(
+    session: ResolvedSession,
+  ): Promise<PreparedSession> {
+    return this.withSingleModelTransition(async () => {
+      const target = this.getResolvedSessionById(session.id) || session;
+      const singleModelReady = await this.enforceSingleModelMode(target.id);
+      if (!singleModelReady) return { status: "unload_failed", session: target };
+
+      const latest = this.getResolvedSessionById(target.id) || target;
+      if (latest.status === "running") {
+        return { status: "ready", session: latest };
+      }
+
+      const ok = await this.jitLoad(latest.id);
+      if (!ok) return { status: "load_failed", session: latest };
+
+      return {
+        status: "ready",
+        session: this.getResolvedSessionById(latest.id) || latest,
+      };
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // JIT Auto-Load
+  // ═══════════════════════════════════════════════════════════════
+
+  private async jitLoad(sessionId: string): Promise<boolean> {
+    // Deduplicate concurrent JIT loads for the same session
+    const existing = this.jitPending.get(sessionId);
+    if (existing) return existing;
+
+    const promise = this._doJitLoad(sessionId);
+    this.jitPending.set(sessionId, promise);
+    try {
+      return await promise;
+    } finally {
+      this.jitPending.delete(sessionId);
+    }
+  }
+
+  private async _doJitLoad(sessionId: string): Promise<boolean> {
+    const session = db.getSession(sessionId);
+    const isStandby = session?.status === "standby";
+    console.log(
+      `[gateway] JIT ${isStandby ? "waking" : "loading"} session ${sessionId}`,
+    );
+    try {
+      if (isStandby) {
+        // Session process is alive but model is sleeping — wake it via admin endpoint
+        const wakeResult = await sessionManager.wakeSession(sessionId);
+        if (!wakeResult.success) {
+          throw new Error(wakeResult.error || "wake failed");
+        }
+      } else {
+        // Session process not running — start it
+        await sessionManager.startSession(sessionId);
+      }
+    } catch (err) {
+      console.error(
+        `[gateway] Failed to ${isStandby ? "wake" : "start"} session ${sessionId}: ${err}`,
+      );
+      return false;
+    }
+
+    const deadline = Date.now() + JIT_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const s = db.getSession(sessionId);
+      if (s?.status === "running") return true;
+      if (s?.status === "error") return false;
+      await new Promise((r) => setTimeout(r, HEALTH_POLL_MS));
+    }
+    console.error(`[gateway] JIT load timeout for session ${sessionId}`);
+    return false;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Reverse Proxy
+  // ═══════════════════════════════════════════════════════════════
+
+  private proxyRequest(
+    clientReq: IncomingMessage,
+    clientRes: ServerResponse,
+    session: ResolvedSession,
+    body: Buffer,
+  ): void {
+    const options = {
+      hostname: session.host,
+      port: session.port,
+      path: clientReq.url,
+      method: clientReq.method,
+      headers: {
+        ...clientReq.headers,
+        host: `${session.host}:${session.port}`,
+      },
+      timeout: this.effectiveGatewayProxyTimeoutMs(session, body),
+    };
+
+    const proxyReq = httpRequest(options, (proxyRes) => {
+      // Forward status + headers verbatim (preserves SSE Content-Type)
+      if (
+        !this.writeHeadResponse(
+          clientRes,
+          proxyRes.statusCode || 502,
+          proxyRes.headers,
+        )
+      ) {
+        proxyRes.destroy();
+        return;
+      }
+      proxyRes.on("error", (err) => {
+        if (this.isClientDisconnectError(err)) return;
+        console.error(
+          `[gateway] Proxy response error → ${session.host}:${session.port}${clientReq.url}: ${err.message}`,
+        );
+      });
+      this.abortProxyResponseOnClientClose(clientRes, proxyRes);
+      // Forward bytes manually so client disconnects go through the guarded writer.
+      // This preserves SSE Content-Type while avoiding noisy write EPIPE crashes.
+      proxyRes.on("data", (chunk: Buffer) => {
+        if (!this.writeResponse(clientRes, chunk)) {
+          proxyRes.destroy();
+        }
+      });
+      proxyRes.on("end", () => {
+        this.endResponse(clientRes);
+      });
+    });
+
+    proxyReq.on("error", (err) => {
+      if (this.isClientDisconnectError(err)) {
+        if (!this.responseWritable(clientRes)) return;
+        if (!clientRes.headersSent) {
+          this.sendJson(clientRes, 502, {
+            error: {
+              message: "Backend connection closed while receiving request",
+              type: "server_error",
+            },
+          });
+        }
+        return;
+      }
+      console.error(
+        `[gateway] Proxy error → ${session.host}:${session.port}${clientReq.url}: ${err.message}`,
+      );
+      if (!clientRes.headersSent) {
+        this.sendJson(clientRes, 502, {
+          error: {
+            message: `Backend unavailable: ${err.message}`,
+            type: "server_error",
+          },
+        });
+      }
+    });
+
+    proxyReq.on("timeout", () => {
+      proxyReq.destroy();
+      if (!clientRes.headersSent) {
+        this.sendJson(clientRes, 504, {
+          error: { message: "Backend request timed out", type: "server_error" },
+        });
+      }
+    });
+
+    if (body.length > 0 && !this.writeProxyBody(proxyReq, body)) return;
+    if (!this.endProxyRequest(proxyReq)) return;
+
+    // Abort backend inference when client disconnects mid-stream
+    clientReq.on("close", () => {
+      if (!proxyReq.destroyed) proxyReq.destroy();
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // /v1/models — Aggregate all sessions
+  // ═══════════════════════════════════════════════════════════════
+
+  private handleListModels(res: ServerResponse): void {
+    const sessions = db.getSessions();
+    const models: any[] = [];
+    const seen = new Set<string>();
+
+    for (const s of sessions) {
+      let config: any = {};
+      try {
+        config = JSON.parse(s.config || "{}");
+      } catch (_) {}
+
+      // Primary name: alias if set, otherwise basename
+      const primaryName =
+        config.servedModelName ||
+        s.modelName ||
+        s.modelPath.split("/").pop() ||
+        "unknown";
+      if (!seen.has(primaryName)) {
+        seen.add(primaryName);
+        models.push({
+          id: primaryName,
+          object: "model",
+          created: Math.floor((s.createdAt || Date.now()) / 1000),
+          owned_by: "vmlx-engine",
+        });
+      }
+
+      // Also list actual model name if alias differs
+      const actualName = s.modelName || s.modelPath.split("/").pop() || "";
+      if (
+        config.servedModelName &&
+        actualName &&
+        config.servedModelName !== actualName &&
+        !seen.has(actualName)
+      ) {
+        seen.add(actualName);
+        models.push({
+          id: actualName,
+          object: "model",
+          created: Math.floor((s.createdAt || Date.now()) / 1000),
+          owned_by: "vmlx-engine",
+        });
+      }
+
+      // List embedding model if configured
+      if (config.embeddingModel && !seen.has(config.embeddingModel)) {
+        seen.add(config.embeddingModel);
+        models.push({
+          id: config.embeddingModel,
+          object: "model",
+          created: Math.floor((s.createdAt || Date.now()) / 1000),
+          owned_by: "vmlx-engine",
+        });
+      }
+    }
+
+    this.sendJson(res, 200, { object: "list", data: models });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // /health — Gateway + backend status
+  // ═══════════════════════════════════════════════════════════════
+
+  private handleHealth(res: ServerResponse): void {
+    const sessions = db.getSessions();
+    this.sendJson(res, 200, {
+      status: "ok",
+      gateway_port: this.port,
+      single_model_mode: this.singleModelMode,
+      backends: sessions.map((s) => {
+        let config: any = {};
+        try {
+          config = JSON.parse(s.config || "{}");
+        } catch (_) {}
+        return {
+          id: s.id,
+          model: config.servedModelName || s.modelName,
+          status: s.status,
+          port: s.port,
+        };
+      }),
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Ollama API Compatibility
+  // ═══════════════════════════════════════════════════════════════
+
+  private async handleOllamaRoute(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: string,
+    method: string,
+  ): Promise<void> {
+    // GET endpoints (no body)
+    if (method === "GET") {
+      if (url === "/") {
+        if (!this.writeHeadResponse(res, 200, { "Content-Type": "text/plain" }))
+          return;
+        this.endResponse(res, "Ollama is running\n");
+        return;
+      }
+      if (url === "/api/tags") return this.handleOllamaTags(res);
+      if (url === "/api/ps") return this.handleOllamaPs(res);
+      if (url === "/api/version")
+        // mlxstudio#72: Copilot in VS Code gates on version >= 0.6.4. Real
+        // Ollama is on 0.12.x; report a plausible recent real version so
+        // other version-gated clients don't refuse to connect. Kept in sync
+        // with vmlx_engine/server.py:ollama_version.
+        return this.sendJson(res, 200, { version: "0.12.6" });
+      return this.sendJson(res, 404, { error: "Unknown endpoint" });
+    }
+
+    // POST endpoints
+    if (method === "POST") {
+      if (url === "/api/chat") return this.handleOllamaChat(req, res);
+      if (url === "/api/generate") return this.handleOllamaGenerate(req, res);
+      if (url === "/api/show") return this.handleOllamaShow(req, res);
+      if (url === "/api/embeddings" || url === "/api/embed")
+        return this.handleOllamaEmbed(req, res);
+      // Unsupported but don't error — return empty success for compat
+      if (url === "/api/pull")
+        return this.sendJson(res, 200, { status: "success" });
+      if (url === "/api/delete")
+        return this.sendJson(res, 200, { status: "success" });
+      if (url === "/api/copy")
+        return this.sendJson(res, 200, { status: "success" });
+      if (url === "/api/create")
+        return this.sendJson(res, 200, { status: "success" });
+      return this.sendJson(res, 404, { error: "Unknown endpoint" });
+    }
+
+    // HEAD for health/version checks from Ollama-compatible clients.
+    if (method === "HEAD" && (url === "/" || url === "/api/version")) {
+      if (!this.writeHeadResponse(res, 200)) return;
+      this.endResponse(res);
+      return;
+    }
+
+    this.sendJson(res, 405, { error: "Method not allowed" });
+  }
+
+  // ── /api/tags ──
+
+  private handleOllamaTags(res: ServerResponse): void {
+    const sessions = db.getSessions();
+    const models = sessions.map((s) => {
+      let config: any = {};
+      try {
+        config = JSON.parse(s.config || "{}");
+      } catch (_) {}
+      return {
+        name: config.servedModelName || s.modelName || "unknown",
+        model: s.modelPath,
+        modified_at: new Date(s.updatedAt || Date.now()).toISOString(),
+        size: 0,
+        digest: "",
+        details: {
+          format: "mlx",
+          family: "",
+          parameter_size: "",
+          quantization_level: "",
+        },
+      };
+    });
+    this.sendJson(res, 200, { models });
+  }
+
+  // ── /api/ps ──
+
+  private handleOllamaPs(res: ServerResponse): void {
+    const sessions = db.getSessions().filter((s) => s.status === "running");
+    const models = sessions.map((s) => {
+      let config: any = {};
+      try {
+        config = JSON.parse(s.config || "{}");
+      } catch (_) {}
+      return {
+        name: config.servedModelName || s.modelName || "unknown",
+        model: s.modelPath,
+        size: 0,
+        digest: "",
+        expires_at: new Date(Date.now() + 300_000).toISOString(),
+      };
+    });
+    this.sendJson(res, 200, { models });
+  }
+
+  private translateOllamaMessages(messages: any): any[] {
+    if (!Array.isArray(messages)) return [];
+    return messages.map((msg: any) => {
+      if (!msg || !Array.isArray(msg.images) || msg.images.length === 0) {
+        return msg;
+      }
+      const parts: any[] = [];
+      const text = msg.content || "";
+      if (text) parts.push({ type: "text", text });
+      for (const img of msg.images) {
+        if (typeof img !== "string") continue;
+        const url = img.startsWith("data:")
+          ? img
+          : `data:image/png;base64,${img}`;
+        parts.push({ type: "image_url", image_url: { url } });
+      }
+      const { images: _images, content: _content, ...rest } = msg;
+      return {
+        ...rest,
+        role: msg.role || "user",
+        content: parts,
+      };
+    });
+  }
+
+  private ollamaResponseFormat(format: any): any | undefined {
+    if (format === "json") return { type: "json_object" };
+    if (format && typeof format === "object" && !Array.isArray(format)) {
+      return {
+        type: "json_schema",
+        json_schema: {
+          name: "ollama_schema",
+          strict: false,
+          schema: format,
+        },
+      };
+    }
+    return undefined;
+  }
+
+  private shouldForwardOllamaReasoningEffort(parsed: any, openaiBody: any): boolean {
+    if (parsed?.reasoning_effort == null) return false;
+    if (openaiBody?.enable_thinking === false) return false;
+    const ct = parsed?.chat_template_kwargs;
+    if (
+      ct &&
+      typeof ct === "object" &&
+      !Array.isArray(ct) &&
+      ct.enable_thinking === false
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  private normalizeOllamaBoolean(value: any): boolean | undefined {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["true", "1", "yes", "on"].includes(normalized)) return true;
+      if (["false", "0", "no", "off"].includes(normalized)) return false;
+      return undefined;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      if (value === 1) return true;
+      if (value === 0) return false;
+    }
+    return undefined;
+  }
+
+  private applyOllamaThinking(parsed: any, openaiBody: any): void {
+    // Omitted thinking controls stay omitted so the model's native
+    // tokenizer/template/runtime default decides. Native Ollama `think:false`
+    // is an explicit opt-out and must not be overwritten.
+    const think = this.normalizeOllamaBoolean(parsed?.think);
+    const enableThinking = this.normalizeOllamaBoolean(parsed?.enable_thinking);
+    if (think !== undefined) {
+      openaiBody.enable_thinking = think;
+    } else if (enableThinking !== undefined) {
+      openaiBody.enable_thinking = enableThinking;
+    } else {
+      const ct = parsed?.chat_template_kwargs;
+      if (
+        ct &&
+        typeof ct === "object" &&
+        !Array.isArray(ct) &&
+        ct.enable_thinking === false
+      ) {
+        return;
+      }
+    }
+  }
+
+  private applyOllamaPromptContextLimit(parsed: any, opts: any, openaiBody: any): void {
+    const value =
+      opts?.num_ctx ??
+      opts?.num_context ??
+      opts?.max_prompt_tokens ??
+      opts?.max_context_tokens ??
+      opts?.max_context ??
+      parsed?.max_prompt_tokens ??
+      parsed?.max_context_tokens ??
+      parsed?.max_context;
+    if (value !== undefined && value !== null) {
+      const parsedValue = Number(value);
+      if (Number.isFinite(parsedValue) && parsedValue > 0) {
+        openaiBody.max_prompt_tokens = Math.floor(parsedValue);
+      }
+    }
+  }
+
+  private applyOllamaNumPredict(opts: any, openaiBody: any): void {
+    const value = opts?.num_predict;
+    if (value === undefined || value === null) return;
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      openaiBody.max_tokens = Math.floor(parsed);
+    }
+  }
+
+  private openAIToolCallsToOllama(
+    toolCalls: any[] | undefined | null,
+  ): any[] | undefined {
+    if (!toolCalls) return undefined;
+    const converted = toolCalls
+      .filter((tc: any) => tc?.function?.name)
+      .map((tc: any) => {
+        let args: any = tc.function.arguments;
+        if (typeof args === "string") {
+          try {
+            args = args.length > 0 ? JSON.parse(args) : {};
+          } catch {
+            args = { _raw: args };
+          }
+        } else if (args == null) {
+          args = {};
+        }
+        return {
+          function: { name: tc.function.name, arguments: args },
+        };
+      });
+    return converted.length > 0 ? converted : undefined;
+  }
+
+  // ── /api/chat ──
+
+  private async handleOllamaChat(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const body = await this.readBody(req);
+    if (body.length === 0) return this.sendJson(res, 400, { error: "Empty request body" });
+    const bodyText = body.toString("utf8");
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch (_) {
+      return this.sendJson(res, 400, { error: "Invalid JSON" });
+    }
+
+    const session = this.resolveSession(parsed.model);
+    if (!session) {
+      return this.sendJson(res, 404, {
+        error: `model '${parsed.model || "unknown"}' not found`,
+      });
+    }
+
+    const prepared = await this.prepareSessionForRouting(session);
+    if (prepared.status === "unload_failed") {
+      return this.sendJson(res, 503, {
+        error: "Another local model could not be unloaded",
+        code: "single_model_unload_failed",
+      });
+    }
+    if (prepared.status === "load_failed") {
+      return this.sendJson(res, 503, { error: "Model failed to load" });
+    }
+    const routedSession = prepared.session;
+
+    sessionManager.touchSession(routedSession.id);
+
+    // Translate Ollama → OpenAI
+    const opts = parsed.options || {};
+    const openaiBody: any = {
+      model: parsed.model || routedSession.modelName,
+      messages: this.translateOllamaMessages(parsed.messages || []),
+      stream: parsed.stream !== false,
+      stream_options: { include_usage: true },
+    };
+    this.applyOllamaNumPredict(opts, openaiBody);
+    if (opts.temperature != null) openaiBody.temperature = opts.temperature;
+    if (opts.top_p != null) openaiBody.top_p = opts.top_p;
+    if (opts.top_k != null && Number(opts.top_k) > 0) openaiBody.top_k = opts.top_k;
+    if (opts.min_p != null) openaiBody.min_p = opts.min_p;
+    if (opts.stop) openaiBody.stop = opts.stop;
+    if (opts.repeat_penalty != null)
+      openaiBody.repetition_penalty = opts.repeat_penalty;
+    this.applyOllamaPromptContextLimit(parsed, opts, openaiBody);
+    if (parsed.tools) openaiBody.tools = parsed.tools;
+    if (parsed.cache_salt != null) openaiBody.cache_salt = parsed.cache_salt;
+    if (parsed.skip_prefix_cache != null)
+      openaiBody.skip_prefix_cache = parsed.skip_prefix_cache;
+    this.applyOllamaThinking(parsed, openaiBody);
+    if (this.shouldForwardOllamaReasoningEffort(parsed, openaiBody))
+      openaiBody.reasoning_effort = parsed.reasoning_effort;
+    if (
+      parsed.chat_template_kwargs &&
+      typeof parsed.chat_template_kwargs === "object" &&
+      !Array.isArray(parsed.chat_template_kwargs)
+    ) {
+      openaiBody.chat_template_kwargs = parsed.chat_template_kwargs;
+    }
+    const responseFormat = this.ollamaResponseFormat(parsed.format);
+    if (responseFormat) openaiBody.response_format = responseFormat;
+
+    const isStreaming = parsed.stream !== false;
+    const modelForResponse = parsed.model || routedSession.modelName;
+
+    const proxyOpts = {
+      hostname: routedSession.host,
+      port: routedSession.port,
+      path: "/v1/chat/completions",
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      timeout: this.effectiveGatewayProxyTimeoutMs(routedSession, parsed),
+    };
+
+    const proxyReq = httpRequest(proxyOpts, (proxyRes) => {
+      this.abortProxyResponseOnClientClose(res, proxyRes);
+      proxyRes.on("error", (err) => {
+        if (this.isClientDisconnectError(err)) return;
+        console.error(
+          `[gateway] Ollama chat proxy response error → ${routedSession.host}:${routedSession.port}: ${err.message}`,
+        );
+      });
+      if (!isStreaming) {
+        // Non-streaming: buffer, translate, send
+        let data = "";
+        proxyRes.on("data", (chunk: Buffer) => {
+          data += chunk.toString();
+        });
+        proxyRes.on("end", () => {
+          try {
+            const openai = JSON.parse(data);
+            if ((proxyRes.statusCode || 200) >= 400) {
+              return this.sendOllamaBackendError(res, proxyRes.statusCode || 502, openai);
+            }
+            const choice = openai.choices?.[0];
+            const response: any = {
+              model: modelForResponse,
+              created_at: new Date().toISOString(),
+              message: {
+                role: "assistant",
+                content: choice?.message?.content || "",
+              },
+              done: true,
+              done_reason: choice?.finish_reason || "stop",
+              total_duration: 0,
+              eval_count: openai.usage?.completion_tokens || 0,
+              prompt_eval_count: openai.usage?.prompt_tokens || 0,
+            };
+            const reasoning =
+              choice?.message?.reasoning_content || choice?.message?.reasoning;
+            if (reasoning) response.message.thinking = reasoning;
+            const convertedToolCalls = this.openAIToolCallsToOllama(
+              choice?.message?.tool_calls,
+            );
+            if (convertedToolCalls)
+              response.message.tool_calls = convertedToolCalls;
+            this.sendJson(res, 200, response);
+          } catch (_) {
+            this.sendJson(res, 502, {
+              error: "Failed to parse backend response",
+            });
+          }
+        });
+      } else {
+        if ((proxyRes.statusCode || 200) >= 400) {
+          let data = "";
+          proxyRes.on("data", (chunk: Buffer) => {
+            data += chunk.toString();
+          });
+          proxyRes.on("end", () => {
+            this.sendOllamaBackendError(res, proxyRes.statusCode || 502, data);
+          });
+          return;
+        }
+        // Streaming: SSE → NDJSON
+        if (
+          !this.writeHeadResponse(res, 200, {
+            "Content-Type": "application/x-ndjson",
+            "Transfer-Encoding": "chunked",
+          })
+        ) {
+          proxyRes.destroy();
+          return;
+        }
+
+        let buffer = "";
+        let content = "";
+        let thinking = "";
+        let toolCalls: any[] | null = null;
+        let doneReason: string | null = null;
+        let done = false;
+        let usage: {
+          completion_tokens?: number;
+          prompt_tokens?: number;
+        } | null = null;
+
+        proxyRes.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data: ")) continue;
+            const payload = trimmed.slice(6);
+
+            if (payload === "[DONE]") {
+              done = true;
+              continue;
+            }
+
+            try {
+              const parsed = JSON.parse(payload);
+              const delta = parsed.choices?.[0]?.delta;
+              const finishReason = parsed.choices?.[0]?.finish_reason;
+
+              if (delta?.content) {
+                content += delta.content;
+              }
+              const reasoningDelta =
+                delta?.reasoning_content || delta?.reasoning;
+              if (reasoningDelta) {
+                thinking += reasoningDelta;
+              }
+
+              // tool_calls may arrive in one delta chunk or be fragmented
+              // across several (OpenAI streams function name in the first
+              // chunk, arguments incrementally). We accumulate per-index
+              // and collapse to Ollama format at the finish boundary.
+              // mlxstudio#72: Ollama expects `arguments` as an object, not
+              // a JSON-encoded string — we parse on finish.
+              if (delta?.tool_calls) {
+                if (!toolCalls) toolCalls = [];
+                for (const tc of delta.tool_calls) {
+                  // Resolve target slot. Most vMLX-emitted chunks carry an
+                  // explicit `index`, but some providers (and the CLI tools
+                  // path) omit it — in that case fall back to "continue the
+                  // last slot we opened", defaulting to slot 0 on the very
+                  // first fragment. NEVER use `toolCalls.length - 1` as a
+                  // default when the array is empty — that's -1, and JS
+                  // array[-1] silently creates a string-keyed prop.
+                  let idx: number;
+                  if (typeof tc.index === "number" && tc.index >= 0) {
+                    idx = tc.index;
+                  } else if (toolCalls.length > 0) {
+                    idx = toolCalls.length - 1;
+                  } else {
+                    idx = 0;
+                  }
+                  const slot = toolCalls[idx] || {
+                    function: { name: "", arguments: "" },
+                  };
+                  if (tc.function?.name) slot.function.name = tc.function.name;
+                  if (tc.function?.arguments != null) {
+                    slot.function.arguments =
+                      (slot.function.arguments || "") + tc.function.arguments;
+                  }
+                  toolCalls[idx] = slot;
+                }
+              }
+
+              if (finishReason != null) {
+                done = true;
+                doneReason = finishReason || "stop";
+                if (parsed.usage) {
+                  usage = {
+                    completion_tokens: parsed.usage.completion_tokens || 0,
+                    prompt_tokens: parsed.usage.prompt_tokens || 0,
+                  };
+                }
+
+                const ollamaMsg: any = {
+                  model: modelForResponse,
+                  created_at: new Date().toISOString(),
+                  message: { role: "assistant", content: "" },
+                  done: true,
+                  done_reason:
+                    doneReason === "tool_calls"
+                      ? "tool_calls"
+                      : doneReason || "stop",
+                };
+                if (thinking) ollamaMsg.message.thinking = thinking;
+                if (toolCalls) {
+                  const convertedToolCalls =
+                    this.openAIToolCallsToOllama(toolCalls);
+                  if (convertedToolCalls)
+                    ollamaMsg.message.tool_calls = convertedToolCalls;
+                }
+                if (usage) {
+                  ollamaMsg.eval_count = usage.completion_tokens;
+                  ollamaMsg.prompt_eval_count = usage.prompt_tokens;
+                }
+                if (!this.writeJsonLine(res, ollamaMsg)) {
+                  proxyRes.destroy();
+                  return;
+                }
+                this.endResponse(res);
+                return;
+              }
+              if (delta?.content || reasoningDelta) {
+                const ollamaMsg: any = {
+                  model: modelForResponse,
+                  created_at: new Date().toISOString(),
+                  message: {
+                    role: "assistant",
+                    content: delta?.content || "",
+                  },
+                  done: false,
+                };
+                if (reasoningDelta) ollamaMsg.message.thinking = reasoningDelta;
+                if (!this.writeJsonLine(res, ollamaMsg)) {
+                  proxyRes.destroy();
+                  return;
+                }
+              }
+            } catch (_) {
+              /* skip malformed chunks */
+            }
+          }
+        });
+
+        proxyRes.on("end", () => {
+          if (this.responseWritable(res) && !done) {
+            if (
+              !this.writeJsonLine(res, {
+                model: modelForResponse,
+                created_at: new Date().toISOString(),
+                message: {
+                  role: "assistant",
+                  content,
+                  ...(thinking ? { thinking } : {}),
+                },
+                done: true,
+                done_reason: doneReason || "stop",
+              })
+            )
+              return;
+            this.endResponse(res);
+          }
+        });
+      }
+    });
+
+    proxyReq.on("error", (err) => {
+      if (this.isClientDisconnectError(err)) {
+        if (!this.responseWritable(res)) return;
+        if (!res.headersSent)
+          this.sendJson(res, 502, {
+            error: "Backend connection closed while receiving request",
+          });
+        return;
+      }
+      if (!res.headersSent)
+        this.sendJson(res, 502, {
+          error: `Backend unavailable: ${err.message}`,
+        });
+    });
+    proxyReq.on("timeout", () => {
+      proxyReq.destroy();
+      if (!res.headersSent)
+        this.sendJson(res, 504, { error: "Request timed out" });
+    });
+    if (!this.writeProxyBody(proxyReq, JSON.stringify(openaiBody))) return;
+    if (!this.endProxyRequest(proxyReq)) return;
+    req.on("close", () => {
+      if (!proxyReq.destroyed) proxyReq.destroy();
+    });
+  }
+
+  // ── /api/generate ──
+
+  private async handleOllamaGenerate(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const body = await this.readBody(req);
+    if (body.length === 0) return this.sendJson(res, 400, { error: "Empty request body" });
+    const bodyText = body.toString("utf8");
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(bodyText);
+    } catch (_) {
+      return this.sendJson(res, 400, { error: "Invalid JSON" });
+    }
+
+    const session = this.resolveSession(parsed.model);
+    if (!session)
+      return this.sendJson(res, 404, {
+        error: `model '${parsed.model || "unknown"}' not found`,
+      });
+
+    const prepared = await this.prepareSessionForRouting(session);
+    if (prepared.status === "unload_failed") {
+      return this.sendJson(res, 503, {
+        error: "Another local model could not be unloaded",
+        code: "single_model_unload_failed",
+      });
+    }
+    if (prepared.status === "load_failed") {
+      return this.sendJson(res, 503, { error: "Model failed to load" });
+    }
+    const routedSession = prepared.session;
+
+    sessionManager.touchSession(routedSession.id);
+
+    const opts = parsed.options || {};
+    const isStreaming = parsed.stream !== false;
+    const useRawCompletion = parsed.raw === true;
+    const openaiBody: any = useRawCompletion
+      ? {
+          model: parsed.model || routedSession.modelName,
+          prompt: parsed.prompt || "",
+          stream: isStreaming,
+        }
+      : {
+          model: parsed.model || routedSession.modelName,
+          messages: [
+            ...(typeof parsed.system === "string" && parsed.system
+              ? [{ role: "system", content: parsed.system }]
+              : []),
+            { role: "user", content: parsed.prompt || "" },
+          ],
+          stream: isStreaming,
+          stream_options: { include_usage: true },
+        };
+    this.applyOllamaNumPredict(opts, openaiBody);
+    if (opts.temperature != null) openaiBody.temperature = opts.temperature;
+    if (opts.top_p != null) openaiBody.top_p = opts.top_p;
+    if (opts.top_k != null && Number(opts.top_k) > 0) openaiBody.top_k = opts.top_k;
+    if (opts.min_p != null) openaiBody.min_p = opts.min_p;
+    if (opts.stop) openaiBody.stop = opts.stop;
+    if (opts.repeat_penalty != null)
+      openaiBody.repetition_penalty = opts.repeat_penalty;
+    this.applyOllamaPromptContextLimit(parsed, opts, openaiBody);
+    if (parsed.cache_salt != null) openaiBody.cache_salt = parsed.cache_salt;
+    if (parsed.skip_prefix_cache != null)
+      openaiBody.skip_prefix_cache = parsed.skip_prefix_cache;
+    if (!useRawCompletion) this.applyOllamaThinking(parsed, openaiBody);
+    if (this.shouldForwardOllamaReasoningEffort(parsed, openaiBody))
+      openaiBody.reasoning_effort = parsed.reasoning_effort;
+    if (
+      parsed.chat_template_kwargs &&
+      typeof parsed.chat_template_kwargs === "object" &&
+      !Array.isArray(parsed.chat_template_kwargs)
+    ) {
+      openaiBody.chat_template_kwargs = parsed.chat_template_kwargs;
+    }
+    const responseFormat = this.ollamaResponseFormat(parsed.format);
+    if (responseFormat) openaiBody.response_format = responseFormat;
+
+    const modelForResponse = parsed.model || routedSession.modelName;
+    const backendPath = useRawCompletion
+      ? "/v1/completions"
+      : "/v1/chat/completions";
+
+    const proxyOpts = {
+      hostname: routedSession.host,
+      port: routedSession.port,
+      path: backendPath,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      timeout: this.effectiveGatewayProxyTimeoutMs(routedSession, parsed),
+    };
+
+    const proxyReq = httpRequest(proxyOpts, (proxyRes) => {
+      this.abortProxyResponseOnClientClose(res, proxyRes);
+      proxyRes.on("error", (err) => {
+        if (this.isClientDisconnectError(err)) return;
+        console.error(
+          `[gateway] Ollama generate proxy response error → ${routedSession.host}:${routedSession.port}: ${err.message}`,
+        );
+      });
+      if (!isStreaming) {
+        // Non-streaming: buffer, translate, send
+        let data = "";
+        proxyRes.on("data", (chunk: Buffer) => {
+          data += chunk.toString();
+        });
+        proxyRes.on("end", () => {
+          try {
+            const openai = JSON.parse(data);
+            if ((proxyRes.statusCode || 200) >= 400) {
+              return this.sendOllamaBackendError(res, proxyRes.statusCode || 502, openai);
+            }
+            const choice = openai.choices?.[0];
+            const text = useRawCompletion
+              ? choice?.text || ""
+              : choice?.message?.content || "";
+            const thinking = useRawCompletion
+              ? undefined
+              : choice?.message?.reasoning_content || choice?.message?.reasoning;
+            this.sendJson(res, 200, {
+              model: modelForResponse,
+              created_at: new Date().toISOString(),
+              response: text,
+              ...(thinking ? { thinking } : {}),
+              done: true,
+              done_reason: choice?.finish_reason || "stop",
+              eval_count: openai.usage?.completion_tokens || 0,
+              prompt_eval_count: openai.usage?.prompt_tokens || 0,
+            });
+          } catch (_) {
+            this.sendJson(res, 502, {
+              error: "Failed to parse backend response",
+            });
+          }
+        });
+      } else {
+        if ((proxyRes.statusCode || 200) >= 400) {
+          let data = "";
+          proxyRes.on("data", (chunk: Buffer) => {
+            data += chunk.toString();
+          });
+          proxyRes.on("end", () => {
+            this.sendOllamaBackendError(res, proxyRes.statusCode || 502, data);
+          });
+          return;
+        }
+        // Streaming: SSE → NDJSON (same pattern as handleOllamaChat)
+        if (
+          !this.writeHeadResponse(res, 200, {
+            "Content-Type": "application/x-ndjson",
+            "Transfer-Encoding": "chunked",
+          })
+        ) {
+          proxyRes.destroy();
+          return;
+        }
+
+        let buffer = "";
+        proxyRes.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data: ")) continue;
+            const payload = trimmed.slice(6);
+
+            if (payload === "[DONE]") {
+              if (
+                !this.writeJsonLine(res, {
+                  model: modelForResponse,
+                  created_at: new Date().toISOString(),
+                  response: "",
+                  done: true,
+                  done_reason: "stop",
+                })
+              ) {
+                proxyRes.destroy();
+                return;
+              }
+              this.endResponse(res);
+              return;
+            }
+
+            try {
+              const chunk = JSON.parse(payload);
+              const choice = chunk.choices?.[0];
+              const text = useRawCompletion
+                ? choice?.text || ""
+                : choice?.delta?.content || "";
+              const thinking = useRawCompletion
+                ? ""
+                : choice?.delta?.reasoning_content || choice?.delta?.reasoning || "";
+              const finishReason = choice?.finish_reason;
+              const done = finishReason != null;
+
+              const ollamaChunk: any = {
+                model: modelForResponse,
+                created_at: new Date().toISOString(),
+                response: text,
+                ...(thinking ? { thinking } : {}),
+                done,
+              };
+              if (done) {
+                ollamaChunk.done_reason = finishReason || "stop";
+                if (chunk.usage) {
+                  ollamaChunk.eval_count = chunk.usage.completion_tokens || 0;
+                  ollamaChunk.prompt_eval_count =
+                    chunk.usage.prompt_tokens || 0;
+                }
+              }
+              if (!this.writeJsonLine(res, ollamaChunk)) {
+                proxyRes.destroy();
+                return;
+              }
+              if (done) {
+                this.endResponse(res);
+                return;
+              }
+            } catch (_) {
+              /* skip malformed chunks */
+            }
+          }
+        });
+
+        proxyRes.on("end", () => {
+          if (this.responseWritable(res)) {
+            if (
+              !this.writeJsonLine(res, {
+                model: modelForResponse,
+                created_at: new Date().toISOString(),
+                response: "",
+                done: true,
+                done_reason: "stop",
+              })
+            )
+              return;
+            this.endResponse(res);
+          }
+        });
+      }
+    });
+
+    proxyReq.on("error", (err) => {
+      if (this.isClientDisconnectError(err)) {
+        if (!this.responseWritable(res)) return;
+        if (!res.headersSent)
+          this.sendJson(res, 502, {
+            error: "Backend connection closed while receiving request",
+          });
+        return;
+      }
+      if (!res.headersSent)
+        this.sendJson(res, 502, {
+          error: `Backend unavailable: ${err.message}`,
+        });
+    });
+    proxyReq.on("timeout", () => {
+      proxyReq.destroy();
+      if (!res.headersSent) this.sendJson(res, 504, { error: "Timed out" });
+    });
+    if (!this.writeProxyBody(proxyReq, JSON.stringify(openaiBody))) return;
+    if (!this.endProxyRequest(proxyReq)) return;
+    req.on("close", () => {
+      if (!proxyReq.destroyed) proxyReq.destroy();
+    });
+  }
+
+  // ── /api/show ──
+
+  private async handleOllamaShow(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const body = await this.readBody(req);
+    const bodyText = body.toString("utf8");
+    let parsed: any;
+    try {
+      parsed = JSON.parse(bodyText || "{}");
+    } catch (_) {
+      return this.sendJson(res, 400, { error: "Invalid JSON" });
+    }
+
+    const session = this.resolveSession(parsed.name || parsed.model);
+    if (!session) return this.sendJson(res, 404, { error: "model not found" });
+
+    // mlxstudio#72 — Copilot (Ollama spec v0.20.x) gates on `capabilities`.
+    // Compute from the saved session config; fall back to permissive defaults.
+    let cfg: any = {};
+    try {
+      cfg = session.config ? JSON.parse(session.config) : {};
+    } catch (_) {
+      cfg = {};
+    }
+    const capabilities: string[] = ["completion"];
+    const toolParser = cfg.toolCallParser || cfg.toolParser;
+    if (!toolParser || toolParser !== "none") capabilities.push("tools");
+    let detectedForceTextOnly = false;
+    try {
+      const detected = session.modelPath
+        ? detectModelConfigFromDir(session.modelPath)
+        : null;
+      detectedForceTextOnly = detected?.forceTextOnly === true;
+    } catch (_) {
+      detectedForceTextOnly = false;
+    }
+    if (!detectedForceTextOnly && (cfg.isMultimodal === true || cfg.modelType === "vlm"))
+      capabilities.push("vision");
+    const rp = cfg.reasoningParser;
+    if (rp && rp !== "none") capabilities.push("thinking");
+    capabilities.push("insert");
+
+    const modelName = session.servedModelName || session.modelName;
+    this.sendJson(res, 200, {
+      modelfile: "",
+      parameters: "",
+      template: "",
+      details: {
+        parent_model: "",
+        format: "mlx",
+        family: (cfg.family || cfg.modelFamily || "mlx") as string,
+        families: [(cfg.family || cfg.modelFamily || "mlx") as string],
+        parameter_size: cfg.parameterSize || "",
+        quantization_level:
+          cfg.quantization || cfg.bits
+            ? String(cfg.quantization || `${cfg.bits}bit`)
+            : "",
+      },
+      model_info: { name: modelName },
+      capabilities,
+    });
+  }
+
+  // ── /api/embeddings ──
+
+  private async handleOllamaEmbed(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const body = await this.readBody(req);
+    const bodyText = body.toString("utf8");
+    let parsed: any;
+    try {
+      parsed = JSON.parse(bodyText || "{}");
+    } catch (_) {
+      return this.sendJson(res, 400, { error: "Invalid JSON" });
+    }
+
+    const session = this.resolveSession(parsed.model);
+    if (!session) return this.sendJson(res, 404, { error: "model not found" });
+
+    const prepared = await this.prepareSessionForRouting(session);
+    if (prepared.status === "unload_failed") {
+      return this.sendJson(res, 503, {
+        error: "Another local model could not be unloaded",
+        code: "single_model_unload_failed",
+      });
+    }
+    if (prepared.status === "load_failed") {
+      return this.sendJson(res, 503, { error: "Model failed to load" });
+    }
+    const routedSession = prepared.session;
+
+    sessionManager.touchSession(routedSession.id);
+
+    // Translate Ollama embeddings → OpenAI
+    const openaiBody = JSON.stringify({
+      model: parsed.model,
+      input: parsed.input || parsed.prompt || "",
+    });
+
+    const proxyOpts = {
+      hostname: routedSession.host,
+      port: routedSession.port,
+      path: "/v1/embeddings",
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      timeout: this.effectiveGatewayProxyTimeoutMs(routedSession, parsed),
+    };
+
+    const proxyReq = httpRequest(proxyOpts, (proxyRes) => {
+      this.abortProxyResponseOnClientClose(res, proxyRes);
+      proxyRes.on("error", (err) => {
+        if (this.isClientDisconnectError(err)) return;
+        console.error(
+          `[gateway] Ollama embeddings proxy response error → ${routedSession.host}:${routedSession.port}: ${err.message}`,
+        );
+      });
+      let data = "";
+      proxyRes.on("data", (chunk: Buffer) => {
+        data += chunk.toString();
+      });
+      proxyRes.on("end", () => {
+        try {
+          const openai = JSON.parse(data);
+          // Ollama format: { embeddings: [[...]], model: "...", total_duration: ... }
+          const embeddings = openai.data?.map((d: any) => d.embedding) || [];
+          this.sendJson(res, 200, {
+            model: parsed.model,
+            embeddings,
+            total_duration: 0,
+          });
+        } catch (_) {
+          this.sendJson(res, 502, {
+            error: "Failed to parse backend response",
+          });
+        }
+      });
+    });
+
+    proxyReq.on("error", (err) => {
+      if (this.isClientDisconnectError(err)) {
+        if (!this.responseWritable(res)) return;
+        if (!res.headersSent)
+          this.sendJson(res, 502, {
+            error: "Backend connection closed while receiving request",
+          });
+        return;
+      }
+      if (!res.headersSent)
+        this.sendJson(res, 502, { error: "Backend unavailable" });
+    });
+    proxyReq.on("timeout", () => {
+      proxyReq.destroy();
+      if (!res.headersSent) this.sendJson(res, 504, { error: "Timed out" });
+    });
+    if (!this.writeProxyBody(proxyReq, openaiBody)) return;
+    if (!this.endProxyRequest(proxyReq)) return;
+    req.on("close", () => {
+      if (!proxyReq.destroyed) proxyReq.destroy();
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Utilities
+  // ═══════════════════════════════════════════════════════════════
+
+  private readBody(req: IncomingMessage): Promise<Buffer> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", () => resolve(Buffer.alloc(0)));
+    });
+  }
+
+  private sendJson(res: ServerResponse, status: number, data: any): void {
+    const json = JSON.stringify(data);
+    if (!this.responseWritable(res)) return;
+    try {
+      if (
+        !this.writeHeadResponse(res, status, {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(json),
+          "Access-Control-Allow-Origin": "*",
+        })
+      )
+        return;
+      this.endResponse(res, json);
+    } catch (err) {
+      if (!this.isClientDisconnectError(err)) throw err;
+    }
+  }
+
+  private sendOllamaBackendError(
+    res: ServerResponse,
+    status: number,
+    backendPayload: unknown,
+  ): void {
+    let payload = backendPayload;
+    if (typeof backendPayload === "string") {
+      try {
+        payload = JSON.parse(backendPayload);
+      } catch (_) {
+        payload = { error: backendPayload || "Backend request failed" };
+      }
+    }
+    const error = (payload as any)?.error;
+    const message =
+      typeof error === "string"
+        ? error
+        : error?.message || (payload as any)?.message || "Backend request failed";
+    this.sendJson(res, status, {
+      error: message,
+      ...(error?.code ? { code: error.code } : {}),
+    });
+  }
+}
+
+// Singleton
+export const apiGateway = new ApiGateway();

@@ -1,0 +1,223 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Kimi K2.6 MLA fp32-SDPA patch installer.
+
+Patches ``mlx_lm.models.deepseek_v3.DeepseekV3Attention.__call__`` so
+the L==1 MLA absorb path casts q/k/v/mask to ``mx.float32`` before
+``scaled_dot_product_attention`` and back to bf16 afterwards.
+
+Background: without this fix, Kimi K2.6 (``kimi_k25`` model type, built
+on DeepseekV3) decoding at bf16 drifts ~7.0 in logit magnitude per
+token and produces repetition loops after ~14 tokens on quantized
+bundles (see GLM-5.1 / DSV3.2 history in
+``research/VMLX-RUNTIME-FIXES.md``).
+
+Two patch locations, in order of preference:
+
+1. **vMLX release build** — ``panel/scripts/bundle-python.sh`` edits
+   ``panel/bundled-python/.../mlx_lm/models/deepseek_v3.py`` in place
+   BEFORE signing the DMG. No runtime patch needed for shipped users.
+
+2. **File patch for a user-managed ``mlx_lm``** — :func:`install_file`
+   copies ``research/deepseek_v3_patched.py`` (shipped in jang_tools'
+   docs tree) over the target file with a timestamped backup. Refuses
+   to touch files inside a packaged ``vMLX.app/Contents`` bundle so it
+   never corrupts a signed app — that's mode 1's job.
+
+``install_file`` is a thin re-export of
+``jang_tools.kimi_prune.runtime_patch.apply`` so the refusal guard and
+backup contract stay in one place. ``install`` verifies the patch is
+live at runtime and attempts the user-managed file patch only outside a
+packaged app bundle.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from importlib import import_module
+from importlib.util import find_spec
+from pathlib import Path
+from typing import Optional
+import hashlib
+import shutil
+import time
+
+logger = logging.getLogger(__name__)
+
+PATCH_MARKER = "JANG fast fix"
+
+
+def is_patched() -> bool:
+    """Return True if ``mlx_lm.models.deepseek_v3`` source already
+    contains the fp32-SDPA fix (via the build-time in-place edit).
+
+    Runs ``inspect.getsource`` on the imported module so it works even
+    when ``mlx_lm`` comes from a .pyc in the bundled Python.
+    """
+    try:
+        import mlx_lm.models.deepseek_v3 as _dv3  # noqa: WPS433 runtime import
+        import inspect
+
+        src = inspect.getsource(_dv3.DeepseekV3Attention.__call__)
+        return PATCH_MARKER in src and "q_sdpa" in src
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("is_patched() failed: %s", exc)
+        return False
+
+
+def install() -> bool:
+    """Ensure the fp32-SDPA MLA fix is live in the current process.
+
+    Returns ``True`` if the patch is active (either already present in
+    the bundled file or applied through the user-managed file patch),
+    ``False`` if install was not possible (``mlx_lm`` not importable, etc).
+
+    Idempotent — safe to call from every bootstrap, every process.
+    """
+    if is_patched():
+        logger.debug("Kimi MLA patch already active")
+        return True
+
+    # Fallback: attempt a file patch only outside vMLX's bundle. Mirrors
+    # jang_tools.kimi_prune.runtime_patch.apply's refusal contract so we
+    # never corrupt a signed release artifact.
+    target = _locate_target()
+    if target is None:
+        return False
+    if _is_vmlx_bundle(target):
+        logger.warning(
+            "Kimi MLA patch refused: target %s is a vMLX-bundled file. "
+            "Bundled releases apply this patch at build time; if you are "
+            "seeing this message inside /Applications/vMLX.app, please "
+            "file a bug — the build-time patch step was skipped.",
+            target,
+        )
+        return False
+    local_patch_source = _local_patch_source()
+    if local_patch_source is not None:
+        return _apply_local_patch(target, local_patch_source)
+
+    if not _runtime_patch_source_available():
+        logger.debug(
+            "Kimi MLA file patch skipped: optional patched source is not "
+            "available in this environment"
+        )
+        return False
+    try:
+        from jang_tools.kimi_prune.runtime_patch import apply as _apply
+    except ImportError:
+        logger.warning(
+            "Kimi MLA patch needs jang_tools.kimi_prune.runtime_patch for "
+            "file-install; import failed. Install jang_tools or use the "
+            "bundled vMLX Python."
+        )
+        return False
+    rc = _apply(dry_run=False)
+    return rc == 0
+
+
+def _local_patch_source() -> Optional[Path]:
+    """Return vMLX-shipped patched source for PyPI/source installs."""
+    path = Path(__file__).with_name("deepseek_v3_patched.py")
+    return path if path.is_file() else None
+
+
+def _target_has_patch(path: Path) -> bool:
+    try:
+        return PATCH_MARKER in path.read_text(errors="replace")
+    except Exception:
+        return False
+
+
+def _apply_local_patch(target: Path, source: Path) -> bool:
+    if _target_has_patch(target):
+        return True
+    try:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        backup = target.with_name(target.name + f".vmlx-backup-{ts}")
+        shutil.copy2(target, backup)
+        shutil.copy2(source, target)
+        import importlib
+        import mlx_lm.models.deepseek_v3 as _d3  # noqa: WPS433
+
+        importlib.reload(_d3)
+        digest = hashlib.md5(target.read_bytes()).hexdigest()
+        logger.info(
+            "Applied Kimi MLA fp32-SDPA patch to %s (source=%s md5=%s)",
+            target,
+            source,
+            digest,
+        )
+        return is_patched()
+    except Exception as exc:
+        logger.warning("Kimi MLA local patch failed for %s: %s", target, exc)
+        return False
+
+
+def install_file(dry_run: bool = False) -> int:
+    """Thin re-export of ``jang_tools.kimi_prune.runtime_patch.apply``.
+
+    Use this from a command line when you want the backup-and-replace
+    behavior. Returns the same ``int`` exit code as the underlying
+    script (0 on success, 2 on error).
+    """
+    try:
+        from jang_tools.kimi_prune.runtime_patch import apply as _apply
+    except ImportError as _ie:
+        raise ImportError(
+            "vmlx_engine.runtime_patches.kimi_k25_mla.install_file requires "
+            "`jang_tools.kimi_prune` in the active Python environment."
+        ) from _ie
+    return _apply(dry_run=dry_run)
+
+
+def _runtime_patch_source_available() -> bool:
+    try:
+        runtime_patch = import_module("jang_tools.kimi_prune.runtime_patch")
+    except ImportError:
+        return True
+    patch_src = getattr(runtime_patch, "PATCH_SRC", None)
+    if patch_src is None:
+        return True
+    return Path(patch_src).exists()
+
+
+def _locate_target() -> Optional[Path]:
+    spec = find_spec("mlx_lm.models.deepseek_v3")
+    if spec is None or spec.origin is None:
+        return None
+    return Path(spec.origin)
+
+
+def _is_vmlx_bundle(path: Path) -> bool:
+    """Does this file live inside a vMLX-shipped Python bundle?
+
+    Only packaged ``vMLX.app/Contents`` paths count as shipped artifacts.
+    User-managed uv/pipx installs often live under directories literally
+    named ``vmlx`` and must not be mistaken for signed app bundles.
+    """
+    parts = [part.lower() for part in path.parts]
+    for idx, part in enumerate(parts):
+        if part == "vmlx.app" and idx + 1 < len(parts):
+            return parts[idx + 1] == "contents"
+    return False
+
+
+def main(argv: Optional[list] = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit 0 if the patch is already active, 2 otherwise. No edits.",
+    )
+    args = ap.parse_args(argv)
+    if args.check:
+        return 0 if is_patched() else 2
+    return install_file(dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,4118 @@
+// vMLX panel chat IPC — authored by Jinho Jang
+import { ipcMain, BrowserWindow, net } from "electron";
+import { v4 as uuidv4 } from "uuid";
+import { request as httpsRequest } from "node:https";
+import { request as httpRequest } from "node:http";
+import type { ClientRequest } from "node:http";
+import { db, Chat, Message, Folder } from "../database";
+import { sessionManager, resolveUrl, connectHost } from "../sessions";
+import { readGenerationDefaults } from "./models";
+import {
+  BUILTIN_TOOLS,
+  isBuiltinTool,
+  AGENTIC_SYSTEM_PROMPT,
+} from "../tools/registry";
+import { executeBuiltinTool } from "../tools/executor";
+import { detectModelConfigFromDir } from "../model-config-registry";
+import { getAuthHeaders } from "./utils";
+import { extractResponsesWarnings } from "../../shared/responsesWarnings";
+import {
+  appendReasoningDelta,
+  joinReasoningSegments,
+  markReasoningToolBoundary,
+  visibleReasoningSegments,
+} from "../../shared/interleavedReasoning";
+import { shouldAutoContinueAfterToolUse } from "../../shared/toolAutoContinue";
+import { buildToolMediaFollowupContent } from "../../shared/toolMediaFollowup";
+import { dsv4OutputBudget } from "../../shared/dsv4RequestBudget";
+import {
+  buildNewChatInheritedOverrides,
+  sanitizeChatOverrides,
+} from "../chat-override-policy";
+
+// Default connection config (fallback values)
+const DEFAULT_PORT = 8000;
+const GENERIC_DEFAULT_TIMEOUT_SECONDS = 300;
+const DSV4_DEFAULT_TIMEOUT_SECONDS = 900;
+const configuredToolStreamStallTimeoutMs = Number(
+  process.env.VMLX_TOOL_STREAM_STALL_TIMEOUT_MS,
+);
+const TOOL_STREAM_STALL_TIMEOUT_MS = Number.isFinite(
+  configuredToolStreamStallTimeoutMs,
+)
+  ? Math.max(5_000, configuredToolStreamStallTimeoutMs)
+  : 30_000;
+
+function effectiveDsv4RequestTimeoutSeconds(
+  timeoutSeconds: number,
+  detectedFamily?: string,
+): number {
+  return detectedFamily === "deepseek-v4" && timeoutSeconds === GENERIC_DEFAULT_TIMEOUT_SECONDS
+    ? DSV4_DEFAULT_TIMEOUT_SECONDS
+    : timeoutSeconds;
+}
+
+function shouldForwardReasoningEffort(
+  reasoningEffort: unknown,
+  enableThinking: unknown,
+  sessionHasReasoningParser: boolean,
+  detectedFamily?: string,
+): reasoningEffort is string {
+  if (typeof reasoningEffort !== "string" || !reasoningEffort) return false;
+  if (enableThinking === false) return false;
+  if (detectedFamily === "hy3" && enableThinking !== true) return false;
+  return sessionHasReasoningParser || detectedFamily === "deepseek-v4";
+}
+
+function shouldSuppressGenericAgenticPromptForNativeTools(
+  detectedFamily?: string,
+  modelNameOrPath?: string,
+): boolean {
+  const modelName = String(modelNameOrPath || "").toLowerCase();
+  return (
+    detectedFamily === "zaya" ||
+    detectedFamily === "zaya1-vl" ||
+    detectedFamily === "zaya1_vl" ||
+    modelName.includes("zaya")
+  );
+}
+
+function isExpectedChatBackendDisconnectError(error: unknown): boolean {
+  const err = error as NodeJS.ErrnoException | undefined;
+  const code = String(err?.code || "");
+  const message = String(err?.message || error || "");
+  const cause = (err as any)?.cause;
+  const wrappedDisconnects = [
+    cause,
+    (err as any)?.reason,
+    (err as any)?.error,
+    (err as any)?.detail,
+  ].filter(Boolean);
+  const nestedErrors = Array.isArray((err as any)?.errors)
+    ? (err as any).errors
+    : [];
+  return (
+    code === "EPIPE" ||
+    code === "ECONNRESET" ||
+    code === "ERR_STREAM_DESTROYED" ||
+    code === "ERR_STREAM_WRITE_AFTER_END" ||
+    /EPIPE|write EPIPE|broken pipe|socket hang up|connection reset|premature close|stream.*destroyed|write after end/i.test(message) ||
+    wrappedDisconnects.some((nested) => isExpectedChatBackendDisconnectError(nested)) ||
+    nestedErrors.some((nested) => isExpectedChatBackendDisconnectError(nested))
+  );
+}
+
+function expectedChatBackendDisconnectError(): NodeJS.ErrnoException {
+  const error = new Error(
+    "Backend connection closed while streaming response.",
+  ) as NodeJS.ErrnoException;
+  error.code = "EPIPE";
+  return error;
+}
+
+function chatBackendRequestWritable(req: ClientRequest): boolean {
+  const anyReq = req as ClientRequest & {
+    closed?: boolean;
+    writableDestroyed?: boolean;
+    socket?: { destroyed?: boolean } | null;
+  };
+  return (
+    !anyReq.closed &&
+    !anyReq.destroyed &&
+    !anyReq.writableEnded &&
+    !anyReq.writableDestroyed &&
+    !anyReq.socket?.destroyed
+  );
+}
+
+function endChatBackendRequest(
+  req: ClientRequest,
+  bodyBuf: Buffer,
+  reject: (reason?: unknown) => void,
+): void {
+  if (!chatBackendRequestWritable(req)) {
+    const error = new Error("Backend connection closed before request completed.") as NodeJS.ErrnoException;
+    error.code = "EPIPE";
+    reject(error);
+    return;
+  }
+  try {
+    req.end(bodyBuf);
+  } catch (error) {
+    if (isExpectedChatBackendDisconnectError(error)) {
+      reject(error);
+      return;
+    }
+    throw error;
+  }
+}
+
+type ComposerAttachment = {
+  dataUrl: string;
+  name: string;
+  kind?: "image" | "video" | "audio" | "text";
+  type?: string;
+  size?: number;
+  text?: string;
+};
+
+function inferKind(a: ComposerAttachment): "image" | "video" | "audio" | "text" {
+  if (a.kind) return a.kind;
+  if (a.text !== undefined) return "text";
+  if (a.dataUrl.startsWith("data:audio/")) return "audio";
+  if (a.dataUrl.startsWith("data:video/")) return "video";
+  if (a.dataUrl.startsWith("data:text/")) return "text";
+  return "image";
+}
+
+function mimeFromDataUrl(dataUrl?: string): string | undefined {
+  return dataUrl?.match(/^data:([^;,]+)[;,]/)?.[1]?.toLowerCase();
+}
+
+function redactContentForLog(content: any): any {
+  if (Array.isArray(content)) {
+    return content.map((part: any) => {
+      if (!part || typeof part !== "object") return { type: typeof part };
+      if (part.type === "text") {
+        return { type: "text", chars: String(part.text || "").length };
+      }
+      if (part.type === "image_url") {
+        const url = part.image_url?.url || part.image_url;
+        return {
+          type: "image_url",
+          mime: mimeFromDataUrl(typeof url === "string" ? url : undefined),
+          data_url_chars: typeof url === "string" && url.startsWith("data:") ? url.length : undefined,
+          url: "<redacted>",
+        };
+      }
+      if (part.type === "video_url") {
+        const url = part.video_url?.url || part.video_url;
+        return {
+          type: "video_url",
+          mime: mimeFromDataUrl(typeof url === "string" ? url : undefined),
+          data_url_chars: typeof url === "string" && url.startsWith("data:") ? url.length : undefined,
+          url: "<redacted>",
+        };
+      }
+      if (part.type === "input_audio") {
+        return {
+          type: "input_audio",
+          format: part.input_audio?.format,
+          data_chars:
+            typeof part.input_audio?.data === "string"
+              ? part.input_audio.data.length
+              : undefined,
+        };
+      }
+      return { type: part.type || "unknown", keys: Object.keys(part).sort() };
+    });
+  }
+  if (typeof content === "string") return { type: "text", chars: content.length };
+  if (content == null) return null;
+  return { type: typeof content };
+}
+
+function summarizeRequestForLog(bodyJson: string, useResponsesApi: boolean): Record<string, any> {
+  try {
+    const body = JSON.parse(bodyJson);
+    const items = useResponsesApi ? body.input : body.messages;
+    return {
+      route: useResponsesApi ? "/v1/responses" : "/v1/chat/completions",
+      model: body.model,
+      stream: body.stream === true,
+      max_tokens: body.max_output_tokens ?? body.max_tokens,
+      temperature: body.temperature,
+      top_p: body.top_p,
+      top_k: body.top_k,
+      min_p: body.min_p,
+      repetition_penalty: body.repetition_penalty,
+      enable_thinking: body.enable_thinking,
+      thinking_mode: body.thinking_mode,
+      reasoning_effort: body.reasoning_effort,
+      max_thinking_tokens: body.max_thinking_tokens,
+      thinking_budget: body.chat_template_kwargs?.thinking_budget,
+      previous_response_id: body.previous_response_id ? "<present>" : undefined,
+      has_tools: Array.isArray(body.tools) && body.tools.length > 0,
+      messages: Array.isArray(items)
+        ? items.slice(-8).map((m: any) => ({
+            role: m.role || m.type || "item",
+            content: redactContentForLog(m.content ?? m.input ?? m.output ?? m.text),
+          }))
+        : redactContentForLog(items),
+    };
+  } catch (e: any) {
+    return { error: `request summary failed: ${e?.message || String(e)}` };
+  }
+}
+
+function summarizeAttachmentsForLog(attachments?: ComposerAttachment[]): Record<string, any> {
+  const counts = { image: 0, video: 0, audio: 0, text: 0 };
+  const files: Array<Record<string, any>> = [];
+  for (const attachment of attachments || []) {
+    const kind = inferKind(attachment);
+    counts[kind] += 1;
+    files.push({
+      kind,
+      name: attachment.name,
+      mime: attachment.type || mimeFromDataUrl(attachment.dataUrl),
+      size: attachment.size,
+      data_url_chars: attachment.dataUrl?.startsWith("data:")
+        ? attachment.dataUrl.length
+        : undefined,
+      text_chars: attachment.text?.length,
+    });
+  }
+  return { total: attachments?.length || 0, counts, files };
+}
+
+/**
+ * SSE-streaming fetch using Node.js http/https directly.
+ * Electron 28's global fetch() uses Chromium's net module which buffers
+ * SSE chunks instead of delivering them immediately. Node.js http/https
+ * streams data as it arrives from the socket.
+ */
+async function streamingFetch(
+  url: string,
+  init: {
+    method: string;
+    headers: Record<string, string>;
+    body: string;
+    signal?: AbortSignal;
+  },
+): Promise<{
+  ok: boolean;
+  status: number;
+  statusText: string;
+  body: ReadableStream<Uint8Array> | null;
+  text: () => Promise<string>;
+}> {
+  const parsed = new URL(url);
+  const isHttps = parsed.protocol === "https:";
+  const reqFn = isHttps ? httpsRequest : httpRequest;
+  const bodyBuf = Buffer.from(init.body, "utf-8");
+
+  return new Promise((resolve, reject) => {
+    if (init.signal?.aborted) {
+      reject(
+        Object.assign(new Error("The operation was aborted."), {
+          name: "AbortError",
+        }),
+      );
+      return;
+    }
+
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (!settled) {
+        settled = true;
+        fn();
+      }
+    };
+
+    const req = reqFn(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: init.method,
+        // Disable connection pooling — each SSE stream gets a fresh TCP connection.
+        // Prevents stale keep-alive connections from causing ECONNRESET/"aborted" errors.
+        agent: false,
+        headers: {
+          ...init.headers,
+          "Content-Length": bodyBuf.length.toString(),
+        },
+      },
+      (res) => {
+        const ok = (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300;
+
+        if (!ok) {
+          let data = "";
+          res.on("data", (chunk) => {
+            data += chunk.toString();
+          });
+          res.on("end", () => {
+            settle(() =>
+              resolve({
+                ok,
+                status: res.statusCode ?? 0,
+                statusText: res.statusMessage ?? "",
+                body: null,
+                text: () => Promise.resolve(data),
+              }),
+            );
+          });
+          res.on("error", () => {
+            settle(() =>
+              resolve({
+                ok,
+                status: res.statusCode ?? 0,
+                statusText: res.statusMessage ?? "",
+                body: null,
+                text: () => Promise.resolve(data),
+              }),
+            );
+          });
+          return;
+        }
+
+        // Wrap Node.js stream in Web ReadableStream for compatibility with streamSSE
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            res.on("data", (chunk: Buffer) => {
+              controller.enqueue(new Uint8Array(chunk));
+            });
+            res.on("end", () => {
+              try {
+                controller.close();
+              } catch (_) {}
+            });
+            res.on("error", (err) => {
+              if (isExpectedChatBackendDisconnectError(err)) {
+                try {
+                  controller.error(err);
+                } catch (_) {}
+                return;
+              }
+              console.error(
+                `[streamingFetch] stream error: message="${(err as any)?.message}" code="${(err as any)?.code}"`,
+              );
+              try {
+                controller.error(err);
+              } catch (_) {}
+            });
+            // Handle premature close (server drops connection before response completes)
+            res.on("close", () => {
+              if (!res.complete) {
+                try {
+                  controller.error(
+                    new Error("Connection closed before response completed"),
+                  );
+                } catch (_) {}
+              }
+            });
+          },
+          cancel() {
+            res.destroy();
+          },
+        });
+
+        settle(() =>
+          resolve({
+            ok: true,
+            status: res.statusCode ?? 200,
+            statusText: res.statusMessage ?? "OK",
+            body: stream,
+            text: () =>
+              Promise.reject(
+                new Error("Cannot read text from streaming response"),
+              ),
+          }),
+        );
+      },
+    );
+
+    req.on("error", (err) => {
+      settle(() => reject(err));
+    });
+
+    if (init.signal) {
+      const onAbort = () => {
+        req.destroy();
+        settle(() =>
+          reject(
+            Object.assign(new Error("The operation was aborted."), {
+              name: "AbortError",
+            }),
+          ),
+        );
+      };
+      init.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    endChatBackendRequest(req, bodyBuf, reject);
+  });
+}
+
+// Common chat template stop tokens that models may generate
+const TEMPLATE_STOP_TOKENS = [
+  "<|im_end|>",
+  "<|im_start|>", // ChatML (Qwen, etc.)
+  "<|eot_id|>",
+  "<|start_header_id|>", // Llama 3
+  "<|end|>",
+  "<|user|>",
+  "<|assistant|>", // Phi-3
+  "</s>",
+  "<s>", // Llama 2, Mistral
+  "<|endoftext|>", // GPT-NeoX, StableLM
+  "[/INST]",
+  "[INST]", // Mistral instruct
+  "<end_of_turn>", // Gemma
+  "<minimax:tool_call>", // MiniMax tool call open tag
+  "</minimax:tool_call>", // MiniMax tool call close tag
+  "<|start|>",
+  "<|channel|>",
+  "<|message|>", // Harmony/GPT-OSS protocol (GLM-4.7, GPT-OSS)
+];
+
+// Regex to strip any leaked template tokens from output
+const TEMPLATE_TOKEN_REGEX = new RegExp(
+  TEMPLATE_STOP_TOKENS.map((t) =>
+    t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+  ).join("|"),
+  "g",
+);
+
+/**
+ * Use Electron's net.fetch for remote sessions — Chromium's network stack handles
+ * HTTPS certificates, system proxies, and SSE streaming properly.
+ * Local sessions use streamingFetch (Node.js http/https) to avoid Electron 28's
+ * global fetch buffering SSE chunks.
+ */
+const remoteFetch: typeof globalThis.fetch = (input, init?) =>
+  net.fetch(input as any, init as any);
+
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  } catch (_) {
+    return false;
+  }
+}
+
+const DIRECT_MEDIA_ATTACHMENT_TOOL_RULE =
+  "\n\nIMPORTANT: The current user message includes media attachments as chat content. Inspect attached images, video, or audio directly through the model's multimodal input. Do not call read_image, read_video, or list_directory to find attached media unless the user explicitly gives a local filesystem path.";
+
+// Tool category definitions for per-category filtering
+const FILE_TOOLS = new Set([
+  "read_file",
+  "write_file",
+  "edit_file",
+  "patch_file",
+  "batch_edit",
+  "copy_file",
+  "move_file",
+  "delete_file",
+  "create_directory",
+  "list_directory",
+  "insert_text",
+  "replace_lines",
+  "apply_regex",
+  "read_image",
+  "read_video",
+]);
+const SEARCH_TOOLS = new Set([
+  "search_files",
+  "find_files",
+  "file_info",
+  "get_diagnostics",
+  "get_tree",
+  "diff_files",
+]);
+const SHELL_TOOLS = new Set([
+  "run_command",
+  "spawn_process",
+  "get_process_output",
+]);
+const DDG_SEARCH_TOOLS = new Set(["ddg_search"]);
+const FETCH_TOOLS = new Set(["fetch_url"]);
+const GIT_TOOLS = new Set(["git"]);
+const UTILITY_TOOLS = new Set([
+  "count_tokens",
+  "clipboard_read",
+  "clipboard_write",
+  "get_current_datetime",
+]);
+// ask_user is intentionally excluded from UTILITY_TOOLS — it's a core IPC tool that should
+// always be available regardless of the utilityToolsEnabled toggle.
+
+/** Build set of disabled tool names based on per-category toggle overrides */
+function getDisabledTools(overrides: any): Set<string> {
+  const disabled = new Set<string>();
+  if (overrides.fileToolsEnabled === false)
+    FILE_TOOLS.forEach((t) => disabled.add(t));
+  if (overrides.searchToolsEnabled === false)
+    SEARCH_TOOLS.forEach((t) => disabled.add(t));
+  if (overrides.shellEnabled === false)
+    SHELL_TOOLS.forEach((t) => disabled.add(t));
+  if (overrides.webSearchEnabled === false)
+    DDG_SEARCH_TOOLS.forEach((t) => disabled.add(t));
+  if (overrides.fetchUrlEnabled === false)
+    FETCH_TOOLS.forEach((t) => disabled.add(t));
+  if (overrides.gitEnabled === false) GIT_TOOLS.forEach((t) => disabled.add(t));
+  if (overrides.utilityToolsEnabled === false)
+    UTILITY_TOOLS.forEach((t) => disabled.add(t));
+  // Brave web_search requires API key — always disable if no key configured
+  // (user must explicitly enable Brave search via braveSearchEnabled toggle)
+  if (overrides.braveSearchEnabled === false) {
+    disabled.add("web_search");
+  } else {
+    const braveKey = db.getSetting("braveApiKey");
+    if (!braveKey && !process.env.BRAVE_API_KEY) {
+      disabled.add("web_search");
+    }
+  }
+  return disabled;
+}
+
+/** Filter BUILTIN_TOOLS based on per-category toggle overrides */
+function filterTools(
+  overrides: any,
+  context: { hasDirectMediaAttachments?: boolean } = {},
+): any[] {
+  const disabled = getDisabledTools(overrides);
+  if (context.hasDirectMediaAttachments) {
+    disabled.add("read_image");
+    disabled.add("read_video");
+  }
+  if (disabled.size === 0) return BUILTIN_TOOLS;
+  return BUILTIN_TOOLS.filter((t: any) => !disabled.has(t.function.name));
+}
+
+// Track active requests per chat for abort/concurrency (B5/B6)
+const activeRequests = new Map<
+  string,
+  {
+    controller: AbortController;
+    startedAt: number;
+    timeoutMs: number;
+    responseId?: string;
+    endpoint?: { host: string; port: number };
+    baseUrl?: string;
+    authHeaders?: Record<string, string>;
+  }
+>();
+// Stale lock: each request stores its timeoutMs; stale check uses timeoutMs + 30s buffer
+
+// ask_user: single global listener with Map-based resolver (prevents listener accumulation)
+const askUserResolvers = new Map<string, (answer: string) => void>();
+ipcMain.on("chat:answerUser", (_, chatId: string, answer: string) => {
+  const resolve = askUserResolvers.get(chatId);
+  if (resolve) {
+    askUserResolvers.delete(chatId);
+    resolve(answer);
+  }
+});
+
+/** Abort all active chat requests targeting a specific endpoint (called when session stops) */
+export function abortByEndpoint(host: string, port: number): number {
+  let count = 0;
+  for (const [chatId, entry] of activeRequests) {
+    if (entry.endpoint?.host === host && entry.endpoint?.port === port) {
+      console.log(
+        `[CHAT] Aborting chat ${chatId} — session endpoint ${host}:${port} stopped`,
+      );
+      // Send server cancel if we have a response ID (fire-and-forget)
+      if (entry.responseId && (entry.baseUrl || entry.endpoint)) {
+        const cancelPath = entry.responseId.startsWith("resp_")
+          ? `/v1/responses/${entry.responseId}/cancel`
+          : `/v1/chat/completions/${entry.responseId}/cancel`;
+        const cancelBase = entry.baseUrl || `http://${host}:${port}`;
+        fetch(`${cancelBase}${cancelPath}`, {
+          method: "POST",
+          headers: entry.authHeaders || {},
+          signal: AbortSignal.timeout(1000),
+        }).catch(() => {
+          /* server may already be stopped */
+        });
+      }
+      try {
+        entry.controller.abort();
+      } catch (_) {}
+      activeRequests.delete(chatId);
+      count++;
+    }
+  }
+  return count;
+}
+
+/** Resolved endpoint info including optional session reference */
+interface ResolvedEndpoint {
+  host: string;
+  port: number;
+  session?: import("../database").Session;
+}
+
+/** Resolve endpoint for a chat: use modelPath to find session, fallback to detection */
+async function resolveServerEndpoint(
+  modelPath?: string,
+): Promise<ResolvedEndpoint> {
+  // 1. If chat has modelPath, find its session (normalize to handle trailing slash)
+  if (modelPath) {
+    const session = sessionManager.getSessionByModelPath(
+      modelPath.replace(/\/+$/, ""),
+    );
+    if (session && session.status === "running") {
+      return { host: session.host, port: session.port, session };
+    }
+  }
+
+  // 2. Detect any running processes
+  const processes = await sessionManager.detect();
+  const healthy = processes.find((p) => p.healthy);
+  if (healthy) {
+    // Use 127.0.0.1 for connection (0.0.0.0 is a bind address, not connectable)
+    return { host: "127.0.0.1", port: healthy.port };
+  }
+
+  return { host: "127.0.0.1", port: DEFAULT_PORT };
+}
+
+export function registerChatHandlers(
+  getWindow: () => BrowserWindow | null,
+): void {
+  const pushChatSessionLog = (sessionId: string | undefined, line: string) => {
+    if (!sessionId) return;
+    const data = line.endsWith("\n") ? line : `${line}\n`;
+    sessionManager.pushLog(sessionId, data);
+    sessionManager.emit("session:log", { sessionId, data });
+  };
+
+  // Folders
+  ipcMain.handle(
+    "chat:createFolder",
+    async (_, name: string, parentId?: string) => {
+      const folder: Folder = {
+        id: uuidv4(),
+        name,
+        parentId,
+        createdAt: Date.now(),
+      };
+      db.createFolder(folder);
+      return folder;
+    },
+  );
+
+  ipcMain.handle("chat:getFolders", async () => {
+    return db.getFolders();
+  });
+
+  ipcMain.handle("chat:deleteFolder", async (_, id: string) => {
+    db.deleteFolder(id);
+    return { success: true };
+  });
+
+  // Chats
+  ipcMain.handle(
+    "chat:create",
+    async (
+      _,
+      title: string,
+      modelId: string,
+      folderId?: string,
+      modelPath?: string,
+    ) => {
+      const chat: Chat = {
+        id: uuidv4(),
+        title,
+        folderId,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        modelId,
+        modelPath,
+      };
+      db.createChat(chat);
+
+      // Do not seed new chats from per-model settings or sibling chats. A
+      // clean chat starts with no overrides; the engine resolves bundle
+      // defaults and explicit chat/API settings are stored only per chat.
+      // Default profiles / sibling chats may carry tool and workspace
+      // ergonomics into a clean chat, but sampling/reasoning/system prompts are
+      // intentionally excluded so bundle generation defaults stay authoritative.
+      try {
+        const defaultProfile = db.getDefaultChatProfile();
+        if (defaultProfile) {
+          const existing = db.getChatOverrides(chat.id) || { chatId: chat.id };
+          // Default profiles are auto-applied at chat creation time, so treat
+          // them as coding/tool presets. Manual profile loads can still apply
+          // full sampler/reasoning/prompt settings after the user chooses them.
+          const merged = buildNewChatInheritedOverrides(
+            existing as any,
+            defaultProfile as any,
+          );
+          db.setChatOverrides(merged as any);
+          console.log(
+            `[CHAT] Applied default profile coding/tool settings to new chat ${chat.id}; generation/reasoning defaults stayed model-derived`,
+          );
+        } else if (modelPath) {
+          // No starred profile — inherit settings from last chat of same model
+          const siblingChats = db.getChatsByModelPath(modelPath);
+          // Find the most recent OTHER chat (not this one) that has overrides
+          const lastSibling = siblingChats.find((c) => c.id !== chat.id);
+          if (lastSibling) {
+            const lastOverrides = db.getChatOverrides(lastSibling.id);
+            if (lastOverrides) {
+              const existing = db.getChatOverrides(chat.id) || {
+                chatId: chat.id,
+              };
+              const merged = buildNewChatInheritedOverrides(
+                existing as any,
+                lastOverrides as any,
+              );
+              db.setChatOverrides(merged);
+              console.log(
+                `[CHAT] Inherited coding/tool settings from last chat ${lastSibling.id.slice(0, 8)}; generation/reasoning defaults stayed model-derived`,
+              );
+            }
+          }
+        }
+      } catch (e) {
+        console.error("[CHAT] Failed to apply default profile:", e);
+      }
+
+      return chat;
+    },
+  );
+
+  ipcMain.handle("chat:getByModel", async (_, modelPath: string) => {
+    return db.getChatsByModelPath(modelPath);
+  });
+
+  ipcMain.handle("chat:getRecent", async (_, limit: number) => {
+    return db.getRecentChats(limit);
+  });
+
+  ipcMain.handle("chat:getAll", async (_, folderId?: string) => {
+    return db.getChats(folderId);
+  });
+
+  ipcMain.handle("chat:get", async (_, id: string) => {
+    return db.getChat(id);
+  });
+
+  ipcMain.handle(
+    "chat:update",
+    async (_, id: string, updates: Partial<Chat>) => {
+      db.updateChat(id, updates);
+      return { success: true };
+    },
+  );
+
+  ipcMain.handle("chat:delete", async (_, id: string) => {
+    db.deleteChat(id);
+    return { success: true };
+  });
+
+  // vmlx#70: bulk-delete. Reporter wanted "mass delete or wipe chat
+  // history" instead of one-by-one. This single handler covers:
+  //   - wipe everything:               {}
+  //   - wipe unfiled:                  { folderId: "unfiled" }
+  //   - wipe one folder:               { folderId: "<id>" }
+  //   - wipe all chats for a model:    { modelPath: "<path>" }
+  // Returns the count so the UI can confirm "N chats deleted".
+  ipcMain.handle(
+    "chat:deleteAll",
+    async (_, scope?: { folderId?: string; modelPath?: string }) => {
+      try {
+        const deleted = db.deleteAllChats(scope);
+        return { success: true, deleted };
+      } catch (error) {
+        return { success: false, error: (error as Error).message };
+      }
+    },
+  );
+
+  ipcMain.handle("chat:deleteMessage", async (_, messageId: string) => {
+    db.deleteMessage(messageId);
+    return { success: true };
+  });
+
+  ipcMain.handle("chat:deleteMessagesFrom", async (_, chatId: string, fromTimestamp: number) => {
+    db.deleteMessagesFrom(chatId, fromTimestamp);
+    return { success: true };
+  });
+
+  ipcMain.handle("chat:search", async (_, query: string) => {
+    return db.searchChats(query);
+  });
+
+  // Messages
+  ipcMain.handle("chat:getMessages", async (_, chatId: string) => {
+    return db.getMessages(chatId);
+  });
+
+  ipcMain.handle(
+    "chat:addMessage",
+    async (_, chatId: string, role: string, content: string) => {
+      // Ensure chat exists (FK constraint on messages.chat_id)
+      const chat = db.getChat(chatId);
+      if (!chat) {
+        throw new Error(`Cannot add message: chat ${chatId} not found`);
+      }
+      const message: Message = {
+        id: uuidv4(),
+        chatId,
+        role: role as "system" | "user" | "assistant",
+        content,
+        timestamp: Date.now(),
+      };
+      db.addMessage(message);
+      return message;
+    },
+  );
+
+  // Send message and get streaming response
+  // Optional 4th arg: endpoint override { host, port } for multi-server support
+  // Optional 5th arg: attachments from the chat composer. Media attachments
+  // force multimodal routing; text files are inlined as text context.
+  // `kind` distinguishes image, video, audio, and text so we emit the right
+  // OpenAI content part. Back-compat: undefined `kind` falls back to detection
+  // via the data URL mime prefix below.
+  ipcMain.handle(
+    "chat:sendMessage",
+    async (
+      _,
+      chatId: string,
+      content: string,
+      endpoint?: { host: string; port: number },
+      attachments?: Array<{
+        dataUrl: string;
+        name: string;
+        kind?: "image" | "video" | "audio" | "text";
+        type?: string;
+        size?: number;
+        text?: string;
+      }>,
+    ) => {
+      // B6: Concurrency guard — reject if a request is already active for this chat
+      // B6: Concurrency guard with stale lock recovery
+      const existing = activeRequests.get(chatId);
+      if (existing) {
+        const age = Date.now() - existing.startedAt;
+        // Use the timeout configured when that request started, plus 30s buffer
+        // Cap at 10 minutes to prevent indefinite lock (e.g., when serverTimeout is 86400s)
+        const staleLockMs = Math.min(
+          existing.timeoutMs + 30_000,
+          30 * 60 * 1000,
+        );
+        if (age > staleLockMs) {
+          // Lock is stale — abort and clear it
+          console.log(
+            `[CHAT] Clearing stale lock for ${chatId} (${Math.round(age / 1000)}s old, limit ${Math.round(staleLockMs / 1000)}s)`,
+          );
+          try {
+            existing.controller.abort();
+          } catch (_) {}
+          activeRequests.delete(chatId);
+        } else {
+          throw new Error("A message is already being generated for this chat");
+        }
+      }
+
+      // B5: Create AbortController for this request
+      const abortController = new AbortController();
+      let timedOut = false;
+
+      const chat = db.getChat(chatId);
+      if (!chat) {
+        throw new Error("Chat not found");
+      }
+
+      // Look up session for this chat — needed for timeout, reasoning parser,
+      // AND for endpoint resolution (remote sessions need remoteUrl/apiKey/type)
+      let timeoutSeconds = 300;
+      let sessionHasReasoningParser = false;
+      let isHarmonyModel = false;
+      let chatIsMultimodal = false;
+      let chatDetectedFamily: string | undefined;
+      let thinkingBudgetSupported: boolean | undefined;
+      // VLM video sampling (Qwen 3.6, Qwen3.5-VL, etc.) — forwarded as
+      // video_fps / video_max_frames on the request body when present.
+      // Default undefined = engine default (2.0 fps, 8 max frames).
+      let sessionVideoFps: number | undefined;
+      let sessionVideoMaxFrames: number | undefined;
+      let chatSession: import("../database").Session | undefined;
+      if (chat.modelPath) {
+        chatSession = sessionManager.getSessionByModelPath(
+          chat.modelPath.replace(/\/+$/, ""),
+        );
+        if (!chatSession) {
+          // Path mismatch fallback: HF repo ID vs resolved local path can differ
+          // (e.g., "org/Model-CRACKED-MLX" resolves to directory "org/Model-CRACK").
+          // Try matching by basename as a last resort.
+          const basename = chat.modelPath.replace(/\/+$/, "").split("/").pop();
+          if (basename) {
+            const allSessions = sessionManager.getSessions();
+            chatSession = allSessions.find(
+              (s) =>
+                (s.status === "running" ||
+                  s.status === "loading" ||
+                  s.status === "standby") &&
+                s.modelPath.split("/").pop()?.replace(/\/+$/, "") === basename,
+            );
+            if (chatSession) {
+              console.log(
+                `[CHAT] Session found by basename fallback: ${basename} → ${chatSession.id.slice(0, 8)}`,
+              );
+            } else {
+              console.warn(
+                `[CHAT] No session found for modelPath=${chat.modelPath} — timeout will use default 300s`,
+              );
+            }
+          }
+        }
+        if (chatSession) {
+          // Touch session to reset idle timer — prevents premature sleep during active chat
+          sessionManager.touchSession(chatSession.id);
+          try {
+            const sessionConfig = JSON.parse(chatSession.config);
+            if (sessionConfig.timeout === 0) {
+              // "No limit" — match the 86400s (24h) that sessions.ts sends via --timeout
+              timeoutSeconds = 86400;
+            } else if (sessionConfig.timeout && sessionConfig.timeout > 0) {
+              timeoutSeconds = sessionConfig.timeout;
+            }
+            // Check if model has a reasoning parser (for enable_thinking default)
+            const detected = detectModelConfigFromDir(chat.modelPath);
+            try {
+              const generationDefaults = await readGenerationDefaults(chat.modelPath);
+              thinkingBudgetSupported = generationDefaults?.thinkingBudgetSupported;
+            } catch {
+              thinkingBudgetSupported = undefined;
+            }
+            chatDetectedFamily = detected.family;
+            timeoutSeconds = effectiveDsv4RequestTimeoutSeconds(
+              timeoutSeconds,
+              chatDetectedFamily,
+            );
+            const smeltActive = !!sessionConfig.smelt;
+            chatIsMultimodal =
+              smeltActive || detected.forceTextOnly
+                ? false
+                : detected.isMultimodal === true
+                  ? true
+                  : sessionConfig.isMultimodal === true
+                    ? true
+                    : sessionConfig.isMultimodal === false
+                      ? false
+                      : false;
+
+            if (detected.supportsThinking === false || !detected.reasoningParser) {
+              sessionHasReasoningParser = false;
+              isHarmonyModel = false;
+            } else if (
+              sessionConfig.reasoningParser &&
+              sessionConfig.reasoningParser !== "auto"
+            ) {
+              sessionHasReasoningParser = true;
+              isHarmonyModel =
+                sessionConfig.reasoningParser === "openai_gptoss";
+            } else if (chat.modelPath) {
+              // Session config missing reasoningParser (model still loading) or set to "auto" —
+              // detect from model directory so thinking toggle works on first message
+              sessionHasReasoningParser = !!detected.reasoningParser;
+              isHarmonyModel = detected.reasoningParser === "openai_gptoss";
+            }
+            // VLM video sampling knobs (undefined → engine default)
+            if (typeof sessionConfig.videoFps === "number" && sessionConfig.videoFps > 0)
+              sessionVideoFps = sessionConfig.videoFps;
+            if (typeof sessionConfig.videoMaxFrames === "number" && sessionConfig.videoMaxFrames > 0)
+              sessionVideoMaxFrames = sessionConfig.videoMaxFrames;
+          } catch (_) {}
+        }
+      }
+      const fetchTimeout = setTimeout(() => {
+        timedOut = true;
+        abortController.abort();
+      }, timeoutSeconds * 1000);
+      activeRequests.set(chatId, {
+        controller: abortController,
+        startedAt: Date.now(),
+        timeoutMs: timeoutSeconds * 1000,
+        endpoint: undefined,
+        responseId: undefined,
+      });
+
+      // Resolve actual server endpoint: explicit endpoint > session by modelPath > detect > default
+      // CRITICAL: When endpoint is passed from the renderer, attach the chatSession
+      // so remote sessions get proper remoteUrl, auth headers, and health check path.
+      // SECURITY: Validate renderer-provided endpoint is localhost or matches a known session
+      if (endpoint) {
+        const isLocalhost =
+          endpoint.host === "127.0.0.1" ||
+          endpoint.host === "localhost" ||
+          endpoint.host === "::1" ||
+          endpoint.host === "0.0.0.0";
+        const isKnownSession =
+          chatSession &&
+          chatSession.host === endpoint.host &&
+          chatSession.port === endpoint.port;
+        if (!isLocalhost && !isKnownSession) {
+          throw new Error(
+            `Endpoint ${endpoint.host}:${endpoint.port} not allowed — must be localhost or match a configured session`,
+          );
+        }
+      }
+      const resolved = endpoint
+        ? ({
+            host: endpoint.host,
+            port: endpoint.port,
+            session: chatSession,
+          } as ResolvedEndpoint)
+        : await resolveServerEndpoint(chat.modelPath);
+
+      // Detect remote session and compute base URL + auth headers
+      const resolvedSession = resolved.session;
+      const isRemote = resolvedSession?.type === "remote";
+      const rawBaseUrl =
+        isRemote && resolvedSession?.remoteUrl
+          ? resolvedSession.remoteUrl.replace(/\/+$/, "")
+          : `http://${connectHost(resolved.host)}:${resolved.port}`;
+      // Resolve .local mDNS hostnames to IPv4 — Node.js fetch resolves them to
+      // unreachable IPv6 link-local addresses (fe80::...) causing "fetch failed"
+      const baseUrl = await resolveUrl(rawBaseUrl);
+      console.log(
+        `[CHAT] Endpoint resolution: isRemote=${isRemote}, rawBaseUrl=${rawBaseUrl}, baseUrl=${baseUrl}, session=${resolvedSession?.id ?? "none"}, type=${resolvedSession?.type ?? "none"}`,
+      );
+      const authHeaders: Record<string, string> = resolvedSession?.id
+        ? getAuthHeaders(resolvedSession.id)
+        : {};
+      // Update active request entry with resolved baseUrl and auth for cancel support
+      const activeEntry = activeRequests.get(chatId);
+      if (activeEntry) {
+        activeEntry.endpoint = { host: resolved.host, port: resolved.port };
+        activeEntry.baseUrl = baseUrl;
+        if (Object.keys(authHeaders).length > 0)
+          activeEntry.authHeaders = authHeaders;
+      }
+
+      // Health check with retry — wait for server to become ready instead of
+      // failing immediately. This prevents orphaned user messages and allows
+      // chatting as soon as the server finishes loading.
+      //
+      // OPTIMIZATION: If the global health monitor confirmed this session healthy
+      // within the last 15 seconds, skip the per-message health check entirely.
+      // The global monitor runs every 5s, so 15s gives a generous window.
+      // This avoids adding 100-500ms+ RTT on every single message for remote sessions.
+      const recentlyHealthy = resolvedSession?.id
+        ? Date.now() - sessionManager.getLastHealthyAt(resolvedSession.id) <
+          15_000
+        : false;
+
+      // Remote sessions: 1 quick attempt then proceed (the request itself has a timeout).
+      // Local sessions: 15 retries with 2s delays (30s total — JANG models need longer to dequantize).
+      const maxHealthRetries = isRemote ? 1 : 15;
+      const healthRetryDelay = isRemote ? 500 : 2000;
+      let healthOk = recentlyHealthy;
+      if (recentlyHealthy) {
+        console.log(
+          `[CHAT] Skipping health check — global monitor confirmed healthy within 15s`,
+        );
+      } else {
+        const healthUrl = isRemote
+          ? `${baseUrl}/v1/models`
+          : `${baseUrl}/health`;
+        console.log(
+          `[CHAT] Health check URL: ${healthUrl} (${isRemote ? "remote" : "local"}, max ${maxHealthRetries} attempts)`,
+        );
+        for (let attempt = 0; attempt < maxHealthRetries; attempt++) {
+          try {
+            const healthRes = await fetch(healthUrl, {
+              headers: authHeaders,
+              signal: AbortSignal.timeout(isRemote ? 3000 : 5000),
+            });
+            if (healthRes.ok) {
+              healthOk = true;
+              console.log(
+                `[CHAT] Health check passed on attempt ${attempt + 1}`,
+              );
+              break;
+            }
+            if (attempt < maxHealthRetries - 1) {
+              console.log(
+                `[CHAT] Server not ready (HTTP ${healthRes.status}), retrying in ${healthRetryDelay}ms...`,
+              );
+              await new Promise((r) => setTimeout(r, healthRetryDelay));
+            }
+          } catch (healthErr: any) {
+            console.log(
+              `[CHAT] Health check failed (attempt ${attempt + 1}/${maxHealthRetries}): ${healthErr.message || healthErr.cause?.message || healthErr}`,
+            );
+            if (attempt < maxHealthRetries - 1) {
+              await new Promise((r) => setTimeout(r, healthRetryDelay));
+            }
+          }
+        }
+      }
+      // For remote sessions: proceed even if health check failed — the request has
+      // its own timeout and the server may just be busy with another generation.
+      if (!healthOk && isRemote) {
+        console.log(
+          `[CHAT] Remote health check failed but proceeding anyway — request will use its own timeout`,
+        );
+        healthOk = true;
+      }
+      if (!healthOk) {
+        activeRequests.delete(chatId);
+        clearTimeout(fetchTimeout);
+        throw new Error(
+          `Cannot reach server on port ${resolved.port} after ${maxHealthRetries} attempts (${(maxHealthRetries * healthRetryDelay) / 1000}s). The model may still be loading — wait for the status indicator to turn green, then try again.`,
+        );
+      }
+
+      // Add user message AFTER health check passes — this prevents orphaned
+      // user messages when the server isn't ready yet.
+      // When attachments are present, store content as JSON array of content parts.
+      const hasAttachments = attachments && attachments.length > 0;
+      // mlxstudio#69: explicit media attachments override chatIsMultimodal
+      // detection. The user clicked "attach image" — that intent must be
+      // honored even when (a) the session lookup failed, (b) the session
+      // config has isMultimodal=false from an older save, or (c) the model
+      // dir's config.json doesn't expose vision_config. The downstream
+      // server will reject the request properly if the model truly cannot
+      // handle media, which is far better than silently dropping it. Text-file
+      // attachments are plain text context and do not need multimodal routing.
+      const hasMediaAttachments =
+        hasAttachments && attachments!.some((a) => inferKind(a) !== "text");
+      const modelForceTextOnly = (() => {
+        try {
+          return !!chat.modelPath &&
+            detectModelConfigFromDir(chat.modelPath).forceTextOnly === true;
+        } catch (_) {
+          return false;
+        }
+      })();
+      if (hasMediaAttachments && modelForceTextOnly) {
+        const imgs = attachments!.filter((a) => inferKind(a) === "image").length;
+        const vids = attachments!.filter((a) => inferKind(a) === "video").length;
+        const auds = attachments!.filter((a) => inferKind(a) === "audio").length;
+        console.log(
+          `[CHAT] Keeping multimodal=false for ${chatId} — model is forceTextOnly and user attached ${imgs} image(s), ${vids} video(s), ${auds} audio file(s)`,
+        );
+      } else if (hasMediaAttachments && !chatIsMultimodal) {
+        const imgs = attachments!.filter((a) => inferKind(a) === "image").length;
+        const vids = attachments!.filter((a) => inferKind(a) === "video").length;
+        const auds = attachments!.filter((a) => inferKind(a) === "audio").length;
+        console.log(
+          `[CHAT] Forcing multimodal=true for ${chatId} — user attached ${imgs} image(s), ${vids} video(s), ${auds} audio file(s)`,
+        );
+        chatIsMultimodal = true;
+      }
+      if (hasAttachments || chatIsMultimodal) {
+        pushChatSessionLog(
+          chatSession?.id || resolvedSession?.id,
+          `[CHAT_DIAG] attachment_route=${JSON.stringify({
+            chatId: chatId.slice(0, 8),
+            modelPath: chat.modelPath,
+            detectedFamily: chatDetectedFamily,
+            modelForceTextOnly,
+            chatIsMultimodal,
+            attachments: summarizeAttachmentsForLog(attachments),
+          })}`,
+        );
+      }
+      const audioFormatFromDataUrl = (dataUrl: string): string => {
+        const mime = dataUrl.match(/^data:([^;,]+)[;,]/)?.[1]?.toLowerCase() || "";
+        if (mime === "audio/mpeg" || mime === "audio/mp3") return "mp3";
+        if (mime === "audio/wave" || mime === "audio/x-wav" || mime === "audio/wav") return "wav";
+        if (mime === "audio/mp4" || mime === "audio/x-m4a") return "m4a";
+        if (mime.startsWith("audio/")) return mime.slice("audio/".length);
+        return "wav";
+      };
+      const audioDataFromDataUrl = (dataUrl: string): string =>
+        dataUrl.includes(",") ? dataUrl.split(",", 2)[1] : dataUrl;
+      const userContentForDb = hasAttachments
+        ? JSON.stringify([
+            ...(content.trim() ? [{ type: "text", text: content }] : []),
+            ...attachments.map((a) => {
+              const kind = inferKind(a);
+              if (kind === "audio") {
+                return {
+                  type: "input_audio",
+                  input_audio: {
+                    data: audioDataFromDataUrl(a.dataUrl),
+                    format: audioFormatFromDataUrl(a.dataUrl),
+                  },
+                };
+              }
+              if (kind === "text") {
+                return {
+                  type: "text",
+                  text: `[Attached file: ${a.name}]\n${a.text || ""}`.trim(),
+                };
+              }
+              return kind === "video"
+                ? { type: "video_url", video_url: { url: a.dataUrl } }
+                : { type: "image_url", image_url: { url: a.dataUrl } };
+            }),
+          ])
+        : content;
+      const userMessage: Message = {
+        id: uuidv4(),
+        chatId,
+        role: "user",
+        content: userContentForDb,
+        timestamp: Date.now(),
+      };
+      db.addMessage(userMessage);
+
+      // Generate assistant message ID upfront so typing indicator can reference it
+      const assistantMessageId = uuidv4();
+
+      // Signal to renderer that the model is processing (typing indicator during TTFT)
+      try {
+        const win = getWindow();
+        if (win && !win.isDestroyed()) {
+          win.webContents.send("chat:typing", {
+            chatId,
+            messageId: assistantMessageId,
+          });
+        }
+      } catch (_) {}
+
+      // Get messages for context
+      const messages = db.getMessages(chatId);
+
+      // Get overrides if any
+      const overrides = db.getChatOverrides(chatId);
+
+      // Build request messages with system prompt if set
+      // Using any[] to support tool_calls and tool_call_id fields
+      const requestMessages: any[] = [];
+
+      // Add system prompt from overrides if available, or agentic prompt when built-in tools enabled
+      const hasSystemPrompt = !!overrides?.systemPrompt;
+      const latestUserText = [...messages]
+        .reverse()
+        .find((m: any) => m?.role === "user" && typeof m.content === "string")
+        ?.content || "";
+      const suppressAgenticToolPromptForExactOutput =
+        overrides?.builtinToolsEnabled === true &&
+        /\breply exactly\s*:/i.test(latestUserText);
+      const suppressGenericAgenticToolPromptForNativeTools =
+        overrides?.builtinToolsEnabled === true &&
+        shouldSuppressGenericAgenticPromptForNativeTools(
+          chatDetectedFamily,
+          chat.modelPath || chat.modelId,
+        );
+      const directMediaAttachmentRule =
+        hasMediaAttachments && overrides?.builtinToolsEnabled
+          ? DIRECT_MEDIA_ATTACHMENT_TOOL_RULE
+          : "";
+      if (hasSystemPrompt && overrides?.builtinToolsEnabled) {
+        const toolRule =
+          "\n\nIMPORTANT: After using any tools, provide a final response. If the user explicitly requested exact final wording or a strict output format, follow that format exactly; otherwise provide a substantive response explaining what you found or did. Never stop after just executing tools.";
+        requestMessages.push({
+          role: "system",
+          content:
+            overrides!.systemPrompt! +
+            (suppressAgenticToolPromptForExactOutput ||
+            suppressGenericAgenticToolPromptForNativeTools
+              ? ""
+              : toolRule) +
+            directMediaAttachmentRule,
+        });
+      } else if (hasSystemPrompt) {
+        requestMessages.push({
+          role: "system",
+          content: overrides!.systemPrompt!,
+        });
+      } else if (
+        overrides?.builtinToolsEnabled &&
+        !suppressAgenticToolPromptForExactOutput &&
+        !suppressGenericAgenticToolPromptForNativeTools
+      ) {
+        requestMessages.push({
+          role: "system",
+          content: AGENTIC_SYSTEM_PROMPT + directMediaAttachmentRule,
+        });
+      } else if (directMediaAttachmentRule) {
+        requestMessages.push({
+          role: "system",
+          content: directMediaAttachmentRule.trim(),
+        });
+      }
+      // No default system prompt injected — let the model's native template handle defaults.
+      // Injecting "You are a helpful assistant." reinforces safety behavior in abliterated/CRACK models.
+
+      // Determine wire format before rebuilding history because persisted
+      // tool-call context must be reconstructed differently for Responses
+      // (`function_call` / `function_call_output` items) versus Chat
+      // Completions (`assistant.tool_calls` / `role:"tool"` messages).
+      const wireApi =
+        overrides?.wireApi || (isRemote ? "completions" : "responses");
+      const useResponsesApi = wireApi === "responses";
+
+      // Add conversation messages (skip any existing system messages to avoid duplicates)
+      // Messages with JSON content arrays (multimodal) are parsed back to content parts for the API
+      for (const m of messages) {
+        if (
+          m.role === "system" &&
+          (hasSystemPrompt || overrides?.builtinToolsEnabled)
+        )
+          continue;
+        let msgContent: any = m.content;
+        // Strip "[Generation interrupted]" markers from previous assistant messages —
+        // these are UI-only annotations saved to DB on abort, not meant for the model
+        if (m.role === "assistant" && typeof msgContent === "string") {
+          msgContent = msgContent
+            .replace(/\n\n\[Generation interrupted\]$/, "")
+            .replace(/^\[Generation interrupted\]$/, "");
+          // Strip any leaked <think> blocks from prior messages when thinking is OFF.
+          // These can leak if server didn't catch them or model was mid-think on abort.
+          // Without stripping, the model sees prior thinking in context and mimics it.
+          if (overrides?.enableThinking === false) {
+            msgContent = msgContent.replace(/<think>[\s\S]*?<\/think>\s*/g, "");
+            msgContent = msgContent.replace(
+              /\[THINK\][\s\S]*?\[\/THINK\]\s*/g,
+              "",
+            );
+          }
+          // 2026-05-03: keep empty-content assistant turns when they
+          // carry tool_calls. An assistant turn that ONLY emits tool
+          // calls has no visible content — but the chat template still
+          // needs the message in history with `tool_calls` set so the
+          // model sees prior calls + their results. Skipping it
+          // collapsed the conversation into "user → user" gibberish
+          // on continuation.
+          const _hasOaiToolCalls =
+            typeof (m as any).toolCallsOaiJson === "string" &&
+            (m as any).toolCallsOaiJson.length > 0;
+          // Codex 2026-05-06 B2: don't drop reasoning-only assistant
+          // rows. A DSV4 turn that hits max_tokens during <think> emits
+          // empty output_text (correct — see server.py B1 fix) but
+          // populated reasoning_content. Dropping the row here would
+          // collapse the conversation into "user → user" pairs and
+          // cause the next turn to replay/merge wrong-prompt framing.
+          // Treat reasoning_content as substantive content for the
+          // skip-empty check.
+          const _hasReasoningContent =
+            typeof (m as any).reasoningContent === "string" &&
+            (m as any).reasoningContent.trim().length > 0;
+          if (
+            !msgContent.trim()
+            && !_hasOaiToolCalls
+            && !_hasReasoningContent
+          ) continue; // Skip entirely empty aborted messages
+        }
+        // Detect JSON content arrays (multimodal messages with images)
+        if (
+          m.role === "user" &&
+          typeof msgContent === "string" &&
+          msgContent.startsWith("[")
+        ) {
+          try {
+            const parsed = JSON.parse(msgContent);
+            if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].type) {
+              if (chatIsMultimodal || isRemote) {
+                msgContent = parsed;
+              } else {
+                // Multimodal is disabled for this model.
+                // Strip images entirely to prevent standard text-only engines from throwing 400 Bad Request
+                msgContent =
+                  parsed
+                    .filter((p: any) => p.type === "text")
+                    .map((p: any) => p.text)
+                    .join("\n") || "[Image omitted]";
+              }
+            }
+          } catch {
+            /* not JSON, use as plain string */
+          }
+        }
+        // 2026-05-03: rebuild tool-call context from DB so chat-template
+        // re-render preserves the tool-call format anchor on continuation.
+        // We store the tool-call request and tool outputs on the visible
+        // assistant row, then expand them into wire-native history here.
+        const reqMsg: any = { role: m.role, content: msgContent };
+        if (m.role === "assistant") {
+          const oai = (m as any).toolCallsOaiJson;
+          if (typeof oai === "string" && oai.length > 0) {
+            try {
+              const tcs = JSON.parse(oai);
+              if (Array.isArray(tcs) && tcs.length > 0) {
+                // Validate shape: must have `function.name` + `function.arguments`.
+                const valid = tcs.filter(
+                  (tc: any) =>
+                    tc &&
+                    tc.id &&
+                    tc.function &&
+                    typeof tc.function.name === "string" &&
+                    typeof tc.function.arguments === "string",
+                );
+                if (valid.length > 0) {
+                  let toolResults: Array<{
+                    tool_call_id: string;
+                    content: string;
+                  }> = [];
+                  const resultsJson = (m as any).toolResultsOaiJson;
+                  if (typeof resultsJson === "string" && resultsJson.length > 0) {
+                    try {
+                      const parsedResults = JSON.parse(resultsJson);
+                      if (Array.isArray(parsedResults)) {
+                        toolResults = parsedResults
+                          .filter(
+                            (r: any) =>
+                              r &&
+                              typeof r.tool_call_id === "string" &&
+                              typeof r.content === "string",
+                          )
+                          .map((r: any) => ({
+                            tool_call_id: r.tool_call_id,
+                            content: r.content,
+                          }));
+                      }
+                    } catch {
+                      /* malformed tool results — replay tool_calls only */
+                    }
+                  }
+
+                  if (useResponsesApi) {
+                    for (const tc of valid) {
+                      requestMessages.push({
+                        type: "function_call",
+                        call_id: tc.id,
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                      });
+                    }
+                    for (const tr of toolResults) {
+                      requestMessages.push({
+                        type: "function_call_output",
+                        call_id: tr.tool_call_id,
+                        output: tr.content,
+                      });
+                    }
+                    if (
+                      typeof msgContent === "string" &&
+                      msgContent.trim().length > 0
+                    ) {
+                      requestMessages.push({
+                        type: "output_text",
+                        text: msgContent,
+                      });
+                    }
+                  } else {
+                    requestMessages.push({
+                      role: "assistant",
+                      content: null,
+                      tool_calls: valid,
+                    });
+                    for (const tr of toolResults) {
+                      requestMessages.push({
+                        role: "tool",
+                        tool_call_id: tr.tool_call_id,
+                        content: tr.content,
+                      });
+                    }
+                    if (
+                      typeof msgContent === "string" &&
+                      msgContent.trim().length > 0
+                    ) {
+                      requestMessages.push({
+                        role: "assistant",
+                        content: msgContent,
+                      });
+                    }
+                  }
+                  continue;
+                }
+              }
+            } catch {
+              /* malformed JSON — drop, fall through to content-only message */
+            }
+          }
+        }
+        requestMessages.push(reqMsg);
+      }
+
+      // Fix role alternation: merge consecutive same-role messages to prevent
+      // template errors (e.g., Mistral enforces strict user/assistant alternation).
+      // This can happen when an aborted assistant message is stripped empty, leaving
+      // two consecutive user messages in history.
+      const mergedMessages: typeof requestMessages = [];
+      for (const msg of requestMessages) {
+        const prev = mergedMessages[mergedMessages.length - 1];
+        if (
+          prev &&
+          prev.role === msg.role &&
+          typeof prev.content === "string" &&
+          typeof msg.content === "string"
+        ) {
+          prev.content = prev.content + "\n\n" + msg.content;
+        } else {
+          mergedMessages.push({ ...msg });
+        }
+      }
+      requestMessages.length = 0;
+      requestMessages.push(...mergedMessages);
+
+      // Prepare assistant message placeholder
+      const assistantMessage: Message = {
+        id: assistantMessageId,
+        chatId,
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+      };
+
+      // Metrics tracking
+      const startTime = Date.now();
+      let fetchStartTime = startTime; // Updated just before the API fetch (for accurate TTFT)
+      let tokenCount = 0;
+      let promptTokens = 0;
+      let cachedTokens = 0;
+      let cacheDetail = "";
+      let firstTokenTime: number | null = null;
+      // Track actual generation time (excludes PP and tool execution pauses)
+      let generationMs = 0;
+      let lastTokenTime: number | null = null;
+      // Rolling window for live TPS: circular buffer of (timestamp, tokenCount) snapshots.
+      // Uses actual token count deltas for accurate throughput — handles multi-token SSE chunks
+      // correctly (e.g., reasoning batches where each chunk may contain 2+ tokens).
+      const TPS_BUFFER_SIZE = 30;
+      const tpsSnapshots: Array<[number, number]> = []; // [timestamp, relative tokenCount]
+      let liveTps = 0;
+      let tpsTokenBase = 0; // re-anchor point for tpsSnapshots after iteration reset
+      // No streaming throttle — emit every token. Renderer-side useTypewriter
+      // in MessageBubble.tsx handles smooth character reveal via rAF.
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      // (thinkingTimer removed — "Thinking silently" indicator disabled)
+      let fullContent = "";
+      let reasoningContent = "";
+      let reasoningSegments: string[] = [];
+      const currentReasoningContent = () =>
+        joinReasoningSegments(reasoningSegments) || reasoningContent;
+      const currentReasoningSegments = () =>
+        visibleReasoningSegments(reasoningSegments);
+      let responseWarnings: string[] | null = null;
+      // Accumulates content across tool iterations so abort during tool execution can recover
+      // earlier content that would otherwise be lost when fullContent is reset between iterations
+      let allGeneratedContent = "";
+      // Per-iteration token count for auto-continue threshold (tokenCount is cumulative)
+      let iterationTokenCount = 0;
+      let iterationTokenBase = 0; // tokenCount at start of iteration (for server-usage delta)
+      // Cumulative token offset: tracks total tokens from completed iterations.
+      // Server restarts completion_tokens from 0 on each new HTTP request, so
+      // raw tokenCount only reflects the current iteration. This offset + iterationTokenCount
+      // gives the true total across all tool iterations.
+      let cumulativeTokenOffset = 0;
+      // Collect tool statuses for DB persistence (mirrors what's emitted to renderer)
+      const collectedToolStatuses: Array<{
+        phase: string;
+        toolName: string;
+        toolCallId?: string;
+        detail?: string;
+        iteration?: number;
+        contentOffset?: number;
+      }> = [];
+      let toolStatusNeedsFlush = false;
+      // Declared outside try so catch block can access them for error recovery
+      let isReasoning = false;
+      let lastFinishReason: string | undefined;
+      // Periodic DB save interval — saves content every 5s so it survives navigation/crashes
+      let periodicSaveInterval: ReturnType<typeof setInterval> | null = null;
+
+      // Pre-insert assistant message to DB immediately so periodic updates have a row to update.
+      // Uses INSERT OR REPLACE so the final addMessage at completion overwrites cleanly.
+      db.addMessage(assistantMessage);
+
+      const startPeriodicSave = () => {
+        if (periodicSaveInterval) return;
+        periodicSaveInterval = setInterval(() => {
+          const saveContent = allGeneratedContent
+            ? fullContent.trim()
+              ? allGeneratedContent + "\n\n" + fullContent.trim()
+              : allGeneratedContent
+            : fullContent;
+          const saveReasoning = currentReasoningContent();
+          if (saveContent || saveReasoning) {
+            try {
+              db.updateMessageContent(
+                assistantMessage.id,
+                saveContent,
+                saveReasoning || undefined,
+                currentReasoningSegments().length > 0
+                  ? JSON.stringify(currentReasoningSegments())
+                  : undefined,
+              );
+            } catch (_) {}
+          }
+        }, 5000);
+      };
+      const stopPeriodicSave = () => {
+        if (periodicSaveInterval) {
+          clearInterval(periodicSaveInterval);
+          periodicSaveInterval = null;
+        }
+      };
+
+      try {
+        // Call API (local vMLX Engine or remote OpenAI-compatible endpoint)
+        const apiUrl = useResponsesApi
+          ? `${baseUrl}/v1/responses`
+          : `${baseUrl}/v1/chat/completions`;
+        console.log(
+          `[CHAT] Sending to: ${apiUrl} (wire: ${wireApi}, remote: ${isRemote})`,
+        );
+
+        // Get model name: remote uses configured model, local reads from health endpoint
+        let modelName = isRemote
+          ? resolvedSession?.remoteModel || chat.modelId || "default"
+          : chat.modelId || "default";
+        if (!isRemote) {
+          try {
+            const healthRes = await fetch(`${baseUrl}/health`, {
+              signal: AbortSignal.timeout(1000),
+            });
+            if (healthRes.ok) {
+              const health = await healthRes.json();
+              if (health.model_name) modelName = health.model_name;
+            }
+          } catch (_) {
+            /* use fallback */
+          }
+        }
+
+        // Only send stop sequences when the user explicitly sets them in chat settings.
+        // The server already handles stop tokens via the model's chat template — sending
+        // all template tokens for every model risks false-positive stops (e.g. Qwen hitting </s>).
+        const stopSequences = overrides?.stopSequences
+          ? overrides.stopSequences
+              .split(",")
+              .map((s: string) => s.trim())
+              .filter(Boolean)
+          : undefined;
+
+        // Build request body — shared between initial request and tool follow-ups
+        const buildRequestBody = (): Record<string, any> => {
+          const resolvedOutputBudget = dsv4OutputBudget(
+            overrides?.maxTokens,
+            overrides?.enableThinking,
+            chatDetectedFamily,
+            overrides?.reasoningEffort,
+          );
+          const resolvedThinkingBudget =
+            typeof overrides?.maxThinkingTokens === "number" &&
+              Number.isFinite(overrides.maxThinkingTokens) &&
+              overrides.maxThinkingTokens > 0
+              ? Math.floor(overrides.maxThinkingTokens)
+              : undefined;
+          const effectiveEnableThinkingOverride =
+            !isRemote &&
+            !sessionHasReasoningParser &&
+            chatDetectedFamily !== "deepseek-v4"
+              ? undefined
+              : overrides?.enableThinking;
+          const applyLocalThinkingBudget = (obj: Record<string, any>) => {
+            if (isRemote || resolvedThinkingBudget == null || obj.enable_thinking === false) {
+              return;
+            }
+            if (thinkingBudgetSupported === false) {
+              return;
+            }
+            if (!sessionHasReasoningParser && chatDetectedFamily !== "deepseek-v4") {
+              return;
+            }
+            obj.max_thinking_tokens = resolvedThinkingBudget;
+            obj.chat_template_kwargs = {
+              ...(obj.chat_template_kwargs || {}),
+              thinking_budget: resolvedThinkingBudget,
+            };
+          };
+          if (useResponsesApi) {
+            const systemMessages = requestMessages.filter(
+              (m: any) => m.role === "system",
+            );
+            const instructions =
+              overrides?.builtinToolsEnabled && systemMessages.length > 0
+                ? systemMessages.map((m: any) => m.content).join("\n")
+                : overrides?.systemPrompt ||
+              (systemMessages.length > 0
+                ? systemMessages.map((m: any) => m.content).join("\n")
+                : undefined);
+            const inputMessages = requestMessages.filter(
+              (m: any) => m.role !== "system",
+            );
+            const obj: Record<string, any> = {
+              model: modelName,
+              input: inputMessages,
+              instructions,
+              // Only send temperature/top_p when explicitly set in chat overrides.
+              // When omitted, the server resolves bundle metadata/family fallback.
+              ...(overrides?.temperature != null
+                ? { temperature: overrides.temperature }
+                : {}),
+              ...(overrides?.topP != null ? { top_p: overrides.topP } : {}),
+              ...(resolvedOutputBudget
+                ? { max_output_tokens: resolvedOutputBudget }
+                : {}),
+              stream: true,
+              stream_options: { include_usage: true },
+            };
+            if (stopSequences) obj.stop = stopSequences;
+            const effectiveTopK = overrides?.topK;
+            if (effectiveTopK != null && effectiveTopK > 0)
+              obj.top_k = effectiveTopK;
+            if (overrides?.minP != null && overrides.minP > 0)
+              obj.min_p = overrides.minP;
+            // Always send when explicitly set; 1.0 can be an intentional
+            // per-chat override of a bundle repetition penalty.
+            if (overrides?.repeatPenalty != null)
+              obj.repetition_penalty = overrides.repeatPenalty;
+            if (overrides?.builtinToolsEnabled) {
+              obj.tools = filterTools(overrides, {
+                hasDirectMediaAttachments: hasMediaAttachments,
+              }).map((t) => ({
+                type: "function",
+                name: t.function.name,
+                description: t.function.description,
+                parameters: t.function.parameters,
+              }));
+            }
+            // enable_thinking: explicit user override sent to both local and remote.
+            // When undefined (auto), local omits the field so the native
+            // model/template default decides; remote gets sessionHasReasoningParser as hint.
+            if (effectiveEnableThinkingOverride !== undefined) {
+              obj.enable_thinking = effectiveEnableThinkingOverride;
+            } else if (isRemote) {
+              obj.enable_thinking = sessionHasReasoningParser;
+            }
+            // chat_template_kwargs: local only (vMLX Engine internal, no remote provider supports this)
+            if (!isRemote && obj.enable_thinking !== undefined)
+              obj.chat_template_kwargs = {
+                enable_thinking: obj.enable_thinking,
+              };
+            applyLocalThinkingBudget(obj);
+            if (
+              shouldForwardReasoningEffort(
+                overrides?.reasoningEffort,
+                obj.enable_thinking,
+                sessionHasReasoningParser,
+                chatDetectedFamily,
+              )
+            )
+              obj.reasoning_effort = overrides.reasoningEffort;
+            if (!isRemote) {
+              if (obj.enable_thinking === false) obj.thinking_mode = "instruct";
+              else if (obj.enable_thinking === true && obj.reasoning_effort === "max")
+                obj.thinking_mode = "max";
+              else if (obj.enable_thinking === true) obj.thinking_mode = "reasoning";
+            }
+            // VLM video sampling — forward to engine only when session
+            // config has non-default values. Remote OpenAI-compatible
+            // providers don't support these fields, so skip there.
+            if (!isRemote && sessionVideoFps !== undefined)
+              obj.video_fps = sessionVideoFps;
+            if (!isRemote && sessionVideoMaxFrames !== undefined)
+              obj.video_max_frames = sessionVideoMaxFrames;
+            // Send timeout to server so streaming timeout matches client-side timeout
+            if (!isRemote && timeoutSeconds !== 300)
+              obj.timeout = timeoutSeconds;
+            return obj;
+          } else {
+            const obj: Record<string, any> = {
+              model: modelName,
+              messages: requestMessages,
+              // Only send temperature/top_p when explicitly set in chat overrides.
+              // When omitted, the server resolves bundle metadata/family fallback.
+              ...(overrides?.temperature != null
+                ? { temperature: overrides.temperature }
+                : {}),
+              ...(overrides?.topP != null ? { top_p: overrides.topP } : {}),
+              ...(resolvedOutputBudget ? { max_tokens: resolvedOutputBudget } : {}),
+              stream: true,
+              stream_options: { include_usage: true },
+            };
+            if (stopSequences) obj.stop = stopSequences;
+            const effectiveTopK = overrides?.topK;
+            if (effectiveTopK != null && effectiveTopK > 0)
+              obj.top_k = effectiveTopK;
+            if (overrides?.minP != null && overrides.minP > 0)
+              obj.min_p = overrides.minP;
+            // Always send when explicitly set; 1.0 can be an intentional
+            // per-chat override of a bundle repetition penalty.
+            if (overrides?.repeatPenalty != null)
+              obj.repetition_penalty = overrides.repeatPenalty;
+            if (overrides?.builtinToolsEnabled) {
+              // Chat Completions API: tools must be in OpenAI format with "function" wrapper
+              // e.g. {"type": "function", "function": {"name": ..., "parameters": ...}}
+              obj.tools = filterTools(overrides, {
+                hasDirectMediaAttachments: hasMediaAttachments,
+              });
+            }
+            // enable_thinking: explicit user override sent to both local and remote.
+            // When undefined (auto), local omits the field so the native
+            // model/template default decides; remote gets sessionHasReasoningParser as hint.
+            // STRICT ENV: Filter out enable_thinking for strict generic 3rd-party API hosts that throw 400 Bad Request.
+            const isStrictApi =
+              isRemote &&
+              apiUrl &&
+              (apiUrl.includes("api.openai.com") ||
+                apiUrl.includes("api.groq.com") ||
+                apiUrl.includes("api.together.xyz") ||
+                apiUrl.includes("api.anthropic.com") ||
+                apiUrl.includes("openrouter.ai") ||
+                apiUrl.includes("api.deepseek.com"));
+
+            if (!isStrictApi) {
+              if (effectiveEnableThinkingOverride !== undefined) {
+                obj.enable_thinking = effectiveEnableThinkingOverride;
+              } else if (isRemote) {
+                obj.enable_thinking = sessionHasReasoningParser;
+              }
+            }
+
+            // chat_template_kwargs: local only (vMLX Engine internal, no remote provider supports this)
+            if (!isRemote && obj.enable_thinking !== undefined)
+              obj.chat_template_kwargs = {
+                enable_thinking: obj.enable_thinking,
+              };
+            applyLocalThinkingBudget(obj);
+            if (
+              !isStrictApi &&
+              shouldForwardReasoningEffort(
+                overrides?.reasoningEffort,
+                obj.enable_thinking,
+                sessionHasReasoningParser,
+                chatDetectedFamily,
+              )
+            )
+              obj.reasoning_effort = overrides.reasoningEffort;
+            if (!isRemote) {
+              if (obj.enable_thinking === false) obj.thinking_mode = "instruct";
+              else if (obj.enable_thinking === true && obj.reasoning_effort === "max")
+                obj.thinking_mode = "max";
+              else if (obj.enable_thinking === true) obj.thinking_mode = "reasoning";
+            }
+            // VLM video sampling — local engine only (strict 3rd-party APIs
+            // reject unknown fields, remote OpenAI-compat doesn't support it).
+            if (!isRemote && sessionVideoFps !== undefined)
+              obj.video_fps = sessionVideoFps;
+            if (!isRemote && sessionVideoMaxFrames !== undefined)
+              obj.video_max_frames = sessionVideoMaxFrames;
+            // Send timeout to server so streaming timeout matches client-side timeout
+            if (!isRemote && timeoutSeconds !== 300)
+              obj.timeout = timeoutSeconds;
+            return obj;
+          }
+        };
+        const requestBody = JSON.stringify(buildRequestBody());
+        const requestDiagSessionId = chatSession?.id || resolvedSession?.id;
+        if (requestDiagSessionId) {
+          pushChatSessionLog(
+            requestDiagSessionId,
+            `[CHAT_DIAG] request_shape=${JSON.stringify({
+              chatId: chatId.slice(0, 8),
+              wireApi,
+              isRemote,
+              baseUrl,
+              chatIsMultimodal,
+              detectedFamily: chatDetectedFamily,
+              sessionHasReasoningParser,
+              body: summarizeRequestForLog(requestBody, useResponsesApi),
+            })}`,
+          );
+        }
+
+        fetchStartTime = Date.now(); // Capture just before fetch for accurate TTFT
+        // Remote internet providers use Electron's net.fetch for certificates
+        // and proxies; loopback model servers use Node streaming for SSE.
+        const useNodeStreamingFetch = !isRemote || isLoopbackUrl(apiUrl);
+        const response = useNodeStreamingFetch
+          ? await streamingFetch(apiUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...authHeaders },
+              body: requestBody,
+              signal: abortController.signal,
+            })
+          : await remoteFetch(apiUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...authHeaders },
+              body: requestBody,
+              signal: abortController.signal,
+            });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          // Try to extract structured error detail from JSON responses
+          let errorDetail = errorText;
+          try {
+            const parsed = JSON.parse(errorText);
+            if (parsed.detail) {
+              errorDetail =
+                typeof parsed.detail === "string"
+                  ? parsed.detail
+                  : Array.isArray(parsed.detail)
+                    ? parsed.detail
+                        .map((d: any) => d.msg || JSON.stringify(d))
+                        .join("; ")
+                    : JSON.stringify(parsed.detail);
+            }
+          } catch {
+            /* use raw text */
+          }
+          throw new Error(`API error: ${response.status} - ${errorDetail}`);
+        }
+
+        // Stream response
+        reader = response.body?.getReader();
+        if (!reader) throw new Error("Response body is null");
+
+        fullContent = "";
+        reasoningContent = "";
+        isReasoning = false;
+        let currentEventType = ""; // Track SSE event type for Responses API
+        const seenResponsesApiEvents = new Set<string>();
+
+        // Track whether server sends real token counts (via usage in each SSE chunk)
+        let serverSendsUsage = false;
+
+        // Codex 2026-05-06 #2: track if Responses-API stream emitted any
+        // text-delta. When the server sends final text via .done events
+        // only (no deltas), we fall back to consuming those — otherwise
+        // assistant message is blank and history rebuilds skip it,
+        // causing wrong-prompt replay on next turn.
+        let _sawResponsesTextDelta = false;
+
+        // Track tool calls received during streaming for MCP auto-execution
+        let receivedToolCalls: Array<{
+          id: string;
+          function: { name: string; arguments: string };
+        }> = [];
+        // Track finish_reason from server to detect truncation (length), content filter, etc.
+        // (declared outside try block so catch can access it for abort recovery)
+        // Track tool iteration count (declared here so processLine closure can access it)
+        const MAX_TOOL_ITERATIONS = overrides?.maxToolIterations ?? 10;
+        let toolIteration = 0;
+
+        // Track the length of content last emitted to renderer (for inline tool call positioning)
+        let lastEmittedContentLength = 0;
+
+        // Helper: emit tool call status to renderer (separate from content stream)
+        const emitToolStatus = (
+          phase: string,
+          toolName: string,
+          detail?: string,
+          iteration?: number,
+          toolCallId?: string,
+        ) => {
+          const contentOffset =
+            phase === "calling" ? lastEmittedContentLength : undefined;
+          // Collect for persistence — include detail for calling, result, and error phases
+          // so tool results are visible after reload (truncate large results to 4KB)
+          const persistDetail =
+            phase === "calling" || phase === "result" || phase === "error"
+              ? detail && detail.length > 4096
+                ? detail.slice(0, 4096) + "..."
+                : detail
+              : undefined;
+          collectedToolStatuses.push({
+            phase,
+            toolName,
+            toolCallId,
+            iteration,
+            contentOffset,
+            detail: persistDetail,
+          });
+          toolStatusNeedsFlush = true;
+          try {
+            const win = getWindow();
+            if (win && !win.isDestroyed()) {
+              win.webContents.send("chat:toolStatus", {
+                chatId,
+                messageId: assistantMessage.id,
+                phase,
+                toolName,
+                toolCallId,
+                detail,
+                iteration,
+                contentOffset,
+              });
+            }
+          } catch (_) {}
+        };
+        const flushToolStatusToRenderer = async () => {
+          if (!toolStatusNeedsFlush) return;
+          toolStatusNeedsFlush = false;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        };
+
+        // Client-side tool call buffering: suppress content when leaked tool call XML detected.
+        // Must check RAW content before template token stripping, since markers like
+        // <minimax:tool_call> get stripped by TEMPLATE_TOKEN_REGEX and never reach fullContent.
+        let clientToolCallBuffering = false;
+        let rawAccumulated = ""; // Tracks unstripped content for tool call detection
+        // Client-side <think> tag extraction: tracks whether we're inside a <think> block
+        // when the server doesn't provide reasoning_content (fallback for all parser types)
+        let clientSideThinkParsing = false;
+
+        // Helper: emit streaming delta to renderer
+        // skipClientCount: when true, skip client-side token counting/TPS (used when
+        // a single SSE chunk is split into multiple emitDelta calls by think-tag extraction,
+        // so we only count once per SSE chunk, not once per emitDelta call)
+        const emitDelta = (
+          delta: string,
+          isReasoningDelta: boolean,
+          skipClientCount = false,
+        ) => {
+          // Skip emission if abort already fired — prevents stale tokens from reaching renderer
+          if (abortController.signal.aborted) return;
+          // Track raw content BEFORE stripping for tool call marker detection
+          let suppressVisibleToolDelta = false;
+          if (!isReasoningDelta) {
+            rawAccumulated += delta;
+            // Only activate buffering when tool call markers appear at the start of a line,
+            // not when the model is explaining tool syntax in prose (e.g., "I'll use <tool_call>...")
+            if (!clientToolCallBuffering) {
+              // Catch real tool call formats and common hallucinated tool-call tags.
+              // Use trailing window (last 200 chars) to avoid O(n) regex on full response
+              const lineStartPattern =
+                /(?:^|\n)\s*(?:<zyphra_tool_call\b|<function(?:=|\b)|<minimax:tool_call|<tool_call\b|\[Calling tool:|<invoke name=|<read_file\b|<write_file\b|<run_command\b|<search_files\b|<edit_file\b|<list_directory\b|<execute_command\b|<bash\b)/;
+              const searchWindow =
+                rawAccumulated.length > 200
+                  ? rawAccumulated.slice(-200)
+                  : rawAccumulated;
+              if (lineStartPattern.test(searchWindow)) {
+                clientToolCallBuffering = true;
+                console.log(`[CHAT] Client-side tool call buffering activated`);
+                emitToolStatus(
+                  "generating",
+                  "",
+                  "Generating tool call...",
+                  toolIteration,
+                );
+              }
+            }
+            suppressVisibleToolDelta = clientToolCallBuffering;
+          }
+
+          // Strip any leaked chat template tokens from the delta
+          delta = delta.replace(TEMPLATE_TOKEN_REGEX, "");
+          if (!delta) return;
+          // Strip Harmony protocol residue — only for GLM/GPT-OSS models that use the
+          // Harmony <|start|><|channel|><|message|> protocol. Without this guard, these
+          // regexes would strip legitimate prose like "assistant analysis" from all models.
+          if (isHarmonyModel) {
+            delta = delta.replace(/<\/?(?:assistant|analysis|final)+/gi, "");
+            delta = delta.replace(
+              /(?:assistant\s*){1,3}(?:analysis|final)/gi,
+              "",
+            );
+            delta = delta.replace(
+              /(?:analysis|final)\s*(?:assistant\s*){1,3}/gi,
+              "",
+            );
+            if (!delta) return;
+          }
+          // Strip U+FFFD replacement characters
+          delta = delta.replace(/\uFFFD/g, "");
+          if (!delta) return;
+
+          // === State updates (always, no throttle) ===
+          const now = Date.now();
+          if (firstTokenTime === null) {
+            firstTokenTime = now;
+            startPeriodicSave();
+          }
+          // Track generation-only time: count time between consecutive tokens.
+          // Gaps > 5s (e.g., tool execution, follow-up PP) are excluded.
+          // Threshold is 5s (not 2s) to handle slow big models at ~0.5 tok/s.
+          if (lastTokenTime !== null) {
+            const gap = now - lastTokenTime;
+            if (gap < 5000) generationMs += gap;
+          }
+          lastTokenTime = now;
+
+          if (isReasoningDelta) {
+            isReasoning = true;
+            reasoningSegments = appendReasoningDelta(reasoningSegments, delta);
+            const visibleSegments = currentReasoningSegments();
+            reasoningContent =
+              visibleSegments.length > 0
+                ? visibleSegments[visibleSegments.length - 1]
+                : "";
+          } else {
+            if (isReasoning) {
+              isReasoning = false;
+              try {
+                const win = getWindow();
+                if (win && !win.isDestroyed()) {
+                  win.webContents.send("chat:reasoningDone", {
+                    chatId,
+                    messageId: assistantMessage.id,
+                    reasoningContent: currentReasoningContent(),
+                    reasoningSegments: currentReasoningSegments(),
+                  });
+                }
+              } catch (_) {}
+            }
+            if (!suppressVisibleToolDelta) {
+              fullContent += delta;
+              // Update content offset immediately (not throttled) for accurate tool call positioning
+              lastEmittedContentLength = allGeneratedContent
+                ? allGeneratedContent.length + 2 + fullContent.length
+                : fullContent.length;
+            }
+          }
+          // Client-side counting (fallback when server doesn't send usage in each chunk).
+          // Must happen BEFORE TPS snapshot so the rolling window uses accurate counts.
+          // skipClientCount prevents inflation when think-tag splitting calls emitDelta
+          // multiple times for a single SSE chunk.
+          if (!serverSendsUsage && !skipClientCount) {
+            tokenCount++;
+            iterationTokenCount++;
+          }
+
+          // Rolling TPS: snapshot (timestamp, relative tokenCount) for accurate throughput.
+          // Uses tpsTokenBase-relative count to avoid negative deltas at iteration boundaries
+          // (server restarts completion_tokens from 0 on each new HTTP request).
+          tpsSnapshots.push([now, tokenCount - tpsTokenBase]);
+          if (tpsSnapshots.length > TPS_BUFFER_SIZE) tpsSnapshots.shift();
+          if (tpsSnapshots.length >= 2) {
+            const [oldT, oldN] = tpsSnapshots[0];
+            const [newT, newN] = tpsSnapshots[tpsSnapshots.length - 1];
+            const span = (newT - oldT) / 1000;
+            const tpsDelta = newN - oldN;
+            liveTps =
+              span > 0.01 && tpsDelta > 0
+                ? tpsDelta / span
+                : tpsDelta <= 0
+                  ? 0
+                  : liveTps;
+          }
+
+          // Suppress rendering (but not counting/TPS) when tool call content is detected
+          if (!isReasoningDelta && suppressVisibleToolDelta) return;
+
+          // === IPC emission — every token emitted immediately ===
+          // Renderer-side useTypewriter handles smooth character reveal via rAF.
+
+          // Live generation TPS from rolling window (real-time speed of incoming tokens).
+          // Cumulative TPS (tokenCount / generationMs) is used for final saved metrics only.
+          const streamTps = liveTps;
+          // Cumulative generation time for elapsed display
+          const genSec = generationMs / 1000;
+          const wallSec = (now - (firstTokenTime || fetchStartTime)) / 1000;
+          const elapsed = genSec > 0.05 ? genSec : wallSec;
+          // TTFT measured from fetchStartTime (excludes health check and message building overhead)
+          const ttft = Math.max(
+            0,
+            firstTokenTime ? (firstTokenTime - fetchStartTime) / 1000 : 0,
+          );
+          const ppSpeed =
+            promptTokens > 0 && ttft > 0.001
+              ? (promptTokens / ttft).toFixed(1)
+              : undefined;
+
+          try {
+            const win = getWindow();
+            if (win && !win.isDestroyed()) {
+              // Include pre-tool content so UI doesn't lose earlier text when fullContent resets
+              const displayContent =
+                !isReasoningDelta && allGeneratedContent
+                  ? allGeneratedContent + "\n\n" + fullContent
+                  : isReasoningDelta
+                    ? currentReasoningContent()
+                    : fullContent;
+              win.webContents.send("chat:stream", {
+                chatId,
+                messageId: assistantMessage.id,
+                fullContent: displayContent,
+                isReasoning: isReasoningDelta,
+                reasoningSegments: isReasoningDelta
+                  ? currentReasoningSegments()
+                  : undefined,
+                metrics: {
+                  tokenCount: cumulativeTokenOffset + iterationTokenCount,
+                  promptTokens,
+                  cachedTokens,
+                  cacheDetail,
+                  tokensPerSecond: streamTps.toFixed(1),
+                  ppSpeed,
+                  ttft: ttft.toFixed(2),
+                  elapsed: elapsed.toFixed(1),
+                },
+              });
+            }
+          } catch (_) {}
+        };
+
+        // Process a single SSE data line (with event type context)
+        const processLine = (trimmed: string) => {
+          // Track SSE event type (Responses API uses "event:" lines)
+          if (trimmed.startsWith("event: ")) {
+            currentEventType = trimmed.slice(7);
+            return;
+          }
+          if (!trimmed) {
+            currentEventType = "";
+            return;
+          } // Blank line = SSE event boundary, reset type
+          if (!trimmed.startsWith("data: ")) return;
+          const data = trimmed.slice(6);
+          if (data === "[DONE]") {
+            currentEventType = "";
+            return;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            const responsesEventType =
+              typeof parsed.type === "string" ? parsed.type : currentEventType;
+
+            if (useResponsesApi && responsesEventType) {
+              const seq = parsed.sequence_number;
+              if (typeof seq === "number") {
+                const key = `${responsesEventType}:${seq}`;
+                if (seenResponsesApiEvents.has(key)) return;
+                seenResponsesApiEvents.add(key);
+              }
+            }
+
+            if (useResponsesApi) {
+              // ── Responses API SSE parsing ──
+              // Track response ID from response.created event
+              // Server wraps in { response: { id: "resp_..." } }
+              const respId = parsed.response?.id || parsed.id;
+              if (responsesEventType === "response.created" && respId) {
+                const entry = activeRequests.get(chatId);
+                if (entry && !entry.responseId) {
+                  entry.responseId = respId;
+                  entry.endpoint = { host: resolved.host, port: resolved.port };
+                }
+              }
+
+              if (
+                responsesEventType === "response.heartbeat" &&
+                parsed.tool_call_generating
+              ) {
+                if (!clientToolCallBuffering) clientToolCallBuffering = true;
+                emitToolStatus(
+                  "generating",
+                  "",
+                  "Generating tool call...",
+                  toolIteration,
+                );
+              }
+
+              // Reasoning delta from OpenAI Responses reasoning-summary events.
+              // Keep the legacy vMLX event accepted so older installed engines
+              // still display reasoning in the panel.
+              if (
+                (responsesEventType === "response.reasoning_summary_text.delta" ||
+                  responsesEventType === "response.reasoning.delta") &&
+                parsed.delta
+              ) {
+                emitDelta(parsed.delta, true);
+              }
+
+              // Reasoning done — triggers reasoningDone event in emitDelta (isReasoning=true→false transition)
+              if (
+                responsesEventType === "response.reasoning_summary_text.done" ||
+                responsesEventType === "response.reasoning.done"
+              ) {
+                // Force the reasoning→content transition so reasoningDone fires
+                if (isReasoning) {
+                  isReasoning = false;
+                  try {
+                    const win = getWindow();
+                    if (win && !win.isDestroyed()) {
+                      win.webContents.send("chat:reasoningDone", {
+                        chatId,
+                        messageId: assistantMessage.id,
+                        reasoningContent: currentReasoningContent(),
+                        reasoningSegments: currentReasoningSegments(),
+                      });
+                    }
+                  } catch (_) {}
+                }
+              }
+
+              // Delta text from response.output_text.delta
+              // Server sends { delta: "text" }, not { text: "..." }
+              if (
+                responsesEventType === "response.output_text.delta" &&
+                (parsed.delta || parsed.text)
+              ) {
+                emitDelta(parsed.delta || parsed.text, false);
+                _sawResponsesTextDelta = true;
+              }
+
+              // Codex 2026-05-06 #2: SSE final-text fallback. If a stream
+              // never emitted any response.output_text.delta events but
+              // the server sends final text via response.output_text.done
+              // or response.content_part.done or response.completed
+              // wrapping output[*].content[*].text, we MUST consume that
+              // final text — otherwise the assistant message is blank,
+              // gets skipped on next-turn rebuild (empty skip in
+              // buildMessagesForApi), consecutive user messages merge
+              // → new user prompt becomes invisible to the model and
+              // it replays the LAST coherent user turn (e.g. "testing").
+              if (
+                responsesEventType === "response.output_text.done" &&
+                typeof parsed.text === "string" &&
+                parsed.text.length > 0 &&
+                !_sawResponsesTextDelta
+              ) {
+                emitDelta(parsed.text, false);
+                _sawResponsesTextDelta = true;
+              }
+              if (
+                responsesEventType === "response.content_part.done" &&
+                parsed.part?.type === "output_text" &&
+                typeof parsed.part?.text === "string" &&
+                parsed.part.text.length > 0 &&
+                !_sawResponsesTextDelta
+              ) {
+                emitDelta(parsed.part.text, false);
+                _sawResponsesTextDelta = true;
+              }
+              if (
+                responsesEventType === "response.completed" &&
+                !_sawResponsesTextDelta
+              ) {
+                // Walk parsed.response.output[*].content[*].text and
+                // emit any output_text we find.
+                const outputs = parsed.response?.output || [];
+                for (const item of outputs) {
+                  if (item?.type !== "message") continue;
+                  for (const part of item?.content || []) {
+                    if (
+                      part?.type === "output_text" &&
+                      typeof part.text === "string" &&
+                      part.text.length > 0
+                    ) {
+                      emitDelta(part.text, false);
+                      _sawResponsesTextDelta = true;
+                    }
+                  }
+                }
+              }
+
+              // Handle function_call items (tool calls) from Responses API
+              // response.output_item.done carries the complete tool call: { item: { type, call_id, name, arguments } }
+              if (
+                responsesEventType === "response.output_item.done" &&
+                parsed.item?.type === "function_call"
+              ) {
+                const item = parsed.item;
+                const toolCallId =
+                  item.call_id ||
+                  `call_${uuidv4().replace(/-/g, "").slice(0, 16)}`;
+                receivedToolCalls.push({
+                  id: toolCallId,
+                  function: {
+                    name: item.name,
+                    arguments: item.arguments || "{}",
+                  },
+                });
+                emitToolStatus(
+                  "calling",
+                  item.name,
+                  item.arguments || "{}",
+                  toolIteration,
+                  toolCallId,
+                );
+              }
+
+              // Real-time usage from response.usage events (per-chunk, for live TPS accuracy)
+              if (responsesEventType === "response.usage" && parsed.usage) {
+                if (parsed.usage.output_tokens != null) {
+                  tokenCount = parsed.usage.output_tokens;
+                  // Detect server token count restart (new HTTP request resets completion_tokens to 0)
+                  if (tokenCount < iterationTokenBase) iterationTokenBase = 0;
+                  iterationTokenCount = Math.max(
+                    0,
+                    tokenCount - iterationTokenBase,
+                  );
+                  // Clear contaminated client-counted entries when transitioning to server usage
+                  if (!serverSendsUsage) {
+                    tpsSnapshots.length = 0;
+                    tpsTokenBase = tokenCount;
+                  }
+                  serverSendsUsage = true;
+                }
+                if (parsed.usage.input_tokens != null)
+                  promptTokens = parsed.usage.input_tokens;
+                if (parsed.usage.input_tokens_details?.cached_tokens) {
+                  cachedTokens =
+                    parsed.usage.input_tokens_details.cached_tokens;
+                  if (parsed.usage.input_tokens_details.cache_detail)
+                    cacheDetail =
+                      parsed.usage.input_tokens_details.cache_detail;
+                }
+              }
+
+              // Handle error events from Responses API
+              // Server may emit "error", "response.error", or "response.failed" event types
+              if (
+                responsesEventType === "error" ||
+                responsesEventType === "response.error" ||
+                responsesEventType === "response.failed"
+              ) {
+                const errDetail =
+                  parsed.error?.message ||
+                  parsed.error?.code ||
+                  parsed.detail ||
+                  JSON.stringify(parsed);
+                if (isExpectedChatBackendDisconnectError(errDetail)) {
+                  throw expectedChatBackendDisconnectError();
+                }
+                console.error(`[CHAT] Responses API error event: ${errDetail}`);
+                throw new Error(`Server error: ${errDetail}`);
+              }
+
+              if (responsesEventType === "response.warning") {
+                const eventWarnings = extractResponsesWarnings(parsed);
+                if (eventWarnings) {
+                  responseWarnings = Array.from(
+                    new Set([...(responseWarnings || []), ...eventWarnings]),
+                  );
+                }
+              }
+
+              // Final usage from response.completed event
+              // Server wraps in { response: { usage: { input_tokens, output_tokens } } }
+              const respUsage = parsed.response?.usage || parsed.usage;
+              if (responsesEventType === "response.completed") {
+                const completedWarnings = extractResponsesWarnings(
+                  parsed.response || parsed,
+                );
+                if (completedWarnings) {
+                  responseWarnings = Array.from(
+                    new Set([...(responseWarnings || []), ...completedWarnings]),
+                  );
+                }
+                // Track status for truncation detection
+                const respStatus = parsed.response?.status;
+                if (respStatus === "incomplete") lastFinishReason = "length";
+                else if (respStatus === "completed") lastFinishReason = "stop";
+                else if (respStatus) lastFinishReason = respStatus;
+              }
+              if (responsesEventType === "response.completed" && respUsage) {
+                if (respUsage.output_tokens != null) {
+                  tokenCount = respUsage.output_tokens;
+                  if (tokenCount < iterationTokenBase) iterationTokenBase = 0;
+                  iterationTokenCount = Math.max(
+                    0,
+                    tokenCount - iterationTokenBase,
+                  );
+                  if (!serverSendsUsage) {
+                    tpsSnapshots.length = 0;
+                    tpsTokenBase = tokenCount;
+                  }
+                  serverSendsUsage = true;
+                }
+                if (respUsage.input_tokens != null)
+                  promptTokens = respUsage.input_tokens;
+                if (respUsage.input_tokens_details?.cached_tokens) {
+                  cachedTokens = respUsage.input_tokens_details.cached_tokens;
+                  if (respUsage.input_tokens_details.cache_detail)
+                    cacheDetail = respUsage.input_tokens_details.cache_detail;
+                }
+              }
+            } else {
+              // ── Chat Completions SSE parsing ──
+              const chatWarnings = extractResponsesWarnings(parsed);
+              if (chatWarnings) {
+                responseWarnings = Array.from(
+                  new Set([...(responseWarnings || []), ...chatWarnings]),
+                );
+              }
+              const choice = parsed.choices?.[0]?.delta;
+
+              // Track response ID for server-side cancel
+              if (parsed.id) {
+                const entry = activeRequests.get(chatId);
+                if (entry && !entry.responseId) {
+                  entry.responseId = parsed.id;
+                  entry.endpoint = { host: resolved.host, port: resolved.port };
+                }
+              }
+
+              // Update usage BEFORE emitting delta so metrics use real server counts
+              if (parsed.usage) {
+                if (parsed.usage.completion_tokens != null) {
+                  tokenCount = parsed.usage.completion_tokens;
+                  // Detect server token count restart (new HTTP request resets completion_tokens to 0)
+                  if (tokenCount < iterationTokenBase) iterationTokenBase = 0;
+                  iterationTokenCount = Math.max(
+                    0,
+                    tokenCount - iterationTokenBase,
+                  );
+                  // Clear contaminated client-counted entries when transitioning to server usage
+                  if (!serverSendsUsage) {
+                    tpsSnapshots.length = 0;
+                    tpsTokenBase = tokenCount;
+                  }
+                  serverSendsUsage = true;
+                }
+                if (parsed.usage.prompt_tokens != null)
+                  promptTokens = parsed.usage.prompt_tokens;
+                if (parsed.usage.prompt_tokens_details?.cached_tokens) {
+                  cachedTokens =
+                    parsed.usage.prompt_tokens_details.cached_tokens;
+                  if (parsed.usage.prompt_tokens_details.cache_detail)
+                    cacheDetail =
+                      parsed.usage.prompt_tokens_details.cache_detail;
+                }
+              }
+
+              // Track finish_reason (length = truncated, content_filter = filtered)
+              const finishReason = parsed.choices?.[0]?.finish_reason;
+              if (finishReason) lastFinishReason = finishReason;
+
+              // Handle error chunks from Chat Completions (tool_choice/JSON schema failures)
+              if (parsed.error) {
+                const errDetail =
+                  parsed.error.message ||
+                  parsed.error.code ||
+                  JSON.stringify(parsed.error);
+                if (isExpectedChatBackendDisconnectError(errDetail)) {
+                  throw expectedChatBackendDisconnectError();
+                }
+                console.error(
+                  `[CHAT] Chat completions error chunk: ${errDetail}`,
+                );
+                throw new Error(`Server error: ${errDetail}`);
+              }
+
+              // Handle reasoning_content from reasoning parser
+              const reasoning = choice?.reasoning_content || choice?.reasoning;
+              if (reasoning) {
+                emitDelta(reasoning, true);
+              }
+
+              // Suppressed-reasoning heartbeat: server emits a chunk with
+              // usage but no content and no reasoning when the model's
+              // template ignored enable_thinking=false and is generating
+              // reasoning tokens internally (e.g., MiniMax M2.5). Without
+              // this branch the UI sees no stream updates for many seconds
+              // and appears hung. Update the stale message metrics so the
+              // user at least sees a live token counter while reasoning
+              // finishes internally.
+              const _hasContent = !!choice?.content;
+              const _hasFinish = !!finishReason;
+              if (
+                !_hasContent &&
+                !reasoning &&
+                !_hasFinish &&
+                parsed.usage &&
+                fullContent === "" &&
+                reasoningContent === ""
+              ) {
+                try {
+                  const win = getWindow();
+                  if (win && !win.isDestroyed()) {
+                    const now = Date.now();
+                    if (firstTokenTime === null) firstTokenTime = now;
+                    const ttft = Math.max(
+                      0,
+                      firstTokenTime
+                        ? (firstTokenTime - fetchStartTime) / 1000
+                        : 0,
+                    );
+                    // 2026-05-02: derive tps from server's usage instead of
+                    // hard-coded "0.0". Suppressed-reasoning heartbeats fire
+                    // throughout the internal thinking phase on models like
+                    // MiniMax M2.5; "0.0 t/s" was misleading users to think
+                    // generation had stalled. server's usage.completion_tokens
+                    // increments correctly per the SSE stream — use that.
+                    const _hbToks =
+                      parsed.usage.completion_tokens ||
+                      parsed.usage.output_tokens ||
+                      0;
+                    const _hbElapsed =
+                      firstTokenTime !== null
+                        ? (now - firstTokenTime) / 1000
+                        : 0;
+                    const _hbTps =
+                      _hbElapsed > 0.1 && _hbToks > 0
+                        ? (_hbToks / _hbElapsed).toFixed(1)
+                        : "0.0";
+                    win.webContents.send("chat:stream", {
+                      chatId,
+                      messageId: assistantMessage.id,
+                      fullContent: "",
+                      isReasoning: false,
+                      metrics: {
+                        tokenCount: _hbToks || tokenCount,
+                        promptTokens,
+                        cachedTokens,
+                        cacheDetail,
+                        tokensPerSecond: _hbTps,
+                        ttft: ttft.toFixed(2),
+                        elapsed: ((now - fetchStartTime) / 1000).toFixed(1),
+                      },
+                    });
+                  }
+                } catch (_) {}
+              }
+
+              if (choice?.content) {
+                // Client-side fallback: if server didn't provide reasoning_content
+                // but content contains <think> tags, extract them client-side.
+                // This handles servers without a reasoning parser, remote endpoints,
+                // and older server versions.
+                // chunkCounted tracks whether we've already counted this SSE chunk's token
+                // to prevent inflation from think-tag splitting into multiple emitDelta calls.
+                if (!reasoning) {
+                  let content = choice.content as string;
+                  let chunkCounted = !!reasoning; // if reasoning was emitted above, counting already happened
+                  const emitWithCount = (text: string, isR: boolean) => {
+                    emitDelta(text, isR, chunkCounted);
+                    chunkCounted = true; // subsequent calls skip counting
+                  };
+                  // Normalize [THINK]/[/THINK] (Mistral 4) to <think>/</think> for unified parsing
+                  content = content
+                    .replace(/\[THINK\]/g, "<think>")
+                    .replace(/\[\/THINK\]/g, "</think>");
+
+                  if (clientSideThinkParsing) {
+                    // We're inside a <think> block — check for closing tag
+                    const endIdx = content.indexOf("</think>");
+                    if (endIdx >= 0) {
+                      const reasoningPart = content.slice(0, endIdx);
+                      const contentPart = content.slice(endIdx + 8); // 8 = '</think>'.length
+                      clientSideThinkParsing = false;
+                      if (reasoningPart) emitWithCount(reasoningPart, true);
+                      if (contentPart) emitWithCount(contentPart, false);
+                    } else {
+                      // Still in reasoning block
+                      emitWithCount(content, true);
+                    }
+                  } else if (content.includes("<think>")) {
+                    // Start of think block found in this delta
+                    const startIdx = content.indexOf("<think>");
+                    const preContent = content.slice(0, startIdx);
+                    const afterStart = content.slice(startIdx + 7); // 7 = '<think>'.length
+                    if (preContent) emitWithCount(preContent, false);
+                    // Check if closing tag is also in this delta
+                    const endIdx = afterStart.indexOf("</think>");
+                    if (endIdx >= 0) {
+                      const reasoningPart = afterStart.slice(0, endIdx);
+                      const postContent = afterStart.slice(endIdx + 8);
+                      if (reasoningPart) emitWithCount(reasoningPart, true);
+                      if (postContent) emitWithCount(postContent, false);
+                    } else {
+                      clientSideThinkParsing = true;
+                      if (afterStart) emitWithCount(afterStart, true);
+                    }
+                  } else {
+                    emitWithCount(content, false);
+                  }
+                } else {
+                  emitDelta(choice.content, false, !!reasoning);
+                }
+              }
+
+              // Detect server-side tool call buffering signal (TPS keeps counting, show status)
+              if (parsed.tool_call_generating) {
+                if (!clientToolCallBuffering) clientToolCallBuffering = true;
+                console.log(
+                  `[CHAT] Server signaled tool call generation in progress`,
+                );
+                emitToolStatus(
+                  "generating",
+                  "",
+                  "Generating tool call...",
+                  toolIteration,
+                );
+              }
+
+              // Handle tool_calls from streaming response
+              // Supports both complete tool calls (vmlx-engine default) and incremental argument
+              // streaming (OpenAI-style: first chunk has name, subsequent chunks append arguments)
+              if (choice?.tool_calls && Array.isArray(choice.tool_calls)) {
+                for (const tc of choice.tool_calls) {
+                  const fn = tc.function;
+                  const idx = tc.index ?? -1;
+                  if (fn?.name) {
+                    // New tool call: initialize (use index for positional tracking)
+                    const toolCall = {
+                      id:
+                        tc.id ||
+                        `call_${uuidv4().replace(/-/g, "").slice(0, 16)}`,
+                      function: {
+                        name: fn.name,
+                        arguments: fn.arguments || "",
+                      },
+                    };
+                    if (idx >= 0) {
+                      receivedToolCalls[idx] = toolCall;
+                    } else {
+                      receivedToolCalls.push(toolCall);
+                    }
+                    console.log(
+                      `[CHAT] Tool call detected: ${fn.name}(${(fn.arguments || "").slice(0, 100)})`,
+                    );
+                    // Don't emit arguments here — during incremental streaming,
+                    // arguments may be empty/partial. Final args shown after execution.
+                    emitToolStatus("calling", fn.name, "", toolIteration, toolCall.id);
+                  } else if (fn?.arguments && idx >= 0) {
+                    // Incremental argument chunk: accumulate arguments for existing tool call
+                    if (receivedToolCalls[idx]) {
+                      receivedToolCalls[idx].function.arguments += fn.arguments;
+                    } else {
+                      // Out-of-order index: initialize a placeholder to prevent sparse array crash
+                      receivedToolCalls[idx] = {
+                        id:
+                          tc.id ||
+                          `call_${uuidv4().replace(/-/g, "").slice(0, 16)}`,
+                        function: { name: "", arguments: fn.arguments },
+                      };
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            // Skip malformed JSON lines — log at debug level for troubleshooting
+            if (e instanceof SyntaxError) {
+              // Expected: malformed SSE data line
+            } else {
+              console.warn(
+                "[CHAT] Error processing SSE line:",
+                (e as Error).message,
+              );
+            }
+          }
+        };
+
+        // ─── Helper: stream SSE response through processLine ──────────────
+        const streamSSE = async (
+          rdr: ReadableStreamDefaultReader<Uint8Array>,
+        ) => {
+          const dec = new TextDecoder();
+          let buf = "";
+          const readNext = async (): Promise<
+            ReadableStreamReadResult<Uint8Array>
+          > => {
+            if (!clientToolCallBuffering) return rdr.read();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              return await Promise.race([
+                rdr.read(),
+                new Promise<ReadableStreamReadResult<Uint8Array>>(
+                  (resolve) => {
+                    timer = setTimeout(async () => {
+                      console.warn(
+                        `[CHAT] Tool call generation stalled for ${TOOL_STREAM_STALL_TIMEOUT_MS}ms; cancelling stalled stream`,
+                      );
+                      emitToolStatus(
+                        "error",
+                        "",
+                        "Tool call generation stalled; cancelled stalled stream.",
+                        toolIteration,
+                      );
+                      clientToolCallBuffering = false;
+                      try {
+                        await rdr.cancel();
+                      } catch (_) {}
+                      resolve({ value: undefined, done: true });
+                    }, TOOL_STREAM_STALL_TIMEOUT_MS);
+                  },
+                ),
+              ]);
+            } finally {
+              if (timer) clearTimeout(timer);
+            }
+          };
+          while (true) {
+            // Check abort before each read — fast models can buffer many chunks
+            if (abortController.signal.aborted) break;
+            const { value, done } = await readNext();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const lines = buf.split("\n");
+            buf = lines.pop() || "";
+            for (let li = 0; li < lines.length; li++) {
+              if (abortController.signal.aborted) break;
+              processLine(lines[li].trim());
+              if (toolStatusNeedsFlush) {
+                await flushToolStatusToRenderer();
+              }
+            }
+          }
+          if (abortController.signal.aborted) return;
+          const rem = dec.decode(); // flush TextDecoder streaming buffer
+          if (rem) buf += rem;
+          // Process remaining lines (may contain multiple newline-separated events)
+          if (buf.trim()) {
+            for (const line of buf.split("\n")) {
+              if (abortController.signal.aborted) break;
+              if (line.trim()) {
+                processLine(line.trim());
+                if (toolStatusNeedsFlush) {
+                  await flushToolStatusToRenderer();
+                }
+              }
+            }
+          }
+        };
+
+        await streamSSE(reader);
+
+        // ─── Helper: send follow-up request and stream response ────────────
+        const sendFollowUp = async (): Promise<boolean> => {
+          // Reset SSE parser state from previous stream
+          currentEventType = "";
+          seenResponsesApiEvents.clear();
+          // Reset fetchStartTime so TTFT for follow-up is measured correctly
+          fetchStartTime = Date.now();
+          firstTokenTime = null;
+          // Use the same wire API format as the initial request
+          const url = useResponsesApi
+            ? `${baseUrl}/v1/responses`
+            : `${baseUrl}/v1/chat/completions`;
+          // Remote internet providers use Electron net.fetch; loopback model
+          // servers use Node streaming so SSE tool events are not buffered.
+          const followUpInit = {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...authHeaders },
+            body: JSON.stringify(buildRequestBody()),
+            signal: abortController.signal,
+          };
+          const useNodeStreamingFetch = !isRemote || isLoopbackUrl(url);
+          const res = useNodeStreamingFetch
+            ? await streamingFetch(url, followUpInit as any)
+            : await remoteFetch(url, followUpInit);
+          if (!res.ok) {
+            const errText = await res.text();
+            console.log(`[CHAT] Follow-up failed: ${res.status} ${errText}`);
+            emitToolStatus(
+              "error",
+              "",
+              `Follow-up error: ${res.status} ${errText}`,
+              toolIteration,
+            );
+            return false;
+          }
+          const followUpReader = res.body?.getReader();
+          if (!followUpReader) return false;
+          await streamSSE(followUpReader);
+          return true;
+        };
+
+        // ─── Helper: execute tool calls and push results to messages ───────
+        const executeToolCalls = async () => {
+          if (useResponsesApi) {
+            // Responses API: push individual output items (not Chat Completions format)
+            if (fullContent) {
+              requestMessages.push({ type: "output_text", text: fullContent });
+            }
+            for (const tc of receivedToolCalls) {
+              requestMessages.push({
+                type: "function_call",
+                call_id: tc.id,
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+              });
+            }
+          } else {
+            // Chat Completions: push assistant message with tool_calls array
+            requestMessages.push({
+              role: "assistant",
+              content: fullContent || null,
+              tool_calls: receivedToolCalls.map((tc) => ({
+                id: tc.id,
+                type: "function" as const,
+                function: {
+                  name: tc.function.name,
+                  arguments: tc.function.arguments,
+                },
+              })),
+            });
+          }
+
+          const pendingImageDataUrls: string[] = [];
+          const pendingVideoDataUrls: string[] = [];
+          for (const tc of receivedToolCalls) {
+            // Check abort between each tool — don't make user wait for all tools to finish
+            if (abortController.signal.aborted)
+              throw Object.assign(new Error("AbortError"), {
+                name: "AbortError",
+              });
+            let resultText = "";
+            try {
+              let toolArgs: Record<string, any>;
+              try {
+                toolArgs = JSON.parse(tc.function.arguments || "{}");
+              } catch (parseErr) {
+                resultText = `Invalid tool arguments: ${(parseErr as Error).message}`;
+                emitToolStatus(
+                  "error",
+                  tc.function.name,
+                  resultText,
+                  toolIteration,
+                  tc.id,
+                );
+                requestMessages.push(
+                  useResponsesApi
+                    ? {
+                        type: "function_call_output",
+                        call_id: tc.id,
+                        output: resultText,
+                      }
+                    : {
+                        role: "tool",
+                        tool_call_id: tc.id,
+                        content: resultText,
+                      },
+                );
+                continue;
+              }
+              emitToolStatus(
+                "executing",
+                tc.function.name,
+                undefined,
+                toolIteration,
+                tc.id,
+              );
+              await flushToolStatusToRenderer();
+
+              if (tc.function.name === "ask_user") {
+                // Special handling: ask_user needs IPC to renderer, not executor
+                const question =
+                  toolArgs.question || "What would you like to do?";
+                emitToolStatus("asking", "ask_user", question, toolIteration, tc.id);
+                resultText = await new Promise<string>((resolve) => {
+                  const win = getWindow();
+                  if (!win || win.isDestroyed()) {
+                    resolve("(User interface not available)");
+                    return;
+                  }
+                  if (abortController.signal.aborted) {
+                    resolve("(Generation was stopped)");
+                    return;
+                  }
+                  win.webContents.send("chat:askUser", { chatId, question });
+                  // Use Map-based resolver (single global listener, no per-call listener accumulation)
+                  const cleanup = () => {
+                    askUserResolvers.delete(chatId);
+                    clearTimeout(askTimeout);
+                    abortController.signal.removeEventListener(
+                      "abort",
+                      onAbort,
+                    );
+                  };
+                  askUserResolvers.set(chatId, (answer: string) => {
+                    cleanup();
+                    resolve(answer);
+                  });
+                  const onAbort = () => {
+                    cleanup();
+                    resolve("(Generation was stopped)");
+                  };
+                  abortController.signal.addEventListener("abort", onAbort, {
+                    once: true,
+                  });
+                  const askTimeout = setTimeout(() => {
+                    cleanup();
+                    resolve("(User did not respond within 5 minutes)");
+                  }, 300000);
+                });
+                emitToolStatus("result", "ask_user", resultText, toolIteration, tc.id);
+              } else if (isBuiltinTool(tc.function.name)) {
+                // Enforce tool category toggles at execution time (defense-in-depth:
+                // filterTools removes disabled tools from definitions sent to model,
+                // but models can hallucinate tool calls not in the provided list)
+                const disabledSet = getDisabledTools(overrides || {});
+                if (disabledSet.has(tc.function.name)) {
+                  resultText = `Tool "${tc.function.name}" is disabled in chat settings.`;
+                  emitToolStatus(
+                    "error",
+                    tc.function.name,
+                    resultText,
+                    toolIteration,
+                    tc.id,
+                  );
+                } else if (!overrides?.workingDirectory) {
+                  resultText =
+                    "Error: Working directory not set. Configure it in Chat Settings.";
+                  emitToolStatus(
+                    "error",
+                    tc.function.name,
+                    resultText,
+                    toolIteration,
+                    tc.id,
+                  );
+                } else {
+                  const workDir = overrides.workingDirectory;
+                  console.log(`[CHAT] Builtin tool: ${tc.function.name}`);
+                  const result = await executeBuiltinTool(
+                    tc.function.name,
+                    toolArgs,
+                    workDir,
+                    overrides?.toolResultMaxChars,
+                  );
+                  resultText = result.content;
+                  // For read_image/read_video: inject media as multimodal
+                  // content for VLM follow-ups. Tool result text is not enough
+                  // for vision models to actually inspect local media bytes.
+                  // Keep local text-only models on text; vmlx-engine will
+                  // reject image_url/video_url content when the loaded runtime
+                  // is not multimodal. Remote endpoints may be multimodal even
+                  // when the local session registry cannot infer it.
+                  if ((result.imageDataUrl || result.videoDataUrl) && !(chatIsMultimodal || isRemote)) {
+                    resultText += "\n\n[Media bytes were not sent because this local session is text-only. Use a VL-compatible model/session to inspect the file visually.]";
+                    console.log(
+                      `[CHAT] Skipping tool media bytes for text-only local session (${tc.function.name})`,
+                    );
+                  } else {
+                    if (result.imageDataUrl) {
+                      pendingImageDataUrls.push(result.imageDataUrl);
+                    }
+                    if (result.videoDataUrl) {
+                      pendingVideoDataUrls.push(result.videoDataUrl);
+                    }
+                  }
+                  emitToolStatus(
+                    result.is_error ? "error" : "result",
+                    tc.function.name,
+                    resultText,
+                    toolIteration,
+                    tc.id,
+                  );
+                }
+              } else if (isRemote) {
+                // MCP tool passthrough is only available on local vmlx-engine servers
+                resultText = `MCP tool "${tc.function.name}" is only available with local vmlx-engine sessions.`;
+                emitToolStatus(
+                  "error",
+                  tc.function.name,
+                  resultText,
+                  toolIteration,
+                  tc.id,
+                );
+              } else {
+                const execRes = await fetch(`${baseUrl}/v1/mcp/execute`, {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    ...authHeaders,
+                  },
+                  body: JSON.stringify({
+                    tool_name: tc.function.name,
+                    arguments: toolArgs,
+                  }),
+                  signal: abortController.signal,
+                });
+                if (!execRes.ok) {
+                  const errText = await execRes.text();
+                  resultText = `Error (${execRes.status}): ${errText}`;
+                  emitToolStatus(
+                    "error",
+                    tc.function.name,
+                    resultText,
+                    toolIteration,
+                    tc.id,
+                  );
+                } else {
+                  const result = await execRes.json();
+                  if (result.is_error) {
+                    resultText = `Error: ${result.error_message || "Unknown error"}`;
+                    emitToolStatus(
+                      "error",
+                      tc.function.name,
+                      resultText,
+                      toolIteration,
+                      tc.id,
+                    );
+                  } else {
+                    resultText =
+                      typeof result.content === "string"
+                        ? result.content
+                        : JSON.stringify(result.content, null, 2);
+                    // Apply same truncation as built-in tools to prevent context overflow
+                    const mcpMaxChars = overrides?.toolResultMaxChars || 50000;
+                    if (resultText.length > mcpMaxChars) {
+                      resultText =
+                        resultText.slice(0, mcpMaxChars) +
+                        `\n\n[Truncated — showing first ${mcpMaxChars} of ${resultText.length} characters]`;
+                    }
+                    emitToolStatus(
+                      "result",
+                      tc.function.name,
+                      resultText,
+                      toolIteration,
+                      tc.id,
+                    );
+                  }
+                }
+              }
+            } catch (err: any) {
+              if (err?.name === "AbortError") throw err;
+              resultText = `Tool execution error: ${err.message}`;
+              emitToolStatus(
+                "error",
+                tc.function.name,
+                err.message,
+                toolIteration,
+                tc.id,
+              );
+            }
+            await flushToolStatusToRenderer();
+
+            requestMessages.push(
+              useResponsesApi
+                ? {
+                    type: "function_call_output",
+                    call_id: tc.id,
+                    output: resultText,
+                  }
+                : { role: "tool", tool_call_id: tc.id, content: resultText },
+            );
+          }
+
+          // Inject media from read_image/read_video tool results as multimodal
+          // content parts. VL models can only process media in content arrays,
+          // not in tool result strings. Text FIRST, then media — Qwen VL
+          // expects this order.
+          const contentParts = buildToolMediaFollowupContent(
+            pendingImageDataUrls,
+            pendingVideoDataUrls,
+          );
+          if (contentParts) {
+            requestMessages.push({ role: "user", content: contentParts });
+            console.log(
+              `[CHAT] Injected ${pendingImageDataUrls.length} image(s), ${pendingVideoDataUrls.length} video(s) as multimodal content for VLM`,
+            );
+          }
+        };
+
+        console.log(
+          `[CHAT] Stream ended — content: ${fullContent.length} chars, reasoning: ${reasoningContent.length} chars, tool calls: ${receivedToolCalls.length}, buffered: ${clientToolCallBuffering}`,
+        );
+
+        // ─── Unified Tool Execution + Auto-Continue Loop ───────────────────
+        // Handles both tool call execution and auto-continuation for models
+        // that stop after tool use without providing a response.
+        // Auto-continue is limited to MAX_AUTO_CONTINUES consecutive attempts.
+        // Resets after each successful tool call round.
+        const AUTO_CONTINUE_TOKEN_THRESHOLD = 100;
+        const MAX_AUTO_CONTINUES = 3;
+        let autoContinueCount = 0;
+        while (toolIteration < MAX_TOOL_ITERATIONS) {
+          // Compact sparse array: parallel tool calls at non-contiguous indices create holes
+          // that for...of silently skips. Filter to only real entries.
+          if (receivedToolCalls.length > 0) {
+            receivedToolCalls = receivedToolCalls.filter(Boolean);
+          }
+          if (receivedToolCalls.length > 0) {
+            // ── Model made tool calls: execute and send follow-up ──
+            toolIteration++;
+            autoContinueCount = 0; // reset — model is making progress
+            console.log(
+              `[CHAT] Tool execution iteration ${toolIteration} (${receivedToolCalls.length} tool calls)`,
+            );
+            // Preserve content before tool execution so abort can recover it
+            if (fullContent.trim()) {
+              allGeneratedContent +=
+                (allGeneratedContent ? "\n\n" : "") + fullContent.trim();
+            }
+            // Flush accumulated content to renderer before blocking on tool execution
+            try {
+              const win = getWindow();
+              if (win && !win.isDestroyed() && allGeneratedContent.trim()) {
+                win.webContents.send("chat:stream", {
+                  chatId,
+                  messageId: assistantMessage.id,
+                  fullContent: allGeneratedContent,
+                  isReasoning: false,
+                  metrics: {
+                    tokenCount: cumulativeTokenOffset + iterationTokenCount,
+                    promptTokens,
+                    cachedTokens,
+                    cacheDetail,
+                    tokensPerSecond: liveTps.toFixed(1),
+                    ttft: firstTokenTime
+                      ? ((firstTokenTime - fetchStartTime) / 1000).toFixed(2)
+                      : "0",
+                    elapsed: (generationMs / 1000).toFixed(1),
+                  },
+                });
+              }
+            } catch (_) {}
+            // Reset idle timer before tool execution — builtin tools run locally
+            // without server contact, so the model could sleep during long tool runs
+            if (chatSession) sessionManager.touchSession(chatSession.id);
+            const touchInterval = chatSession
+              ? setInterval(() => {
+                  sessionManager.touchSession(chatSession.id);
+                }, 30000)
+              : null; // Ping every 30s during tool execution
+
+            try {
+              await executeToolCalls();
+            } finally {
+              if (touchInterval) clearInterval(touchInterval);
+            }
+            receivedToolCalls = [];
+            fullContent = "";
+            rawAccumulated = "";
+            currentEventType = "";
+            seenResponsesApiEvents.clear();
+            lastFinishReason = undefined; // Reset for next iteration
+            // Reset content offset tracker to match the accumulated content position
+            lastEmittedContentLength = allGeneratedContent.length
+              ? allGeneratedContent.length + 2
+              : 0;
+            clientToolCallBuffering = false;
+            clientSideThinkParsing = false;
+            cumulativeTokenOffset += iterationTokenCount; // Save completed iteration tokens for cumulative total
+            iterationTokenBase = tokenCount; // Save cumulative base for server-usage delta
+            iterationTokenCount = 0;
+            tpsSnapshots.length = 0;
+            liveTps = 0;
+            tpsTokenBase = tokenCount; // Reset rolling TPS for fresh generation phase
+            serverSendsUsage = false; // Re-detect for new HTTP request (server restarts completion_tokens from 1)
+            // Fire reasoningDone if model was still in reasoning mode when tool calls appeared
+            if (isReasoning && reasoningContent) {
+              try {
+                const win = getWindow();
+                if (win && !win.isDestroyed()) {
+                  win.webContents.send("chat:reasoningDone", {
+                    chatId,
+                    messageId: assistantMessage.id,
+                    reasoningContent: currentReasoningContent(),
+                    reasoningSegments: currentReasoningSegments(),
+                  });
+                }
+              } catch (_) {}
+            }
+            // chat:reasoningDone emitted above before resetting for the next segment.
+            isReasoning = false; // Reset reasoning state for new iteration
+            reasoningSegments = markReasoningToolBoundary(reasoningSegments);
+            reasoningContent = ""; // Start a fresh reasoning segment for the next iteration
+            // (thinking indicator removed)
+            emitToolStatus("processing", "", undefined, toolIteration);
+            // Reset idle timer before follow-up — tools may have consumed minutes
+            if (chatSession) sessionManager.touchSession(chatSession.id);
+            if (!(await sendFollowUp())) break;
+          } else if (
+            toolIteration > 0 &&
+            autoContinueCount < MAX_AUTO_CONTINUES &&
+            shouldAutoContinueAfterToolUse({
+              content: fullContent,
+              iterationTokenCount,
+              finishReason: lastFinishReason,
+              thresholdTokens: AUTO_CONTINUE_TOKEN_THRESHOLD,
+            })
+          ) {
+            // ── Auto-continue: model stopped without a substantive response after tool use ──
+            // This handles two cases:
+            // 1. Model generated ZERO content after tool results (just stopped)
+            // 2. Model hit the length limit with a brief/incomplete response
+            autoContinueCount++;
+            const hasContent = fullContent.trim().length > 0;
+            console.log(
+              `[CHAT] Auto-continue ${autoContinueCount}/${MAX_AUTO_CONTINUES}: model stopped with ${iterationTokenCount} tokens (iteration), content=${hasContent}`,
+            );
+            if (hasContent) {
+              allGeneratedContent +=
+                (allGeneratedContent ? "\n\n" : "") + fullContent.trim();
+              if (useResponsesApi) {
+                requestMessages.push({
+                  type: "output_text",
+                  text: fullContent,
+                });
+              } else {
+                requestMessages.push({
+                  role: "assistant",
+                  content: fullContent,
+                });
+              }
+            }
+            const continuePrompt =
+              "Based on the tool results above, provide your complete response. Summarize what you found, explain the results, and address my original request.";
+            if (useResponsesApi) {
+              requestMessages.push({
+                type: "message",
+                role: "user",
+                content: continuePrompt,
+              });
+            } else {
+              requestMessages.push({ role: "user", content: continuePrompt });
+            }
+            fullContent = "";
+            rawAccumulated = "";
+            currentEventType = "";
+            seenResponsesApiEvents.clear();
+            lastFinishReason = undefined; // Reset for next iteration
+            clientToolCallBuffering = false;
+            clientSideThinkParsing = false;
+            receivedToolCalls = [];
+            // Reset content offset tracker to match the accumulated content position
+            lastEmittedContentLength = allGeneratedContent.length
+              ? allGeneratedContent.length + 2
+              : 0;
+            cumulativeTokenOffset += iterationTokenCount; // Save completed iteration tokens for cumulative total
+            iterationTokenBase = tokenCount; // Save cumulative base for server-usage delta
+            iterationTokenCount = 0;
+            tpsSnapshots.length = 0;
+            liveTps = 0;
+            tpsTokenBase = tokenCount; // Reset rolling TPS for fresh generation phase
+            serverSendsUsage = false; // Re-detect for new HTTP request (server restarts completion_tokens from 1)
+            // Fire reasoningDone if model was still in reasoning mode at auto-continue boundary
+            if (isReasoning && reasoningContent) {
+              try {
+                const win = getWindow();
+                if (win && !win.isDestroyed()) {
+                  win.webContents.send("chat:reasoningDone", {
+                    chatId,
+                    messageId: assistantMessage.id,
+                    reasoningContent: currentReasoningContent(),
+                    reasoningSegments: currentReasoningSegments(),
+                  });
+                }
+              } catch (_) {}
+            }
+            // chat:reasoningDone emitted above before resetting for the next segment.
+            isReasoning = false; // Reset reasoning state for new iteration
+            reasoningSegments = markReasoningToolBoundary(reasoningSegments);
+            reasoningContent = ""; // Start a fresh reasoning segment for the next iteration
+            // (thinking indicator removed)
+            emitToolStatus(
+              "processing",
+              "",
+              "Generating response...",
+              toolIteration,
+            );
+            // Reset idle timer before auto-continue follow-up
+            if (chatSession) sessionManager.touchSession(chatSession.id);
+            if (!(await sendFollowUp())) break;
+          } else {
+            break;
+          }
+        }
+
+        if (toolIteration > 0 || collectedToolStatuses.length > 0) {
+          if (toolIteration > 0) {
+            console.log(
+              `[CHAT] Tool loop completed after ${toolIteration} iteration(s)`,
+            );
+          }
+          emitToolStatus("done", "", undefined, toolIteration);
+        }
+
+        // Fire reasoningDone if stream ended while still in reasoning mode
+        // (e.g., model only produced analysis channel, never transitioned to final)
+        if (isReasoning) {
+          isReasoning = false;
+          try {
+            const win = getWindow();
+            if (win && !win.isDestroyed()) {
+              win.webContents.send("chat:reasoningDone", {
+                chatId,
+                messageId: assistantMessage.id,
+                reasoningContent: currentReasoningContent(),
+                reasoningSegments: currentReasoningSegments(),
+              });
+            }
+          } catch (_) {}
+        }
+
+        // Calculate final metrics — use generation-only time for t/s, fallback to wall clock
+        const totalTime = (Date.now() - startTime) / 1000;
+        const genTimeSec = generationMs > 0 ? generationMs / 1000 : 0;
+        const wallTimeSec =
+          firstTokenTime && lastTokenTime && lastTokenTime > firstTokenTime
+            ? (lastTokenTime - firstTokenTime) / 1000
+            : firstTokenTime
+              ? (Date.now() - firstTokenTime) / 1000
+              : totalTime;
+        const finalGenSec = genTimeSec > 0.05 ? genTimeSec : wallTimeSec;
+        // Use cumulative total across all tool iterations (server restarts completion_tokens per request)
+        const totalTokenCount = cumulativeTokenOffset + iterationTokenCount;
+        const finalTps = finalGenSec > 0 ? totalTokenCount / finalGenSec : 0;
+        // TTFT measured from fetchStartTime (excludes health check and message building overhead)
+        const ttft = Math.max(
+          0,
+          firstTokenTime ? (firstTokenTime - fetchStartTime) / 1000 : 0,
+        );
+        // Guard against Infinity when TTFT is near zero (e.g., prefix cache hit)
+        const finalPpSpeed =
+          promptTokens > 0 && ttft > 0.001
+            ? (promptTokens / ttft).toFixed(1)
+            : undefined;
+
+        // Combine content from all tool iterations into the final message
+        if (allGeneratedContent && fullContent.trim()) {
+          fullContent = allGeneratedContent + "\n\n" + fullContent;
+        } else if (allGeneratedContent && !fullContent.trim()) {
+          fullContent = allGeneratedContent;
+        }
+
+        // Strip any remaining template tokens and leaked tool call XML
+        fullContent = fullContent.replace(TEMPLATE_TOKEN_REGEX, "");
+        // Strip Harmony protocol residue (concatenated protocol words after template token removal)
+        fullContent = fullContent.replace(
+          /<\/?(?:assistant|analysis|final)+/gi,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /(?:assistant\s*){1,3}(?:analysis|final)/gi,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /(?:analysis|final)\s*(?:assistant\s*){1,3}/gi,
+          "",
+        );
+        // Strip leaked tool call blocks that server didn't parse (various model formats)
+        fullContent = fullContent.replace(
+          /<zyphra_tool_call>[\s\S]*?<\/zyphra_tool_call>/g,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /<minimax:tool_call>[\s\S]*?<\/minimax:tool_call>/g,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /<tool_call>[\s\S]*?<\/tool_call>/g,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /\[Calling tool:\s*\w+\(\{[\s\S]*?\}\)\]/g,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /<invoke\b[^>]*>[\s\S]*?<\/invoke>/g,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /<function(?:=|\b)[\s\S]*?(?:<\/function>|$)/g,
+          "",
+        );
+        fullContent = fullContent.replace(
+          /<parameter\b[^>]*>[\s\S]*?<\/parameter>/g,
+          "",
+        );
+        // Strip hallucinated Claude-style tool calls (models trained on Anthropic data)
+        fullContent = fullContent.replace(
+          /<(?:read_file|write_file|run_command|search_files|edit_file|list_directory|execute_command|bash)\b[^>]*>[\s\S]*?(?:<\/(?:read_file|write_file|run_command|search_files|edit_file|list_directory|execute_command|bash)>|$)/g,
+          "",
+        );
+        // Strip self-closing hallucinated tool calls like <read_file path="..." />
+        fullContent = fullContent.replace(
+          /<(?:read_file|write_file|run_command|search_files|edit_file|list_directory|execute_command|bash)\b[^>]*\/>/g,
+          "",
+        );
+        // Strip leaked Harmony protocol channel markers (GLM, GPT-OSS)
+        fullContent = fullContent.replace(/<\|start\|>assistant/g, "");
+        fullContent = fullContent.replace(
+          /<\|channel\|>(?:analysis|final)<\|message\|>/g,
+          "",
+        );
+        stopPeriodicSave(); // Stop periodic saves — final save below overwrites with complete content
+        fullContent = fullContent.trim();
+        // If no main content but reasoning was produced, keep them separate.
+        // Reasoning stays in reasoningContent for the reasoning box; content stays empty.
+        // (Previously this did fullContent = reasoningContent which triggered the anti-dup
+        // check in MessageBubble, hiding the reasoning box.)
+        const finalReasoningContent = currentReasoningContent();
+        const finalReasoningSegments = currentReasoningSegments();
+        if (!fullContent && finalReasoningContent) {
+          console.log(
+            `[CHAT] No main content — reasoning only (${finalReasoningContent.length} chars)`,
+          );
+        }
+        assistantMessage.content = fullContent;
+        assistantMessage.tokens = totalTokenCount;
+        assistantMessage.metricsJson = JSON.stringify({
+          tokenCount: totalTokenCount,
+          promptTokens: promptTokens || undefined,
+          cachedTokens: cachedTokens || undefined,
+          cacheDetail: cacheDetail || undefined,
+          tokensPerSecond: finalTps.toFixed(1),
+          ppSpeed: finalPpSpeed,
+          ttft: ttft.toFixed(2),
+          totalTime: totalTime.toFixed(1),
+        });
+        if (collectedToolStatuses.length > 0) {
+          assistantMessage.toolCallsJson = JSON.stringify(
+            collectedToolStatuses,
+          );
+        }
+        if (finalReasoningContent) {
+          assistantMessage.reasoningContent = finalReasoningContent;
+        }
+        if (finalReasoningSegments.length > 0) {
+          assistantMessage.reasoningSegmentsJson = JSON.stringify(
+            finalReasoningSegments,
+          );
+        }
+        const finalResponseWarnings = responseWarnings as string[] | null;
+        if (finalResponseWarnings && finalResponseWarnings.length > 0) {
+          assistantMessage.warningsJson = JSON.stringify(finalResponseWarnings);
+          console.warn(
+            `[CHAT] Responses warning(s): ${finalResponseWarnings.join(" | ")}`,
+          );
+        }
+        const mediaWarningWithoutVisibleActivity =
+          hasMediaAttachments &&
+          !fullContent &&
+          !finalReasoningContent &&
+          finalReasoningSegments.length === 0 &&
+          collectedToolStatuses.length === 0 &&
+          finalResponseWarnings &&
+          finalResponseWarnings.length > 0;
+        if (mediaWarningWithoutVisibleActivity) {
+          // Responses can complete with an empty-warning payload instead of
+          // throwing when a VLM image prefill guard rejects before generation.
+          // Do not persist the failed media user turn; otherwise the next
+          // text-only prompt replays the same image and repeats the guard until
+          // the user manually rolls back.
+          try {
+            db.deleteMessage(userMessage.id);
+            pushChatSessionLog(
+              chatSession?.id || resolvedSession?.id,
+              `[CHAT_DIAG] rolled_back_empty_warning_media_user_message=${JSON.stringify({
+                chatId: chatId.slice(0, 8),
+                messageId: userMessage.id.slice(0, 8),
+                warnings: finalResponseWarnings,
+              })}`,
+            );
+          } catch (_) {}
+          throw new Error(
+            `Media request failed before visible output: ${finalResponseWarnings.join(" | ")}`,
+          );
+        }
+
+        // 2026-05-03: persist model-visible tool context separately from
+        // the UI-display tool_calls_json. Without this, history replay drops
+        // tool_calls and the model's chat template can't render `<tool_call>`
+        // XML on continuation — Qwen3 was observed to improvise
+        // `{"tool_name": ..., "arguments": ...}` JSON after an interrupted
+        // tool round.
+        //
+        // Keep the data on the visible assistant row as JSON context, not as
+        // hidden role="tool" DB rows. Older SQLite schemas CHECK message.role
+        // to system/user/assistant, and renderer message lists would display
+        // hidden tool rows. Request reconstruction expands this JSON back into
+        // Responses or Chat-Completions-native history.
+        try {
+          const harvestedCalls: Array<{
+            id: string;
+            type: "function";
+            function: { name: string; arguments: string };
+          }> = [];
+          const harvestedResults: Array<{
+            tool_call_id: string;
+            content: string;
+          }> = [];
+          for (const m of requestMessages) {
+            if (
+              m &&
+              m.role === "assistant" &&
+              Array.isArray(m.tool_calls) && m.tool_calls.length > 0
+            ) {
+              for (const tc of m.tool_calls) {
+                if (
+                  tc &&
+                  tc.id &&
+                  tc.function &&
+                  typeof tc.function.name === "string"
+                ) {
+                  harvestedCalls.push({
+                    id: tc.id,
+                    type: "function",
+                    function: {
+                      name: tc.function.name,
+                      arguments:
+                        typeof tc.function.arguments === "string"
+                          ? tc.function.arguments
+                          : JSON.stringify(tc.function.arguments ?? {}),
+                    },
+                  });
+                }
+              }
+            } else if (
+              m &&
+              m.type === "function_call" &&
+              typeof m.call_id === "string"
+            ) {
+              harvestedCalls.push({
+                id: m.call_id,
+                type: "function",
+                function: {
+                  name: typeof m.name === "string" ? m.name : "",
+                  arguments:
+                    typeof m.arguments === "string"
+                      ? m.arguments
+                      : JSON.stringify(m.arguments ?? {}),
+                },
+              });
+            } else if (
+              m &&
+              m.role === "tool" &&
+              typeof m.tool_call_id === "string"
+            ) {
+              harvestedResults.push({
+                tool_call_id: m.tool_call_id,
+                content:
+                  typeof m.content === "string"
+                    ? m.content
+                    : JSON.stringify(m.content),
+              });
+            } else if (
+              m &&
+              m.type === "function_call_output" &&
+              typeof m.call_id === "string"
+            ) {
+              harvestedResults.push({
+                tool_call_id: m.call_id,
+                content:
+                  typeof m.output === "string"
+                    ? m.output
+                    : JSON.stringify(m.output),
+              });
+            }
+          }
+          if (harvestedCalls.length > 0) {
+            assistantMessage.toolCallsOaiJson = JSON.stringify(
+              harvestedCalls,
+            );
+          }
+          if (harvestedResults.length > 0) {
+            assistantMessage.toolResultsOaiJson = JSON.stringify(
+              harvestedResults,
+            );
+          }
+        } catch (_persistErr) {
+          /* Non-fatal: persistence is best-effort; UI still works without it. */
+        }
+        db.addMessage(assistantMessage);
+
+        // Send final metrics
+        try {
+          const win = getWindow();
+          if (win && !win.isDestroyed()) {
+            win.webContents.send("chat:complete", {
+              chatId,
+              messageId: assistantMessage.id,
+              content: fullContent,
+              reasoningContent: finalReasoningContent || undefined,
+              reasoningSegments:
+                finalReasoningSegments.length > 0
+                  ? finalReasoningSegments
+                  : undefined,
+              warnings: finalResponseWarnings || undefined,
+              finishReason: lastFinishReason,
+              metrics: {
+                tokenCount: totalTokenCount,
+                promptTokens,
+                cachedTokens,
+                cacheDetail,
+                tokensPerSecond: finalTps.toFixed(1),
+                ppSpeed: finalPpSpeed,
+                ttft: ttft.toFixed(2),
+                totalTime: totalTime.toFixed(1),
+              },
+            });
+          }
+        } catch (_) {}
+
+        console.log(
+          `[CHAT] Response complete: ${totalTokenCount} tokens in ${totalTime.toFixed(1)}s (${finalTps.toFixed(1)} t/s, live=${liveTps.toFixed(1)} t/s, TTFT: ${ttft.toFixed(2)}s${promptTokens ? `, pp: ${promptTokens} tokens${cachedTokens ? ` (${cachedTokens} cached)` : ""}, ${finalPpSpeed} pp/s` : ""}, usage=${serverSendsUsage ? "server" : "client"})`,
+        );
+
+        return assistantMessage;
+      } catch (error) {
+        stopPeriodicSave();
+        // Release the SSE reader if it was acquired
+        try {
+          reader?.cancel();
+        } catch (_) {}
+
+        const _err = error as any;
+        if (!isExpectedChatBackendDisconnectError(error)) {
+          console.error("[CHAT] Error caught:", {
+            message: _err?.message,
+            name: _err?.name,
+            code: _err?.code,
+            type: _err?.constructor?.name,
+            stack: _err?.stack?.split("\n").slice(0, 5).join("\n"),
+            abortSignal: abortController.signal.aborted,
+            timedOut,
+            fullContentLen: fullContent?.length,
+            readerAcquired: !!reader,
+          });
+        }
+        pushChatSessionLog(
+          chatSession?.id || resolvedSession?.id,
+          `[CHAT_DIAG] request_error=${JSON.stringify({
+            chatId: chatId.slice(0, 8),
+            message: _err?.message,
+            name: _err?.name,
+            code: _err?.code,
+            timedOut,
+            fullContentLen: fullContent?.length || 0,
+            readerAcquired: !!reader,
+          })}`,
+        );
+
+        // Fire reasoningDone if interrupted during reasoning mode
+        if (isReasoning) {
+          isReasoning = false;
+          try {
+            const win = getWindow();
+            if (win && !win.isDestroyed()) {
+              win.webContents.send("chat:reasoningDone", {
+                chatId,
+                messageId: assistantMessage.id,
+                reasoningContent: currentReasoningContent(),
+                reasoningSegments: currentReasoningSegments(),
+              });
+            }
+          } catch (_) {}
+        }
+
+        // Save partial response: combine all content from previous tool iterations + current.
+        // allGeneratedContent holds text from completed iterations; fullContent has current iteration.
+        const abortFinishReason = lastFinishReason ?? null;
+        let partialContent = "";
+        if (allGeneratedContent.trim() && fullContent.trim()) {
+          partialContent =
+            allGeneratedContent.trim() + "\n\n" + fullContent.trim();
+        } else if (allGeneratedContent.trim()) {
+          partialContent = allGeneratedContent.trim();
+        } else {
+          partialContent = fullContent.trim();
+        }
+        if (partialContent) {
+          partialContent = partialContent.replace(TEMPLATE_TOKEN_REGEX, "");
+          partialContent = partialContent.replace(
+            /<zyphra_tool_call>[\s\S]*?<\/zyphra_tool_call>/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /<minimax:tool_call>[\s\S]*?<\/minimax:tool_call>/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /<tool_call>[\s\S]*?<\/tool_call>/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /\[Calling tool:\s*\w+\(\{[\s\S]*?\}\)\]/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /<invoke\b[^>]*>[\s\S]*?<\/invoke>/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /<function(?:=|\b)[\s\S]*?(?:<\/function>|$)/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /<parameter\b[^>]*>[\s\S]*?<\/parameter>/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /<(?:read_file|write_file|run_command|search_files|edit_file|list_directory|execute_command|bash)\b[^>]*>[\s\S]*?(?:<\/(?:read_file|write_file|run_command|search_files|edit_file|list_directory|execute_command|bash)>|$)/g,
+            "",
+          );
+          partialContent = partialContent.replace(
+            /<(?:read_file|write_file|run_command|search_files|edit_file|list_directory|execute_command|bash)\b[^>]*\/>/g,
+            "",
+          );
+          partialContent = partialContent.replace(/<\|start\|>assistant/g, "");
+          partialContent = partialContent.replace(
+            /<\|channel\|>(?:analysis|final)<\|message\|>/g,
+            "",
+          );
+          partialContent = partialContent.trim();
+        }
+        // Check abort status BEFORE save/delete decision — needed to preserve
+        // tool call displays that the user already saw on screen.
+        const wasAborted = abortController.signal.aborted;
+        const abortTotalTokens = cumulativeTokenOffset + iterationTokenCount;
+        const abortReasoningContent = currentReasoningContent();
+        const abortReasoningSegments = currentReasoningSegments();
+        const hadVisibleActivity =
+          partialContent ||
+          abortReasoningContent.trim() ||
+          collectedToolStatuses.length > 0 ||
+          abortTotalTokens > 0;
+
+        // Save message if we have any content, reasoning, or visible tool activity
+        if (hadVisibleActivity) {
+          assistantMessage.content = partialContent
+            ? partialContent + "\n\n[Generation interrupted]"
+            : "[Generation interrupted]";
+          assistantMessage.tokens = abortTotalTokens;
+
+          // Calculate real metrics for the partial generation (not hardcoded zeros)
+          const abortTotalTime = (Date.now() - startTime) / 1000;
+          const abortGenSec =
+            generationMs > 50
+              ? generationMs / 1000
+              : firstTokenTime
+                ? (Date.now() - firstTokenTime) / 1000
+                : abortTotalTime;
+          const abortTps =
+            abortGenSec > 0 && abortTotalTokens > 0
+              ? abortTotalTokens / abortGenSec
+              : 0;
+          // Use fetchStartTime for TTFT (consistent with non-abort path)
+          const abortTtft = firstTokenTime
+            ? (firstTokenTime - fetchStartTime) / 1000
+            : 0;
+          const abortPpSpeed =
+            promptTokens > 0 && abortTtft > 0.001
+              ? (promptTokens / abortTtft).toFixed(1)
+              : undefined;
+
+          const abortMetrics = {
+            tokenCount: abortTotalTokens,
+            promptTokens: promptTokens || undefined,
+            cachedTokens: cachedTokens || undefined,
+            cacheDetail: cacheDetail || undefined,
+            tokensPerSecond: abortTps.toFixed(1),
+            ppSpeed: abortPpSpeed,
+            ttft: abortTtft.toFixed(2),
+            totalTime: abortTotalTime.toFixed(1),
+          };
+
+          // Persist metricsJson to DB so reloading the chat shows real stats
+          assistantMessage.metricsJson = JSON.stringify(abortMetrics);
+          if (collectedToolStatuses.length > 0) {
+            assistantMessage.toolCallsJson = JSON.stringify(
+              collectedToolStatuses,
+            );
+          }
+          if (abortReasoningContent) {
+            assistantMessage.reasoningContent = abortReasoningContent;
+          }
+          if (abortReasoningSegments.length > 0) {
+            assistantMessage.reasoningSegmentsJson = JSON.stringify(
+              abortReasoningSegments,
+            );
+          }
+          db.addMessage(assistantMessage);
+
+          try {
+            const win = getWindow();
+            if (win && !win.isDestroyed()) {
+              win.webContents.send("chat:complete", {
+                chatId,
+                messageId: assistantMessage.id,
+                content: assistantMessage.content,
+                reasoningContent: abortReasoningContent || undefined,
+                reasoningSegments:
+                  abortReasoningSegments.length > 0
+                    ? abortReasoningSegments
+                    : undefined,
+                finishReason: abortFinishReason,
+                metrics: abortMetrics,
+              });
+            }
+          } catch (_) {}
+        } else {
+          // No content generated — remove the pre-inserted empty placeholder row
+          try {
+            db.deleteMessage(assistantMessage.id);
+          } catch (_) {}
+        }
+
+        if (hasMediaAttachments && !hadVisibleActivity && !wasAborted) {
+          // A failed oversized media turn must not remain in local history.
+          // Otherwise the next text-only prompt replays the same image payload and
+          // hits the same VLM image prefill guard until the user manually rolls back.
+          try {
+            db.deleteMessage(userMessage.id);
+            pushChatSessionLog(
+              chatSession?.id || resolvedSession?.id,
+              `[CHAT_DIAG] rolled_back_failed_media_user_message=${JSON.stringify({
+                chatId: chatId.slice(0, 8),
+                messageId: userMessage.id.slice(0, 8),
+              })}`,
+            );
+          } catch (_) {}
+        }
+
+        // Distinguish timeout from user-initiated abort for better error messages.
+        // CRITICAL: Check abortController.signal.aborted FIRST — when abort fires during
+        // reader.read(), the error message can be 'terminated' instead of 'AbortError',
+        // which would be misclassified as "server connection lost".
+        const errMsg = (error as Error).message || "";
+        if (timedOut) {
+          throw new Error(
+            `Request timed out after ${timeoutSeconds}s. Increase the Timeout setting in Server Settings, or the model may be overloaded.`,
+          );
+        }
+        if (wasAborted) {
+          // User-initiated abort: return normally so the renderer's success path handles it.
+          // Content (if any) was already saved to DB and chat:complete event sent above.
+          console.log(
+            `[CHAT] Abort complete — saved ${partialContent ? partialContent.length : 0} chars, ${collectedToolStatuses.length} tool statuses`,
+          );
+          return hadVisibleActivity ? assistantMessage : null;
+        }
+        // Check both error message AND error code — Node.js ConnResetException has
+        // message "aborted" but code "ECONNRESET", which the message-only check missed.
+        const errCode = (error as any)?.code || "";
+        if (
+          errMsg === "terminated" ||
+          errMsg === "aborted" ||
+          errMsg.includes("ECONNREFUSED") ||
+          errMsg.includes("ECONNRESET") ||
+          errCode === "ECONNRESET" ||
+          errCode === "ECONNREFUSED" ||
+          errCode === "EPIPE" ||
+          errCode === "ERR_STREAM_DESTROYED" ||
+          errMsg.includes("write EPIPE") ||
+          errMsg.includes("Connection closed before response completed") ||
+          errMsg.includes("socket hang up") ||
+          isExpectedChatBackendDisconnectError(error)
+        ) {
+          throw new Error(
+            `Server connection lost. The model server may have crashed or stopped. Try restarting the session.`,
+          );
+        }
+        throw new Error(`Failed to send message: ${errMsg}`);
+      } finally {
+        // Always clean up the active request tracker and periodic save
+        stopPeriodicSave();
+        clearTimeout(fetchTimeout);
+        activeRequests.delete(chatId);
+      }
+    },
+  );
+
+  // B5: Abort active generation for a chat
+  ipcMain.handle("chat:abort", async (_, chatId: string) => {
+    const entry = activeRequests.get(chatId);
+    if (entry) {
+      console.log(`[CHAT] Aborting generation for chat ${chatId}`);
+      // 1. Abort the SSE fetch stream
+      try {
+        entry.controller.abort();
+      } catch (_) {}
+
+      // 2. Tell the server to cancel inference (frees GPU immediately)
+      if (entry.responseId && (entry.endpoint || entry.baseUrl)) {
+        try {
+          // Route to correct cancel endpoint based on response ID prefix
+          const cancelPath = entry.responseId.startsWith("resp_")
+            ? `/v1/responses/${entry.responseId}/cancel`
+            : `/v1/chat/completions/${entry.responseId}/cancel`;
+          const cancelBase =
+            entry.baseUrl ||
+            `http://${connectHost(entry.endpoint!.host)}:${entry.endpoint!.port}`;
+          const cancelRes = await fetch(`${cancelBase}${cancelPath}`, {
+            method: "POST",
+            headers: entry.authHeaders || {},
+            signal: AbortSignal.timeout(2000),
+          });
+          console.log(
+            `[CHAT] Server cancel sent for ${entry.responseId} — status ${cancelRes.status}`,
+          );
+        } catch (cancelErr: any) {
+          console.log(
+            `[CHAT] Server cancel failed for ${entry.responseId}: ${cancelErr.message || cancelErr}`,
+          );
+        }
+      } else if (!entry.responseId) {
+        // Abort during prefill: responseId not assigned yet. The fetch abort (step 1)
+        // closes the connection; the server will detect disconnect via is_disconnected()
+        // on the next token yield. No explicit cancel needed — prefill is typically <2s.
+        console.log(
+          `[CHAT] Abort during prefill (no responseId yet) — connection closed, server will detect disconnect`,
+        );
+      }
+
+      activeRequests.delete(chatId);
+      return { success: true };
+    }
+    return { success: false, error: "No active request for this chat" };
+  });
+
+  // Check if a chat has an active streaming generation (used for re-sync on tab switch)
+  ipcMain.handle("chat:isStreaming", (_, chatId: string) => {
+    return activeRequests.has(chatId);
+  });
+
+  // Clear all active locks (called on window reload/close)
+  ipcMain.handle("chat:clearAllLocks", async () => {
+    const count = activeRequests.size;
+    for (const [chatId, entry] of activeRequests) {
+      // 1. Abort the SSE fetch stream
+      try {
+        entry.controller.abort();
+      } catch (_) {}
+      // 2. Send server-side cancel to free GPU (same logic as chat:abort)
+      if (entry.responseId && (entry.endpoint || entry.baseUrl)) {
+        try {
+          const cancelPath = entry.responseId.startsWith("resp_")
+            ? `/v1/responses/${entry.responseId}/cancel`
+            : `/v1/chat/completions/${entry.responseId}/cancel`;
+          const cancelBase =
+            entry.baseUrl ||
+            `http://${connectHost(entry.endpoint!.host)}:${entry.endpoint!.port}`;
+          fetch(`${cancelBase}${cancelPath}`, {
+            method: "POST",
+            headers: entry.authHeaders || {},
+            signal: AbortSignal.timeout(2000),
+          }).catch(() => {}); // Fire-and-forget, don't block window close
+          console.log(
+            `[CHAT] clearAllLocks: cancel sent for ${chatId} (${entry.responseId})`,
+          );
+        } catch (_) {}
+      }
+    }
+    activeRequests.clear();
+    return { cleared: count };
+  });
+
+  // Overrides — validate numeric bounds to prevent garbage values from reaching the engine
+  ipcMain.handle(
+    "chat:setOverrides",
+    async (_, chatId: string, overrides: any) => {
+      const sanitized = sanitizeChatOverrides({ chatId, ...overrides });
+      db.setChatOverrides({ chatId, ...sanitized });
+
+      return { success: true };
+    },
+  );
+
+  ipcMain.handle("chat:getOverrides", async (_, chatId: string) => {
+    return db.getChatOverrides(chatId);
+  });
+
+  ipcMain.handle("chat:clearOverrides", async (_, chatId: string) => {
+    db.clearChatOverrides(chatId);
+    return { success: true };
+  });
+
+  // Chat Profiles (named presets for chat settings)
+  ipcMain.handle(
+    "chat:saveProfile",
+    async (_, name: string, overrides: any, isDefault?: boolean) => {
+      const id = db.saveChatProfile(name, overrides, isDefault);
+      return { id };
+    },
+  );
+
+  ipcMain.handle(
+    "chat:updateProfile",
+    async (
+      _,
+      id: string,
+      name: string,
+      overrides: any,
+      isDefault?: boolean,
+    ) => {
+      db.updateChatProfile(id, name, overrides, isDefault);
+      return { success: true };
+    },
+  );
+
+  ipcMain.handle("chat:getProfiles", async () => {
+    return db.getChatProfiles();
+  });
+
+  ipcMain.handle("chat:getDefaultProfile", async () => {
+    return db.getDefaultChatProfile();
+  });
+
+  ipcMain.handle("chat:deleteProfile", async (_, id: string) => {
+    db.deleteChatProfile(id);
+    return { success: true };
+  });
+}

@@ -1,0 +1,140 @@
+{
+  "release": "experimental",
+  "configs_compared": [
+    "baseline_fp16",
+    "stable_k8_v5_gs64",
+    "stable_k8_v5_gs32",
+    "experimental_hybrid",
+    "turbo_polar",
+    "adaptive",
+    "turbo_k8r8v6"
+  ],
+  "stable_source": "artifacts/proof/main28",
+  "experimental_source": "artifacts/proof/experimental",
+  "qjl_status": {
+    "enabled_by_default": false,
+    "passes_attention_score_benchmark": false,
+    "recommendation": "disabled"
+  },
+  "rows": [
+    {
+      "config": "baseline_fp16",
+      "cosine_mean": null,
+      "cosine_min": null,
+      "top5_overlap": null,
+      "kl": null,
+      "nll_delta": null,
+      "pass_512": "pass",
+      "pass_1024": "pass",
+      "pass_2048": "pass",
+      "compression_ratio": 1.0,
+      "total_compressed_bytes": null,
+      "recommended_status": "reference"
+    },
+    {
+      "config": "stable_k8_v5_gs64",
+      "source_config": "k8_v5_gs64",
+      "cosine_mean": 0.9997500780969858,
+      "cosine_min": 0.9950459599494934,
+      "top5_overlap": 0.975,
+      "kl": 1.149054559228535e-05,
+      "nll_delta": 7.780431754866868e-05,
+      "pass_512": "pass",
+      "pass_1024": "pass",
+      "pass_2048": "pass",
+      "compression_ratio": 2.2269967304997667,
+      "total_compressed_bytes": 2466432,
+      "memory_basis": "mean_per_prompt_real_model_cache",
+      "recommended_status": "candidate"
+    },
+    {
+      "config": "stable_k8_v5_gs32",
+      "source_config": "k8_v5_gs32",
+      "cosine_mean": 0.9998589498922229,
+      "cosine_min": 0.9991812109947205,
+      "top5_overlap": 0.983125,
+      "kl": 4.598808644756813e-06,
+      "nll_delta": -4.9048874473101026e-08,
+      "pass_512": "pass",
+      "pass_1024": "pass",
+      "pass_2048": "pass",
+      "compression_ratio": 2.0820960698689954,
+      "total_compressed_bytes": 2638080,
+      "memory_basis": "mean_per_prompt_real_model_cache",
+      "recommended_status": "candidate"
+    },
+    {
+      "config": "experimental_hybrid",
+      "cosine_mean": 0.9996278600767254,
+      "cosine_min": 0.9940921068191528,
+      "top5_overlap": 0.97625,
+      "kl": 3.532716303850103e-05,
+      "nll_delta": 6.524444446469602e-05,
+      "pass_512": "pass",
+      "pass_1024": "pass",
+      "pass_2048": "pass",
+      "compression_ratio": 2.27182846932698,
+      "total_compressed_bytes": 2417760,
+      "memory_basis": "mean_per_prompt_real_model_cache",
+      "recommended_status": "candidate"
+    },
+    {
+      "config": "turbo_polar",
+      "cosine_mean": 0.9996293580159545,
+      "cosine_min": 0.9940921068191528,
+      "top5_overlap": 0.9775,
+      "kl": 3.507544003108487e-05,
+      "nll_delta": 8.759105982605319e-05,
+      "pass_512": "pass",
+      "pass_1024": "pass",
+      "pass_2048": "pass",
+      "compression_ratio": 2.27182846932698,
+      "total_compressed_bytes": 2417760,
+      "memory_basis": "mean_per_prompt_real_model_cache",
+      "recommended_status": "candidate"
+    },
+    {
+      "config": "adaptive",
+      "cosine_mean": 0.9998624322935938,
+      "cosine_min": 0.9990529417991638,
+      "top5_overlap": 0.9868750000000001,
+      "kl": 1.2256083610889812e-05,
+      "nll_delta": 0.00012323795861561847,
+      "pass_512": "pass",
+      "pass_1024": "pass",
+      "pass_2048": "pass",
+      "compression_ratio": 2.27182846932698,
+      "total_compressed_bytes": 2417760,
+      "memory_basis": "mean_per_prompt_real_model_cache",
+      "recommended_status": "candidate"
+    },
+    {
+      "config": "turbo_k8r8v6",
+      "cosine_mean": 0.9997904542833567,
+      "cosine_min": 0.9963390827178955,
+      "top5_overlap": 0.97875,
+      "kl": 2.335267554481324e-05,
+      "nll_delta": -0.00010646203022162126,
+      "pass_512": "pass",
+      "pass_1024": "pass",
+      "pass_2048": "pass",
+      "compression_ratio": 2.1118370058686744,
+      "total_compressed_bytes": 2600928,
+      "memory_basis": "mean_per_prompt_real_model_cache",
+      "recommended_status": "candidate"
+    }
+  ],
+  "notes": [
+    "recommended_status values: reference, candidate, rejected_real_model, rejected_quality, rejected_context, rejected_no_compression, needs_memory_data, needs_context_data, missing_data",
+    "No config is recommended after failing any context.",
+    "Unknown context fields produce needs_context_data, never candidate."
+  ],
+  "memory_notes": [
+    "experimental_hybrid, turbo_polar, and adaptive use identical bit widths (8/8/7/8/5); memory differs only if cartesian_bits or group_size changes. adaptive differs only by adaptive_angle_range=True (quality tuning, not storage).",
+    "turbo_k8r8v6 uses cartesian_bits=6, producing larger codes (2,600,928 bytes).",
+    "All configs now use mean_per_prompt_real_model_cache basis via validate_experimental_quant.py.",
+    "Bit-packing is real for 2-8 bit code buffers. Code widths above 8 use raw uint32 fallback.",
+    "No Metal kernels exist for the experimental quantizer path.",
+    "No experimental throughput speedup is proven."
+  ]
+}

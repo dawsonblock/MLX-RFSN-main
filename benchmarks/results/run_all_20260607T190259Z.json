@@ -1,0 +1,37 @@
+{
+  "metadata": {
+    "hardware": "arm64",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "python_version": "3.12.0",
+    "mlx_available": true,
+    "timestamp": "20260607T190259Z",
+    "fast_mode": true
+  },
+  "bitpack_numpy": {
+    "suite": "bitpack_numpy",
+    "status": "failed",
+    "error": "Cannot interpret 'mlx.core.uint32' as a data type",
+    "traceback": "Traceback (most recent call last):\n  File \"/Users/dawsonblock/rfsn_v10_corrected_full/benchmarks/run_all.py\", line 204, in suite_bitpack_numpy\n    packed, count = backend.pack_bits(data, bits=4)\n                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/dawsonblock/rfsn_v10_corrected_full/rfsn_v10/kernels/_metal_backend.py\", line 55, in pack_bits\n    codes = codes.astype(mx.uint32)\n            ^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: Cannot interpret 'mlx.core.uint32' as a data type\n"
+  },
+  "attention_mlx": {
+    "suite": "attention_mlx",
+    "status": "ok",
+    "data": {
+      "t_k=256": {
+        "sparse_ms": 1.5185410011326894,
+        "dense_ms": 0.23489599698223174,
+        "speedup": 0.15468531755614193
+      },
+      "t_k=512": {
+        "sparse_ms": 1.1328544933348894,
+        "dense_ms": 0.17800001660361886,
+        "speedup": 0.15712522451106992
+      },
+      "t_k=1024": {
+        "sparse_ms": 1.6236670053331181,
+        "dense_ms": 0.22666651057079434,
+        "speedup": 0.13960159923573154
+      }
+    }
+  }
+}
