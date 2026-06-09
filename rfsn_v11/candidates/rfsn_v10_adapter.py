@@ -60,8 +60,10 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 error="rfsn_v10 or mlx_lm not importable",
             )
         try:
+            import contextlib
+            import io
             from rfsn_v10.config import RFSNConfig, QuantizationConfig
-            from rfsn_v10.runtime.generation import GenerationConfig, RFSNGenerator
+            from rfsn_v10.runtime.generation import RFSNGenerator
 
             quant_kwargs = _PRESET_MAP[self.config_name]
             cfg = RFSNConfig(
@@ -75,8 +77,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 enable_sparse_decode=False,
             )
 
-            # Suppress mlx-lm deprecated-arg print()s from RFSNGenerator internals
-            import io, contextlib
+            # Suppress mlx-lm deprecated-arg print()s from internals
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(io.StringIO()):
                 tokens = list(generator.generate(
