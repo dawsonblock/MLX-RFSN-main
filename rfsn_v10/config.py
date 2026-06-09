@@ -126,6 +126,11 @@ class ServerConfig(BaseModel):
     request_timeout_seconds: int = Field(default=120, ge=1)
     enable_dashboard: bool = Field(default=True, description="Serve /dashboard static HTML")
     enable_docs: bool = Field(default=True, description="Serve /docs and /redoc")
+    max_concurrent_requests: int = Field(
+        default=1,
+        ge=1,
+        description="Max simultaneous generation requests (RFSN_MAX_CONCURRENT_REQUESTS)",
+    )
 
     @field_validator("api_key")
     @classmethod
@@ -138,6 +143,12 @@ class ServerConfig(BaseModel):
             raise ValueError(
                 "ServerConfig.api_key must be set when require_api_key=True. "
                 "Set RFSN_API_KEY in environment."
+            )
+        if self.host == "0.0.0.0" and not self.require_api_key:
+            raise ValueError(
+                "LAN mode (host=0.0.0.0) requires API key enforcement. "
+                "Pass --require-api-key and --api-key, or set "
+                "RFSN_REQUIRE_API_KEY=true and RFSN_API_KEY=<key>."
             )
 
 
@@ -166,6 +177,35 @@ class RuntimeConfig(BaseModel):
     qjl_enabled: bool = Field(default=False)
     sparse_decode_enabled: bool = Field(default=False)
     audit_enabled: bool = Field(default=True)
+    enable_kv_compression: bool = Field(
+        default=False,
+        description="Enable v10 KV compression (RFSN_ENABLE_KV_COMPRESSION). "
+        "Deprecated alias: RFSN_ENABLE_QUANTIZED_KV.",
+    )
+
+
+def _resolve_kv_compression_env() -> bool:
+    """Resolve KV compression flag with compat alias.
+
+    Canonical name: ``RFSN_ENABLE_KV_COMPRESSION``.
+    Deprecated alias: ``RFSN_ENABLE_QUANTIZED_KV`` — accepted but emits a
+    :class:`DeprecationWarning` so operators can migrate.
+    """
+    import warnings as _w
+
+    new_val = os.getenv("RFSN_ENABLE_KV_COMPRESSION")
+    old_val = os.getenv("RFSN_ENABLE_QUANTIZED_KV")
+
+    if old_val is not None and new_val is None:
+        _w.warn(
+            "RFSN_ENABLE_QUANTIZED_KV is deprecated. "
+            "Use RFSN_ENABLE_KV_COMPRESSION instead.",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+        return old_val.lower() == "true"
+
+    return (new_val or "false").lower() == "true"
 
 
 class RFSNConfig(BaseModel):
@@ -244,6 +284,9 @@ class RFSNConfig(BaseModel):
                 enable_docs=(
                     os.getenv("RFSN_ENABLE_DOCS", "true").lower() == "true"
                 ),
+                max_concurrent_requests=int(
+                    os.getenv("RFSN_MAX_CONCURRENT_REQUESTS", "1")
+                ),
             ),
             runtime=RuntimeConfig(
                 default_quant_mode=os.getenv(
@@ -264,6 +307,7 @@ class RFSNConfig(BaseModel):
                     os.getenv("RFSN_AUDIT_ENABLED", "true").lower()
                     == "true"
                 ),
+                enable_kv_compression=_resolve_kv_compression_env(),
             ),
             experimental=ExperimentalConfig(
                 enable_qjl=(

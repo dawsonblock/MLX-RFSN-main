@@ -72,15 +72,50 @@ A v11 fusion candidate can enter `rfsn_v10` when:
 - Has a rollback flag
 - Has docs
 
+## Automated Verdict System
+
+`benchmarks/kv_shootout.py` runs `_classify_candidate()` at the end of every
+shootout and attaches a verdict to each result row in `results.json` and the
+markdown report.
+
+| Verdict | Meaning |
+|---------|---------|
+| `PROMOTE` | All numeric gates pass. Candidate is eligible for promotion to default-on. |
+| `KEEP_EXPERIMENTAL` | Quality passes but memory or performance gate is uncertain. Leave opt-in. |
+| `REGRESSION` | Candidate is meaningfully slower or uses more memory than baseline. Do not promote. |
+| `REJECT` | Failed quality gate or produced no output. Broken — fix before re-running. |
+| `BASELINE` | This row is the FP16 reference. No verdict required. |
+
+### Numeric gates used by the classifier
+
+| Gate | Threshold | Source field |
+|------|-----------|-------------|
+| KV memory reduction | ≥ 30% | `size_ratio` |
+| Peak memory reduction | ≥ 20% | `working_set_memory_mb` vs baseline |
+| Latency regression limit | ≤ −10% tokens/s | `tokens_per_sec` vs baseline |
+| Logit cosine similarity | ≥ 0.995 | `logit_cosine` |
+| Top-5 overlap | ≥ 0.95 | `top5_overlap` |
+
+When a metric is `None` (not yet measured), the classifier conservatively
+assumes it is within spec for that single gate and uses other available gates.
+
 ## Running the shootout
 
 ```bash
-# Quick run (0.5B, 3 prompts)
-python benchmarks/kv_shootout.py --quick
+# Quick run (0.5B, 2 prompts)
+rfsn-bench --quick
 
-# Full run (1.5B, all prompts)
-python benchmarks/kv_shootout.py
+# Full run (1.5B, one prompt per category)
+rfsn-bench
 
-# Results land in benchmarks/results/
-# Report generated at benchmarks/reports/latest.md
+# All prompts in every category
+rfsn-bench --all-prompts
+
+# Specific categories only
+rfsn-bench --categories coding,math
+
+# Results land in artifacts/bench/shootout/
+#   results.json  — machine-readable with promotion_verdict field
+#   results.csv   — spreadsheet-friendly
+#   results.md    — human-readable with Promotion Summary table
 ```

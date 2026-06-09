@@ -79,13 +79,6 @@ MODELS_QUICK = [
     "Qwen/Qwen2.5-0.5B-Instruct",  # quick iteration: head_dim=64, fast load
 ]
 
-PROMPTS_FULL = [
-    "Hello",
-    "The capital of Canada is",
-    "Write a Python function that adds two numbers.",
-    "Explain the difference between RAM and storage.",
-    "Summarize this paragraph in one sentence.",
-]
 PROMPTS_QUICK = [
     "Hello",
     "Write a Python function that adds two numbers.",
@@ -93,6 +86,36 @@ PROMPTS_QUICK = [
 
 MAX_TOKENS_FULL = 200
 MAX_TOKENS_QUICK = 50
+
+PROMPT_SUITE: dict[str, list[str]] = {
+    "short_chat": [
+        "Hello",
+        "What is 2 + 2?",
+    ],
+    "coding": [
+        "Write a Python function that adds two numbers.",
+        "Write a Python class for a min-heap with push and pop methods.",
+        "Implement binary search in Python with type hints.",
+    ],
+    "summarization": [
+        "Summarize this paragraph in one sentence.",
+        "In one sentence, what is machine learning?",
+    ],
+    "long_context": [
+        "Explain the difference between RAM and storage in detail.",
+        "Describe the history of the internet from ARPANET to modern day.",
+    ],
+    "math": [
+        "Solve step by step: if x^2 - 5x + 6 = 0, what are the values of x?",
+        "Explain why 0.1 + 0.2 != 0.3 in floating point arithmetic.",
+    ],
+    "multi_turn": [
+        "User: What is the capital of France?\nAssistant: Paris.\nUser: And what language do they speak there?",
+    ],
+}
+
+# Flat list for non-quick full runs (one prompt per category)
+PROMPTS_FULL = [prompts[0] for prompts in PROMPT_SUITE.values()]
 
 # Temperature=0.0 for all candidates to make text comparable across methods.
 # Without greedy decoding, stochastic sampling causes false text-heuristic FAILs.
@@ -274,6 +297,77 @@ def _text_quality_heuristic(
 
 
 # ---------------------------------------------------------------------------
+# Promotion classifier
+# ---------------------------------------------------------------------------
+
+# Numeric gates from CANDIDATE_PROMOTION.md
+_PROMOTE_KV_MEM_REDUCTION = 0.30      # KV mem reduction >= 30%
+_PROMOTE_PEAK_MEM_REDUCTION = 0.20    # Peak mem reduction >= 20%
+_PROMOTE_LATENCY_REGRESSION = 0.10    # Latency regression no worse than +10%
+_PROMOTE_COSINE_MIN = 0.995
+_PROMOTE_TOP5_MIN = 0.95
+
+
+def _classify_candidate(
+    result: CandidateResult,
+    baseline: "CandidateResult | None",
+) -> str:
+    """Return a promotion verdict for *result* against *baseline*.
+
+    Verdicts
+    --------
+    PROMOTE          — all numeric gates pass; safe to enable by default
+    KEEP_EXPERIMENTAL — quality passes but performance gate uncertain
+    REJECT           — failed quality gate or produced no output
+    REGRESSION       — slower or higher memory than baseline (quality aside)
+    BASELINE         — this is the baseline, no verdict required
+    """
+    if result.name == "mlx_lm_baseline":
+        return "BASELINE"
+    if result.error or not result.passed_quality_gate:
+        return "REJECT"
+
+    if baseline is None:
+        return "KEEP_EXPERIMENTAL"
+
+    # Quality checks
+    cosine_ok = (
+        result.logit_cosine is None  # not measured yet; don't reject on absence
+        or result.logit_cosine >= _PROMOTE_COSINE_MIN
+    )
+    top5_ok = (
+        result.top5_overlap is None
+        or result.top5_overlap >= _PROMOTE_TOP5_MIN
+    )
+    if not (cosine_ok and top5_ok):
+        return "REJECT"
+
+    # Speed regression check
+    if baseline.tokens_per_sec and result.tokens_per_sec:
+        speed_ratio = result.tokens_per_sec / baseline.tokens_per_sec
+        if speed_ratio < (1.0 - _PROMOTE_LATENCY_REGRESSION):
+            return "REGRESSION"
+
+    # Memory gate: KV memory reduction
+    kv_gate_passed = False
+    if result.size_ratio is not None:
+        kv_gate_passed = (1.0 - result.size_ratio) >= _PROMOTE_KV_MEM_REDUCTION
+
+    # Peak memory reduction
+    peak_gate_passed = False
+    if baseline.working_set_memory_mb and result.working_set_memory_mb:
+        peak_reduction = (
+            (baseline.working_set_memory_mb - result.working_set_memory_mb)
+            / baseline.working_set_memory_mb
+        )
+        peak_gate_passed = peak_reduction >= _PROMOTE_PEAK_MEM_REDUCTION
+
+    if kv_gate_passed and peak_gate_passed:
+        return "PROMOTE"
+    return "KEEP_EXPERIMENTAL"
+
+
+# ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
 
@@ -301,6 +395,7 @@ def _result_to_dict(r: CandidateResult) -> dict:
         "passed_quality_gate": r.passed_quality_gate,
         "notes": r.notes,
         "error": r.error,
+        "promotion_verdict": getattr(r, "_promotion_verdict", None),
     }
     return d
 
@@ -381,6 +476,25 @@ def _write_markdown(results: list[CandidateResult], path: Path) -> None:
             )
         lines.append("\n")
 
+    # Promotion summary per candidate
+    lines.append("## Promotion Summary\n\n")
+    lines.append("| Candidate | Verdict | Tokens/s | Quality Gate |\n")
+    lines.append("|---|---|---|---|\n")
+    seen_names: set[str] = set()
+    baseline_result = next(
+        (r for r in results if r.name == "mlx_lm_baseline"), None
+    )
+    for r in results:
+        if r.name in seen_names:
+            continue
+        seen_names.add(r.name)
+        verdict = _classify_candidate(r, baseline_result)
+        r._promotion_verdict = verdict  # attach for JSON output
+        gate = "PASS" if r.passed_quality_gate else ("ERR" if r.error else "FAIL")
+        tps = f"{r.tokens_per_sec:.1f}" if r.tokens_per_sec else "—"
+        lines.append(f"| {r.name} | {verdict} | {tps} | {gate} |\n")
+    lines.append("\n")
+
     # Decision summary
     lines.append("## Decision\n\n")
     passed = [r for r in results if r.passed_quality_gate and r.tokens_per_sec]
@@ -391,14 +505,22 @@ def _write_markdown(results: list[CandidateResult], path: Path) -> None:
         )
     else:
         winner = max(passed, key=lambda r: r.tokens_per_sec or 0.0)
+        winner_verdict = _classify_candidate(winner, baseline_result)
         lines.append(
             f"**Winner: `{winner.name}`** — "
             f"{winner.tokens_per_sec:.1f} tokens/s, "
-            f"quality gate PASS\n\n"
+            f"quality gate PASS, verdict **{winner_verdict}**\n\n"
         )
-        lines.append(
-            "See `STRUCTURE.md` → Promotion rule for next steps.\n"
-        )
+        if winner_verdict == "PROMOTE":
+            lines.append(
+                "> All gates passed. Candidate is eligible for promotion.\n"
+                "> See `docs/CANDIDATE_PROMOTION.md` for promotion steps.\n"
+            )
+        else:
+            lines.append(
+                "> Candidate requires further validation before promotion.\n"
+                "> See `docs/CANDIDATE_PROMOTION.md`.\n"
+            )
 
     with open(path, "w") as f:
         f.writelines(lines)
@@ -429,12 +551,40 @@ def main() -> None:
         default=str(ARTIFACTS_DIR),
         help="Output directory for results",
     )
+    parser.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated PROMPT_SUITE categories to run "
+            "(default: all). Available: "
+            + ", ".join(PROMPT_SUITE.keys())
+        ),
+    )
+    parser.add_argument(
+        "--all-prompts",
+        action="store_true",
+        default=False,
+        help="Run every prompt in each selected category (default: first prompt only)",
+    )
     args = parser.parse_args()
 
     models = [args.model] if args.model else (MODELS_QUICK if args.quick else MODELS_FULL)
-    prompts = PROMPTS_QUICK if args.quick else PROMPTS_FULL
     max_tokens = MAX_TOKENS_QUICK if args.quick else MAX_TOKENS_FULL
     out_dir = Path(args.out)
+
+    if args.quick:
+        prompts = PROMPTS_QUICK
+    elif args.categories:
+        selected = [c.strip() for c in args.categories.split(",")]
+        if args.all_prompts:
+            prompts = [p for k in selected for p in PROMPT_SUITE.get(k, [])]
+        else:
+            prompts = [PROMPT_SUITE[k][0] for k in selected if k in PROMPT_SUITE]
+    elif args.all_prompts:
+        prompts = [p for ps in PROMPT_SUITE.values() for p in ps]
+    else:
+        prompts = PROMPTS_FULL
 
     print("=" * 60)
     print("MLX-RFSN KV-Cache Compression Shootout")

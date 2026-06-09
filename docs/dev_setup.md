@@ -53,7 +53,7 @@ python scripts/release_gate.py --cpu-only
 |----------|---------|-------------|
 | `RFSN_BACKEND` | `mlx` | `mlx` or `numpy` |
 | `RFSN_MODEL_ID` | — | HuggingFace model ID or local path |
-| `RFSN_ENABLE_KV_COMPRESSION` | `false` | Enable v10 KV compression |
+| `RFSN_ENABLE_QUANTIZED_KV` | `false` | Enable v10 KV compression |
 | `RFSN_ENABLE_SPARSE_DECODE` | `false` | Enable sparse decode (experimental) |
 | `RFSN_EXPERIMENTAL_QJL` | `false` | Enable QJL (experimental) |
 | `RFSN_EXPERIMENTAL_POLAR` | `false` | Enable PolarQuant (experimental) |

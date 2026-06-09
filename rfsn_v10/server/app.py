@@ -20,8 +20,9 @@ RFSN_BACKEND
     ``mlx`` or ``numpy`` (default: ``mlx``).
 RFSN_ENABLE_SPARSE_DECODE
     ``true`` or ``false`` (default: ``false``).
-RFSN_ENABLE_QUANTIZED_KV
-    ``true`` or ``false`` (default: ``true``).
+RFSN_ENABLE_KV_COMPRESSION
+    ``true`` or ``false`` (default: ``false``). Deprecated alias:
+    ``RFSN_ENABLE_QUANTIZED_KV`` still accepted but emits a warning.
 RFSN_MAX_NEW_TOKENS
     Default ``256``.
 RFSN_HOST
@@ -53,37 +54,40 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 from .._version import __version__
+from ..config import RFSNConfig
 from ..model_loader import load_model_auto
 from ..runtime.generation import GenerationConfig, RFSNGenerator
 
 
 # ---------------------------------------------------------------------------
-# Server settings (read once at startup)
+# Server settings (read once at startup via RFSNConfig)
 # ---------------------------------------------------------------------------
 
 def _env_bool(key: str, default: bool) -> bool:
     return os.environ.get(key, str(default)).lower() == "true"
 
 
-def _env_int(key: str, default: int) -> int:
-    try:
-        return int(os.environ.get(key, str(default)))
-    except ValueError:
-        return default
+_rfsn_cfg = RFSNConfig.from_env()
+_server_cfg = _rfsn_cfg.server
 
+_REQUIRE_API_KEY: bool = _server_cfg.require_api_key
+_API_KEY: str = _server_cfg.api_key
+_MAX_PROMPT_CHARS: int = _server_cfg.max_prompt_chars
+_MAX_TOKENS_LIMIT: int = _server_cfg.max_tokens_limit
+_REQUEST_TIMEOUT_SECONDS: float = float(_server_cfg.request_timeout_seconds)
 
-def _env_float(key: str, default: float) -> float:
-    try:
-        return float(os.environ.get(key, str(default)))
-    except ValueError:
-        return default
+# Concurrency gate: prevents overlapping generations from crushing the Mac
+_generation_semaphore = asyncio.Semaphore(_server_cfg.max_concurrent_requests)
 
-
-_REQUIRE_API_KEY: bool = _env_bool("RFSN_REQUIRE_API_KEY", False)
-_API_KEY: str = os.environ.get("RFSN_API_KEY", "")
-_MAX_PROMPT_CHARS: int = _env_int("RFSN_MAX_PROMPT_CHARS", 24000)
-_MAX_TOKENS_LIMIT: int = _env_int("RFSN_MAX_TOKENS_LIMIT", 4096)
-_REQUEST_TIMEOUT_SECONDS: float = _env_float("RFSN_REQUEST_TIMEOUT_SECONDS", 120.0)
+# Live metrics (updated on each completed/failed request)
+_metrics: dict = {
+    "requests_total": 0,
+    "last_latency_ms": None,
+    "last_decode_tps": None,
+    "last_error": None,
+    "model_loaded": False,
+    "kv_compression": False,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +173,7 @@ def _load_generator() -> RFSNGenerator:
     model_id = _get_model_id()
     backend = os.environ.get("RFSN_BACKEND", "mlx").lower()
     _sparse_decode_enabled = _env_bool("RFSN_ENABLE_SPARSE_DECODE", False)
-    _kv_compression_enabled = _env_bool("RFSN_ENABLE_QUANTIZED_KV", True)
+    _kv_compression_enabled = _rfsn_cfg.runtime.enable_kv_compression
 
     _model, _tokenizer = load_model_auto(model_id, backend=backend)
     _generator = RFSNGenerator(
@@ -179,6 +183,8 @@ def _load_generator() -> RFSNGenerator:
         enable_quantized_kv=_kv_compression_enabled,
     )
     _model_id_loaded = model_id
+    _metrics["model_loaded"] = True
+    _metrics["kv_compression"] = _kv_compression_enabled
     return _generator
 
 
@@ -220,7 +226,15 @@ async def health() -> dict:
         "sparse_decode": _sparse_decode_enabled,
         "telemetry": False,
         "host": os.environ.get("RFSN_HOST", "127.0.0.1"),
+        "api_key_required": _REQUIRE_API_KEY,
+        "max_concurrent_requests": _server_cfg.max_concurrent_requests,
     }
+
+
+@app.get("/metrics")
+async def metrics() -> dict:
+    """Live server metrics: request counts, last latency, last error."""
+    return dict(_metrics)
 
 
 @app.get("/v1/models")
@@ -306,10 +320,26 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <span id="sparse-val" class="val">...</span></div>
   <div class="row"><span class="label">Telemetry</span>
     <span id="telemetry-val" class="val">...</span></div>
+  <div class="row"><span class="label">API Key Required</span>
+    <span id="apikey-val" class="val">...</span></div>
+  <div class="row"><span class="label">Max Concurrent</span>
+    <span id="concurrent-val" class="val">...</span></div>
+</div>
+<div class="card" id="card-metrics">
+  <h2>Performance</h2>
+  <div class="row"><span class="label">Requests Total</span>
+    <span id="req-total-val" class="val">...</span></div>
+  <div class="row"><span class="label">Last Latency</span>
+    <span id="latency-val" class="val">...</span></div>
+  <div class="row"><span class="label">Last Decode TPS</span>
+    <span id="tps-val" class="val">...</span></div>
+  <div class="row"><span class="label">Last Error</span>
+    <span id="last-error-val" class="val">...</span></div>
 </div>
 <p class="footer">
   <a href="/docs">API Docs</a> &middot;
   <a href="/health">Raw Health JSON</a> &middot;
+  <a href="/metrics">Metrics JSON</a> &middot;
   <a href="/v1/models">Models</a>
 </p>
 <script>
@@ -320,8 +350,9 @@ function badge(val, trueLabel, trueClass, falseLabel, falseClass) {
 }
 async function refresh() {
   try {
-    const r = await fetch('/health');
-    const d = await r.json();
+    const [rh, rm] = await Promise.all([fetch('/health'), fetch('/metrics')]);
+    const d = await rh.json();
+    const m = await rm.json();
     document.getElementById('status-val').innerHTML =
       '<span class="status-dot ' + (d.status==='ok'?'dot-ok':'dot-err') + '"></span>'
       + (d.status || 'unknown');
@@ -337,6 +368,17 @@ async function refresh() {
       badge(d.sparse_decode, 'On (experimental)', 'badge-warn', 'Off', 'badge-off');
     document.getElementById('telemetry-val').innerHTML =
       badge(d.telemetry, 'On', 'badge-on', 'Off', 'badge-off');
+    document.getElementById('apikey-val').innerHTML =
+      badge(d.api_key_required, 'Yes', 'badge-on', 'No', 'badge-off');
+    document.getElementById('concurrent-val').textContent =
+      d.max_concurrent_requests || '1';
+    document.getElementById('req-total-val').textContent = m.requests_total ?? '0';
+    document.getElementById('latency-val').textContent =
+      m.last_latency_ms != null ? m.last_latency_ms + ' ms' : '—';
+    document.getElementById('tps-val').textContent =
+      m.last_decode_tps != null ? m.last_decode_tps + ' tok/s' : '—';
+    document.getElementById('last-error-val').textContent =
+      m.last_error || '—';
     document.getElementById('last-update').textContent =
       'Last updated: ' + new Date().toLocaleTimeString();
   } catch(e) {
@@ -368,6 +410,16 @@ async def chat_completions(
     _auth=Depends(_require_auth),
 ) -> StreamingResponse | ChatCompletionResponse:
     """OpenAI-compatible chat completions endpoint."""
+    # Concurrency gate: return 429 immediately if all slots are busy
+    if not _generation_semaphore._value:  # noqa: SLF001
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Server busy: max {_server_cfg.max_concurrent_requests} "
+                "concurrent request(s). Retry shortly."
+            ),
+        )
+
     # Load generator (may raise on bad config)
     try:
         generator = _load_generator()
@@ -415,21 +467,34 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
-    # Non-streaming: run generation in thread to avoid blocking the event loop
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                generator.chat,
-                prompt,
-                max_new_tokens=cfg.max_new_tokens,
-                temperature=cfg.temperature,
-                top_p=cfg.top_p,
-                repetition_penalty=cfg.repetition_penalty,
-            ),
-            timeout=_REQUEST_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Generation timed out")
+    # Non-streaming: acquire semaphore slot, run in thread
+    _metrics["requests_total"] += 1
+    t_start = time.monotonic()
+    async with _generation_semaphore:
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    generator.chat,
+                    prompt,
+                    max_new_tokens=cfg.max_new_tokens,
+                    temperature=cfg.temperature,
+                    top_p=cfg.top_p,
+                    repetition_penalty=cfg.repetition_penalty,
+                ),
+                timeout=_REQUEST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            _metrics["last_error"] = "Generation timed out"
+            raise HTTPException(status_code=504, detail="Generation timed out")
+        except Exception as exc:
+            _metrics["last_error"] = str(exc)[:200]
+            raise
+    elapsed_ms = (time.monotonic() - t_start) * 1000
+    _metrics["last_latency_ms"] = round(elapsed_ms, 1)
+    _metrics["last_error"] = None
+    tokens = len(result.text.split())
+    if elapsed_ms > 0:
+        _metrics["last_decode_tps"] = round(tokens / (elapsed_ms / 1000), 1)
     return ChatCompletionResponse(
         id=f"rfsn-{int(time.time() * 1000)}",
         created=int(time.time()),

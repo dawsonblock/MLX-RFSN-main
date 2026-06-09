@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> None:
         "--kv-compression",
         action="store_true",
         default=None,
-        help="Enable v10 KV compression (default: on)",
+        help="Enable v10 KV compression (default: off; benchmark before enabling)",
     )
     parser.add_argument(
         "--no-kv-compression",
@@ -81,7 +81,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.backend:
         os.environ["RFSN_BACKEND"] = args.backend
     if args.no_kv_compression:
-        os.environ["RFSN_ENABLE_QUANTIZED_KV"] = "false"
+        os.environ["RFSN_ENABLE_KV_COMPRESSION"] = "false"
+    if args.kv_compression:
+        os.environ["RFSN_ENABLE_KV_COMPRESSION"] = "true"
     if args.require_api_key:
         os.environ["RFSN_REQUIRE_API_KEY"] = "true"
     if args.api_key:
@@ -94,6 +96,13 @@ def main(argv: list[str] | None = None) -> None:
             "  Example: rfsn-server --model mlx-community/Qwen2.5-0.5B-Instruct-4bit"
         )
 
+    # Early config validation (catches LAN guard, missing api_key, etc.)
+    try:
+        from ..config import RFSNConfig
+        cfg = RFSNConfig.from_env()
+    except Exception as exc:
+        sys.exit(f"Configuration error: {exc}")
+
     try:
         import uvicorn
     except ImportError:
@@ -101,14 +110,14 @@ def main(argv: list[str] | None = None) -> None:
             "uvicorn is not installed.  Run: pip install 'mlx-rfsn[production]'"
         )
 
-    host = os.environ.get("RFSN_HOST", "127.0.0.1")
-    port = int(os.environ.get("RFSN_PORT", "8000"))
+    host = cfg.server.host
+    port = cfg.server.port
 
     print(f"Starting RFSN v10 server on http://{host}:{port}")
     print(f"  model:   {os.environ.get('RFSN_MODEL_ID')}")
     print(f"  backend: {os.environ.get('RFSN_BACKEND', 'mlx')}")
-    print(f"  kv:      {os.environ.get('RFSN_ENABLE_QUANTIZED_KV', 'true')}")
-    print(f"  api-key: {'required' if os.environ.get('RFSN_REQUIRE_API_KEY') == 'true' else 'not required'}")
+    print(f"  kv:      {os.environ.get('RFSN_ENABLE_KV_COMPRESSION', 'false')}")
+    print(f"  api-key: {'required' if cfg.server.require_api_key else 'not required'}")
     print()
 
     uvicorn.run(
