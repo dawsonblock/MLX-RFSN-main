@@ -11,21 +11,11 @@ import math
 import pytest
 import numpy as np
 
-try:
-    import mlx.core as mx
-    MLX_AVAILABLE = True
-except ImportError:
-    MLX_AVAILABLE = False
+mx = pytest.importorskip("mlx.core")
 
-try:
-    from rfsn_v11.quant.key_quant import KeyQuant, wht64_metal, maybe_supports_metal_kernels
-    KEYQUANT_AVAILABLE = True
-except Exception:
-    KEYQUANT_AVAILABLE = False
+from rfsn_v11.quant.key_quant import KeyQuant, wht64_metal, maybe_supports_metal_kernels  # noqa: E402
 
 
-@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not available")
-@pytest.mark.skipif(not KEYQUANT_AVAILABLE, reason="KeyQuant not available")
 @pytest.mark.parametrize("n", [128, 256, 512, 1024])
 def test_wht_python_self_inverse(n):
     """WHT(WHT(x)) ≈ x for Python fallback (up to floating-point)."""
@@ -39,8 +29,6 @@ def test_wht_python_self_inverse(n):
     assert err < 1e-4, f"WHT self-inverse error too large: {err}"
 
 
-@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not available")
-@pytest.mark.skipif(not KEYQUANT_AVAILABLE, reason="KeyQuant not available")
 @pytest.mark.parametrize("n", [128, 256, 1024])
 def test_wht_python_vs_reference(n):
     """Python WHT fallback must produce the standard normalized WHT output.
@@ -75,10 +63,8 @@ def test_wht_python_vs_reference(n):
     assert err < 1e-5, f"WHT output mismatch: max_err={err}"
 
 
-@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not available")
-@pytest.mark.skipif(not KEYQUANT_AVAILABLE, reason="KeyQuant not available")
 @pytest.mark.skipif(
-    not (KEYQUANT_AVAILABLE and maybe_supports_metal_kernels()),
+    not maybe_supports_metal_kernels(),
     reason="Metal kernel API not available",
 )
 @pytest.mark.parametrize("n", [128, 256, 1024])
@@ -103,16 +89,12 @@ def test_wht_metal_matches_python(n):
     )
 
 
-@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not available")
-@pytest.mark.skipif(not KEYQUANT_AVAILABLE, reason="KeyQuant not available")
 def test_wht_grid_dispatch_assertion():
     """The WHT kernel must reject inputs whose size is not a multiple of 64."""
     with pytest.raises((ValueError, AssertionError)):
         wht64_metal(mx.array(np.ones(100, dtype=np.float32)))
 
 
-@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not available")
-@pytest.mark.skipif(not KEYQUANT_AVAILABLE, reason="KeyQuant not available")
 @pytest.mark.parametrize("n", [128, 256, 1024])
 def test_key_compress_decompress_identity(n):
     """KeyQuant compress → decompress should approximately reconstruct (cosine ≥ 0.99)."""

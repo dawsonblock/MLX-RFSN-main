@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import enum
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 
 class ErrorCode(enum.Enum):
@@ -75,9 +75,9 @@ class RFSNError:
     code: ErrorCode
     message: str
     severity: ErrorSeverity = ErrorSeverity.ERROR
-    timestamp: datetime = None
-    context: dict[str, Any] = None
-    stack_trace: str | None = None
+    timestamp: Optional[datetime] = field(default=None)
+    context: Optional[dict[str, Any]] = field(default=None)
+    stack_trace: Optional[str] = None
     recoverable: bool = True
 
     def __post_init__(self):

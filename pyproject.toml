@@ -3,9 +3,9 @@ requires = ["setuptools>=70.0", "wheel", "setuptools_scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rfsn-v10"
+name = "mlx-rfsn"
 dynamic = ["version"]
-description = "RFSN v10 - Quantized KV-cache + decode-time sparse-attention runtime for MLX/Apple Silicon"
+description = "MLX-RFSN Fusion Alpha - Quantized KV-cache + sparse-attention runtime for Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = {text = "MIT"}
@@ -22,7 +22,7 @@ keywords = [
     "inference",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
@@ -51,6 +51,9 @@ dev = [
     "pytest-cov>=5.0",
     "ruff==0.4.*",
     "mypy==1.8.*",
+    "alembic>=1.13",
+    "sqlalchemy>=2.0",
+    "build>=1.2",
 ]
 real_model = [
     "torch==2.3.1",
@@ -64,20 +67,42 @@ production = [
     "uvicorn[standard]>=0.29",
 ]
 all = [
-    "rfsn-v10[mlx,dev,real_model,production]",
+    "mlx==0.21.1",
+    "mlx-lm>=0.19",
+    "pytest>=7.0,<9",
+    "pytest-timeout>=2.3",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff==0.4.*",
+    "mypy==1.8.*",
+    "alembic>=1.13",
+    "sqlalchemy>=2.0",
+    "build>=1.2",
+    "torch==2.3.1",
+    "transformers>=4.38",
+    "huggingface_hub>=0.20",
+    "psutil>=5.9",
+    "structlog>=24.1",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/rfsn_v10"
-Documentation = "https://github.com/yourusername/rfsn_v10#readme"
-Repository = "https://github.com/yourusername/rfsn_v10"
-Issues = "https://github.com/yourusername/rfsn_v10/issues"
+Homepage = "https://github.com/dawsonblock/MLX-RFSN-main"
+Documentation = "https://github.com/dawsonblock/MLX-RFSN-main#readme"
+Repository = "https://github.com/dawsonblock/MLX-RFSN-main"
+Issues = "https://github.com/dawsonblock/MLX-RFSN-main/issues"
 
 [project.scripts]
+rfsn-server = "rfsn_v10.server.cli:main"
+rfsn-bench = "benchmarks.kv_shootout:main"
+rfsn-health = "rfsn_v10.server.cli:health_check"
+rfsn-config-check = "rfsn_v10.server.cli:config_check"
 rfsn-benchmark = "rfsn_v10.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["rfsn_v10*", "agent_core*", "tools*"]
+include = ["rfsn_v10*", "rfsn_v11*", "agent_core*", "tools*", "benchmarks*"]
+exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["*.pyc", "__pycache__/*", "*.so", "*.dylib"]
@@ -89,11 +114,23 @@ fallback_version = "10.1.0.dev0"
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"
-testpaths = ["tests"]
+testpaths = ["tests", "rfsn_v11/tests"]
 timeout = 300
 filterwarnings = [
     "ignore::DeprecationWarning:mlx",
     "ignore::UserWarning",
+]
+markers = [
+    "unit: fast unit tests, no external deps",
+    "integration: integration tests",
+    "db: database tests (requires alembic/sqlalchemy)",
+    "e2e: end-to-end tests (requires full stack)",
+    "mlx: requires Apple Silicon + MLX",
+    "slow: slow tests (>10s)",
+    "security: security and privacy tests",
+    "benchmark: benchmark tests (not for CI)",
+    "experimental: experimental candidate tests",
+    "server: server/API tests",
 ]
 
 [tool.ruff]

@@ -5,66 +5,67 @@ for backend mismatch and missing configuration, not raw 500s.
 """
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from rfsn_v10.server.app import _load_generator, app
+from rfsn_v10.config import RFSNConfig
+from rfsn_v10.server.app import create_app, ServerState
+
+
+def _state_with(**overrides) -> ServerState:
+    """Build a ServerState with custom config fields."""
+    cfg = RFSNConfig.from_env()
+    for key, val in overrides.items():
+        parts = key.split(".")
+        obj = cfg
+        for p in parts[:-1]:
+            obj = getattr(obj, p)
+        setattr(obj, parts[-1], val)
+    return ServerState(cfg=cfg)
 
 
 class TestBackendErrors:
     """Server backend error handling tests."""
 
-    def test_numpy_backend_raises_valueerror(self, monkeypatch: Any) -> None:
-        """RFSN_BACKEND=numpy should raise ValueError from load_model_auto."""
-        monkeypatch.setenv("RFSN_BACKEND", "numpy")
-        monkeypatch.setenv("RFSN_MODEL_ID", "dummy")
-
+    def test_numpy_backend_raises_valueerror(self) -> None:
+        """RFSN_BACKEND=numpy should raise ValueError."""
+        s = _state_with(**{"backend.name": "numpy", "model.id": "dummy"})
         with pytest.raises(ValueError, match="Unknown backend 'numpy'"):
-            _load_generator()
+            s.load_generator()
 
-    def test_bad_backend_raises_valueerror(self, monkeypatch: Any) -> None:
-        """RFSN_BACKEND=bad should raise ValueError from load_model_auto."""
-        monkeypatch.setenv("RFSN_BACKEND", "bad")
-        monkeypatch.setenv("RFSN_MODEL_ID", "dummy")
-
+    def test_bad_backend_raises_valueerror(self) -> None:
+        """RFSN_BACKEND=bad should raise ValueError."""
+        s = _state_with(**{"backend.name": "bad", "model.id": "dummy"})
         with pytest.raises(ValueError, match="Unknown backend 'bad'"):
-            _load_generator()
+            s.load_generator()
 
-    def test_missing_model_id_error(self, monkeypatch: Any) -> None:
+    def test_missing_model_id_error(self) -> None:
         """Missing RFSN_MODEL_ID should raise RuntimeError."""
-        monkeypatch.delenv("RFSN_MODEL_ID", raising=False)
-
+        s = _state_with(**{"model.id": ""})
         with pytest.raises(RuntimeError, match="RFSN_MODEL_ID is not set"):
-            _load_generator()
+            s.load_generator()
 
 
 class TestChatEndpointErrorCodes:
     """Verify chat endpoint HTTP status codes via route-level testing."""
 
-    def test_numpy_backend_returns_400(self, monkeypatch: Any) -> None:
-        """Simulate numpy backend → chat should get HTTP 400, not 500."""
-        monkeypatch.setenv("RFSN_BACKEND", "numpy")
-        monkeypatch.setenv("RFSN_MODEL_ID", "dummy")
-
-        # Simulate what the route does
+    def test_numpy_backend_returns_400(self) -> None:
+        """Simulate numpy backend → load_generator → ValueError."""
+        s = _state_with(**{"backend.name": "numpy", "model.id": "dummy"})
         try:
-            _load_generator()
+            s.load_generator()
             pytest.fail("Expected ValueError")
         except ValueError as exc:
-            # Route converts this to HTTP 400
             http_exc = HTTPException(status_code=400, detail=str(exc))
             assert http_exc.status_code == 400
             assert "numpy" in http_exc.detail
 
-    def test_missing_model_id_returns_503(self, monkeypatch: Any) -> None:
-        """Missing model ID → chat should get HTTP 503."""
-        monkeypatch.delenv("RFSN_MODEL_ID", raising=False)
-
+    def test_missing_model_id_returns_503(self) -> None:
+        """Missing model ID → load_generator → RuntimeError."""
+        s = _state_with(**{"model.id": ""})
         try:
-            _load_generator()
+            s.load_generator()
             pytest.fail("Expected RuntimeError")
         except RuntimeError as exc:
             http_exc = HTTPException(status_code=503, detail=str(exc))
@@ -77,9 +78,11 @@ class TestHealthEndpoint:
 
     def test_health_always_200(self) -> None:
         """Health check does not depend on backend or model ID."""
-        client = TestClient(app)
+        cfg = RFSNConfig.from_env()
+        cfg.model.id = ""
+        client = TestClient(create_app(cfg))
         response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "healthy"
+        assert data["status"] in ("ok", "healthy")
         assert "version" in data

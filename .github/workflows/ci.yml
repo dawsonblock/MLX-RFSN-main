@@ -90,6 +90,9 @@ jobs:
           RFSN_BACKEND: numpy
         run: python -m rfsn_v10 validate-config --config configs/default_runtime.yaml
 
+      - name: Alembic migrations (ticket 4-4)
+        run: pytest tests/test_alembic_migrations.py -q
+
   # ---------------------------------------------------------------------------
   # Job 2: linux-cpu-package
   # Build wheel, install into clean environment, verify subpackage imports

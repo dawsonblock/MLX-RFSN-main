@@ -1,0 +1,153 @@
+"""Quality gate evaluation for shootout candidates.
+
+Gates (initial thresholds — update after first full shootout run):
+    logit_cosine  >= 0.999
+    KL divergence <= 1e-4
+    top5_overlap  >= 0.95
+    top10_overlap >= 0.98
+
+A candidate that fails any gate is labelled:
+    experimental / failed quality gate
+
+Failures are never hidden.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Sequence
+
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------------------------
+
+LOGIT_COSINE_MIN: float = 0.999
+KL_MAX: float = 1e-4
+TOP5_MIN: float = 0.95
+TOP10_MIN: float = 0.98
+
+
+@dataclass
+class QualityGateResult:
+    passed: bool
+    logit_cosine: float | None
+    kl_divergence: float | None
+    top1_match: float | None
+    top5_overlap: float | None
+    top10_overlap: float | None
+    max_logit_delta: float | None
+    first_divergent_token: int | None
+    failure_reasons: list[str]
+
+
+def logit_quality_metrics(
+    baseline_logits: np.ndarray,
+    candidate_logits: np.ndarray,
+) -> dict[str, float | None]:
+    """Compute quality metrics between baseline and candidate logit arrays.
+
+    Parameters
+    ----------
+    baseline_logits, candidate_logits
+        Shape (T, vocab) float32 arrays of log-probabilities or raw logits.
+    """
+    if baseline_logits.shape != candidate_logits.shape:
+        return {
+            "logit_cosine": None,
+            "kl_divergence": None,
+            "top1_match": None,
+            "top5_overlap": None,
+            "top10_overlap": None,
+            "max_logit_delta": None,
+            "first_divergent_token": None,
+        }
+
+    T = baseline_logits.shape[0]
+
+    # Cosine similarity per token, averaged
+    dots = np.sum(baseline_logits * candidate_logits, axis=-1)
+    norms_b = np.linalg.norm(baseline_logits, axis=-1) + 1e-12
+    norms_c = np.linalg.norm(candidate_logits, axis=-1) + 1e-12
+    cosines = dots / (norms_b * norms_c)
+    logit_cosine = float(np.mean(cosines))
+
+    # KL divergence: softmax baseline as reference distribution
+    b_sm = _safe_softmax(baseline_logits)
+    c_sm = _safe_softmax(candidate_logits)
+    kl_per_token = np.sum(b_sm * (np.log(b_sm + 1e-12) - np.log(c_sm + 1e-12)), axis=-1)
+    kl_divergence = float(np.mean(kl_per_token))
+
+    # Top-k overlaps
+    b_top1 = np.argmax(baseline_logits, axis=-1)
+    c_top1 = np.argmax(candidate_logits, axis=-1)
+    top1_match = float(np.mean(b_top1 == c_top1))
+
+    b_top5 = np.argsort(baseline_logits, axis=-1)[:, -5:]
+    c_top5 = np.argsort(candidate_logits, axis=-1)[:, -5:]
+    top5_overlap = float(np.mean([
+        len(set(b_top5[t]) & set(c_top5[t])) / 5.0 for t in range(T)
+    ]))
+
+    b_top10 = np.argsort(baseline_logits, axis=-1)[:, -10:]
+    c_top10 = np.argsort(candidate_logits, axis=-1)[:, -10:]
+    top10_overlap = float(np.mean([
+        len(set(b_top10[t]) & set(c_top10[t])) / 10.0 for t in range(T)
+    ]))
+
+    # Max logit delta
+    max_logit_delta = float(np.max(np.abs(baseline_logits - candidate_logits)))
+
+    # First divergent token (top-1 differs)
+    divergent = np.where(b_top1 != c_top1)[0]
+    first_divergent_token = int(divergent[0]) if len(divergent) > 0 else None
+
+    return {
+        "logit_cosine": logit_cosine,
+        "kl_divergence": kl_divergence,
+        "top1_match": top1_match,
+        "top5_overlap": top5_overlap,
+        "top10_overlap": top10_overlap,
+        "max_logit_delta": max_logit_delta,
+        "first_divergent_token": first_divergent_token,
+    }
+
+
+def evaluate_quality_gate(metrics: dict[str, float | None]) -> QualityGateResult:
+    """Apply quality gate thresholds and return a structured result."""
+    failures: list[str] = []
+
+    cosine = metrics.get("logit_cosine")
+    kl = metrics.get("kl_divergence")
+    top5 = metrics.get("top5_overlap")
+    top10 = metrics.get("top10_overlap")
+
+    if cosine is None or cosine < LOGIT_COSINE_MIN:
+        failures.append(
+            f"logit_cosine {cosine} < {LOGIT_COSINE_MIN}"
+        )
+    if kl is None or kl > KL_MAX:
+        failures.append(f"KL {kl} > {KL_MAX}")
+    if top5 is None or top5 < TOP5_MIN:
+        failures.append(f"top5_overlap {top5} < {TOP5_MIN}")
+    if top10 is None or top10 < TOP10_MIN:
+        failures.append(f"top10_overlap {top10} < {TOP10_MIN}")
+
+    return QualityGateResult(
+        passed=len(failures) == 0,
+        logit_cosine=cosine,
+        kl_divergence=kl,
+        top1_match=metrics.get("top1_match"),
+        top5_overlap=top5,
+        top10_overlap=top10,
+        max_logit_delta=metrics.get("max_logit_delta"),
+        first_divergent_token=metrics.get("first_divergent_token"),
+        failure_reasons=failures,
+    )
+
+
+def _safe_softmax(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x, axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / (np.sum(e, axis=-1, keepdims=True) + 1e-12)

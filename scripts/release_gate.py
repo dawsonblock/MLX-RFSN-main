@@ -1,381 +1,521 @@
 #!/usr/bin/env python3
-"""RFSN v10 — release gate.
+"""RFSN v10 Release Gate.
 
-Runs all verification steps that must pass before a release tag is created.
-Exits non-zero if any step fails.
+Runs a sequence of checks and produces a machine-readable JSON report.
 
-Usage:
-    python scripts/release_gate.py              # full gate
-    python scripts/release_gate.py --cpu-only   # skip MLX tests (CI / Linux)
-    python scripts/release_gate.py --check-list # print gate steps and exit
+Usage::
 
-Steps:
-    1. Import smoke             — package imports and subpackage presence
-    2. CLI smoke                — python -m rfsn_v10 version / healthcheck
-    3. Config validation        — validate-config with default config
-    4. CPU tests                — pytest tests that run without MLX
-    5. MLX tests                — pytest tests requiring Apple Silicon (skipped w/ --cpu-only)
-    6. Security tests           — clickhouse security and routing tests
-    7. SDPA enforcement         — no raw SDPA calls in runtime code
-    8. Benchmark smoke          — run_all.py --fast (verifies runner doesn't crash)
-    9. Packaging smoke          — build wheel, verify subpackages present
+    python scripts/release_gate.py --cpu-only  # CI / no Apple Silicon required
+    python scripts/release_gate.py --mlx        # Apple Silicon only
+    python scripts/release_gate.py --full       # all checks + benchmark smoke
 
-Exit codes:
-    0   — all steps passed
-    1   — at least one step failed
+Exit code 0 = release ready.  Exit code 1 = one or more checks failed.
 """
 from __future__ import annotations
 
-import argparse
-import subprocess
 import sys
-from dataclasses import dataclass, field
+
+# Suppress bytecode generation to avoid dirty artifact false positives
+sys.dont_write_bytecode = True
+
+import argparse
+import ast
+import importlib
+import json
+import os
+import re
+import subprocess
+import time
 from pathlib import Path
-from typing import Callable
 
-ROOT = Path(__file__).parent.parent
+REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 
 # ---------------------------------------------------------------------------
-# Result helpers
+# Individual checks
 # ---------------------------------------------------------------------------
 
-@dataclass
-class GateResult:
-    step: str
-    passed: bool
-    skipped: bool = False
-    message: str = ""
+def check_python_version() -> dict:
+    vi = sys.version_info
+    ok = (3, 11) <= vi < (3, 13)
+    return {
+        "name": "python_version",
+        "passed": ok,
+        "detail": f"{vi.major}.{vi.minor}.{vi.micro}",
+        "message": (
+            "OK" if ok
+            else f"Unsupported Python {vi.major}.{vi.minor}. Use 3.11 or 3.12."
+        ),
+    }
 
 
-def _run(cmd: list[str], env_extra: dict | None = None) -> tuple[int, str]:
-    import os
+def check_compile_all() -> dict:
+    """Byte-compile all project source files; catch syntax errors."""
+    compile_targets = [
+        "rfsn_v10",
+        "rfsn_v11",
+        "benchmarks",
+        "tests",
+        "scripts",
+    ]
+    all_ok = True
+    errors = []
+    # Run compileall in subprocess with bytecode disabled
     env = os.environ.copy()
-    if env_extra:
-        env.update(env_extra)
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, env=env)
-    return r.returncode, r.stdout + r.stderr
-
-
-def _check(step: str, cmd: list[str], env_extra: dict | None = None) -> GateResult:
-    rc, out = _run(cmd, env_extra)
-    if rc == 0:
-        return GateResult(step=step, passed=True)
-    # Show last 20 lines of output for diagnosis
-    tail = "\n".join(out.splitlines()[-20:])
-    return GateResult(step=step, passed=False, message=tail)
-
-
-def _skip(step: str, reason: str) -> GateResult:
-    return GateResult(step=step, passed=True, skipped=True, message=reason)
-
-
-# ---------------------------------------------------------------------------
-# Gate steps
-# ---------------------------------------------------------------------------
-
-def step_compileall(_cpu_only: bool) -> GateResult:
-    """Every .py file in rfsn_v10/ and tests/ must compile without SyntaxError.
-
-    This is the first and most critical gate. Placeholder text or incomplete
-    generated code produces a SyntaxError that blocks all downstream steps.
-    """
-    return _check(
-        "compileall",
-        [sys.executable, "-m", "compileall", "-q", "rfsn_v10", "tests"],
-    )
-
-
-def step_import_smoke(_cpu_only: bool) -> GateResult:
-    """Verify all required package imports succeed."""
-    code = (
-        "import rfsn_v10; "
-        "import rfsn_v10.kernels; "
-        "import rfsn_v10.runtime; "
-        "from rfsn_v10 import RFSNRuntime; "
-        "from rfsn_v10.runtime import RFSNRuntime; "
-        "print('OK')"
-    )
-    return _check("import_smoke", [sys.executable, "-c", code])
-
-
-def step_cli_version(_cpu_only: bool) -> GateResult:
-    return _check(
-        "cli_version",
-        [sys.executable, "-m", "rfsn_v10", "version"],
-        env_extra={"RFSN_BACKEND": "numpy"},
-    )
-
-
-def step_cli_healthcheck(_cpu_only: bool) -> GateResult:
-    return _check(
-        "cli_healthcheck",
-        [sys.executable, "-m", "rfsn_v10", "healthcheck"],
-        env_extra={"RFSN_BACKEND": "numpy"},
-    )
-
-
-def step_config_validate(_cpu_only: bool) -> GateResult:
-    cfg = ROOT / "configs" / "default_runtime.yaml"
-    return _check(
-        "config_validate",
-        [sys.executable, "-m", "rfsn_v10", "validate-config", "--config", str(cfg)],
-        env_extra={"RFSN_BACKEND": "numpy"},
-    )
-
-
-def step_cpu_tests(_cpu_only: bool) -> GateResult:
-    tests = [
-        "tests/test_config.py",
-        "tests/test_config_strict.py",
-        "tests/test_kernels_validation.py",
-        "tests/test_quantization_lazy_imports.py",
-        "tests/test_experimental_flags.py",
-        "tests/test_no_runtime_raw_sdpa.py",
-    ]
-    return _check(
-        "cpu_tests",
-        [sys.executable, "-m", "pytest", "-q", "--tb=short"] + tests,
-        env_extra={"RFSN_BACKEND": "numpy"},
-    )
-
-
-def step_security_tests(_cpu_only: bool) -> GateResult:
-    tests = ["tests/test_clickhouse_security.py"]
-    # Add routing / tool runner tests if they exist
-    for t in ["tests/test_clickhouse_routing.py", "tests/test_tool_runner_security.py"]:
-        if (ROOT / t).exists():
-            tests.append(t)
-    return _check(
-        "security_tests",
-        [sys.executable, "-m", "pytest", "-q", "--tb=short"] + tests,
-    )
-
-
-def step_sdpa_enforcement(_cpu_only: bool) -> GateResult:
-    return _check(
-        "sdpa_enforcement",
-        [sys.executable, "-m", "pytest", "-q", "--tb=short",
-         "tests/test_no_runtime_raw_sdpa.py"],
-    )
-
-
-def step_mlx_tests(cpu_only: bool) -> GateResult:
-    if cpu_only:
-        return _skip("mlx_tests", "--cpu-only flag set")
-
-    tests = [
-        "tests/test_drift.py",
-        "tests/test_attention_causal_mask.py",
-        "tests/test_short_prompt_decode_drift.py",
-        "tests/test_prefill_decode_split.py",
-    ]
-    # Filter to tests that actually exist
-    tests = [t for t in tests if (ROOT / t).exists()]
-    if not tests:
-        return _skip("mlx_tests", "No MLX test files found")
-    return _check(
-        "mlx_tests",
-        [sys.executable, "-m", "pytest", "-q", "--tb=short"] + tests,
-    )
-
-
-def step_benchmark_smoke(_cpu_only: bool) -> GateResult:
-    return _check(
-        "benchmark_smoke",
-        [sys.executable, "benchmarks/run_all.py", "--fast"],
-    )
-
-
-def step_build_install(_cpu_only: bool) -> GateResult:
-    """Build wheel, install it, and verify subpackage imports work from the wheel.
-
-    This catches package-discovery bugs (missing __init__.py, wrong find pattern)
-    that only appear when the package is installed — not when running from source.
-    """
-    import tempfile
-    import zipfile
-
-    with tempfile.TemporaryDirectory(prefix="rfsn_build_") as build_dir:
-        # Ensure build tool is available
-        rc, out = _run([sys.executable, "-m", "pip", "install", "--quiet", "build"])
-        if rc != 0:
-            return GateResult(
-                step="build_install", passed=False,
-                message=f"pip install build failed:\n{out[-500:]}"
-            )
-
-        # Build wheel
-        rc, out = _run(
-            [sys.executable, "-m", "build", "--wheel", "--outdir", build_dir],
-        )
-        if rc != 0:
-            return GateResult(
-                step="build_install", passed=False,
-                message=f"wheel build failed:\n{out[-1000:]}"
-            )
-
-        wheels = list(Path(build_dir).glob("*.whl"))
-        if not wheels:
-            return GateResult(step="build_install", passed=False, message="No wheel produced")
-
-        wheel = wheels[0]
-
-        # Verify subpackages present in wheel zip before installing
-        with zipfile.ZipFile(wheel) as zf:
-            names = zf.namelist()
-        required_paths = [
-            "rfsn_v10/__init__.py",
-            "rfsn_v10/kernels/__init__.py",
-            "rfsn_v10/runtime/__init__.py",
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    for target in compile_targets:
+        target_path = REPO_ROOT / target
+        if not target_path.exists():
+            continue
+        cmd = [
+            sys.executable, "-m", "compileall",
+            "-q", "-f",
+            str(target_path)
         ]
-        missing = [r for r in required_paths if not any(n.endswith(r) for n in names)]
-        if missing:
-            return GateResult(
-                step="build_install", passed=False,
-                message=f"Wheel missing subpackages: {missing}"
-            )
-
-        # Attempt to install the wheel into the current interpreter.
-        # If the Python version doesn't match requires-python, skip install
-        # and fall through to zip-only content check (already done above).
-        rc, out = _run([
-            sys.executable, "-m", "pip", "install",
-            "--quiet", "--force-reinstall", str(wheel),
-        ])
-        if rc != 0:
-            # Check if this is purely a Python version mismatch
-            if "requires a different Python" in out or "python_requires" in out:
-                # Wheel content verified by zip inspection above; skip install.
-                # Log a warning but do not fail the gate — the wheel itself is valid.
-                print(f"\n    NOTE: wheel install skipped (Python version mismatch: "
-                      f"gate running {sys.version.split()[0]}, "
-                      f"wheel requires 3.11). Zip content verified.")
-                # Re-install editable before returning
-                _run([sys.executable, "-m", "pip", "install", "--quiet", "-e", "."])
-                return GateResult(step="build_install", passed=True,
-                                  message="wheel content verified; install skipped (Python version)")
-            return GateResult(
-                step="build_install", passed=False,
-                message=f"pip install wheel failed:\n{out[-500:]}"
-            )
-
-        # Verify imports work from the installed wheel
-        verify_code = (
-            "import rfsn_v10; "
-            "import rfsn_v10.kernels; "
-            "import rfsn_v10.quantization; "
-            "import rfsn_v10.runtime; "
-            "from rfsn_v10 import RFSNRuntime; "
-            "print('wheel import OK')"
-        )
-        rc, out = _run([sys.executable, "-c", verify_code])
-        if rc != 0:
-            return GateResult(
-                step="build_install", passed=False,
-                message=f"wheel import check failed:\n{out[-500:]}"
-            )
-
-        # Re-install editable so the rest of the session works from source
-        _run([sys.executable, "-m", "pip", "install", "--quiet", "-e", "."])
-
-    return GateResult(step="build_install", passed=True)
+        result = subprocess.run(cmd, capture_output=True, env=env, cwd=REPO_ROOT)
+        if result.returncode != 0:
+            all_ok = False
+            errors.append(target)
+    return {
+        "name": "compileall_full_repo",
+        "passed": all_ok,
+        "message": (
+            "All project .py files compile OK" if all_ok
+            else f"Compilation errors in: {', '.join(errors)}"
+        ),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Gate runner
-# ---------------------------------------------------------------------------
-
-GATE_STEPS: list[Callable[[bool], GateResult]] = [
-    step_compileall,      # must be first — blocks all others on SyntaxError
-    step_import_smoke,
-    step_cli_version,
-    step_cli_healthcheck,
-    step_config_validate,
-    step_cpu_tests,
-    step_security_tests,
-    step_sdpa_enforcement,
-    step_mlx_tests,
-    step_benchmark_smoke,
-    step_build_install,   # builds wheel, verifies subpackages, installs — must be last
-]
-
-
-def _ensure_editable_install() -> bool:
-    """Install package in editable mode if not already importable.
-
-    This ensures the gate can be run from a fresh clone without needing
-    manual ``PYTHONPATH=.`` or ``pip install -e .`` beforehand.
-
-    Returns True if the install succeeded (or was already present).
-    """
-    import subprocess
+def check_import(module: str) -> dict:
     try:
-        import rfsn_v10  # noqa: F401
-        return True  # already installed
-    except ImportError:
-        pass
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "-e", "."],
-        cwd=ROOT,
-    )
-    return result.returncode == 0
+        importlib.import_module(module)
+        return {"name": f"import_{module}", "passed": True, "message": "OK"}
+    except Exception as exc:
+        return {
+            "name": f"import_{module}",
+            "passed": False,
+            "message": str(exc),
+        }
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="RFSN v10 release gate")
-    parser.add_argument(
-        "--cpu-only", action="store_true",
-        help="Skip MLX-dependent tests (for Linux / CI without Apple Silicon)"
-    )
-    parser.add_argument(
-        "--check-list", action="store_true",
-        help="Print gate steps and exit without running them"
-    )
-    args = parser.parse_args(argv)
+def check_stable_imports() -> dict:
+    """Core stable modules must import without MLX."""
+    modules = [
+        "rfsn_v10.config",
+        "rfsn_v10.errors",
+        "rfsn_v10.health",
+        "rfsn_v10.logging",
+        "rfsn_v10.metrics",
+        "rfsn_v10.bitpack",
+    ]
+    failures = []
+    for m in modules:
+        # Remove cached version for a fresh import
+        for key in list(sys.modules):
+            if key == m or key.startswith(m + "."):
+                del sys.modules[key]
+        try:
+            importlib.import_module(m)
+        except Exception as exc:
+            failures.append(f"{m}: {exc}")
+    ok = len(failures) == 0
+    return {
+        "name": "stable_imports",
+        "passed": ok,
+        "message": "All stable imports OK" if ok else "; ".join(failures),
+    }
 
-    if args.check_list:
-        for fn in GATE_STEPS:
-            print(f"  {fn.__name__.replace('step_', '')}")
-        return 0
 
-    # Ensure the package is importable without manual PYTHONPATH setup
-    if not _ensure_editable_install():
-        print("ERROR: Could not install package in editable mode. Run: pip install -e .")
-        return 1
+def check_no_forbidden_v10_imports() -> dict:
+    """rfsn_v10 must not import from rfsn_v11, external, research, or agent_core."""
+    v10_dir = REPO_ROOT / "rfsn_v10"
+    forbidden = ("rfsn_v11", "external", "research", "agent_core")
+    violations = []
+    for py_file in sorted(v10_dir.rglob("*.py")):
+        if "__pycache__" in str(py_file):
+            continue
+        # rfsn_v10/benchmarks/ was removed — no exclusions needed
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    names = [node.module]
+            for name in names:
+                for prefix in forbidden:
+                    if name == prefix or name.startswith(prefix + "."):
+                        rel = py_file.relative_to(REPO_ROOT)
+                        violations.append(f"{rel}: {name!r}")
+    ok = len(violations) == 0
+    return {
+        "name": "no_forbidden_v10_imports",
+        "passed": ok,
+        "message": "No forbidden imports" if ok else f"{len(violations)} violation(s): " + "; ".join(violations[:5]),
+    }
 
-    results: list[GateResult] = []
-    for fn in GATE_STEPS:
-        name = fn.__name__.replace("step_", "")
-        print(f"  [{name}] ...", end=" ", flush=True)
-        result = fn(args.cpu_only)
-        results.append(result)
-        if result.skipped:
-            print(f"SKIP  ({result.message})")
-        elif result.passed:
-            print("PASS")
-        else:
-            print("FAIL")
-            if result.message:
-                for line in result.message.splitlines()[-10:]:
-                    print(f"    {line}")
 
-    passed = sum(1 for r in results if r.passed and not r.skipped)
-    skipped = sum(1 for r in results if r.skipped)
-    failed = sum(1 for r in results if not r.passed)
+def check_no_placeholder_source() -> dict:
+    """Scan for TODO/FIXME/NotImplemented placeholders in stable runtime."""
+    v10_dir = REPO_ROOT / "rfsn_v10"
+    patterns = ["raise NotImplementedError", "TODO: implement", "FIXME: implement", "pass  # TODO"]
+    hits = []
+    for py_file in sorted(v10_dir.rglob("*.py")):
+        if "__pycache__" in str(py_file):
+            continue
+        try:
+            source = py_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for pat in patterns:
+            if pat in source:
+                rel = py_file.relative_to(REPO_ROOT)
+                hits.append(f"{rel}: {pat!r}")
+    ok = len(hits) == 0
+    return {
+        "name": "no_placeholder_source",
+        "passed": ok,
+        "message": "No placeholders found" if ok else f"{len(hits)} placeholder(s): " + "; ".join(hits[:5]),
+    }
 
-    print()
-    print(f"Gate: {passed} passed, {skipped} skipped, {failed} failed")
 
-    if failed:
-        failed_names = [r.step for r in results if not r.passed]
-        print(f"Failed steps: {', '.join(failed_names)}")
-        print("\nRelease gate FAILED — do not tag.")
-        return 1
+def check_config_defaults() -> dict:
+    """All experimental flags must default to False."""
+    try:
+        for key in list(sys.modules):
+            if "rfsn_v10.config" in key:
+                del sys.modules[key]
+        import os
+        for env in ["RFSN_EXPERIMENTAL_QJL", "RFSN_EXPERIMENTAL_POLAR",
+                    "RFSN_EXPERIMENTAL_ADAPTIVE", "RFSN_SPARSE_DECODE_ENABLED",
+                    "RFSN_QJL_ENABLED"]:
+            os.environ.pop(env, None)
+        from rfsn_v10.config import RFSNConfig
+        cfg = RFSNConfig()
+        failures = []
+        if cfg.experimental.enable_qjl:
+            failures.append("enable_qjl defaults to True")
+        if cfg.experimental.enable_polar:
+            failures.append("enable_polar defaults to True")
+        if cfg.experimental.enable_adaptive:
+            failures.append("enable_adaptive defaults to True")
+        if cfg.runtime.sparse_decode_enabled:
+            failures.append("sparse_decode_enabled defaults to True")
+        if cfg.runtime.qjl_enabled:
+            failures.append("qjl_enabled defaults to True")
+        ok = len(failures) == 0
+        return {
+            "name": "config_defaults_safe",
+            "passed": ok,
+            "message": "All experimental flags default to False" if ok else "; ".join(failures),
+        }
+    except Exception as exc:
+        return {"name": "config_defaults_safe", "passed": False, "message": str(exc)}
 
-    print("\nRelease gate PASSED.")
-    return 0
+
+def check_project_scripts() -> dict:
+    """Parse [project.scripts] from pyproject.toml and validate imports.
+
+    Runs in a subprocess to avoid polluting the release-gate process's
+    sys.modules with entry-point modules that may have side effects.
+    """
+    helper = """
+import sys, importlib, json, tomllib
+from pathlib import Path
+REPO_ROOT = Path(sys.argv[1])
+data = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
+scripts = data.get('project', {}).get('scripts', {})
+failures = []
+for name, target in scripts.items():
+    module_name, _, attr = target.partition(':')
+    try:
+        module = importlib.import_module(module_name)
+        if attr and not hasattr(module, attr):
+            failures.append(f"{name}: {target} missing attribute '{attr}'")
+    except Exception as exc:
+        failures.append(f"{name}: {target} import failed: {exc}")
+print(json.dumps(failures))
+"""
+    try:
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", helper, str(REPO_ROOT)],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=REPO_ROOT,
+        )
+        if result.returncode != 0:
+            return {
+                "name": "project_script_entrypoints",
+                "passed": False,
+                "message": (
+                    (result.stderr or result.stdout).strip()[:200]
+                ),
+            }
+        failures = json.loads(result.stdout.strip())
+        ok = len(failures) == 0
+        return {
+            "name": "project_script_entrypoints",
+            "passed": ok,
+            "message": "All entry points importable" if ok else "; ".join(failures[:5]),
+        }
+    except Exception as exc:
+        return {"name": "project_script_entrypoints", "passed": False, "message": str(exc)}
+
+
+def check_no_dirty_artifacts() -> dict:
+    """Scan for cache/build artifacts that should not ship."""
+    forbidden_dirs = {"__pycache__", ".pytest_cache", ".rfsn_cache", ".tmp", ".mypy_cache", ".ruff_cache"}
+    forbidden_suffixes = {".pyc", ".pyo", ".egg-info"}
+    # Only check source dirs that should be clean, not runtime-created caches
+    source_dirs = ["rfsn_v10", "rfsn_v11", "benchmarks", "tests", "scripts", "tools"]
+    bad = []
+    for src_dir in source_dirs:
+        dir_path = REPO_ROOT / src_dir
+        if not dir_path.exists():
+            continue
+        for path in dir_path.rglob("*"):
+            if ".git" in path.parts:
+                continue
+            parts = set(path.parts)
+            in_forbidden_dir = bool(parts & forbidden_dirs)
+            if in_forbidden_dir:
+                bad.append(str(path.relative_to(REPO_ROOT)))
+            elif path.suffix in forbidden_suffixes:
+                bad.append(str(path.relative_to(REPO_ROOT)))
+    ok = len(bad) == 0
+    return {
+        "name": "dirty_artifact_scan",
+        "passed": ok,
+        "message": "No dirty artifacts found" if ok else f"{len(bad)} artifact(s): " + "; ".join(bad[:10]),
+    }
+
+
+def check_wheel_installation() -> dict:
+    """Build wheel, install into temp venv, verify CLI entry points."""
+    import shutil
+    import venv
+
+    start = time.time()
+    venv_dir = REPO_ROOT / ".tmp" / "wheel-smoke"
+
+    def _fail(name: str, msg: str) -> dict:
+        return {
+            "name": name,
+            "passed": False,
+            "message": msg,
+            "duration_s": round(time.time() - start, 2),
+        }
+
+    try:
+        # 1. Build wheel
+        build_result = subprocess.run(
+            [sys.executable, "-m", "build", "--wheel"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if build_result.returncode != 0:
+            return _fail(
+                "wheel_build",
+                f"Wheel build failed: {build_result.stderr[:300]}",
+            )
+
+        dist_dir = REPO_ROOT / "dist"
+        wheel_files = sorted(dist_dir.glob("*.whl"))
+        if not wheel_files:
+            return _fail("wheel_build", "No .whl found after build")
+        wheel_path = wheel_files[-1]
+
+        # 2. Create temp venv + install wheel
+        if venv_dir.exists():
+            shutil.rmtree(venv_dir)
+        venv.create(str(venv_dir), with_pip=True)
+        venv_python = venv_dir / "bin" / "python"
+        if not venv_python.exists():
+            venv_python = venv_dir / "Scripts" / "python.exe"
+
+        pip_install = subprocess.run(
+            [str(venv_python), "-m", "pip", "install",
+             "--quiet", str(wheel_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if pip_install.returncode != 0:
+            return _fail(
+                "wheel_install",
+                f"pip install failed: {pip_install.stderr[:300]}",
+            )
+
+        # 3. Verify entry-point imports inside the venv
+        import_check = subprocess.run(
+            [str(venv_python), "-c",
+             "import rfsn_v10.server.cli; "
+             "import rfsn_v10.config; "
+             "from rfsn_v10.server.app import create_app; "
+             "print('OK')"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if import_check.returncode != 0:
+            return _fail(
+                "wheel_imports",
+                f"Import check failed: {import_check.stderr[:300]}",
+            )
+
+        # 4. Verify rfsn-server --help exits 0
+        help_check = subprocess.run(
+            [str(venv_python), "-m", "rfsn_v10.server.cli",
+             "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if help_check.returncode != 0:
+            return _fail(
+                "wheel_cli",
+                f"rfsn-server --help failed: "
+                f"{help_check.stderr[:200]}",
+            )
+
+        return {
+            "name": "wheel_installation",
+            "passed": True,
+            "message": f"Wheel OK: {wheel_path.name}",
+            "duration_s": round(time.time() - start, 2),
+        }
+
+    except subprocess.TimeoutExpired:
+        return _fail("wheel_installation", "Timed out")
+    except Exception as e:
+        return _fail("wheel_installation", f"Error: {e}")
+    finally:
+        if venv_dir.exists():
+            shutil.rmtree(venv_dir, ignore_errors=True)
+
+
+def run_pytest(markers: str, label: str) -> dict:
+    """Run pytest with the given marker expression."""
+    cmd = [
+        sys.executable, "-m", "pytest",
+        "-q", "--tb=short",
+        f"-m={markers}",
+        f"--rootdir={REPO_ROOT}",
+        str(REPO_ROOT / "tests"),
+    ]
+    t0 = time.perf_counter()
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+    elapsed = time.perf_counter() - t0
+    passed = result.returncode == 0
+    # Extract counts from last line
+    output_tail = (result.stdout + result.stderr).strip().splitlines()
+    summary = output_tail[-1] if output_tail else ""
+    return {
+        "name": f"pytest_{label}",
+        "passed": passed,
+        "message": summary,
+        "duration_s": round(elapsed, 2),
+        "returncode": result.returncode,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="RFSN release gate")
+    parser.add_argument("--cpu-only", action="store_true", help="Run CPU-safe checks only")
+    parser.add_argument("--mlx", action="store_true", help="Include MLX Apple Silicon checks")
+    parser.add_argument("--full", action="store_true", help="All checks including benchmark smoke")
+    parser.add_argument("--output", default=None, help="Write JSON report to this file")
+    args = parser.parse_args()
+
+    checks = []
+
+    # Always run - dirty artifact scan first before any cache-creating operations
+    checks.append(check_python_version())
+    checks.append(check_no_dirty_artifacts())
+    checks.append(check_compile_all())
+    checks.append(check_stable_imports())
+    checks.append(check_no_forbidden_v10_imports())
+    checks.append(check_no_placeholder_source())
+    checks.append(check_config_defaults())
+    checks.append(check_project_scripts())
+    checks.append(check_wheel_installation())
+
+    # CPU-safe pytest (exclude heavy/optional markers)
+    checks.append(run_pytest(
+        "not mlx and not slow and not benchmark"
+        " and not experimental and not integration and not db",
+        "cpu_safe",
+    ))
+
+    if args.mlx or args.full:
+        checks.append(run_pytest("mlx", "mlx"))
+
+    if args.full:
+        checks.append(run_pytest("benchmark", "benchmark_smoke"))
+
+    # Summarise
+    n_passed = sum(1 for c in checks if c["passed"])
+    n_failed = sum(1 for c in checks if not c["passed"])
+    release_ready = n_failed == 0
+
+    # Find the pytest_cpu_safe result for test counts
+    tests_passed = 0
+    tests_failed = 0
+    for c in checks:
+        if c["name"] == "pytest_cpu_safe":
+            msg = c.get("message", "")
+            m = re.search(r"(\d+) passed", msg)
+            if m:
+                tests_passed = int(m.group(1))
+            m2 = re.search(r"(\d+) failed", msg)
+            if m2:
+                tests_failed = int(m2.group(1))
+
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT, text=True
+        ).strip()
+    except Exception:
+        git_commit = "unknown"
+
+    report = {
+        "release_ready": release_ready,
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "checks_passed": n_passed,
+        "checks_failed": n_failed,
+        "tests_passed": tests_passed,
+        "tests_failed": tests_failed,
+        "mlx_tests": "included" if (args.mlx or args.full) else "skipped",
+        "git_commit": git_commit,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "checks": checks,
+    }
+
+    print(json.dumps(report, indent=2))
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2))
+        print(f"\nReport written to: {args.output}", file=sys.stderr)
+
+    if not release_ready:
+        print("\nFAILED checks:", file=sys.stderr)
+        for c in checks:
+            if not c["passed"]:
+                print(f"  [{c['name']}] {c['message']}", file=sys.stderr)
+
+    return 0 if release_ready else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

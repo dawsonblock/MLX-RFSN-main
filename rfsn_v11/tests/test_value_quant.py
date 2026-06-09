@@ -9,22 +9,13 @@ import math
 import numpy as np
 import pytest
 
-try:
-    import mlx.core as mx
-    MLX_AVAILABLE = True
-except ImportError:
-    MLX_AVAILABLE = False
+mx = pytest.importorskip("mlx.core")
 
-try:
-    from rfsn_v11.quant.value_quant import PolarQuant, make_value_quantizer
-    from rfsn_v11.quant.kv_compressor import KVCompressor, _paper_mse_bound, _MSE_TOLERANCE_FACTOR
-    QUANT_AVAILABLE = True
-except Exception:
-    QUANT_AVAILABLE = False
-
-
-pytestmark = pytest.mark.skipif(
-    not (MLX_AVAILABLE and QUANT_AVAILABLE), reason="MLX or quant module not available"
+from rfsn_v11.quant.value_quant import PolarQuant, make_value_quantizer  # noqa: E402
+from rfsn_v11.quant.kv_compressor import (  # noqa: E402
+    KVCompressor,
+    _paper_mse_bound,
+    _MSE_TOLERANCE_FACTOR,
 )
 
 
