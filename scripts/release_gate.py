@@ -135,9 +135,7 @@ def check_no_forbidden_v10_imports() -> dict:
     for py_file in sorted(v10_dir.rglob("*.py")):
         if "__pycache__" in str(py_file):
             continue
-        # Skip benchmarks directory as they legitimately import from rfsn_v11
-        if "benchmarks" in py_file.parts:
-            continue
+        # rfsn_v10/benchmarks/ was removed — no exclusions needed
         try:
             source = py_file.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=str(py_file))
@@ -302,11 +300,23 @@ def check_no_dirty_artifacts() -> dict:
 
 
 def check_wheel_installation() -> dict:
-    """Check that the package can be built and installed."""
+    """Build wheel, install into temp venv, verify CLI entry points."""
+    import shutil
+    import venv
+
     start = time.time()
-    
+    venv_dir = REPO_ROOT / ".tmp" / "wheel-smoke"
+
+    def _fail(name: str, msg: str) -> dict:
+        return {
+            "name": name,
+            "passed": False,
+            "message": msg,
+            "duration_s": round(time.time() - start, 2),
+        }
+
     try:
-        # Build the wheel
+        # 1. Build wheel
         build_result = subprocess.run(
             [sys.executable, "-m", "build", "--wheel"],
             cwd=REPO_ROOT,
@@ -314,65 +324,79 @@ def check_wheel_installation() -> dict:
             text=True,
             timeout=300,
         )
-        
         if build_result.returncode != 0:
-            return {
-                "name": "wheel_build",
-                "passed": False,
-                "message": f"Wheel build failed: {build_result.stderr}",
-                "duration_s": round(time.time() - start, 2),
-            }
-        
-        # Find the built wheel
+            return _fail(
+                "wheel_build",
+                f"Wheel build failed: {build_result.stderr[:300]}",
+            )
+
         dist_dir = REPO_ROOT / "dist"
-        wheel_files = list(dist_dir.glob("*.whl"))
+        wheel_files = sorted(dist_dir.glob("*.whl"))
         if not wheel_files:
-            return {
-                "name": "wheel_build",
-                "passed": False,
-                "message": "No wheel file found after build",
-                "duration_s": round(time.time() - start, 2),
-            }
-        
-        wheel_path = wheel_files[0]
-        
-        # Test CLI entry points are importable
-        import_err = None
-        try:
-            import rfsn_v10.benchmarks.kv_shootout
-            import rfsn_v10.server.cli
-        except ImportError as e:
-            import_err = e
-        
-        if import_err is not None:
-            return {
-                "name": "wheel_imports",
-                "passed": False,
-                "message": f"CLI entry points not importable: {import_err}",
-                "duration_s": round(time.time() - start, 2),
-            }
-        
+            return _fail("wheel_build", "No .whl found after build")
+        wheel_path = wheel_files[-1]
+
+        # 2. Create temp venv + install wheel
+        if venv_dir.exists():
+            shutil.rmtree(venv_dir)
+        venv.create(str(venv_dir), with_pip=True)
+        venv_python = venv_dir / "bin" / "python"
+        if not venv_python.exists():
+            venv_python = venv_dir / "Scripts" / "python.exe"
+
+        pip_install = subprocess.run(
+            [str(venv_python), "-m", "pip", "install",
+             "--quiet", str(wheel_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if pip_install.returncode != 0:
+            return _fail(
+                "wheel_install",
+                f"pip install failed: {pip_install.stderr[:300]}",
+            )
+
+        # 3. Verify entry-point imports inside the venv
+        import_check = subprocess.run(
+            [str(venv_python), "-c",
+             "import rfsn_v10.server.cli; "
+             "import rfsn_v10.config; "
+             "from rfsn_v10.server.app import create_app; "
+             "print('OK')"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if import_check.returncode != 0:
+            return _fail(
+                "wheel_imports",
+                f"Import check failed: {import_check.stderr[:300]}",
+            )
+
+        # 4. Verify rfsn-server --help exits 0
+        help_check = subprocess.run(
+            [str(venv_python), "-m", "rfsn_v10.server.cli",
+             "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if help_check.returncode != 0:
+            return _fail(
+                "wheel_cli",
+                f"rfsn-server --help failed: "
+                f"{help_check.stderr[:200]}",
+            )
+
         return {
             "name": "wheel_installation",
             "passed": True,
-            "message": f"Wheel build successful: {wheel_path.name}",
+            "message": f"Wheel OK: {wheel_path.name}",
             "duration_s": round(time.time() - start, 2),
         }
-        
+
     except subprocess.TimeoutExpired:
-        return {
-            "name": "wheel_installation",
-            "passed": False,
-            "message": "Wheel installation test timed out",
-            "duration_s": round(time.time() - start, 2),
-        }
+        return _fail("wheel_installation", "Timed out")
     except Exception as e:
-        return {
-            "name": "wheel_installation",
-            "passed": False,
-            "message": f"Wheel installation test failed: {e}",
-            "duration_s": round(time.time() - start, 2),
-        }
+        return _fail("wheel_installation", f"Error: {e}")
+    finally:
+        if venv_dir.exists():
+            shutil.rmtree(venv_dir, ignore_errors=True)
 
 
 def run_pytest(markers: str, label: str) -> dict:
@@ -425,9 +449,10 @@ def main() -> int:
     checks.append(check_project_scripts())
     checks.append(check_wheel_installation())
 
-    # CPU-safe pytest
+    # CPU-safe pytest (exclude heavy/optional markers)
     checks.append(run_pytest(
-        "not mlx and not slow and not benchmark",
+        "not mlx and not slow and not benchmark"
+        " and not experimental and not integration and not db",
         "cpu_safe",
     ))
 

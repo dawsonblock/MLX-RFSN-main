@@ -45,6 +45,7 @@ import json
 import os
 import time
 import threading
+from dataclasses import dataclass, field
 from threading import Thread
 from typing import AsyncIterator
 
@@ -60,34 +61,78 @@ from ..runtime.generation import GenerationConfig, RFSNGenerator
 
 
 # ---------------------------------------------------------------------------
-# Server settings (read once at startup via RFSNConfig)
+# ServerState: all mutable per-app state in one object
 # ---------------------------------------------------------------------------
 
-def _env_bool(key: str, default: bool) -> bool:
-    return os.environ.get(key, str(default)).lower() == "true"
+@dataclass
+class ServerState:
+    """Encapsulates all mutable server state for a single app instance."""
 
+    cfg: RFSNConfig
 
-_rfsn_cfg = RFSNConfig.from_env()
-_server_cfg = _rfsn_cfg.server
+    # Lazy-loaded singletons
+    model: object | None = None
+    tokenizer: object | None = None
+    generator: RFSNGenerator | None = None
+    model_id_loaded: str = ""
+    kv_compression_enabled: bool = False
+    sparse_decode_enabled: bool = False
 
-_REQUIRE_API_KEY: bool = _server_cfg.require_api_key
-_API_KEY: str = _server_cfg.api_key
-_MAX_PROMPT_CHARS: int = _server_cfg.max_prompt_chars
-_MAX_TOKENS_LIMIT: int = _server_cfg.max_tokens_limit
-_REQUEST_TIMEOUT_SECONDS: float = float(_server_cfg.request_timeout_seconds)
+    # Live metrics
+    metrics: dict = field(default_factory=lambda: {
+        "requests_total": 0,
+        "last_latency_ms": None,
+        "last_decode_tps": None,
+        "last_error": None,
+        "model_loaded": False,
+        "kv_compression": False,
+    })
 
-# Concurrency gate: prevents overlapping generations from crushing the Mac
-_generation_semaphore = asyncio.Semaphore(_server_cfg.max_concurrent_requests)
+    # Concurrency gate (created in __post_init__)
+    semaphore: asyncio.Semaphore = field(init=False)
+    _semaphore_slots: int = field(init=False)
 
-# Live metrics (updated on each completed/failed request)
-_metrics: dict = {
-    "requests_total": 0,
-    "last_latency_ms": None,
-    "last_decode_tps": None,
-    "last_error": None,
-    "model_loaded": False,
-    "kv_compression": False,
-}
+    def __post_init__(self) -> None:
+        self._semaphore_slots = self.cfg.server.max_concurrent_requests
+        self.semaphore = asyncio.Semaphore(self._semaphore_slots)
+
+    def get_model_id(self) -> str:
+        model_id = self.cfg.model.id.strip()
+        if not model_id:
+            raise RuntimeError(
+                "RFSN_MODEL_ID is not set.  "
+                "Set it to a HuggingFace model ID, e.g.:\n"
+                "  export RFSN_MODEL_ID="
+                "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+            )
+        return model_id
+
+    def load_generator(self) -> RFSNGenerator:
+        if self.generator is not None:
+            return self.generator
+
+        model_id = self.get_model_id()
+        backend = self.cfg.backend.name.lower() or None
+        self.sparse_decode_enabled = (
+            self.cfg.runtime.sparse_decode_enabled
+        )
+        self.kv_compression_enabled = (
+            self.cfg.runtime.enable_kv_compression
+        )
+
+        self.model, self.tokenizer = load_model_auto(
+            model_id, backend=backend,
+        )
+        self.generator = RFSNGenerator(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            enable_sparse_decode=self.sparse_decode_enabled,
+            enable_quantized_kv=self.kv_compression_enabled,
+        )
+        self.model_id_loaded = model_id
+        self.metrics["model_loaded"] = True
+        self.metrics["kv_compression"] = self.kv_compression_enabled
+        return self.generator
 
 
 # ---------------------------------------------------------------------------
@@ -134,130 +179,7 @@ class ChatCompletionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="RFSN v10 Inference Server",
-    version=__version__,
-    docs_url="/docs" if _server_cfg.enable_docs else None,
-    redoc_url="/redoc" if _server_cfg.enable_docs else None,
-)
-
-# Lazy-loaded singletons
-_model: object | None = None
-_tokenizer: object | None = None
-_generator: RFSNGenerator | None = None
-_model_id_loaded: str = ""
-_kv_compression_enabled: bool = False
-_sparse_decode_enabled: bool = False
-
-
-def _get_model_id() -> str:
-    model_id = _rfsn_cfg.model.id.strip()
-    if not model_id:
-        raise RuntimeError(
-            "RFSN_MODEL_ID is not set.  "
-            "Set it to a HuggingFace model ID, e.g.:\n"
-            "  export RFSN_MODEL_ID=mlx-community/Qwen2.5-0.5B-Instruct-4bit"
-        )
-    return model_id
-
-
-def _load_generator() -> RFSNGenerator:
-    global _model, _tokenizer, _generator
-    global _model_id_loaded, _kv_compression_enabled, _sparse_decode_enabled
-    if _generator is not None:
-        return _generator
-
-    model_id = _get_model_id()
-    backend = _rfsn_cfg.backend.name.lower() or None
-    _sparse_decode_enabled = _rfsn_cfg.runtime.sparse_decode_enabled
-    _kv_compression_enabled = _rfsn_cfg.runtime.enable_kv_compression
-
-    _model, _tokenizer = load_model_auto(model_id, backend=backend)
-    _generator = RFSNGenerator(
-        model=_model,
-        tokenizer=_tokenizer,
-        enable_sparse_decode=_sparse_decode_enabled,
-        enable_quantized_kv=_kv_compression_enabled,
-    )
-    _model_id_loaded = model_id
-    _metrics["model_loaded"] = True
-    _metrics["kv_compression"] = _kv_compression_enabled
-    return _generator
-
-
-# ---------------------------------------------------------------------------
-# Auth dependency
-# ---------------------------------------------------------------------------
-
-_security = HTTPBearer(auto_error=False)
-
-
-async def _require_auth(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_security),
-) -> None:
-    if not _REQUIRE_API_KEY:
-        return
-    if not _API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Server misconfigured: RFSN_API_KEY not set but RFSN_REQUIRE_API_KEY=true",
-        )
-    if credentials is None or credentials.credentials != _API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-
-# ---------------------------------------------------------------------------
-# Health + models endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-async def health() -> dict:
-    """Liveness/readiness probe.  Returns feature flag status."""
-    return {
-        "status": "ok",
-        "version": __version__,
-        "backend": _rfsn_cfg.backend.name or "auto",
-        "model_loaded": _generator is not None,
-        "model_id": _model_id_loaded or None,
-        "kv_compression": _kv_compression_enabled,
-        "sparse_decode": _sparse_decode_enabled,
-        "telemetry": False,
-        "host": _server_cfg.host,
-        "api_key_required": _REQUIRE_API_KEY,
-        "max_concurrent_requests": _server_cfg.max_concurrent_requests,
-    }
-
-
-@app.get("/metrics")
-async def metrics() -> dict:
-    """Live server metrics: request counts, last latency, last error."""
-    return dict(_metrics)
-
-
-@app.get("/v1/models")
-async def list_models(_auth=Depends(_require_auth)) -> dict:
-    """List available models (OpenAI-compatible)."""
-    models = []
-    
-    # Show configured model even if not yet loaded
-    configured_model_id = _rfsn_cfg.model.id.strip()
-    if configured_model_id:
-        models.append({
-            "id": configured_model_id,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "rfsn-v10",
-            "loaded": _generator is not None,
-        })
-    
-    return {"object": "list", "data": models}
-
-
-# ---------------------------------------------------------------------------
-# Dashboard
+# Dashboard HTML (static)
 # ---------------------------------------------------------------------------
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -399,140 +321,305 @@ setInterval(refresh, 3000);
 </html>"""
 
 
-# Conditional dashboard endpoint
-if _server_cfg.enable_dashboard:
-    @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-    async def dashboard(_auth=Depends(_require_auth)) -> str:
-        """Local monitoring dashboard.  Polls /health every 3 seconds."""
-        return _DASHBOARD_HTML
-
-
 # ---------------------------------------------------------------------------
-# Chat completions
+# App factory
 # ---------------------------------------------------------------------------
 
-@app.post("/v1/chat/completions", response_model=None)
-async def chat_completions(
-    request: ChatCompletionRequest,
-    _auth=Depends(_require_auth),
-) -> StreamingResponse | ChatCompletionResponse:
-    """OpenAI-compatible chat completions endpoint."""
-    # Concurrency gate: return 429 immediately if all slots are busy
-    if not _generation_semaphore._value:  # noqa: SLF001
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Server busy: max {_server_cfg.max_concurrent_requests} "
-                "concurrent request(s). Retry shortly."
-            ),
-        )
+_security = HTTPBearer(auto_error=False)
 
-    # Load generator (may raise on bad config)
-    try:
-        generator = _load_generator()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    # Build the prompt
-    messages = [{"role": m.role, "content": m.content} for m in request.messages]
-    prompt: str = _tokenizer.apply_chat_template(  # type: ignore[union-attr]
-        messages, tokenize=False, add_generation_prompt=True
+def _get_state(request: Request) -> ServerState:
+    """Retrieve ServerState from the running app."""
+    return request.app.state.server  # type: ignore[return-value]
+
+
+def create_app(config: RFSNConfig | None = None) -> FastAPI:
+    """Create a fully configured FastAPI app instance.
+
+    Parameters
+    ----------
+    config : RFSNConfig | None
+        Server configuration.  Falls back to ``RFSNConfig.from_env()``
+        when *None* (production default).
+
+    Returns
+    -------
+    FastAPI
+        Ready-to-run app with all routes registered.
+    """
+    if config is None:
+        config = RFSNConfig.from_env()
+
+    srv_cfg = config.server
+    state = ServerState(cfg=config)
+
+    application = FastAPI(
+        title="RFSN v10 Inference Server",
+        version=__version__,
+        docs_url="/docs" if srv_cfg.enable_docs else None,
+        redoc_url="/redoc" if srv_cfg.enable_docs else None,
     )
+    application.state.server = state  # type: ignore[attr-defined]
 
-    # Request limit checks
-    if len(prompt) > _MAX_PROMPT_CHARS:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Prompt too large ({len(prompt)} chars). "
-                f"Limit: {_MAX_PROMPT_CHARS} chars."
-            ),
-        )
-    if request.max_tokens > _MAX_TOKENS_LIMIT:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"max_tokens ({request.max_tokens}) exceeds configured limit "
-                f"({_MAX_TOKENS_LIMIT})."
-            ),
-        )
-
-    cfg = GenerationConfig(
-        max_new_tokens=request.max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        repetition_penalty=request.repetition_penalty,
-        stop_sequences=request.stop or [],
-        stream=request.stream,
-    )
-
-    _metrics["requests_total"] += 1
-
-    if request.stream:
-        return StreamingResponse(
-            _sse_stream(generator, prompt, cfg),
-            media_type="text/event-stream",
-        )
-
-    # Non-streaming: acquire semaphore slot, run in thread
-    t_start = time.monotonic()
-    async with _generation_semaphore:
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    generator.chat,
-                    prompt,
-                    max_new_tokens=cfg.max_new_tokens,
-                    temperature=cfg.temperature,
-                    top_p=cfg.top_p,
-                    repetition_penalty=cfg.repetition_penalty,
+    # ------------------------------------------------------------------
+    # Auth dependency (closure over state)
+    # ------------------------------------------------------------------
+    async def require_auth(
+        credentials: (
+            HTTPAuthorizationCredentials | None
+        ) = Depends(_security),
+    ) -> None:
+        if not srv_cfg.require_api_key:
+            return
+        if not srv_cfg.api_key:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Server misconfigured: RFSN_API_KEY not set "
+                    "but RFSN_REQUIRE_API_KEY=true"
                 ),
-                timeout=_REQUEST_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
-            _metrics["last_error"] = "Generation timed out"
-            raise HTTPException(status_code=504, detail="Generation timed out")
-        except Exception as exc:
-            _metrics["last_error"] = str(exc)[:200]
-            raise
-    elapsed_ms = (time.monotonic() - t_start) * 1000
-    _metrics["last_latency_ms"] = round(elapsed_ms, 1)
-    _metrics["last_error"] = None
-    tokens = len(result.text.split())
-    if elapsed_ms > 0:
-        _metrics["last_decode_tps"] = round(tokens / (elapsed_ms / 1000), 1)
-    return ChatCompletionResponse(
-        id=f"rfsn-{int(time.time() * 1000)}",
-        created=int(time.time()),
-        model=request.model or _model_id_loaded or "rfsn-v10",
-        choices=[
-            ChatCompletionChoice(
-                index=0,
-                message=ChatMessage(role="assistant", content=result.text),
-                finish_reason="stop",
+        if (
+            credentials is None
+            or credentials.credentials != srv_cfg.api_key
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing API key",
             )
-        ],
-    )
 
+    # ------------------------------------------------------------------
+    # Health
+    # ------------------------------------------------------------------
+    @application.get("/health")
+    async def health(request: Request) -> dict:
+        s = _get_state(request)
+        return {
+            "status": "ok",
+            "version": __version__,
+            "backend": s.cfg.backend.name or "auto",
+            "model_loaded": s.generator is not None,
+            "model_id": s.model_id_loaded or None,
+            "kv_compression": s.kv_compression_enabled,
+            "sparse_decode": s.sparse_decode_enabled,
+            "telemetry": False,
+            "host": srv_cfg.host,
+            "api_key_required": srv_cfg.require_api_key,
+            "max_concurrent_requests": (
+                srv_cfg.max_concurrent_requests
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+    @application.get("/metrics")
+    async def metrics(
+        request: Request,
+        _auth=Depends(require_auth),
+    ) -> dict:
+        return dict(_get_state(request).metrics)
+
+    # ------------------------------------------------------------------
+    # Models
+    # ------------------------------------------------------------------
+    @application.get("/v1/models")
+    async def list_models(
+        request: Request,
+        _auth=Depends(require_auth),
+    ) -> dict:
+        s = _get_state(request)
+        models = []
+        configured_model_id = s.cfg.model.id.strip()
+        if configured_model_id:
+            models.append({
+                "id": configured_model_id,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "rfsn-v10",
+                "loaded": s.generator is not None,
+            })
+        return {"object": "list", "data": models}
+
+    # ------------------------------------------------------------------
+    # Dashboard (conditionally mounted)
+    # ------------------------------------------------------------------
+    if srv_cfg.enable_dashboard:
+        @application.get(
+            "/dashboard",
+            response_class=HTMLResponse,
+            include_in_schema=False,
+        )
+        async def dashboard(
+            _auth=Depends(require_auth),
+        ) -> str:
+            return _DASHBOARD_HTML
+
+    # ------------------------------------------------------------------
+    # Chat completions
+    # ------------------------------------------------------------------
+    @application.post("/v1/chat/completions", response_model=None)
+    async def chat_completions(
+        chat_request: ChatCompletionRequest,
+        request: Request,
+        _auth=Depends(require_auth),
+    ) -> StreamingResponse | ChatCompletionResponse:
+        s = _get_state(request)
+        timeout_s = float(srv_cfg.request_timeout_seconds)
+        max_prompt = srv_cfg.max_prompt_chars
+        max_tok_limit = srv_cfg.max_tokens_limit
+
+        # Concurrency gate: try to acquire without blocking
+        if not s.semaphore._value:  # noqa: SLF001
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Server busy: max "
+                    f"{srv_cfg.max_concurrent_requests} "
+                    "concurrent request(s). Retry shortly."
+                ),
+            )
+
+        # Load generator (may raise on bad config)
+        try:
+            generator = s.load_generator()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=str(exc),
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503, detail=str(exc),
+            ) from exc
+
+        # Build prompt
+        messages = [
+            {"role": m.role, "content": m.content}
+            for m in chat_request.messages
+        ]
+        prompt: str = s.tokenizer.apply_chat_template(  # type: ignore[union-attr]
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+        # Limit checks
+        if len(prompt) > max_prompt:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Prompt too large ({len(prompt)} chars). "
+                    f"Limit: {max_prompt} chars."
+                ),
+            )
+        if chat_request.max_tokens > max_tok_limit:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"max_tokens ({chat_request.max_tokens}) "
+                    f"exceeds configured limit "
+                    f"({max_tok_limit})."
+                ),
+            )
+
+        cfg = GenerationConfig(
+            max_new_tokens=chat_request.max_tokens,
+            temperature=chat_request.temperature,
+            top_p=chat_request.top_p,
+            repetition_penalty=chat_request.repetition_penalty,
+            stop_sequences=chat_request.stop or [],
+            stream=chat_request.stream,
+        )
+
+        s.metrics["requests_total"] += 1
+
+        if chat_request.stream:
+            return StreamingResponse(
+                _sse_stream(s, prompt, cfg, timeout_s),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming
+        t_start = time.monotonic()
+        async with s.semaphore:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        generator.chat,
+                        prompt,
+                        max_new_tokens=cfg.max_new_tokens,
+                        temperature=cfg.temperature,
+                        top_p=cfg.top_p,
+                        repetition_penalty=cfg.repetition_penalty,
+                    ),
+                    timeout=timeout_s,
+                )
+            except asyncio.TimeoutError:
+                s.metrics["last_error"] = "Generation timed out"
+                raise HTTPException(
+                    status_code=504,
+                    detail="Generation timed out",
+                )
+            except Exception as exc:
+                s.metrics["last_error"] = str(exc)[:200]
+                raise
+        elapsed_ms = (time.monotonic() - t_start) * 1000
+        s.metrics["last_latency_ms"] = round(elapsed_ms, 1)
+        s.metrics["last_error"] = None
+        tokens = len(result.text.split())
+        if elapsed_ms > 0:
+            s.metrics["last_decode_tps"] = round(
+                tokens / (elapsed_ms / 1000), 1,
+            )
+        return ChatCompletionResponse(
+            id=f"rfsn-{int(time.time() * 1000)}",
+            created=int(time.time()),
+            model=(
+                chat_request.model
+                or s.model_id_loaded
+                or "rfsn-v10"
+            ),
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant", content=result.text,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+        )
+
+    return application
+
+
+# ---------------------------------------------------------------------------
+# SSE streaming helper
+# ---------------------------------------------------------------------------
 
 async def _sse_stream(
-    generator: RFSNGenerator,
+    state: ServerState,
     prompt: str,
     cfg: GenerationConfig,
+    timeout_s: float,
 ) -> AsyncIterator[str]:
     """Yield SSE events from a background thread via a queue bridge.
 
     Running synchronous token generation directly on the event loop would
     block all other requests.  We push tokens from a daemon thread through
     an asyncio.Queue so the event loop stays free between tokens.
+
+    The semaphore is held for the duration of the stream so that
+    streaming requests participate in the concurrency gate.
     """
+    generator = state.generator
+    assert generator is not None
+
+    await state.semaphore.acquire()
+
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
     created = int(time.time())
     id_prefix = f"rfsn-{created}"
-    deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_s
     stop_event = threading.Event()
 
     def _worker() -> None:
@@ -553,7 +640,7 @@ async def _sse_stream(
                     "id": f"{id_prefix}-{idx}",
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": _model_id_loaded or "rfsn-v10",
+                    "model": state.model_id_loaded or "rfsn-v10",
                     "choices": [
                         {
                             "index": 0,
@@ -563,7 +650,8 @@ async def _sse_stream(
                     ],
                 }
                 loop.call_soon_threadsafe(
-                    queue.put_nowait, f"data: {json.dumps(payload)}\n\n"
+                    queue.put_nowait,
+                    f"data: {json.dumps(payload)}\n\n",
                 )
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -580,7 +668,9 @@ async def _sse_stream(
                 timed_out = True
                 break
             try:
-                item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                item = await asyncio.wait_for(
+                    queue.get(), timeout=remaining,
+                )
             except asyncio.TimeoutError:
                 timed_out = True
                 break
@@ -589,21 +679,39 @@ async def _sse_stream(
             if isinstance(item, Exception):
                 raise item
             yield item
+
+        if timed_out:
+            error_payload = {
+                "id": f"{id_prefix}-error",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": (
+                    state.model_id_loaded or "rfsn-v10"
+                ),
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    },
+                ],
+                "error": "Generation timed out",
+            }
+            yield (
+                f"data: {json.dumps(error_payload)}\n\n"
+            )
+
+        yield "data: [DONE]\n\n"
     finally:
         stop_event.set()
+        state.semaphore.release()
 
-    if timed_out:
-        error_payload = {
-            "id": f"{id_prefix}-error",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": _model_id_loaded or "rfsn-v10",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "error": "Generation timed out",
-        }
-        yield f"data: {json.dumps(error_payload)}\n\n"
 
-    yield "data: [DONE]\n\n"
+# ---------------------------------------------------------------------------
+# Module-level default app (for uvicorn / CLI)
+# ---------------------------------------------------------------------------
+
+app = create_app()
 
 
 # ---------------------------------------------------------------------------

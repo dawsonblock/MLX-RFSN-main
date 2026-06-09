@@ -25,6 +25,7 @@ def main() -> None:
         ".ruff_cache",
         ".rfsn_cache",
         ".tmp",
+        ".venv",
         "dist",
         "build",
         "*.egg-info",
@@ -40,6 +41,7 @@ def main() -> None:
         "*.swp",
         "*.swo",
         "*~",
+        "=*",
     ]
 
     removed_count = 0

@@ -44,6 +44,9 @@ _EXCLUDE_PATTERNS: frozenset[str] = frozenset({
     "*.log",
     "*.jsonl",
     "progress.txt",
+    ".venv",
+    ".rfsn_cache",
+    "=*",
 })
 
 
@@ -54,6 +57,8 @@ def _is_excluded(rel_path: str) -> bool:
             return True
         for pat in _EXCLUDE_PATTERNS:
             if pat.startswith("*") and part.endswith(pat[1:]):
+                return True
+            if pat.endswith("*") and part.startswith(pat[:-1]):
                 return True
     return False
 
