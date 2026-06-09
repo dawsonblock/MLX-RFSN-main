@@ -280,9 +280,10 @@ class TestSIGTERMHandling:
     """Ticket 4-3: SIGTERM handler for graceful shutdown."""
 
     def test_flush_path_defined(self):
-        """Flush path should be defined for disk persistence."""
-        assert hasattr(ClickHouseClient, '_FLUSH_PATH')
-        assert ClickHouseClient._FLUSH_PATH.endswith('.jsonl')
+        """Flush path should be defined per instance for disk persistence."""
+        client = ClickHouseClient(host="localhost", secure=False)
+        assert hasattr(client, '_flush_path')
+        assert client._flush_path.endswith('.jsonl')
 
     def test_sigterm_handler_exists(self):
         """SIGTERM handler method should exist."""

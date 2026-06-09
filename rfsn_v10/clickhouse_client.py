@@ -14,20 +14,27 @@ import atexit
 import hashlib
 import hmac
 import json
+import logging
 import os
 import signal
+import threading
 import time
 import warnings
 import weakref
 from typing import Any
 from urllib import error, request
 
+logger = logging.getLogger(__name__)
+
 _active_clients: set[weakref.ref[ClickHouseClient]] = set()
+_active_clients_lock = threading.Lock()
 
 
 def _sigterm_dispatcher(_signum, _frame) -> None:
     """Dispatch SIGTERM to all active ClickHouseClient instances."""
-    for ref in list(_active_clients):
+    with _active_clients_lock:
+        clients = list(_active_clients)
+    for ref in clients:
         client = ref()
         if client is not None:
             client._flush_queue_to_disk()
@@ -69,7 +76,6 @@ class ClickHouseClient:
         "user_message",
         "query",
     }
-    _FLUSH_PATH = "/tmp/rfsn_telemetry_flush.jsonl"
 
     def __init__(
         self,
@@ -117,7 +123,15 @@ class ClickHouseClient:
         self._pending_queue: list[tuple[str, dict[str, Any]]] = []
         self._max_retries = 5
         self._flush_interval = 1.0
-        self._flush_path = self._FLUSH_PATH
+        # Use user-specific temp path to avoid conflicts in multi-user systems
+        import tempfile
+        import getpass
+
+        tmpdir = tempfile.gettempdir()
+        user = getpass.getuser()
+        self._flush_path = os.path.join(
+            tmpdir, f"rfsn_telemetry_flush_{user}.jsonl"
+        )
 
         # Register SIGTERM handler to flush queue to disk
         self._register_flush_handlers()
@@ -133,29 +147,50 @@ class ClickHouseClient:
     def _register_flush_handlers(self) -> None:
         """Register atexit and SIGTERM handlers for queue flush."""
         atexit.register(self._flush_queue_to_disk)
-        _active_clients.add(weakref.ref(self))
+        with _active_clients_lock:
+            _active_clients.add(weakref.ref(self))
         try:
             signal.signal(signal.SIGTERM, _sigterm_dispatcher)
-        except (ValueError, OSError):
-            pass  # May fail in threads or restricted environments
+        except (ValueError, OSError) as e:
+            logger.debug("SIGTERM handler registration failed: %s", e)
 
     def _flush_queue_to_disk(self) -> None:
-        """Write pending queue to local JSONL file.
+        """Write pending queue to local JSONL file atomically.
 
         Each line is a JSON object with a ``_table`` routing key and an
         ``_event`` payload key.  The routing key is stored outside the event
         payload so it never appears in ClickHouse rows.
+
+        Uses atomic write (temp file + rename) to prevent corruption from
+        concurrent processes.
         """
         if not self._pending_queue:
             return
         try:
-            with open(self._flush_path, "a", encoding="utf-8") as f:
-                for table, event in self._pending_queue:
-                    record = {"_table": table, "_event": event}
-                    f.write(json.dumps(record, default=str) + "\n")
-            self._pending_queue.clear()
-        except OSError:
-            pass
+            import tempfile
+
+            # Write to temp file in same directory, then rename atomically
+            flush_dir = os.path.dirname(self._flush_path) or "."
+            fd, temp_path = tempfile.mkstemp(
+                dir=flush_dir, prefix=".rfsn_flush_"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    for table, event in self._pending_queue:
+                        record = {"_table": table, "_event": event}
+                        f.write(json.dumps(record, default=str) + "\n")
+                # Atomic rename on same filesystem
+                os.replace(temp_path, self._flush_path)
+                self._pending_queue.clear()
+            except Exception:
+                # Clean up temp file on failure
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            logger.warning("Failed to flush telemetry queue to disk: %s", e)
 
     def _replay_flushed_events(self) -> None:
         """Read previously flushed events and add them to the queue."""
@@ -173,16 +208,16 @@ class ClickHouseClient:
                         event.pop("_table", None)
                         self._pending_queue.append((table, event))
             os.remove(self._flush_path)
-        except (OSError, json.JSONDecodeError):
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Failed to replay flushed telemetry events: %s", e)
 
     @staticmethod
     def _hmac_hash_text(text: str, secret: str) -> str:
         """HMAC-SHA256 hash of *text* using *secret* as the key.
 
-        Salted HMAC is used instead of bare SHA-256 so that common prompt
-        prefixes cannot be pre-computed by an attacker with access to the
-        telemetry database.
+        HMAC is used instead of bare SHA-256 so that common prompt prefixes
+        cannot be pre-computed by an attacker with access to the telemetry
+        database. The secret key provides the keyed hashing property.
         """
         return hmac.new(
             secret.encode("utf-8"),

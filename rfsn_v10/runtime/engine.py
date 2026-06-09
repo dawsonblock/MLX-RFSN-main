@@ -136,8 +136,18 @@ class RFSNRuntime:
         a_f = a.flatten().astype(mx.float32)
         b_f = b.flatten().astype(mx.float32)
         dot = mx.sum(a_f * b_f)
-        norm = mx.sqrt(mx.sum(a_f * a_f)) * mx.sqrt(mx.sum(b_f * b_f))
-        return (dot / mx.maximum(norm, mx.array(1e-8))).item()
+        norm_a = mx.sqrt(mx.sum(a_f * a_f))
+        norm_b = mx.sqrt(mx.sum(b_f * b_f))
+        norm = norm_a * norm_b
+        # Handle zero vectors: if both are zero, similarity is 1.0 (identical)
+        # if only one is zero, similarity is 0.0 (orthogonal)
+        norm_a_val = norm_a.item()
+        norm_b_val = norm_b.item()
+        if norm_a_val == 0.0 and norm_b_val == 0.0:
+            return 1.0
+        if norm_a_val == 0.0 or norm_b_val == 0.0:
+            return 0.0
+        return (dot / norm).item()
 
     @staticmethod
     def _rel_mae(a: mx.array, b: mx.array) -> float:

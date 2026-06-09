@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 
 import pytest
 
@@ -10,16 +11,26 @@ from rfsn_v10.clickhouse_client import ClickHouseClient
 
 @pytest.fixture(autouse=True)
 def isolate_clickhouse_flush_path(tmp_path, monkeypatch):
-    """Redirect the ClickHouseClient shared flush file to a per-test temp path.
+    """Redirect the ClickHouseClient flush file to a per-test temp path.
 
-    Without this, retry tests that write to /tmp/rfsn_telemetry_flush.jsonl
-    leave stale events on disk that get replayed by the next ClickHouseClient
-    constructor, causing spurious extra _execute_query calls in other tests.
+    Without this, retry tests that write to the shared flush file leave stale
+    events on disk that get replayed by the next ClickHouseClient constructor,
+    causing spurious extra _execute_query calls in other tests.
     """
     isolated_path = str(tmp_path / "rfsn_telemetry_flush.jsonl")
-    monkeypatch.setattr(ClickHouseClient, "_FLUSH_PATH", isolated_path)
-    # Also remove any leftover shared file from previous runs outside pytest.
-    shared = "/tmp/rfsn_telemetry_flush.jsonl"
-    if os.path.exists(shared):
-        os.unlink(shared)
+    original_init = ClickHouseClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # Override the instance flush path after init
+        self._flush_path = isolated_path
+
+    monkeypatch.setattr(ClickHouseClient, "__init__", patched_init)
+    # Also remove any leftover shared files from previous runs outside pytest.
+    for shared in [
+        "/tmp/rfsn_telemetry_flush.jsonl",
+        os.path.join(tempfile.gettempdir(), "rfsn_telemetry_flush.jsonl"),
+    ]:
+        if os.path.exists(shared):
+            os.unlink(shared)
     yield
