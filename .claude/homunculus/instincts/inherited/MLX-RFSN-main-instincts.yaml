@@ -1,0 +1,564 @@
+# Instincts generated from https://github.com/dawsonblock/MLX-RFSN-main
+# Generated: 2026-06-09T23:42:14.647Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: MLX-RFSN-main-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Commit Length
+
+## Action
+
+Write moderate-length commit messages (~83 characters)
+
+## Evidence
+
+- Average commit message length: 83 chars
+- Based on 11 commits
+
+---
+id: MLX-RFSN-main-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: MLX-RFSN-main-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: MLX-RFSN-main-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: MLX-RFSN-main-arch-type-based
+trigger: "when adding new code"
+confidence: 0.8
+domain: architecture
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Arch Type Based
+
+## Action
+
+Place code in the appropriate type folder (components/, services/, utils/, etc.)
+
+## Evidence
+
+- Type-based module organization detected
+- Folders: 
+
+---
+id: MLX-RFSN-main-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: MLX-RFSN-main-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: MLX-RFSN-main-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~22x per month
+- Files: external/vmlx/panel/*, external/vmlx/panel/src/*, external/vmlx/panel/src/main/*
+
+---
+id: MLX-RFSN-main-workflow-adapter-fix-and-benchmark-update
+trigger: "when doing adapter fix and benchmark update"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Workflow Adapter Fix And Benchmark Update
+
+## Action
+
+Follow the adapter-fix-and-benchmark-update workflow:
+1. Edit or add files in rfsn_v11/candidates/ (e.g., *_adapter.py, base.py)
+2. Update benchmarks/kv_shootout.py to reflect adapter changes or new evaluation logic
+3. Regenerate benchmark result artifacts (artifacts/bench/shootout/results.*)
+4. Commit all changes together
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: rfsn_v11/candidates/*.py, benchmarks/kv_shootout.py, artifacts/bench/shootout/results.*
+
+---
+id: MLX-RFSN-main-workflow-server-feature-or-hardening
+trigger: "when doing server feature or hardening"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Workflow Server Feature Or Hardening
+
+## Action
+
+Follow the server-feature-or-hardening workflow:
+1. Edit rfsn_v10/server/app.py and/or rfsn_v10/server/cli.py to add/modify features
+2. Update rfsn_v10/config.py for new config options
+3. Update or add documentation in docs/ (e.g., FEATURE_FLAGS.md, RUN_SERVER.md)
+4. Add or update tests in tests/server/ and/or tests/runtime/
+5. Update scripts/release_gate.py if release checks are affected
+6. Commit all related changes together
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: rfsn_v10/server/app.py, rfsn_v10/server/cli.py, rfsn_v10/config.py
+
+---
+id: MLX-RFSN-main-workflow-benchmark-promotion-policy-update
+trigger: "when doing benchmark promotion policy update"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Workflow Benchmark Promotion Policy Update
+
+## Action
+
+Follow the benchmark-promotion-policy-update workflow:
+1. Edit benchmarks/kv_shootout.py to add new gates, verdict logic, or prompt suites
+2. Update docs/CANDIDATE_PROMOTION.md and related docs to describe new policies
+3. Optionally update tests for new gates or categories
+4. Commit all changes together
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: benchmarks/kv_shootout.py, docs/CANDIDATE_PROMOTION.md, docs/FEATURE_FLAGS.md
+
+---
+id: MLX-RFSN-main-workflow-packaging-and-release-hardening
+trigger: "when doing packaging and release hardening"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/dawsonblock/MLX-RFSN-main
+---
+
+# MLX RFSN Main Workflow Packaging And Release Hardening
+
+## Action
+
+Follow the packaging-and-release-hardening workflow:
+1. Update .python-version and/or pyproject.toml for new Python/package versions
+2. Edit scripts/make_release_zip.py, scripts/clean_artifacts.py, scripts/release_gate.py as needed
+3. Update docs/README_REALITY.md, RUN_SERVER.md, etc. for new release notes or instructions
+4. Remove obsolete artifacts or logs
+5. Commit all changes together
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: .python-version, pyproject.toml, scripts/make_release_zip.py
+
+---
+id: mlx-rfsn-main-instinct-file-naming
+trigger: "When creating a new file or renaming an existing file in the codebase"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct File Naming
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- Pattern in files: rfsn_v10/server/app.py, rfsn_v10/config.py
+
+---
+id: mlx-rfsn-main-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: mlx-rfsn-main-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Class Naming
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: mlx-rfsn-main-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: mlx-rfsn-main-instinct-import-style
+trigger: "When importing modules within the package"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+
+---
+id: mlx-rfsn-main-instinct-export-style
+trigger: "When exporting symbols from a module"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: mlx-rfsn-main-instinct-test-location
+trigger: "When adding new tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Test Location
+
+## Action
+
+Place test files in the separate 'tests/' directory
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation
+- Files: tests/server/*.py, tests/runtime/*.py
+
+---
+id: mlx-rfsn-main-instinct-test-pattern
+trigger: "When naming a test file"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Test Pattern
+
+## Action
+
+Use the '*.test.ts' file pattern for test files
+
+## Evidence
+
+- Pattern in testing.filePattern
+
+---
+id: mlx-rfsn-main-instinct-test-type
+trigger: "When writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Test Type
+
+## Action
+
+Write unit tests as the primary test type
+
+## Evidence
+
+- Pattern in testing.testTypes
+
+---
+id: mlx-rfsn-main-instinct-commit-format
+trigger: "When writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Commit Format
+
+## Action
+
+Use concise, imperative, freeform commit messages without prefixes
+
+## Evidence
+
+- Pattern in commits.type
+- Examples: 'Fix all shootout candidate errors + clean output', 'Restructure as MLX-RFSN Fusion Alpha'
+
+---
+id: mlx-rfsn-main-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Commit Length
+
+## Action
+
+Keep commit messages brief (average ~83 characters)
+
+## Evidence
+
+- Pattern in commits.averageLength
+
+---
+id: mlx-rfsn-main-instinct-adapter-benchmark-update
+trigger: "When a candidate adapter is added, fixed, or enhanced in rfsn_v11/candidates/"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Adapter Benchmark Update
+
+## Action
+
+Update benchmarks/kv_shootout.py, regenerate artifacts/bench/shootout/results.*, and commit all changes together
+
+## Evidence
+
+- Workflow: adapter-fix-and-benchmark-update
+- Files: rfsn_v11/candidates/*.py, benchmarks/kv_shootout.py, artifacts/bench/shootout/results.*
+
+---
+id: mlx-rfsn-main-instinct-server-feature-hardening
+trigger: "When implementing a new server feature, config option, or hardening (e.g., timeouts, API keys)"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Server Feature Hardening
+
+## Action
+
+Edit rfsn_v10/server/app.py and/or cli.py, update config.py, docs, and tests, and commit all related changes together
+
+## Evidence
+
+- Workflow: server-feature-or-hardening
+- Files: rfsn_v10/server/app.py, rfsn_v10/server/cli.py, rfsn_v10/config.py, docs/*.md, tests/server/*.py
+
+---
+id: mlx-rfsn-main-instinct-benchmark-policy-update
+trigger: "When candidate promotion policies or prompt suites change"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Benchmark Policy Update
+
+## Action
+
+Edit benchmarks/kv_shootout.py, update docs/CANDIDATE_PROMOTION.md and related docs, optionally update tests, and commit all changes together
+
+## Evidence
+
+- Workflow: benchmark-promotion-policy-update
+- Files: benchmarks/kv_shootout.py, docs/CANDIDATE_PROMOTION.md, docs/FEATURE_FLAGS.md, docs/BENCHMARKING.md, tests/*.py
+
+---
+id: mlx-rfsn-main-instinct-packaging-release
+trigger: "When preparing for a new release or updating Python/package versions"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: dawsonblock/MLX-RFSN-main
+---
+
+# Mlx Rfsn Main Instinct Packaging Release
+
+## Action
+
+Update .python-version, pyproject.toml, relevant scripts, docs, remove obsolete artifacts, and commit all changes together
+
+## Evidence
+
+- Workflow: packaging-and-release-hardening
+- Files: .python-version, pyproject.toml, scripts/make_release_zip.py, scripts/clean_artifacts.py, scripts/release_gate.py, docs/*.md, artifacts/proof/*
+
