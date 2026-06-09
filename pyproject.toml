@@ -51,6 +51,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff==0.4.*",
     "mypy==1.8.*",
+    "alembic>=1.13",
+    "sqlalchemy>=2.0",
 ]
 real_model = [
     "torch==2.3.1",

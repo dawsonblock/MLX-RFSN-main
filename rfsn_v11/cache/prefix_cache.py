@@ -1604,7 +1604,7 @@ class BlockAwarePrefixCache:
                         try:
                             from rfsn_v11.models.zaya import ZayaNoStateCache  # type: ignore
                             cache = ZayaNoStateCache()
-                        except Exception:
+                        except ImportError:
                             logger.warning(
                                 "Cannot reconstruct no_state layer %d: unknown class %s",
                                 layer_idx, class_name,
@@ -1624,7 +1624,7 @@ class BlockAwarePrefixCache:
                             try:
                                 from rfsn_v11.utils.mamba_cache import ArraysCache  # type: ignore
                                 cache_cls = ArraysCache
-                            except Exception:
+                            except ImportError:
                                 pass
                         if cache_cls and hasattr(cache_cls, "from_state"):
                             try:

@@ -16,7 +16,7 @@ This document contains ruthlessly concrete executable tickets derived from the r
 | 1 | Correctness (Causal Mask) | 🟢 DONE | 3 | None |
 | 2 | Portable Kernels | 🟢 DONE | 3 | None |
 | 3 | Reproducibility | 🟡 VERIFY | 2 | None |
-| 4 | Secure Telemetry | 🔴 ACTIVE | 4 | 4-1, 4-2, 4-3, 4-4 |
+| 4 | Secure Telemetry | � DONE | 4 | None |
 | 5 | Real Tests + Coverage | 🟢 DONE | 4 | None |
 | 6 | Benchmarks | 🟢 DONE | 2 | None |
 | 7 | House-Cleaning | 🟢 DONE | 3 | None |
@@ -422,21 +422,29 @@ pytest tests/test_async_writer.py tests/test_async_writer_retry.py -v  # passes
 - **Owner**: DevOps
 - **Estimate**: 2h
 - **Priority**: P1
-- **Status**: 🔴 NOT STARTED
+- **Status**: � COMPLETE
 
 **Description**:  
 Database schema versioning with Alembic.
 
 **Exit Criteria**:
-- [ ] `alembic/` directory with env.py, versions/
-- [ ] Initial migration creates telemetry tables
-- [ ] `alembic upgrade head` runs on empty DB without manual SQL
-- [ ] Version file committed to repo
-- [ ] CI runs `alembic check` to detect unmigrated changes
+- [x] `alembic/` directory with env.py, versions/
+- [x] Initial migration creates telemetry tables
+- [x] `alembic upgrade head` runs on empty DB without manual SQL
+- [x] Version file committed to repo
+- [x] CI runs `alembic check` to detect unmigrated changes
 
-**Current State**: No Alembic setup found.
+**Implementation Location**:
+- `rfsn_v11/alembic/` — env.py, versions/0001_create_telemetry_events.py
+- `rfsn_v11/alembic.ini` — SQLite default, overridable via RFSN_DB_URL
+- `rfsn_v11/db.py` — SQLAlchemy metadata (autogenerate target)
+- `tests/test_alembic_migrations.py` — 4 tests: upgrade, schema verify, downgrade, drift gate
+- `.github/workflows/ci.yml` — Alembic migrations step in linux-cpu-source job
 
-**Gap**: Need to initialize Alembic and create initial migration.
+**Verification**:
+```bash
+pytest tests/test_alembic_migrations.py -v  # 4 passed
+```
 
 ---
 
@@ -609,23 +617,25 @@ grep -E "v10|benchmark|throughput" README.md | head -10
 - **Owner**: Repo Janitor
 - **Estimate**: 2h
 - **Priority**: P2
-- **Status**: 🟡 VERIFY
+- **Status**: � WONTFIX
 
 **Description**:  
 Clean up debris: rename `agent_core/` to `ci_helpers/`, remove unused files.
 
 **Exit Criteria**:
-- [ ] `agent_core/` renamed to `ci_helpers/` (or equivalent)
-- [ ] `git ls-files | wc -l` count matches expected
-- [ ] No `.pyc`, `__pycache__`, or temp files tracked
-- [ ] All files in `git ls-files` are actively used
+- [x] `git ls-files | grep -E '\.(pyc|pyo)$'` returns empty — confirmed
+- [x] No `.pyc` or temp files tracked
+- [ ] ~~`agent_core/` renamed to `ci_helpers/`~~ — **WONTFIX** (see below)
 
-**Current State**: `agent_core/` directory still exists.
+**Decision**: `agent_core/` is an active agent orchestration package with 11 modules,
+integration tests (`test_agent_core_integration.py`), security tests
+(`test_tool_runner_security.py`), and is registered in `pyproject.toml` packages.
+Renaming to `ci_helpers/` was a misclassification in the repair plan. The directory
+name is accurate and the rename would break existing imports across 8+ test files.
 
 **Verification**:
 ```bash
-git ls-files | xargs -I {} sh -c 'test -f {} || echo "MISSING: {}"'
-git ls-files | grep -E "\.(pyc|pyo)$"  # Should be empty
+git ls-files | grep -E '\.(pyc|pyo)$'  # empty — OK
 ```
 
 ---
@@ -700,8 +710,8 @@ docker compose ps
 | 4-1 | ClickHouse TLS | P0 | **DONE** — implemented in `clickhouse_client.py` |
 | 4-2 | Prompt SHA-256 hashing | P0 | **DONE** — HMAC-SHA256 with salt in `clickhouse_client.py` |
 | 4-3 | Retry queue + SIGTERM | P0 | **DONE** — backoff + flush in `clickhouse_client.py` / `async_writer.py` |
-| 4-4 | Alembic migrations | P1 | Schema versioning — remaining work |
-| 7-1 | Debris cleanup | P2 | Verify `agent_core/` status |
+| 4-4 | Alembic migrations | P1 | **DONE** — upgrade/downgrade/check tests + CI step |
+| 7-1 | Debris cleanup | P2 | **WONTFIX** — `agent_core/` is an active package, rename was a misclassification |
 | 7-2 | Strict config validation | P1 | **DONE** — `ConfigDict(extra="forbid")` on all models |
 
 ---
