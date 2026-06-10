@@ -58,15 +58,102 @@ class RFSNV10Candidate(KVCompressionCandidate):
         max_tokens: int = 200,
         temp: float = 0.0,
     ) -> Any:
-        """Capture teacher-forced log-probs via standard MLX-LM path.
+        """Capture teacher-forced log-probs with RFSN v10 real cache active.
 
-        RFSN v10's current generation path (``enable_sparse_decode=False``)
-        delegates to ``mlx_lm.stream_generate`` without SDPA patching, so the
-        teacher-forced capture can use the standard MLX-LM forward pass.
+        Creates an RFSNGenerator with ``enable_sparse_decode=True`` so the
+        SDPA patch routes through RFSNRuntime and the quantized KV cache.
+        The teacher-forced loop then feeds the exact baseline token sequence
+        through the model and captures per-step log-probability vectors.
         """
-        return capture_teacher_forced_logprobs(
-            model, tokenizer, prompt, target_text,
-        )
+        try:
+            import numpy as np
+            import mlx.core as mx
+            from mlx_lm.models import cache as mlx_cache
+            from rfsn_v10.config import QuantizationConfig, RFSNConfig
+            from rfsn_v10.runtime.generation import (
+                RFSNGenerator,
+                _RFSNSDPAPatcher,
+                _unwrap_layers_for_rfsn,
+                _wrap_layers_for_rfsn,
+            )
+
+            quant_kwargs = _PRESET_MAP[self.config_name]
+            cfg = RFSNConfig(
+                quantization=QuantizationConfig(**quant_kwargs),
+            )
+            generator = RFSNGenerator(
+                model,
+                tokenizer,
+                cfg,
+                enable_quantized_kv=True,
+                enable_sparse_decode=True,
+            )
+
+            prompt_ids = tokenizer.encode(prompt)
+            target_ids = tokenizer.encode(target_text)
+
+            # Same logic as capture_teacher_forced_logprobs
+            if (
+                len(target_ids) >= len(prompt_ids)
+                and target_ids[: len(prompt_ids)] == prompt_ids
+            ):
+                gen_ids = target_ids[len(prompt_ids):]
+            else:
+                gen_ids = target_ids
+
+            if not gen_ids:
+                return None
+
+            _wrap_layers_for_rfsn(model)
+            try:
+                if hasattr(model, "make_cache"):
+                    cache_list = model.make_cache()
+                else:
+                    cache_list = [
+                        mlx_cache.KVCache()
+                        for _ in range(len(model.layers))
+                    ]
+
+                # Prefill
+                y = mx.array(prompt_ids)
+                while y.size > 512:
+                    model(y[:512][None], cache=cache_list)
+                    y = y[512:]
+
+                patcher = _RFSNSDPAPatcher(generator._runtime)
+                patcher.__enter__()
+                logprob_list: list[np.ndarray] = []
+                try:
+                    # Prefill + first decode prediction
+                    logits = model(y[None], cache=cache_list)
+                    logits = logits[:, -1, :]
+                    logprobs = logits - mx.logsumexp(logits, keepdims=True)
+                    lp_np = np.array(logprobs.astype(mx.float32).squeeze(0))
+                    logprob_list.append(lp_np)
+
+                    # Teacher-forced decode
+                    for next_token_id in gen_ids[1:]:
+                        logits = model(
+                            mx.array([next_token_id])[None], cache=cache_list
+                        )
+                        logits = logits[:, -1, :]
+                        logprobs = logits - mx.logsumexp(
+                            logits, keepdims=True
+                        )
+                        lp_np = np.array(
+                            logprobs.astype(mx.float32).squeeze(0)
+                        )
+                        logprob_list.append(lp_np)
+                finally:
+                    patcher.__exit__(None, None, None)
+
+                if not logprob_list:
+                    return None
+                return np.stack(logprob_list, axis=0)
+            finally:
+                _unwrap_layers_for_rfsn(model)
+        except Exception:
+            return None
 
     def run(
         self,
@@ -100,7 +187,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 tokenizer,
                 cfg,
                 enable_quantized_kv=True,
-                enable_sparse_decode=False,
+                enable_sparse_decode=True,
             )
 
             # Suppress mlx-lm deprecated-arg print()s from internals
@@ -141,8 +228,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
                     f"RFSN v10 stable baseline — config={self.config_name} "
                     f"bits={quant_kwargs['default_bits']} "
                     f"gs={quant_kwargs['group_size']}  "
-                    "Generation path currently delegates to mlx_lm.stream_generate; "
-                    "real RFSN v10 cache injection is pending."
+                    "Real RFSN v10 quantized KV cache active via SDPA patch."
                 ),
             )
         except Exception as exc:

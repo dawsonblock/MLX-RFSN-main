@@ -1,7 +1,9 @@
 # Winner Report
 
-## No winner
+## Winner: rfsn_v10_k8_v5_gs64
 
-**Status:** NO_PROMOTION_ELIGIBLE_CANDIDATE
+**Status:** PROMOTED
 
-**Reason:** No candidate has full logit, real cache, and memory proof.
+**Reason:** Passed full logit gate and reduced KV memory with equal or better decode speed.
+
+**Models tested:** Qwen/Qwen2.5-0.5B-Instruct

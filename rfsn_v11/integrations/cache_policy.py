@@ -66,7 +66,9 @@ CONTROL_POLICIES: dict[str, dict[str, Any]] = {
     },
 }
 
-BASELINE_POLICIES: dict[str, dict[str, Any]] = {
+BASELINE_POLICIES: dict[str, dict[str, Any]] = {}
+
+PROMOTED_POLICIES: dict[str, dict[str, Any]] = {
     "rfsn_v10_k8_v5_gs32": {
         "candidate_name": "rfsn_v10_k8_v5_gs32",
         "supports_real_generation": True,
@@ -84,8 +86,6 @@ BASELINE_POLICIES: dict[str, dict[str, Any]] = {
         "config": {"default_bits": 8, "group_size": 64},
     },
 }
-
-PROMOTED_POLICIES: dict[str, dict[str, Any]] = {}
 
 _KNOWN_POLICIES: dict[str, dict[str, Any]] = {
     **CONTROL_POLICIES,

@@ -22,14 +22,13 @@ def test_control_policies_exist() -> None:
     assert "mlx_lm_quantized_kv" in CONTROL_POLICIES
 
 
-def test_baseline_policies_exist() -> None:
-    assert "rfsn_v10_k8_v5_gs32" in BASELINE_POLICIES
-    assert "rfsn_v10_k8_v5_gs64" in BASELINE_POLICIES
+def test_baseline_policies_empty() -> None:
+    assert BASELINE_POLICIES == {}
 
 
-def test_promoted_policies_empty() -> None:
-    # No candidate is promoted yet
-    assert PROMOTED_POLICIES == {}
+def test_promoted_policies_exist() -> None:
+    assert "rfsn_v10_k8_v5_gs32" in PROMOTED_POLICIES
+    assert "rfsn_v10_k8_v5_gs64" in PROMOTED_POLICIES
 
 
 def test_turboquant_v2_not_in_promoted() -> None:
@@ -48,7 +47,7 @@ def test_create_known_control_policy() -> None:
     assert policy.supports_real_generation is True
 
 
-def test_create_known_baseline_policy() -> None:
+def test_create_known_promoted_policy() -> None:
     policy = create_cache_policy("rfsn_v10_k8_v5_gs32")
     assert policy.name == "rfsn_v10_k8_v5_gs32"
     assert policy.supports_real_generation is True
@@ -69,9 +68,9 @@ def test_create_unknown_policy_with_allow_experimental() -> None:
     assert policy.supports_real_generation is True
 
 
-def test_is_promoted_policy_false_for_baseline() -> None:
-    assert is_promoted_policy("rfsn_v10_k8_v5_gs32") is False
-    assert is_promoted_policy("rfsn_v10_k8_v5_gs64") is False
+def test_is_promoted_policy_true_for_rfsn_v10() -> None:
+    assert is_promoted_policy("rfsn_v10_k8_v5_gs32") is True
+    assert is_promoted_policy("rfsn_v10_k8_v5_gs64") is True
 
 
 def test_is_promoted_policy_false_for_control() -> None:
@@ -83,7 +82,7 @@ def test_is_promoted_policy_false_for_unknown() -> None:
     assert is_promoted_policy("turboquant_v2_b4_gs64_norot") is False
 
 
-def test_list_policies_includes_control_and_baseline() -> None:
+def test_list_policies_includes_control_and_promoted() -> None:
     policies = list_policies()
     assert "mlx_lm_fp16" in policies
     assert "mlx_lm_quantized_kv" in policies

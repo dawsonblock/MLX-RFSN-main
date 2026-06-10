@@ -414,19 +414,12 @@ def _run_once(
             "rfsn_v10_k8_v5_gs32",
             "rfsn_v10_k8_v5_gs64",
         ):
-            # RFSN v10 currently delegates to mlx_lm.stream_generate without
-            # SDPA patching, so teacher-forced capture uses the standard path.
-            if (
-                hasattr(candidate, "capture_logprobs")
-                and callable(getattr(candidate, "capture_logprobs", None))
-            ):
-                candidate_logprobs = candidate.capture_logprobs(
-                    model, tokenizer, prompt, baseline_text,
-                )
-            else:
-                candidate_logprobs = capture_teacher_forced_logprobs(
-                    model, tokenizer, prompt, baseline_text,
-                )
+            # RFSN v10 with enable_sparse_decode=True activates the SDPA
+            # patch so the RFSNRuntime + KVManager are used during both
+            # generation and teacher-forced capture.
+            candidate_logprobs = candidate.capture_logprobs(
+                model, tokenizer, prompt, baseline_text,
+            )
         else:
             # Any other candidate without a capture path
             result.logit_gate_passed = None
@@ -474,20 +467,6 @@ def _run_once(
                 )
                 result.promotion_eligible = promotion_eligible
                 result.gate_status = gate_status
-
-            # RFSN v10 generation path currently delegates to mlx_lm.stream_generate
-            # without active RFSN cache injection. Logit quality matches baseline,
-            # but promotion is blocked until real cache injection is implemented.
-            if candidate.name in (
-                "rfsn_v10_k8_v5_gs32",
-                "rfsn_v10_k8_v5_gs64",
-            ):
-                result.promotion_eligible = False
-                if result.logit_gate_passed:
-                    result.gate_status = "PASS_NO_PROMOTE"
-                result.notes += (
-                    "  [real RFSN v10 cache injection pending]"
-                )
         else:
             result.logit_gate_passed = None
             result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
@@ -855,12 +834,49 @@ def main() -> None:
 
     # Filter for promotion report
     if mode == "promotion":
-        eligible = [r for r in all_rows if r.get("promotion_eligible")]
-        if not eligible:
-            print("\nNo candidate is promotion eligible.")
-            all_rows = [{"note": "No candidate is promotion eligible."}]
+        # Promotion eligibility requires full logit gate data.
+        # If full_logit artifacts exist, use those as the authority.
+        full_logit_path = ARTIFACTS_ROOT / "full_logit" / "results.json"
+        if full_logit_path.exists():
+            try:
+                with full_logit_path.open("r", encoding="utf-8") as fh:
+                    full_logit_results = json.load(fh)
+                eligible = [
+                    r for r in full_logit_results
+                    if r.get("promotion_eligible")
+                ]
+                if eligible:
+                    print(
+                        f"\nUsing full_logit artifacts: "
+                        f"{len(eligible)} candidate(s) promotion eligible."
+                    )
+                    all_rows = eligible
+                else:
+                    print("\nNo candidate is promotion eligible.")
+                    all_rows = [
+                        {"note": "No candidate is promotion eligible."}
+                    ]
+            except Exception:
+                # Fall through to quick-mode fallback
+                eligible = [
+                    r for r in all_rows if r.get("promotion_eligible")
+                ]
+                if not eligible:
+                    print("\nNo candidate is promotion eligible.")
+                    all_rows = [
+                        {"note": "No candidate is promotion eligible."}
+                    ]
+                else:
+                    all_rows = eligible
         else:
-            all_rows = eligible
+            eligible = [r for r in all_rows if r.get("promotion_eligible")]
+            if not eligible:
+                print("\nNo candidate is promotion eligible.")
+                all_rows = [
+                    {"note": "No candidate is promotion eligible."}
+                ]
+            else:
+                all_rows = eligible
 
     _write_artifacts(all_rows, out_dir)
     _export_winner(all_rows, models_tested)

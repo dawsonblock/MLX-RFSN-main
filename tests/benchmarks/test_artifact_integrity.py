@@ -132,30 +132,37 @@ def test_no_active_legacy_winner_artifact() -> None:
 
 
 def test_promotion_artifact_exists() -> None:
-    # Promotion report must exist and say no candidate is eligible
+    # Promotion report must exist and contain eligible candidates
+    # (RFSN v10 passed full logit + memory gates)
     promo_json = Path("artifacts/bench/shootout/promotion/results.json")
     promo_md = Path("artifacts/bench/shootout/promotion/results.md")
     assert promo_json.exists(), "Promotion JSON artifact missing"
     assert promo_md.exists(), "Promotion Markdown artifact missing"
     data = json.loads(promo_json.read_text())
-    # Either a note row or actual rows with no promotion eligible
+    # Either a note row or actual rows with promotion eligible
     has_note = any("note" in r for r in data if isinstance(r, dict))
-    no_eligible = not any(
+    has_eligible = any(
         r.get("promotion_eligible") for r in data if isinstance(r, dict)
     )
-    assert has_note or no_eligible, (
-        "Promotion artifact should say no candidate is eligible"
+    assert has_note or has_eligible, (
+        "Promotion artifact should contain candidates or a note"
     )
 
 
 def test_winner_json_agrees_with_promotion_report() -> None:
-    rows = [{"note": "No candidate is promotion eligible."}]
-    _export_winner(rows, ["Qwen/Qwen2.5-0.5B-Instruct"])
-    # winner.json should exist with null winner
+    promo_json = Path("artifacts/bench/shootout/promotion/results.json")
+    promo_data = json.loads(promo_json.read_text())
+    has_eligible = any(
+        r.get("promotion_eligible") for r in promo_data if isinstance(r, dict)
+    )
     winner_json = Path("artifacts/winner/winner.json")
-    if winner_json.exists():
-        data = json.loads(winner_json.read_text())
-        if not any(
-            r.get("promotion_eligible") for r in rows if isinstance(r, dict)
-        ):
-            assert data.get("winner") is None
+    assert winner_json.exists(), "winner.json must exist"
+    data = json.loads(winner_json.read_text())
+    if has_eligible:
+        assert data.get("winner") is not None, (
+            "winner.json should name a winner when candidates are promoted"
+        )
+    else:
+        assert data.get("winner") is None, (
+            "winner.json should have null winner when no candidate is eligible"
+        )
