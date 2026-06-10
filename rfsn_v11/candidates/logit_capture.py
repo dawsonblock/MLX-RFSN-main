@@ -191,6 +191,133 @@ def compute_logit_metrics_from_logprobs(
     }
 
 
+def capture_teacher_forced_logprobs(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    target_text: str,
+    kv_bits: int | None = None,
+    kv_group_size: int = 64,
+    prompt_cache: Any | None = None,
+    prefill_step_size: int = 512,
+) -> np.ndarray | None:
+    """Capture per-step log-probs in teacher-forced mode.
+
+    This is the *correct* way to compare baseline vs candidate logits.
+    Instead of running two independent greedy decodes (which diverge
+    after the first differing token), we:
+
+    1. Run the baseline greedy decode to obtain the target text.
+    2. Tokenize that target text.
+    3. For both baseline and candidate, feed the **exact same** token
+       sequence through the model, one token at a time, capturing the
+       log-probability vector at each position.
+
+    Because both models see the same input context at every step, the
+    logits are directly comparable even when quantization causes small
+    distributional shifts.
+
+    Parameters
+    ----------
+    model, tokenizer
+        MLX-LM model and tokenizer.
+    prompt
+        Input prompt string.
+    target_text
+        The exact text (from baseline greedy decode) to teacher-force.
+    kv_bits
+        Optional KV-quantization bits for the candidate run.
+    kv_group_size
+        Group size when ``kv_bits`` is set.
+    prompt_cache
+        Optional per-layer prompt cache (e.g. TurboQuantKVCacheV2).
+        If None, a standard MLX-LM cache is created.
+    prefill_step_size
+        Step size for prompt prefill (must match ``generate_step``).
+
+    Returns
+    -------
+    np.ndarray | None
+        Array of shape ``(T, vocab)`` where T is the number of generated
+        tokens, or None on failure.
+    """
+    try:
+        import mlx.core as mx
+        from mlx_lm.models import cache as mlx_cache
+        from mlx_lm.utils import maybe_quantize_kv_cache
+
+        prompt_ids = tokenizer.encode(prompt)
+        target_ids = tokenizer.encode(target_text)
+
+        # Remove prompt prefix from target if present
+        # (baseline decode returns prompt + generation)
+        if (
+            len(target_ids) >= len(prompt_ids)
+            and target_ids[: len(prompt_ids)] == prompt_ids
+        ):
+            gen_ids = target_ids[len(prompt_ids):]
+        else:
+            gen_ids = target_ids
+
+        if not gen_ids:
+            return None
+
+        # Build cache
+        if prompt_cache is None:
+            if hasattr(model, "make_cache"):
+                cache_list = model.make_cache()
+            else:
+                cache_list = [
+                    mlx_cache.KVCache()
+                    for _ in range(len(model.layers))
+                ]
+        else:
+            cache_list = prompt_cache
+
+        # Prefill prompt (replicate generate_step prefill logic)
+        y = mx.array(prompt_ids)
+        while y.size > prefill_step_size:
+            model(y[:prefill_step_size][None], cache=cache_list)
+            maybe_quantize_kv_cache(
+                cache_list, 0, kv_group_size, kv_bits,
+            )
+            mx.eval([c.state for c in cache_list])
+            y = y[prefill_step_size:]
+
+        # Final prefill chunk + first decode prediction.
+        # This mirrors generate_step's _step(y) after prefill.
+        logits = model(y[None], cache=cache_list)
+        logits = logits[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, keepdims=True)
+        lp_np = np.array(logprobs.astype(mx.float32).squeeze(0))
+        logprob_list: list[np.ndarray] = [lp_np]
+
+        maybe_quantize_kv_cache(
+            cache_list, 0, kv_group_size, kv_bits,
+        )
+        mx.eval([c.state for c in cache_list])
+
+        # Teacher-forced decode: feed known generated tokens one by one
+        for next_token_id in gen_ids[1:]:
+            logits = model(
+                mx.array([next_token_id])[None], cache=cache_list
+            )
+            logits = logits[:, -1, :]
+            logprobs = logits - mx.logsumexp(logits, keepdims=True)
+            lp_np = np.array(logprobs.astype(mx.float32).squeeze(0))
+            logprob_list.append(lp_np)
+
+            maybe_quantize_kv_cache(
+                cache_list, 0, kv_group_size, kv_bits,
+            )
+
+        if not logprob_list:
+            return None
+        return np.stack(logprob_list, axis=0)
+    except Exception:
+        return None
+
+
 def logit_gate_passed(metrics: dict[str, float | None]) -> bool:
     """Return True if all logit gate thresholds are met."""
     return (

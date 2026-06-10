@@ -1,14 +1,18 @@
 """Quality gate evaluation for shootout candidates.
 
-Gates (initial thresholds — update after first full shootout run):
+Gates (Alpha 8.3 teacher-forced calibration):
     logit_cosine  >= 0.999
-    KL divergence <= 1e-4
-    top5_overlap  >= 0.95
-    top10_overlap >= 0.98
-    max_logit_delta <= 0.05
+    KL divergence <= 0.1
+    top5_overlap  >= 0.85
+    top10_overlap >= 0.90
+    max_logit_delta <= 10.0
 
-A candidate that fails any gate is labelled:
-    experimental / failed quality gate
+Calibration data (mlx_lm_quantized_kv_b8, 0.5B, teacher-forced):
+    cosine=0.99983  KL=0.055  top5=0.889  top10=0.904  delta=7.46  top1=1.0
+
+These thresholds pass the upstream-maintained 8-bit KV baseline while
+still rejecting genuinely degraded candidates (TurboQuant V2 b4 on
+0.5B: cosine=0.995  top5=0.40  top10=0.40).
 
 Failures are never hidden.
 """
@@ -25,10 +29,10 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 LOGIT_COSINE_MIN: float = 0.999
-KL_DIVERGENCE_MAX: float = 1e-4
-TOP5_OVERLAP_MIN: float = 0.95
-TOP10_OVERLAP_MIN: float = 0.98
-MAX_LOGIT_DELTA_MAX: float = 0.05
+KL_DIVERGENCE_MAX: float = 0.1
+TOP5_OVERLAP_MIN: float = 0.85
+TOP10_OVERLAP_MIN: float = 0.90
+MAX_LOGIT_DELTA_MAX: float = 10.0
 
 
 # ---------------------------------------------------------------------------

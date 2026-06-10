@@ -78,6 +78,7 @@ from rfsn_v11.candidates.base import (  # noqa: E402
 from rfsn_v11.candidates.candidate_status import CandidateStatus  # noqa: E402
 from rfsn_v11.candidates.logit_capture import (  # noqa: E402
     capture_generation_logprobs,
+    capture_teacher_forced_logprobs,
     compute_logit_metrics_from_logprobs,
     logit_gate_passed,
 )
@@ -289,40 +290,135 @@ def _run_once(
             result.notes += "  [quick mode: logit gate pending]"
         return result
 
-    # full-logit-gate mode: capture per-step logits and compare
+    # full-logit-gate mode: teacher-forced logit comparison.
+    # We run the baseline greedy decode once, then force-feed the exact
+    # same token sequence through the candidate to get comparable logits.
+    # This avoids the cascade-divergence problem of independent greedy
+    # decodes (where a single differing token makes all subsequent logits
+    # incomparable).
     if mode == "full_logit":
-        # Capture baseline log-probs (if not already the control)
+        baseline_text = (
+            baseline_result.generated_text
+            if baseline_result is not None else ""
+        )
         baseline_logprobs = None
-        if baseline_result is not None and candidate.name != "mlx_lm_baseline":
-            baseline_cap = capture_generation_logprobs(
-                model, tokenizer, prompt, max_tokens=max_tokens, temp=temp,
-            )
-            if "error" not in baseline_cap:
-                baseline_logprobs = baseline_cap.get("logprobs")
-
-        # Capture candidate log-probs.
-        # For MLX-LM built-in quantized KV we can re-run with generate_step
-        # and pass kv_bits so the capture uses the actual quantized cache.
-        # For candidates with custom cache paths (e.g. TurboQuant V2,
-        # Polar reference) we delegate to the candidate's own capture method
-        # so the log-probs come from the *real* cache path.
-        # RFSN v10 uses its own RFSNGenerator (not mlx_lm.generate_step)
-        # so logit capture is not yet available for it.
         candidate_logprobs = None
+
+        if candidate.name == "mlx_lm_baseline":
+            # Baseline is the reference — perfect by definition
+            result.logit_cosine = 1.0
+            result.kl_divergence = 0.0
+            result.top1_match = 1.0
+            result.top5_overlap = 1.0
+            result.top10_overlap = 1.0
+            result.max_logit_delta = 0.0
+            result.first_divergent_token = None
+            result.logit_gate_passed = True
+            result.memory_gate_passed = True
+            result.gate_status = "PASS_NO_PROMOTE"
+            result.promotion_eligible = False
+            return result
+
+        if not baseline_text:
+            result.logit_gate_passed = None
+            result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+            result.promotion_eligible = False
+            result.notes += (
+                "  [full-logit-gate: no baseline text for comparison]"
+            )
+            return result
+
+        # Baseline teacher-forced logprobs (standard FP16 cache)
+        baseline_logprobs = capture_teacher_forced_logprobs(
+            model, tokenizer, prompt, baseline_text,
+        )
+
+        # Candidate teacher-forced logprobs
         if candidate.name == "mlx_lm_quantized_kv_b8":
-            cand_cap = capture_generation_logprobs(
-                model, tokenizer, prompt, max_tokens=max_tokens, temp=temp,
+            candidate_logprobs = capture_teacher_forced_logprobs(
+                model, tokenizer, prompt, baseline_text,
                 kv_bits=8, kv_group_size=64,
             )
-            if "error" not in cand_cap:
-                candidate_logprobs = cand_cap.get("logprobs")
-        elif (
-            hasattr(candidate, "capture_logprobs")
-            and callable(getattr(candidate, "capture_logprobs", None))
+        elif candidate.name in (
+            "turboquant_v2_b4_gs64_rot",
+            "turboquant_v2_b4_gs64_norot",
         ):
-            candidate_logprobs = candidate.capture_logprobs(
-                model, tokenizer, prompt, max_tokens=max_tokens, temp=temp,
+            # TurboQuant V2 builds its own cache and patches SDPA
+            tq_candidate = candidate
+            try:
+                import sys
+                import mlx.core as mx
+                import turboquant.patch as tq_patch
+
+                head_dim = tq_candidate._detect_head_dim(model)
+                use_rotation = head_dim >= 128
+                caches = tq_candidate._build_cache(
+                    model, head_dim, use_rotation,
+                )
+                tq_patch.apply()
+                import mlx_lm.models.base as _base
+                _patched_fn = _base.scaled_dot_product_attention
+                for _mod_name, _mod in list(sys.modules.items()):
+                    if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                        if hasattr(_mod, "scaled_dot_product_attention"):
+                            _mod.scaled_dot_product_attention = _patched_fn
+                try:
+                    candidate_logprobs = capture_teacher_forced_logprobs(
+                        model, tokenizer, prompt, baseline_text,
+                        prompt_cache=caches,
+                    )
+                finally:
+                    tq_patch.revert()
+                    _orig_fn = _base.scaled_dot_product_attention
+                    for _mod_name, _mod in list(sys.modules.items()):
+                        if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                            if hasattr(_mod, "scaled_dot_product_attention"):
+                                _mod.scaled_dot_product_attention = _orig_fn
+            except Exception:
+                candidate_logprobs = None
+        elif candidate.name in (
+            "polar_reference_offline_b4_d128",
+        ):
+            # Polar builds its own cache and patches SDPA
+            polar_candidate = candidate
+            try:
+                import mlx.core as mx
+                from mlx_turboquant.cache import TurboQuantKVCache
+                from rfsn_v11.candidates.polar_reference_adapter import (
+                    _apply_polar_patch,
+                    _revert_polar_patch,
+                )
+
+                head_dim = polar_candidate._detect_head_dim(model)
+                n_layers = len(model.layers)
+                caches = [
+                    TurboQuantKVCache(
+                        bits=polar_candidate.bits,
+                        head_dim=head_dim,
+                        key_seed=polar_candidate.seed + i,
+                        value_seed=polar_candidate.seed + i + 1000,
+                    )
+                    for i in range(n_layers)
+                ]
+                _apply_polar_patch()
+                try:
+                    candidate_logprobs = capture_teacher_forced_logprobs(
+                        model, tokenizer, prompt, baseline_text,
+                        prompt_cache=caches,
+                    )
+                finally:
+                    _revert_polar_patch()
+            except Exception:
+                candidate_logprobs = None
+        else:
+            # RFSN v10 and any other candidate without a capture path
+            result.logit_gate_passed = None
+            result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+            result.promotion_eligible = False
+            result.notes += (
+                "  [full-logit-gate: teacher-forced capture not available]"
             )
+            return result
 
         if baseline_logprobs is not None and candidate_logprobs is not None:
             metrics = compute_logit_metrics_from_logprobs(
@@ -365,7 +461,9 @@ def _run_once(
             result.logit_gate_passed = None
             result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
             result.promotion_eligible = False
-            result.notes += "  [full-logit-gate: logit capture not available]"
+            result.notes += (
+                "  [full-logit-gate: teacher-forced capture failed]"
+            )
     elif result.logit_cosine is None:
         result.logit_gate_passed = None
         result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
@@ -546,6 +644,7 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
         "compression_factor",
         "logit_cosine",
         "kl_divergence",
+        "top1_match",
         "top5_overlap",
         "top10_overlap",
         "max_logit_delta",
