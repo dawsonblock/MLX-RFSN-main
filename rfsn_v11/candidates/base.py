@@ -18,7 +18,9 @@ Do NOT report these as "0.265x compression" — that is misleading.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
+
+from .candidate_status import CandidateStatus
 
 
 @dataclass
@@ -30,36 +32,47 @@ class CandidateResult:
     prompt: str = ""
 
     # Memory
-    actual_kv_memory_mb: Optional[float] = None
-    working_set_memory_mb: Optional[float] = None
+    actual_kv_memory_mb: float | None = None
+    working_set_memory_mb: float | None = None
 
     # Compression
-    size_ratio: Optional[float] = None          # compressed / baseline (lower is better)
-    compression_factor: Optional[float] = None  # baseline / compressed (higher is better)
+    size_ratio: float | None = None  # compressed / baseline
+    compression_factor: float | None = None  # baseline / compressed
 
     # Timing (milliseconds)
-    prefill_ms: Optional[float] = None
-    decode_ms: Optional[float] = None
-    total_ms: Optional[float] = None
+    prefill_ms: float | None = None
+    decode_ms: float | None = None
+    total_ms: float | None = None
 
     # Throughput
-    tokens_per_sec: Optional[float] = None
+    tokens_per_sec: float | None = None
 
     # Quality vs. FP16 baseline
-    logit_cosine: Optional[float] = None
-    kl_divergence: Optional[float] = None
-    top1_match: Optional[float] = None
-    top5_overlap: Optional[float] = None
-    top10_overlap: Optional[float] = None
-    max_logit_delta: Optional[float] = None
-    first_divergent_token: Optional[int] = None
+    logit_cosine: float | None = None
+    kl_divergence: float | None = None
+    top1_match: float | None = None
+    top5_overlap: float | None = None
+    top10_overlap: float | None = None
+    max_logit_delta: float | None = None
+    first_divergent_token: int | None = None
 
     # Gate outcomes
-    text_heuristic_passed: Optional[bool] = None
-    logit_gate_passed: Optional[bool] = None
-    memory_gate_passed: Optional[bool] = None
+    text_heuristic_passed: bool | None = None
+    logit_gate_passed: bool | None = None
+    memory_gate_passed: bool | None = None
     promotion_eligible: bool = False
     gate_status: str = "PENDING_LOGIT_GATE"
+
+    # Candidate lifecycle status (CONTROL, BASELINE, EXPERIMENTAL, etc.)
+    candidate_status: CandidateStatus = field(
+        default=CandidateStatus.EXPERIMENTAL
+    )
+
+    # Real cache proof (required for promotion eligibility)
+    cache_backend_used: str = ""          # e.g. "turboquant_v2", "mlx_lm_fp16"
+    cache_events: list[str] = field(default_factory=list)
+    cache_bytes_written: int | None = None
+    cache_bytes_read: int | None = None
 
     # Free-form notes
     notes: str = ""
@@ -97,6 +110,7 @@ class KVCompressionCandidate:
     """
 
     name: str = "unnamed"
+    candidate_status: CandidateStatus = CandidateStatus.EXPERIMENTAL
 
     def run(
         self,
@@ -111,5 +125,6 @@ class KVCompressionCandidate:
         )
 
     def is_available(self) -> bool:
-        """Return False if the candidate cannot run in the current environment."""
+        """Return False if the candidate cannot run in the
+        current environment."""
         return True

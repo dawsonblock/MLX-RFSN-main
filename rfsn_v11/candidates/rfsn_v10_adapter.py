@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .candidate_status import CandidateStatus
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 # Map the human-readable preset names to actual QuantizationConfig kwargs.
@@ -27,6 +28,8 @@ _PRESET_MAP: dict[str, dict[str, Any]] = {
 class RFSNV10Candidate(KVCompressionCandidate):
     """RFSN v10 with a given quantization config."""
 
+    candidate_status = CandidateStatus.BASELINE
+
     def __init__(self, config_name: str = "k8_v5_gs32") -> None:
         if config_name not in _PRESET_MAP:
             raise ValueError(
@@ -38,8 +41,8 @@ class RFSNV10Candidate(KVCompressionCandidate):
 
     def is_available(self) -> bool:
         try:
-            import rfsn_v10  # noqa: F401
             import mlx_lm  # noqa: F401
+            import rfsn_v10  # noqa: F401
             return True
         except ImportError:
             return False
@@ -63,7 +66,8 @@ class RFSNV10Candidate(KVCompressionCandidate):
         try:
             import contextlib
             import io
-            from rfsn_v10.config import RFSNConfig, QuantizationConfig
+
+            from rfsn_v10.config import QuantizationConfig, RFSNConfig
             from rfsn_v10.runtime.generation import RFSNGenerator
 
             quant_kwargs = _PRESET_MAP[self.config_name]
@@ -99,6 +103,9 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 generated_tokens=gen_tokens,
                 generated_text=result_text,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
+                candidate_status=self.candidate_status,
+                cache_backend_used="rfsn_v10_quantized_kv",
+                cache_events=["prefill_quantize", "decode_quantized_fetch"],
                 notes=(
                     f"RFSN v10 stable baseline — config={self.config_name} "
                     f"bits={quant_kwargs['default_bits']} "

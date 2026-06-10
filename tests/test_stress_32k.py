@@ -10,6 +10,7 @@ from rfsn_v10.kernels import backend
 mx = pytest.importorskip("mlx.core")
 
 
+@pytest.mark.mlx
 class Test32KStress:
     """End-to-end synthetic 32k-context stress test.
 

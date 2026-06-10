@@ -1,0 +1,5 @@
+{
+  "winner": null,
+  "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
+  "reason": "No candidate has full logit, real cache, and memory proof."
+}

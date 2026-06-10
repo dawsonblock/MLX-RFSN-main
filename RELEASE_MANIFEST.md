@@ -51,6 +51,12 @@ These are the only quantization presets validated for use:
 | Shootout memory | NOT RUN |
 | Promotion report | PASS — output: No candidate is promotion eligible |
 | Promoted candidate | NONE |
+| Candidate statuses | ADDED — CONTROL, BASELINE, EXPERIMENTAL, OFFLINE_ONLY, REFERENCE_ONLY |
+| No-false-promotion tests | ADDED |
+| Artifact integrity tests | ADDED |
+| Install modes | basic / fusion / memory |
+| Product boundary docs | ADDED |
+| Platform support docs | ADDED |
 
 ## Previous gate results
 
@@ -169,7 +175,7 @@ Guard test: `tests/test_no_placeholder_source.py` — prevents regression.
 The status remains `3 - Alpha` until **all** items below are checked.
 Do not call this beta until the full logit gate passes for at least one candidate.
 
-Alpha 8 completed:
+Alpha 8 completed (Plan B):
 - [x] Quality gate semantics fixed (text_heuristic_passed, logit_gate_passed, promotion_eligible, gate_status)
 - [x] Logit metrics module exists and tested
 - [x] Memory metrics module exists and tested
@@ -182,6 +188,19 @@ Alpha 8 completed:
 - [x] CI workflow fusion-alpha.yml added
 - [x] `benchmarks/kv_shootout.py --quick` produces artifacts
 - [x] `benchmarks/kv_shootout.py --promotion-report` correctly says: No candidate is promotion eligible
+- [x] CandidateStatus enum added (CONTROL, BASELINE, EXPERIMENTAL, OFFLINE_ONLY, REFERENCE_ONLY, PROMOTION_ELIGIBLE, PROMOTED, FAILED)
+- [x] Candidate adapters set canonical statuses
+- [x] kv_shootout enforces promotion rules by candidate status
+- [x] Honest benchmark table generated in results.md
+- [x] Real cache proof test scaffold added
+- [x] Winner export artifacts (winner.json, winner.md, integration_notes.md)
+- [x] Memory layer scaffold added (Qdrant, TurboVec, chunking, embeddings)
+- [x] Cache policy abstraction added
+- [x] Install modes: basic, fusion, memory
+- [x] Platform support docs added
+- [x] No-false-promotion tests added
+- [x] Artifact integrity tests added
+- [x] release_gate.sh and mlx_gate.sh added
 
 Next required before promotion:
 - [ ] At least one candidate captures real logits during generation

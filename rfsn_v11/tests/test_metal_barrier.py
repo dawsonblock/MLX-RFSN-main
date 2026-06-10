@@ -243,6 +243,7 @@ def _rand_fp16(shape, seed):
 # Test 1 — D=128 shape and finiteness
 # ---------------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_fused_attn_d128_shape():
     """D=128: output shape must be [1,1,128] and all elements finite."""
     T, D = 64, 128
@@ -260,6 +261,7 @@ def test_fused_attn_d128_shape():
 # Test 2 — D=256 shape and finiteness
 # ---------------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_fused_attn_d256_shape():
     """D=256: output shape must be [1,1,256] and all elements finite."""
     T, D = 64, 256
@@ -277,6 +279,7 @@ def test_fused_attn_d256_shape():
 # Test 3 — D=128 matches MSE+QJL numpy reference (cosine > 0.99)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_fused_attn_d128_matches_reference():
     """D=128, T=16: kernel output must match the MSE+QJL numpy reference.
 
@@ -314,6 +317,7 @@ def test_fused_attn_d128_matches_reference():
 # Test 4 — D=256 matches MSE+QJL numpy reference (cosine > 0.99)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_fused_attn_d256_matches_reference():
     """D=256, T=16: kernel output must match the MSE+QJL numpy reference."""
     T, D = 16, 256
@@ -346,6 +350,7 @@ def test_fused_attn_d256_matches_reference():
 # Test 5 — unsupported D=64 raises KernelDimError
 # ---------------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_fused_attn_unsupported_dim_raises():
     """D=64 must raise KernelDimError (not in (128, 256))."""
     T, D = 16, 64
@@ -361,6 +366,7 @@ def test_fused_attn_unsupported_dim_raises():
 # Test 6 — all-zero block_mask drives output to exact zero
 # ---------------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_fused_attn_block_mask_zeros_output():
     """All-zero block_mask: when every token is masked the kernel skips all
     iterations, leaving local_sum=0 so inv=0 and the output is exactly zero."""
@@ -387,6 +393,7 @@ def test_fused_attn_block_mask_zeros_output():
 # Test 7 — D=128 and D=256 determinism under 10 repeated calls (barrier race)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.mlx
 def test_d128_d256_barrier_consistency():
     """Run D=128 and D=256 kernels 10 times each with identical inputs.
 

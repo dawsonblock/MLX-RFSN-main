@@ -9,16 +9,15 @@ import time
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
-from .quality_gates import (
-    GATE_STATUS_PASS,
-    compute_promotion_eligibility,
-)
+from .candidate_status import CandidateStatus
+from .quality_gates import compute_promotion_eligibility
 
 
 class MLXLMBaseline(KVCompressionCandidate):
     """Plain MLX-LM generation with no KV compression."""
 
     name = "mlx_lm_baseline"
+    candidate_status = CandidateStatus.CONTROL
 
     def is_available(self) -> bool:
         try:
@@ -36,9 +35,7 @@ class MLXLMBaseline(KVCompressionCandidate):
         temp: float = 0.0,
     ) -> CandidateResult:
         try:
-            import mlx.core as mx
             import mlx_lm
-
             from mlx_lm.sample_utils import make_sampler
             sampler = make_sampler(temp=temp)
             t0 = time.perf_counter()
@@ -87,6 +84,9 @@ class MLXLMBaseline(KVCompressionCandidate):
                 memory_gate_passed=True,
                 promotion_eligible=promotion_eligible,
                 gate_status=gate_status,
+                candidate_status=self.candidate_status,
+                cache_backend_used="mlx_lm_fp16",
+                cache_events=["prefill", "decode", "attention_fp16"],
                 notes="FP16 baseline — no compression applied",
             )
         except Exception as exc:

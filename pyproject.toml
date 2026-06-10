@@ -40,9 +40,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mlx = [
+basic = []
+fusion = [
     "mlx==0.21.1",
     "mlx-lm>=0.19",
+]
+memory = [
+    "qdrant-client>=1.9",
+    "sentence-transformers>=3.0",
 ]
 dev = [
     "pytest>=7.0,<9",
@@ -54,6 +59,11 @@ dev = [
     "alembic>=1.13",
     "sqlalchemy>=2.0",
     "build>=1.2",
+]
+# Legacy aliases for backward compatibility
+mlx = [
+    "mlx==0.21.1",
+    "mlx-lm>=0.19",
 ]
 real_model = [
     "torch==2.3.1",
@@ -69,6 +79,8 @@ production = [
 all = [
     "mlx==0.21.1",
     "mlx-lm>=0.19",
+    "qdrant-client>=1.9",
+    "sentence-transformers>=3.0",
     "pytest>=7.0,<9",
     "pytest-timeout>=2.3",
     "pytest-asyncio>=0.23",
@@ -101,7 +113,7 @@ rfsn-config-check = "rfsn_v10.server.cli:config_check"
 rfsn-benchmark = "rfsn_v10.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["rfsn_v10*", "rfsn_v11*", "agent_core*", "tools*", "benchmarks*"]
+include = ["rfsn_v10*", "rfsn_v11*", "agent_core*", "tools*", "benchmarks*", "memory*"]
 exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 
 [tool.setuptools.exclude-package-data]

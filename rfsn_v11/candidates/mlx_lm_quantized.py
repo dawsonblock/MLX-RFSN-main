@@ -1,8 +1,8 @@
 """Candidate: MLX-LM built-in quantized KV cache.
 
-If MLX-LM already exposes a maintained quantized KV cache that passes quality
-gates, custom compression may not be necessary.  This adapter measures it fairly
-so the decision is data-driven.
+If MLX-LM already exposes a maintained quantized KV cache that passes
+quality gates, custom compression may not be necessary. This adapter
+measures it fairly so the decision is data-driven.
 
 NOTE: The ``kv_bits`` parameter availability depends on your installed mlx-lm
 version.  If this candidate returns ``is_available() == False``, your installed
@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .candidate_status import CandidateStatus
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 
@@ -21,16 +22,19 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
     """MLX-LM generation with its built-in quantized KV cache flag."""
 
     name = "mlx_lm_quantized_kv"
+    candidate_status = CandidateStatus.CONTROL
 
     def __init__(self, kv_bits: int = 8) -> None:
         self.kv_bits = kv_bits
         self.name = f"mlx_lm_quantized_kv_b{kv_bits}"
 
     def is_available(self) -> bool:
-        # kv_bits flows through generate() **kwargs → stream_generate → generate_step
-        # Check generate_step directly since generate() uses **kwargs
+        # kv_bits flows through generate() **kwargs → stream_generate →
+        # generate_step. Check generate_step directly since generate() uses
+        # **kwargs.
         try:
             import inspect
+
             from mlx_lm.utils import generate_step
             sig = inspect.signature(generate_step)
             return "kv_bits" in sig.parameters
@@ -59,7 +63,6 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
             )
         try:
             import mlx_lm
-
             from mlx_lm.sample_utils import make_sampler
             sampler = make_sampler(temp=temp)
             t0 = time.perf_counter()
@@ -89,6 +92,9 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
                 generated_tokens=gen_tokens,
                 generated_text=output,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
+                candidate_status=self.candidate_status,
+                cache_backend_used="mlx_lm_quantized_kv",
+                cache_events=["prefill_quantize", "decode_quantized_fetch"],
                 notes=f"MLX-LM built-in {self.kv_bits}-bit KV quantization",
             )
         except Exception as exc:

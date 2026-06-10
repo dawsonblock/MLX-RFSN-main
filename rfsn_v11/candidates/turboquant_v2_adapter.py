@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .candidate_status import CandidateStatus
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 # Absolute path to external/turboquant-mlx so the import works regardless
@@ -48,6 +49,8 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
     TurboQuantKVCacheV2 prompt cache, not plain mlx_lm.generate().
     """
 
+    candidate_status = CandidateStatus.EXPERIMENTAL
+
     def __init__(
         self,
         bits: int = 4,
@@ -67,8 +70,8 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
             _ensure_ext_on_path()
             import mlx.core as mx  # noqa: F401
             import mlx_lm  # noqa: F401
-            from turboquant.cache_v2 import TurboQuantKVCacheV2  # noqa: F401
             import turboquant.patch  # noqa: F401
+            from turboquant.cache_v2 import TurboQuantKVCacheV2  # noqa: F401
             return True
         except ImportError:
             return False
@@ -251,6 +254,11 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
+                candidate_status=self.candidate_status,
+                cache_backend_used="turboquant_v2",
+                cache_events=["prefill_compress", "decode_fetch", "attention_quantized_matmul"],
+                cache_bytes_written=int(compressed_bytes),
+                cache_bytes_read=int(compressed_bytes),
                 notes=(
                     f"TurboQuant V2: b{self.bits} gs{self.group_size} "
                     f"rotation={use_rotation} head_dim={head_dim}  "
@@ -262,8 +270,8 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
             # Make sure patch is always reverted on error
             try:
                 _ensure_ext_on_path()
-                import turboquant.patch as tq_patch  # type: ignore[import]
                 import mlx_lm.models.base as _base_err
+                import turboquant.patch as tq_patch  # type: ignore[import]
                 tq_patch.revert()
                 _orig_err = _base_err.scaled_dot_product_attention
                 for _mn, _mm in list(sys.modules.items()):
@@ -277,5 +285,6 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 model_id="unknown",
                 prompt=prompt,
                 gate_status="ERROR",
+                candidate_status=CandidateStatus.FAILED,
                 error=str(exc),
             )

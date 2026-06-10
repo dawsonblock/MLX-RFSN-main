@@ -1,16 +1,16 @@
-# RFSN v10.2 Stable Alpha
+# MLX-RFSN Fusion Alpha 8
 
-## Status: RFSN v10.2 Stable Alpha
+## Status: MLX-RFSN Fusion Alpha 8 — Promotion Gate Ready
 
-**Stable alpha.** Critical packaging and deployment issues resolved, server hardening
-completed, and comprehensive test coverage added. This is a research and benchmarking system for comparing KV-cache compression
-candidates on Apple Silicon. It is not production-ready.
+**Research alpha.** MLX-RFSN is a KV-cache compression research and benchmarking
+system for Apple Silicon. It is not production-ready, not a general AI server,
+and not a full vector database.
 
 To verify the current state locally:
 
 ```bash
-python -m compileall -q rfsn_v10 tests          # must produce no output
-python scripts/release_gate.py --cpu-only        # must print: Gate: 9 passed, 0 failed
+python -m compileall -q rfsn_v10 rfsn_v11 tests benchmarks scripts
+bash scripts/release_gate.sh
 ```
 
 | Path | Status |
@@ -48,8 +48,19 @@ python scripts/release_gate.py --cpu-only        # must print: Gate: 9 passed, 0
 ## Quick Start
 
 ```bash
-# Requires Python 3.11 and Apple Silicon with MLX for full runtime
-pip install -e .
+# Three install modes — do not install everything at once
+
+# Basic: core only, no MLX, no memory (any platform)
+pip install -e ".[basic]"
+
+# Fusion: MLX + KV compression benchmarks (macOS Apple Silicon)
+pip install -e ".[fusion]"
+
+# Memory: external vector memory (any platform)
+pip install -e ".[memory]"
+
+# Dev: everything for development
+pip install -e ".[fusion,memory,dev]"
 
 # Verify install
 python -m rfsn_v10 version
@@ -74,6 +85,9 @@ pytest tests/test_attention.py tests/test_bitpack.py \
        tests/test_drift.py tests/test_attention_causal_mask.py \
        tests/test_short_prompt_decode_drift.py \
        tests/test_prefill_decode_split.py -q
+
+# Central benchmark command
+python benchmarks/kv_shootout.py --promotion-report
 ```
 
 ## Inference Server

@@ -66,14 +66,14 @@ warnings.filterwarnings(
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rfsn_v11.candidates.base import CandidateResult, KVCompressionCandidate  # noqa: E402
+from rfsn_v11.candidates.candidate_status import CandidateStatus  # noqa: E402
 from rfsn_v11.candidates.quality_gates import (  # noqa: E402
-    evaluate_quality_gate,
-    compute_promotion_eligibility,
-    GATE_STATUS_PASS,
     GATE_STATUS_FAIL,
+    GATE_STATUS_PASS,
     GATE_STATUS_PENDING_LOGIT_GATE,
-    GATE_STATUS_PENDING_MEMORY_METRICS,
     GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
+    compute_promotion_eligibility,
+    evaluate_quality_gate,
 )
 
 # ---------------------------------------------------------------------------
@@ -130,6 +130,7 @@ PROMPTS_FULL = [prompts[0] for prompts in PROMPT_SUITE.values()]
 GENERATION_TEMP = 0.0
 
 ARTIFACTS_ROOT = Path("artifacts/bench/shootout")
+WINNER_DIR = Path("artifacts/winner")
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +141,10 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
     """Instantiate all candidates. Skip unavailable ones gracefully."""
     from rfsn_v11.candidates.mlx_lm_baseline import MLXLMBaseline
     from rfsn_v11.candidates.mlx_lm_quantized import MLXLMQuantizedKV
+    from rfsn_v11.candidates.polar_reference_adapter import PolarReferenceAdapter
     from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
     from rfsn_v11.candidates.rfsn_v11_adapter import RFSNV11Candidate
     from rfsn_v11.candidates.turboquant_v2_adapter import TurboQuantV2Candidate
-    from rfsn_v11.candidates.polar_reference_adapter import PolarReferenceAdapter
 
     all_candidates: list[KVCompressionCandidate] = [
         MLXLMBaseline(),
@@ -230,7 +231,6 @@ def _run_once(
 
     # Preserve adapter-specific pending statuses (more specific than generic logic)
     if result.gate_status == GATE_STATUS_PENDING_REAL_CACHE_INJECTION:
-        # Real cache injection is the blocker; do not overwrite with generic logit-pending
         result.promotion_eligible = False
         return result
 
@@ -262,8 +262,6 @@ def _run_once(
         return result
 
     # full-logit-gate mode: require real logits
-    # For now, most candidates do not capture logits during generation.
-    # Mark them as PENDING_LOGIT_GATE honestly.
     if result.logit_cosine is None:
         result.logit_gate_passed = None
         result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
@@ -285,7 +283,6 @@ def _run_once(
             result.promotion_eligible = False
             result.notes += "  [logit gate failed: " + "; ".join(gate.failure_reasons) + "]"
         else:
-            # Check memory gate for promotion eligibility
             result.memory_gate_passed = (
                 result.actual_kv_memory_mb is not None
                 and result.working_set_memory_mb is not None
@@ -303,6 +300,32 @@ def _run_once(
             result.promotion_eligible = promotion_eligible
             result.gate_status = gate_status
 
+    # Enforce promotion rules based on candidate status
+    result = _apply_promotion_rules(result, candidate)
+    return result
+
+
+def _apply_promotion_rules(
+    result: CandidateResult, candidate: KVCompressionCandidate
+) -> CandidateResult:
+    """Enforce candidate-status-based promotion rules.
+
+    Only EXPERIMENTAL or BASELINE candidates can become PROMOTED.
+    OFFLINE_ONLY cannot promote until real cache injection exists.
+    REFERENCE_ONLY cannot promote unless upgraded into a real runtime candidate.
+    CONTROL does not promote; it is the comparison target.
+    """
+    status = result.candidate_status or candidate.candidate_status
+    if status in (CandidateStatus.CONTROL, CandidateStatus.REFERENCE_ONLY):
+        result.promotion_eligible = False
+        if result.gate_status == GATE_STATUS_PASS:
+            result.gate_status = "PASS_NO_PROMOTE"
+    elif status == CandidateStatus.OFFLINE_ONLY:
+        result.promotion_eligible = False
+        result.gate_status = GATE_STATUS_PENDING_REAL_CACHE_INJECTION
+    elif status == CandidateStatus.FAILED:
+        result.promotion_eligible = False
+    # EXPERIMENTAL and BASELINE keep their computed eligibility
     return result
 
 
@@ -365,6 +388,7 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
 
     name = results[0].name
     model_id = results[0].model_id
+    candidate_status = results[0].candidate_status
 
     # Average numeric fields
     numeric = [
@@ -378,7 +402,11 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
         "top10_overlap",
         "max_logit_delta",
     ]
-    agg: dict[str, Any] = {"name": name, "model_id": model_id}
+    agg: dict[str, Any] = {
+        "name": name,
+        "model_id": model_id,
+        "candidate_status": str(candidate_status),
+    }
     for field in numeric:
         vals = [getattr(r, field) for r in results if getattr(r, field) is not None]
         agg[field] = float(np.mean(vals)) if vals else None
@@ -390,11 +418,15 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
     elif all(s == GATE_STATUS_PASS for s in statuses):
         agg["gate_status"] = GATE_STATUS_PASS
     else:
-        # Use the most common pending status
         pending = [s for s in statuses if s != GATE_STATUS_PASS]
         agg["gate_status"] = pending[0] if pending else GATE_STATUS_PASS
 
     agg["promotion_eligible"] = all(r.promotion_eligible for r in results)
+    agg["real_cache_used"] = any(
+        r.cache_backend_used and r.cache_backend_used != ""
+        and r.cache_backend_used != "rfsn_v11_offline"
+        for r in results
+    )
     agg["count"] = len(results)
     agg["notes"] = " | ".join({r.notes for r in results if r.notes})
     return agg
@@ -421,28 +453,111 @@ def _write_artifacts(rows: list[dict[str, Any]], out_dir: Path) -> None:
     # Markdown
     md_path = out_dir / "results.md"
     with md_path.open("w", encoding="utf-8") as fh:
-        fh.write("# KV Shootout Results\n\n")
-        if not rows:
-            fh.write("No results.\n")
-            return
-
-        # Header
-        headers = list(rows[0].keys())
-        fh.write("| " + " | ".join(headers) + " |\n")
-        fh.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
-        for row in rows:
-            cells = []
-            for h in headers:
-                v = row.get(h, "")
-                if v is None:
-                    cells.append("—")
-                elif isinstance(v, float):
-                    cells.append(f"{v:.4f}")
-                else:
-                    cells.append(str(v))
-            fh.write("| " + " | ".join(cells) + " |\n")
+        fh.write(_build_honest_markdown_table(rows))
 
     print(f"  Wrote {json_path}, {csv_path if rows else ''}, {md_path}")
+
+
+def _build_honest_markdown_table(rows: list[dict[str, Any]]) -> str:
+    """Build the honest benchmark table required by Plan B."""
+    lines: list[str] = ["# KV Shootout Results\n"]
+    if not rows:
+        lines.append("No results.\n")
+        return "\n".join(lines)
+
+    # Header
+    lines.append("## Honest Benchmark Table\n")
+    lines.append(
+        "| Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |"
+    )
+    lines.append(
+        "|-----------|--------|-------------|----------------|------------|-----------------|-----------|"
+    )
+
+    for row in rows:
+        if "note" in row:
+            lines.append(f"| {row['note']} | | | | | | |")
+            continue
+        name = row.get("name", "")
+        status = row.get("candidate_status", "—")
+        speed = f"{row.get('tokens_per_sec', 0):.2f}" if row.get("tokens_per_sec") is not None else "—"
+        mem = f"{row.get('size_ratio', 0):.3f}" if row.get("size_ratio") is not None else "baseline"
+        gate = row.get("gate_status", "—")
+        real_cache = "yes" if row.get("real_cache_used") else "no"
+        promo = "yes" if row.get("promotion_eligible") else "no"
+        lines.append(
+            f"| {name} | {status} | {speed} | {mem} | {gate} | {real_cache} | {promo} |"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Winner export
+# ---------------------------------------------------------------------------
+
+def _export_winner(rows: list[dict[str, Any]], models_tested: list[str]) -> None:
+    """Export winner artifacts when a candidate is promotion eligible."""
+    eligible = [r for r in rows if r.get("promotion_eligible")]
+    WINNER_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not eligible:
+        winner_data = {
+            "winner": None,
+            "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
+            "reason": "No candidate has full logit, real cache, and memory proof.",
+        }
+    else:
+        # Pick the one with best tokens/sec among eligible
+        best = max(eligible, key=lambda r: r.get("tokens_per_sec") or 0)
+        winner_data = {
+            "winner": best.get("name"),
+            "status": "PROMOTED",
+            "reason": (
+                "Passed full logit gate and reduced KV memory with equal or better decode speed."
+            ),
+            "models_tested": models_tested,
+            "artifacts": {
+                "full_logit": str(ARTIFACTS_ROOT / "full_logit" / "results.json"),
+                "memory": str(ARTIFACTS_ROOT / "memory" / "results.json"),
+                "promotion": str(ARTIFACTS_ROOT / "promotion" / "results.json"),
+            },
+        }
+
+    json_path = WINNER_DIR / "winner.json"
+    with json_path.open("w", encoding="utf-8") as fh:
+        json.dump(winner_data, fh, indent=2)
+
+    md_path = WINNER_DIR / "winner.md"
+    with md_path.open("w", encoding="utf-8") as fh:
+        fh.write("# Winner Report\n\n")
+        if winner_data["winner"] is None:
+            fh.write("## No winner\n\n")
+            fh.write(f"**Status:** {winner_data['status']}\n\n")
+            fh.write(f"**Reason:** {winner_data['reason']}\n")
+        else:
+            fh.write(f"## Winner: {winner_data['winner']}\n\n")
+            fh.write(f"**Status:** {winner_data['status']}\n\n")
+            fh.write(f"**Reason:** {winner_data['reason']}\n\n")
+            fh.write(f"**Models tested:** {', '.join(winner_data['models_tested'])}\n")
+
+    notes_path = WINNER_DIR / "integration_notes.md"
+    with notes_path.open("w", encoding="utf-8") as fh:
+        fh.write("# Integration Notes\n\n")
+        if winner_data["winner"] is None:
+            fh.write("No candidate promoted. Integration notes pending.\n")
+        else:
+            fh.write(
+                f"The promoted candidate `{winner_data['winner']}` can be integrated via:\n\n"
+            )
+            fh.write("```python\n")
+            fh.write("from rfsn_v11.integrations.cache_policy import create_cache_policy\n")
+            fh.write(f'policy = create_cache_policy("{winner_data["winner"]}")\n')
+            fh.write("# model.generate(prompt, cache_policy=policy)\n")
+            fh.write("```\n")
+
+    print(f"  Wrote {json_path}, {md_path}, {notes_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +599,13 @@ def main() -> None:
     max_tokens = MAX_TOKENS_QUICK if args.quick else MAX_TOKENS_FULL
 
     all_rows: list[dict[str, Any]] = []
+    models_tested: list[str] = []
 
     for model_id in models:
         model, tokenizer = _load_model(model_id)
         if model is None:
             continue
+        models_tested.append(model_id)
 
         candidates = _build_candidates(quick=args.quick)
         if not candidates:
@@ -528,6 +645,7 @@ def main() -> None:
             all_rows = eligible
 
     _write_artifacts(all_rows, out_dir)
+    _export_winner(all_rows, models_tested)
     print("\nDone.")
 
 

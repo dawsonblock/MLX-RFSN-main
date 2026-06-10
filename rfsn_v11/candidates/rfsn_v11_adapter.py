@@ -27,11 +27,14 @@ from typing import Any
 import numpy as np
 
 from .base import CandidateResult, KVCompressionCandidate
+from .candidate_status import CandidateStatus
 from .quality_gates import GATE_STATUS_PENDING_REAL_CACHE_INJECTION
 
 
 class RFSNV11Candidate(KVCompressionCandidate):
     """RFSN v11 fusion compressor (offline metrics only)."""
+
+    candidate_status = CandidateStatus.OFFLINE_ONLY
 
     def __init__(
         self,
@@ -54,8 +57,9 @@ class RFSNV11Candidate(KVCompressionCandidate):
 
     def is_available(self) -> bool:
         try:
-            from rfsn_v11.quant.kv_compressor import KVCompressor  # noqa: F401
             import mlx_lm  # noqa: F401
+
+            from rfsn_v11.quant.kv_compressor import KVCompressor  # noqa: F401
             return True
         except ImportError:
             return False
@@ -79,6 +83,7 @@ class RFSNV11Candidate(KVCompressionCandidate):
         try:
             import mlx.core as mx
             import mlx_lm
+
             from rfsn_v11.quant.kv_compressor import KVCompressor
 
             # --- Step 1: measure KVCompressor compression quality offline ---
@@ -108,7 +113,9 @@ class RFSNV11Candidate(KVCompressionCandidate):
             k_code_bytes = batch * self.dim * self.key_bits / 8
             k_scale_bytes = (batch * self.dim / self.group_size) * 4
             # Value: indices (v_bits per element) + norms (float32 per vector)
-            v_idx_bytes = batch * self.dim * float(self.value_bits) / 8
+            v_idx_bytes = (
+                batch * self.dim * float(self.value_bits) / 8
+            )
             v_norm_bytes = batch * 4
             compressed_bytes = k_code_bytes + k_scale_bytes + v_idx_bytes + v_norm_bytes
             size_ratio = compressed_bytes / fp16_bytes
@@ -156,6 +163,9 @@ class RFSNV11Candidate(KVCompressionCandidate):
                 logit_cosine=round(cosine_k, 5),
                 promotion_eligible=False,
                 gate_status=GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
+                candidate_status=self.candidate_status,
+                cache_backend_used="rfsn_v11_offline",
+                cache_events=["offline_compress", "offline_decompress"],
                 notes=(
                     "RFSN v11 compression is measured offline. Generation path is not yet "
                     "using direct RFSN v11 cache injection. Not promotion eligible until "

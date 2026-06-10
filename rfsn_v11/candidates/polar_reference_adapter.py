@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .candidate_status import CandidateStatus
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 _EXT_POLAR = str(
@@ -80,8 +81,8 @@ def _patch_polar_quant_vectorize() -> None:
     if _polar_quant_patched:
         return
     _ensure_ext_on_path()
-    from mlx_turboquant.polar_quant import PolarQuant
     import mlx.core as mx
+    from mlx_turboquant.polar_quant import PolarQuant
 
     def _vectorized_quantize(self, vectors: mx.array):  # type: ignore[override]
         norms = mx.linalg.norm(vectors, axis=-1, keepdims=True)
@@ -136,8 +137,9 @@ def _revert_polar_patch() -> None:
     global _polar_original_sdpa, _polar_patched
     if not _polar_patched or _polar_original_sdpa is None:
         return
-    import mlx_lm.models.base as base
     import sys as _sys
+
+    import mlx_lm.models.base as base
 
     orig = _polar_original_sdpa
     base.scaled_dot_product_attention = orig
@@ -158,6 +160,7 @@ class PolarReferenceAdapter(KVCompressionCandidate):
     """
 
     name = "polar_reference_offline"
+    candidate_status = CandidateStatus.REFERENCE_ONLY
 
     def __init__(self, bits: int = 4, dim: int = 128, seed: int = 42) -> None:
         self.bits = bits
@@ -285,10 +288,15 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
+                candidate_status=self.candidate_status,
+                cache_backend_used="polar_reference_dequant_on_fetch",
+                cache_events=["prefetch_dequant", "decode_dequant", "attention_fp16"],
+                cache_bytes_written=int(compressed_bytes),
+                cache_bytes_read=int(compressed_bytes),
                 notes=(
-                    f"Polar reference dequantizes on fetch. It is a reference candidate "
-                    f"and is not promotion eligible unless full generation, logit, and "
-                    f"working-set metrics pass."
+                    "Polar reference dequantizes on fetch. It is a reference candidate "
+                    "and is not promotion eligible unless full generation, logit, and "
+                    "working-set metrics pass."
                 ),
             )
         except Exception as exc:
@@ -301,5 +309,6 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 model_id="unknown",
                 prompt=prompt,
                 gate_status="ERROR",
+                candidate_status=CandidateStatus.FAILED,
                 error=str(exc),
             )
