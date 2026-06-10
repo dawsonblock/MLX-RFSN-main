@@ -15,7 +15,6 @@ from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
 from .candidate_status import CandidateStatus
-from .logit_capture import capture_teacher_forced_logprobs
 from .memory_metrics import estimate_kv_memory_mb
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
@@ -131,10 +130,14 @@ class RFSNV10Candidate(KVCompressionCandidate):
                     lp_np = np.array(logprobs.astype(mx.float32).squeeze(0))
                     logprob_list.append(lp_np)
 
-                    # Teacher-forced decode
-                    for next_token_id in gen_ids[1:]:
+                    # Teacher-forced decode.
+                    # After prefill we already have the log-prob for predicting
+                    # the FIRST generated token (g1).  To get the log-prob for
+                    # predicting g2 we feed g1, for g3 we feed g2, etc.
+                    # Loop over gen_ids[:-1] — every token except the last.
+                    for forced_token_id in gen_ids[:-1]:
                         logits = model(
-                            mx.array([next_token_id])[None], cache=cache_list
+                            mx.array([forced_token_id])[None], cache=cache_list
                         )
                         logits = logits[:, -1, :]
                         logprobs = logits - mx.logsumexp(
@@ -147,8 +150,10 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 finally:
                     patcher.__exit__(None, None, None)
 
-                if not logprob_list:
-                    return None
+                assert len(logprob_list) == len(gen_ids), (
+                    f"Teacher-forced length mismatch: "
+                    f"{len(logprob_list)} log-probs for {len(gen_ids)} tokens"
+                )
                 return np.stack(logprob_list, axis=0)
             finally:
                 _unwrap_layers_for_rfsn(model)

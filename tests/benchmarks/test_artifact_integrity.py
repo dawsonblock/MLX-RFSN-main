@@ -7,10 +7,10 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from rfsn_v11.candidates.artifact_utils import (
     _build_honest_markdown_table,
-    _export_winner,
 )
 from rfsn_v11.candidates.candidate_status import CandidateStatus
 from rfsn_v11.candidates.json_utils import dump_json_strict
@@ -170,7 +170,9 @@ def test_winner_json_agrees_with_promotion_report() -> None:
     promo_payload = json.loads(promo_json.read_text())
     promo_results = _get_results(promo_payload)
     has_eligible = any(
-        r.get("promotion_eligible") for r in promo_results if isinstance(r, dict)
+        r.get("promotion_eligible")
+        for r in promo_results
+        if isinstance(r, dict)
     )
     winner_json = Path("artifacts/winner/winner.json")
     assert winner_json.exists(), "winner.json must exist"
@@ -236,4 +238,6 @@ def test_active_artifacts_have_no_nan_or_infinity() -> None:
                 errors = _scan_for_non_finite(payload, str(p))
                 if errors:
                     all_errors.extend(errors)
-    assert not all_errors, f"Non-finite floats found in artifacts: {all_errors}"
+    assert not all_errors, (
+        f"Non-finite floats found in artifacts: {all_errors}"
+    )

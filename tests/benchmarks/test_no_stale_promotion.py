@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from rfsn_v11.integrations.cache_policy import PROMOTED_POLICIES
 
@@ -30,7 +31,7 @@ def test_winner_json_declares_teacher_forced_methodology() -> None:
     )
 
 
-def test_promotion_artifact_disallows_promotion_if_methodology_mismatch() -> None:
+def test_promotion_artifact_disallows_promotion_if_mismatch() -> None:
     """Promotion is only allowed when artifact metadata says so."""
     promo_json = Path("artifacts/bench/shootout/promotion/results.json")
     assert promo_json.exists(), "promotion artifact missing"
@@ -39,10 +40,12 @@ def test_promotion_artifact_disallows_promotion_if_methodology_mismatch() -> Non
     if meta.get("promotion_allowed") is False:
         results = payload.get("results", [])
         has_eligible = any(
-            r.get("promotion_eligible") for r in results if isinstance(r, dict)
+            r.get("promotion_eligible")
+            for r in results
+            if isinstance(r, dict)
         )
         assert not has_eligible, (
-            "Artifact says promotion_allowed=false but contains eligible candidates"
+            "promotion_allowed=false but artifact has eligible"
         )
 
 
@@ -98,8 +101,12 @@ def test_winner_requires_full_logit_and_memory_artifacts() -> None:
     assert winner_json.exists(), "winner.json missing"
     data = json.loads(winner_json.read_text())
     if data.get("winner") is not None:
-        assert Path("artifacts/bench/shootout/full_logit/results.json").exists()
-        assert Path("artifacts/bench/shootout/memory/results.json").exists()
+        assert Path(
+            "artifacts/bench/shootout/full_logit/results.json"
+        ).exists()
+        assert Path(
+            "artifacts/bench/shootout/memory/results.json"
+        ).exists()
 
 
 def test_promotion_artifact_not_stale_legacy_path() -> None:

@@ -2,21 +2,34 @@
 
 > This roadmap incorporates the lessons from Alpha 8.3. It is honest about what is blocked, what is feasible, and what is premature.
 
-## Current Reality (Alpha 8.3)
+## Current Reality (Alpha 8.4)
 
-**No candidate is promotion eligible.**
+**No candidate is promotion eligible.  Promotion is disabled until teacher-forced alignment is fixed and artifacts are regenerated.**
 
 | Candidate | Logit Gate | Memory Gate | Real Cache | Blocker |
 |-----------|------------|-------------|------------|---------|
 | mlx_lm_baseline | CONTROL | — | yes | Not a candidate |
-| mlx_lm_quantized_kv_b8 | **FAIL** | PASS | yes | Logit comparison methodology flawed |
-| rfsn_v10_k8_v5_gs32 | PENDING | PASS | yes | Custom generator cannot capture logits |
-| rfsn_v10_k8_v5_gs64 | PENDING | PASS | yes | Custom generator cannot capture logits |
+| mlx_lm_quantized_kv_b8 | **FAIL** | PASS | yes | Teacher-forced alignment bug (off-by-one token feed) |
+| rfsn_v10_k8_v5_gs32 | PENDING | PASS | yes | Custom generator + alignment bug |
+| rfsn_v10_k8_v5_gs64 | PENDING | PASS | yes | Custom generator + alignment bug |
 | rfsn_v11_offline_asymmetric | PENDING | PENDING | **no** | Offline-only, no injection |
-| turboquant_v2_b4_gs64 | **FAIL** | PASS | yes | Logit comparison methodology flawed |
-| polar_reference_offline_b4 | **FAIL** | PASS | yes | Logit comparison methodology flawed |
+| turboquant_v2_b4_gs64 | **FAIL** | PASS | yes | Teacher-forced alignment bug |
+| polar_reference_offline_b4 | **FAIL** | PASS | yes | Teacher-forced alignment bug |
 
-**The common failure mode:** All candidates that actually capture real logits (mlx_lm_quantized, TurboQuant V2, Polar) fail the gate with low cosine / high KL / low top-k overlap. This is suspicious — it suggests the comparison methodology itself is broken, not that every candidate is bad.
+**The common failure mode:** The teacher-forced logit comparison loop was feeding `gen_ids[1:]` instead of `gen_ids[:-1]`.  This means the model was fed token g2 to predict g3, g3 to predict g4, etc. — but the prefill already predicted g1, so the captured log-probabilities do not align with the actual generated token sequence.  All full-logit artifacts produced under this bug are stale and must be regenerated.
+
+**Status:**
+- Teacher-forced capture scaffold exists.
+- Token alignment bug identified and fixed in `rfsn_v11/candidates/logit_capture.py` and `rfsn_v10_adapter.py`.
+- `tests/benchmarks/test_teacher_forced_alignment.py` proves correct token feeding.
+- Artifacts are wrapped with `promotion_allowed=false` and `methodology_status=TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION`.
+- Markdown now correctly renders "Promotion no" when promotion is disabled.
+- `token_sequence_hash` field added; promotion blocked when empty.
+- Gate thresholds are single-source-of-truth in `quality_gates.py` and included in artifact metadata.
+- `failed_gate_reasons` added to every failing row.
+- RFSN v10 proof trace marked as `trace_type: estimated`; promotion blocked until runtime counters replace estimates.
+- `cache_policy.py` PROMOTED_POLICIES is empty; rfsn_v10 is in BASELINE_POLICIES only.
+- `winner.json` reset to `NO_PROMOTION_ELIGIBLE_CANDIDATE`.
 
 ## Critical Finding: The Logit Comparison Methodology is Flawed
 
@@ -41,27 +54,36 @@ This measures: "Given the same context, how much does the candidate's logit dist
 
 **Priority: CRITICAL. Nothing else matters until this works.**
 
-### A1. Implement teacher-forced logit comparison
-- Add `teacher_forced_logits(model, tokenizer, prompt, target_text)` that runs a forward pass at each token position without sampling.
-- Modify `capture_generation_logprobs` or add a new `capture_teacher_forced_logprobs`.
-- Update `benchmarks/kv_shootout.py` full-logit-gate mode to use teacher-forced comparison.
+### A1. Fix teacher-forced token alignment (COMPLETED)
+- ~~Add `capture_teacher_forced_logprobs`~~ — EXISTS.
+- ~~Update `benchmarks/kv_shootout.py`~~ — DONE.
+- **FIXED:** Loop was feeding `gen_ids[1:]` instead of `gen_ids[:-1]`.  Now feeds the correct token at each step.
+- **TEST ADDED:** `tests/benchmarks/test_teacher_forced_alignment.py` proves correct feeding.
 
-### A2. Enable logit capture for RFSN v10 custom generator
+### A2. Enable logit capture for RFSN v10 custom generator (IN PROGRESS)
 - RFSN v10 uses `RFSNGenerator.generate()` which is a custom loop.
-- Add a teacher-forced path to `RFSNGenerator` or create a standalone forward-pass utility.
-- This removes the "PENDING_LOGIT_GATE" blocker for the baseline candidate.
+- `capture_logprobs` in `rfsn_v10_adapter.py` now uses the corrected teacher-forced loop.
+- **PENDING:** Must be revalidated on Apple Silicon after the alignment fix.
 
-### A3. Validate thresholds on known-good configurations
-- Run teacher-forced comparison on `mlx_lm_quantized_kv_b8` (maintained upstream).
+### A3. Validate thresholds on known-good configurations (PENDING RERUN)
+- Run corrected teacher-forced comparison on `mlx_lm_quantized_kv_b8`.
 - If it still fails, the thresholds are too strict.
 - If it passes, we have a validated methodology.
+- **BLOCKED:** Requires Apple Silicon + MLX runtime.
 
-### A4. Re-run full logit gate with fixed methodology
-- Regenerate all artifacts.
+### A4. Re-run full logit gate with fixed methodology (PENDING RERUN)
+- Regenerate all artifacts under corrected teacher-forced gate.
 - Expected outcome: mlx_lm_quantized_kv_b8 passes (it should — it's maintained upstream).
 - Expected outcome: TurboQuant V2 either passes or fails for real quality reasons, not methodology artifacts.
+- **BLOCKED:** Requires Apple Silicon + MLX runtime.
 
-**Timeline:** 1-2 weeks.
+### A5. Post-rerun promotion validation (NOT STARTED)
+- Only after rerun passes can any candidate be promoted.
+- `methodology_status` must change to `TEACHER_FORCED_RERUN_COMPLETE_PROMOTION_ALLOWED`.
+- `token_sequence_hash` must be non-empty.
+- `PROMOTED_POLICIES` in `cache_policy.py` must match `winner.json`.
+
+**Timeline:** 1-2 weeks after alignment fix is merged and Apple Silicon rerun is available.
 **Risk:** Low. This is a measurement fix, not an algorithm change.
 
 ## Phase B — Candidate Hardening (Depends on Phase A)

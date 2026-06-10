@@ -7,6 +7,8 @@ do not support it.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 import numpy as np
@@ -19,6 +21,43 @@ from .quality_gates import (
     TOP5_OVERLAP_MIN,
     TOP10_OVERLAP_MIN,
 )
+
+
+def compute_token_sequence_hash(
+    *,
+    model_id: str,
+    prompt_id: str,
+    prompt_text: str,
+    target_token_ids: list[int],
+    max_tokens: int,
+    temperature: float,
+    decode_mode: str = "greedy",
+    methodology: str = "teacher_forced_logit_v1",
+    tokenizer_id: str | None = None,
+) -> str:
+    """Return a deterministic SHA-256 hash of the teacher-forced configuration.
+
+    This hash proves that baseline and candidate were compared using the
+    exact same target token sequence under the same methodology.
+    """
+    payload = {
+        "model_id": model_id,
+        "prompt_id": prompt_id,
+        "prompt_hash": hashlib.sha256(
+            prompt_text.encode("utf-8")
+        ).hexdigest(),
+        "target_token_ids": target_token_ids,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "decode_mode": decode_mode,
+        "methodology": methodology,
+        "tokenizer_id": tokenizer_id,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def capture_generation_logprobs(
@@ -297,10 +336,21 @@ def capture_teacher_forced_logprobs(
         )
         mx.eval([c.state for c in cache_list])
 
-        # Teacher-forced decode: feed known generated tokens one by one
-        for next_token_id in gen_ids[1:]:
+        # Teacher-forced decode: feed known generated tokens one by one.
+        # After prefill we already have the log-prob for predicting the FIRST
+        # generated token (g1).  To get the log-prob for predicting g2 we
+        # must feed g1 into the model, to get g3 we feed g2, etc.  So the
+        # loop iterates over gen_ids[:-1] — every token except the last one.
+        #
+        # Example: gen_ids = [g1, g2, g3, g4]
+        #   prefill  → logprobs for g1  (already in logprob_list)
+        #   feed g1  → logprobs for g2
+        #   feed g2  → logprobs for g3
+        #   feed g3  → logprobs for g4
+        # Result: 4 log-prob vectors matching the 4 generated tokens.
+        for forced_token_id in gen_ids[:-1]:
             logits = model(
-                mx.array([next_token_id])[None], cache=cache_list
+                mx.array([forced_token_id])[None], cache=cache_list
             )
             logits = logits[:, -1, :]
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
@@ -311,8 +361,10 @@ def capture_teacher_forced_logprobs(
                 cache_list, 0, kv_group_size, kv_bits,
             )
 
-        if not logprob_list:
-            return None
+        assert len(logprob_list) == len(gen_ids), (
+            f"Teacher-forced length mismatch: "
+            f"{len(logprob_list)} log-probs for {len(gen_ids)} tokens"
+        )
         return np.stack(logprob_list, axis=0)
     except Exception:
         return None

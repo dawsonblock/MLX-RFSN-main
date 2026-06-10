@@ -81,6 +81,7 @@ from rfsn_v11.candidates.candidate_status import CandidateStatus  # noqa: E402
 from rfsn_v11.candidates.logit_capture import (  # noqa: E402
     capture_teacher_forced_logprobs,
     compute_logit_metrics_from_logprobs,
+    compute_token_sequence_hash,
     logit_gate_passed,
 )
 from rfsn_v11.candidates.quality_gates import (  # noqa: E402
@@ -89,6 +90,11 @@ from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     GATE_STATUS_PENDING_LOGIT_GATE,
     GATE_STATUS_PENDING_MEMORY_METRICS,
     GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
+    KL_DIVERGENCE_MAX,
+    LOGIT_COSINE_MIN,
+    MAX_LOGIT_DELTA_MAX,
+    TOP5_OVERLAP_MIN,
+    TOP10_OVERLAP_MIN,
     compute_promotion_eligibility,
     evaluate_quality_gate,
 )
@@ -505,6 +511,7 @@ def _run_once(
         if not gate.passed:
             result.gate_status = GATE_STATUS_FAIL
             result.promotion_eligible = False
+            result.failed_gate_reasons = gate.failure_reasons
             reasons = "; ".join(gate.failure_reasons)
             result.notes += f"  [logit gate failed: {reasons}]"
         else:
@@ -708,19 +715,36 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
 _ARTIFACT_METHODLOGY = "teacher_forced_logit_v1"
 
 
+_METHODOLOGY_STATUS_STALE = "STALE_PRE_TEACHER_FORCED"
+_METHODOLOGY_STATUS_RERUN_NO_PROMO = (
+    "TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION"
+)
+_METHODOLOGY_STATUS_RERUN_PROMO = (
+    "TEACHER_FORCED_RERUN_COMPLETE_PROMOTION_ALLOWED"
+)
+_METHODOLOGY_STATUS_RERUN_FAILED = "TEACHER_FORCED_RERUN_FAILED"
+
+
 def _artifact_metadata(
     mode: str,
     token_sequence_hash: str = "",
     promotion_allowed: bool = False,
+    gate_thresholds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     return {
         "benchmark_methodology": _ARTIFACT_METHODLOGY,
+        "methodology_status": (
+            _METHODOLOGY_STATUS_RERUN_PROMO
+            if promotion_allowed
+            else _METHODOLOGY_STATUS_RERUN_NO_PROMO
+        ),
         "baseline_decode_mode": "greedy",
         "comparison_mode": "same_token_sequence",
         "token_sequence_hash": token_sequence_hash,
         "promotion_allowed": promotion_allowed,
         "artifact_schema_version": "2.0",
         "mode": mode,
+        "gate_thresholds": gate_thresholds or {},
     }
 
 
@@ -734,11 +758,20 @@ def _write_artifacts(
     """Write JSON, CSV, and Markdown artifacts."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    gate_thresholds = {
+        "logit_cosine_min": LOGIT_COSINE_MIN,
+        "kl_divergence_max": KL_DIVERGENCE_MAX,
+        "top5_overlap_min": TOP5_OVERLAP_MIN,
+        "top10_overlap_min": TOP10_OVERLAP_MIN,
+        "max_logit_delta_max": MAX_LOGIT_DELTA_MAX,
+    }
+
     payload = {
         "metadata": _artifact_metadata(
             mode=mode,
             token_sequence_hash=token_sequence_hash,
             promotion_allowed=promotion_allowed,
+            gate_thresholds=gate_thresholds,
         ),
         "results": rows,
     }
@@ -760,7 +793,11 @@ def _write_artifacts(
     # Markdown
     md_path = out_dir / "results.md"
     with md_path.open("w", encoding="utf-8") as fh:
-        fh.write(_build_honest_markdown_table(rows))
+        fh.write(
+            _build_honest_markdown_table(
+                rows, promotion_allowed=promotion_allowed,
+            )
+        )
         fh.write("\n## Notes\n\n")
         fh.write(
             "**Methodology:** "
@@ -841,6 +878,9 @@ def main() -> None:
     all_rows: list[dict[str, Any]] = []
     models_tested: list[str] = []
     any_model_loaded = False
+    last_tokenizer: Any = None
+    last_baseline_result: CandidateResult | None = None
+    last_model_id: str = ""
 
     for model_id in models:
         model, tokenizer = _load_model(model_id)
@@ -848,6 +888,8 @@ def main() -> None:
             continue
         any_model_loaded = True
         models_tested.append(model_id)
+        last_tokenizer = tokenizer
+        last_model_id = model_id
 
         candidates = _build_candidates(quick=args.quick)
         if not candidates:
@@ -876,6 +918,7 @@ def main() -> None:
 
                 if candidate.name == "mlx_lm_baseline":
                     baseline_result = result
+                    last_baseline_result = result
 
                 print(
                     f"{result.gate_status}  "
@@ -945,10 +988,36 @@ def main() -> None:
             else:
                 all_rows = eligible
 
+    # Compute token-sequence hash from the last baseline result if
+    # available.  Requires MLX + tokenizer; on CPU-only sandboxes the
+    # hash remains empty and promotion is blocked.
+    token_sequence_hash = ""
+    if mode == "full_logit" and last_baseline_result is not None:
+        try:
+            baseline_text = last_baseline_result.generated_text
+            if baseline_text and last_tokenizer is not None:
+                target_ids = last_tokenizer.encode(baseline_text)
+                token_sequence_hash = compute_token_sequence_hash(
+                    model_id=last_model_id,
+                    prompt_id="prompt_0",
+                    prompt_text=prompts[0] if prompts else "",
+                    target_token_ids=target_ids,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    decode_mode="greedy",
+                    methodology=_ARTIFACT_METHODLOGY,
+                    tokenizer_id=getattr(
+                        last_tokenizer, "name_or_path", None
+                    ),
+                )
+        except Exception:
+            pass
+
     _write_artifacts(
         all_rows,
         out_dir,
         mode=mode,
+        token_sequence_hash=token_sequence_hash,
         promotion_allowed=False,
     )
     _export_winner(all_rows, models_tested)

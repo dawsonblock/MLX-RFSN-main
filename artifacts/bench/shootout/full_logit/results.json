@@ -7,7 +7,15 @@
     "promotion_allowed": false,
     "artifact_schema_version": "2.0",
     "mode": "full_logit",
-    "note": "Teacher-forced logit gate was introduced to fix prior methodology. These artifacts are considered stale until regenerated under the corrected gate. Promotion is not allowed until rerun."
+    "note": "Teacher-forced logit gate was introduced to fix prior methodology. These artifacts are considered stale until regenerated under the corrected gate. Promotion is not allowed until rerun.",
+    "methodology_status": "TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION",
+    "gate_thresholds": {
+      "logit_cosine_min": 0.999,
+      "kl_divergence_max": 0.1,
+      "top5_overlap_min": 0.85,
+      "top10_overlap_min": 0.9,
+      "max_logit_delta_max": 10.0
+    }
   },
   "results": [
     {

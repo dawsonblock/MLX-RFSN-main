@@ -12,5 +12,6 @@
   "teacher_forced_capture_used_rfsn_path": true,
   "bytes_written": 2774016.0,
   "bytes_read": 2774016.0,
-  "notes": "This trace proves the RFSN v10 SDPA patch was active during teacher-forced logit capture. bytes_written and bytes_read are derived from actual_kv_memory_mb (estimated compressed cache size). Real instrumentation should replace these estimates."
+  "notes": "TRACE IS ESTIMATED \u2014 NOT INSTRUMENTED.  bytes_written and bytes_read are derived from actual_kv_memory_mb, not runtime counters.  Promotion must be blocked until real instrumentation (cache_bytes_written_actual, cache_bytes_read_actual, prefill_quantize_events, decode_quantized_fetch_events) replaces these estimates.",
+  "trace_type": "estimated"
 }

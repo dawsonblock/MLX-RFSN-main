@@ -16,8 +16,23 @@ WINNER_DIR = Path("artifacts/winner")
 DEBUG_DIR = Path("artifacts/bench/shootout/debug")
 
 
-def _build_honest_markdown_table(rows: list[dict[str, Any]]) -> str:
-    """Build the honest benchmark table required by Plan B."""
+def _build_honest_markdown_table(
+    rows: list[dict[str, Any]],
+    *,
+    promotion_allowed: bool = False,
+) -> str:
+    """Build the honest benchmark table required by Plan B.
+
+    Parameters
+    ----------
+    rows
+        Candidate result rows.
+    promotion_allowed
+        If False, every row renders Promotion=no regardless of the
+        row's internal ``promotion_eligible`` flag.  This prevents
+        stale or unvalidated artifacts from accidentally looking
+        promotable in human-readable output.
+    """
     lines: list[str] = ["# KV Shootout Results\n"]
     if not rows:
         lines.append("No results.\n")
@@ -63,10 +78,22 @@ def _build_honest_markdown_table(rows: list[dict[str, Any]]) -> str:
         )
         gate = row.get("gate_status", "—")
         real_cache = "yes" if row.get("real_cache_used") else "no"
-        promo = "yes" if row.get("promotion_eligible") else "no"
+        # Override promotion display when promotion is globally disabled
+        if promotion_allowed and row.get("promotion_eligible"):
+            promo = "yes"
+        else:
+            promo = "no"
         lines.append(
             f"| {name} | {status} | {speed} | {mem} | "
             f"{gate} | {real_cache} | {promo} |"
+        )
+
+    # Summary line when promotion is not allowed
+    if not promotion_allowed:
+        lines.append("")
+        lines.append(
+            "| *Summary* | — | — | — | "
+            "— | — | **No candidate is promotion eligible.** |"
         )
 
     lines.append("")
@@ -98,6 +125,7 @@ def _export_rfsn_v10_proof_trace(
         bytes_read = bytes_written
 
     trace = {
+        "trace_type": "estimated",
         "candidate_name": candidate_name,
         "config_name": config_name,
         "cache_backend_used": "rfsn_v10_quantized_kv",
@@ -109,11 +137,13 @@ def _export_rfsn_v10_proof_trace(
         "bytes_written": bytes_written,
         "bytes_read": bytes_read,
         "notes": (
-            "This trace proves the RFSN v10 SDPA patch was active during "
-            "teacher-forced logit capture. bytes_written and bytes_read are "
-            "derived from actual_kv_memory_mb (estimated compressed "
-            "cache size). "
-            "Real instrumentation should replace these estimates."
+            "TRACE IS ESTIMATED — NOT INSTRUMENTED.  "
+            "bytes_written and bytes_read are derived from "
+            "actual_kv_memory_mb, not runtime counters.  "
+            "Promotion must be blocked until real instrumentation "
+            "(cache_bytes_written_actual, cache_bytes_read_actual, "
+            "prefill_quantize_events, decode_quantized_fetch_events) "
+            "replaces these estimates."
         ),
     }
 

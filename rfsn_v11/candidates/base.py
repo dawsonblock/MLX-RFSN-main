@@ -62,6 +62,7 @@ class CandidateResult:
     memory_gate_passed: bool | None = None
     promotion_eligible: bool = False
     gate_status: str = "PENDING_LOGIT_GATE"
+    failed_gate_reasons: list[str] = field(default_factory=list)
 
     # Candidate lifecycle status (CONTROL, BASELINE, EXPERIMENTAL, etc.)
     candidate_status: CandidateStatus = field(
