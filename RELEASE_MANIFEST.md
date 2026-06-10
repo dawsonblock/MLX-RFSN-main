@@ -4,10 +4,10 @@
 
 | Field | Value |
 |-------|-------|
-| Release name | `MLX-RFSN Fusion Alpha 8.1` |
+| Release name | `MLX-RFSN Fusion Alpha 8.2` |
 | Git branch | `mlx-rfsn-fusion-alpha-8` |
 | Git commit | (see `git log -1 --oneline`) |
-| Frozen snapshot branch | `mlx-rfsn-fusion-alpha-7-snapshot` (preserved, do not delete) |
+| Frozen snapshot branch | `mlx-rfsn-fusion-alpha-8-1-snapshot` (preserved, do not delete) |
 | Build date | 2026-06-10 |
 | Python requirement | `>=3.11,<3.13` |
 | Development status | `3 - Alpha` |
@@ -35,7 +35,7 @@ These are the only quantization presets validated for use:
 
 ---
 
-## Alpha 8.1 gate results (honest status)
+## Alpha 8.2 gate results (honest status)
 
 | Step | Result |
 |------|--------|
@@ -46,18 +46,26 @@ These are the only quantization presets validated for use:
 | Server tests | PASS (20 passed) |
 | Benchmark tests | PASS |
 | Package build | PASS |
+| Package install Python 3.11 | NOT VERIFIED IN THIS ARCHIVE |
+| Package install Python 3.12 | NOT VERIFIED IN THIS ARCHIVE |
 | Docker healthcheck | NOT RUN |
 | Docker fusion-bench | NOT RUN |
-| Shootout quick | PASS (produces honest artifacts) |
+| Shootout quick | PASS (produces honest artifacts; SKIPPED_NO_MLX_LM on non-MLX) |
 | Shootout promotion report | PASS — output: No candidate is promotion eligible |
-| Shootout full logit | NOT RUN (candidates do not yet capture logits during generation) |
-| Shootout memory | NOT RUN |
+| Shootout full logit | INFRASTRUCTURE ADDED — requires Apple-Silicon run to populate artifacts |
+| Shootout memory | INFRASTRUCTURE ADDED — requires Apple-Silicon run to populate artifacts |
 | Promoted candidate | NONE |
 | Stale false-winner artifacts | REMOVED (moved to artifacts/bench/legacy/alpha7_shootout/) |
 | Control baseline promotion bug | FIXED (now PASS_NO_PROMOTE, not promotion eligible) |
+| CI failure masking | FIXED (`|| true` removed from fusion-alpha.yml) |
+| Skipped artifact markdown | FIXED (explicit SKIPPED_NO_MLX_LM rendering) |
 | Candidate statuses | ADDED — CONTROL, BASELINE, EXPERIMENTAL, OFFLINE_ONLY, REFERENCE_ONLY |
 | No-false-promotion tests | ADDED |
 | Artifact integrity tests | ADDED |
+| Logit capture infrastructure | ADDED (`logit_capture.py` with `generate_step` hook) |
+| Memory report infrastructure | ADDED (memory mode enforces all metrics present) |
+| TurboQuant V2 proof fields | ADDED (`patch_scope`, `global_patch_restored`, `actual_kv_memory_mb`) |
+| Cache policy lock | ADDED (only promoted candidates exposed as policies) |
 | Install modes | basic / fusion / memory |
 | Product boundary docs | ADDED |
 | Platform support docs | ADDED |

@@ -112,6 +112,42 @@ def test_no_misleading_compression_wording() -> None:
     assert "0.265" in md or "26.5" in md
 
 
+def test_skipped_artifact_markdown_is_explicit() -> None:
+    rows = [
+        {
+            "status": "SKIPPED_NO_MLX_LM",
+            "reason": "mlx_lm is not installed",
+        }
+    ]
+    md = _build_honest_markdown_table(rows)
+    assert "SKIPPED_NO_MLX_LM" in md
+    assert "mlx_lm is not installed" in md
+
+
+def test_no_active_legacy_winner_artifact() -> None:
+    # Old Alpha 7 artifacts must not exist in active path
+    assert not Path("artifacts/bench/shootout/results.json").exists()
+    assert not Path("artifacts/bench/shootout/results.md").exists()
+    assert not Path("artifacts/bench/shootout/results.csv").exists()
+
+
+def test_promotion_artifact_exists() -> None:
+    # Promotion report must exist and say no candidate is eligible
+    promo_json = Path("artifacts/bench/shootout/promotion/results.json")
+    promo_md = Path("artifacts/bench/shootout/promotion/results.md")
+    assert promo_json.exists(), "Promotion JSON artifact missing"
+    assert promo_md.exists(), "Promotion Markdown artifact missing"
+    data = json.loads(promo_json.read_text())
+    # Either a note row or actual rows with no promotion eligible
+    has_note = any("note" in r for r in data if isinstance(r, dict))
+    no_eligible = not any(
+        r.get("promotion_eligible") for r in data if isinstance(r, dict)
+    )
+    assert has_note or no_eligible, (
+        "Promotion artifact should say no candidate is eligible"
+    )
+
+
 def test_winner_json_agrees_with_promotion_report() -> None:
     rows = [{"note": "No candidate is promotion eligible."}]
     _export_winner(rows, ["Qwen/Qwen2.5-0.5B-Instruct"])

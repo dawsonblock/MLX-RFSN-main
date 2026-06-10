@@ -113,9 +113,11 @@ is always set honestly.
 ## Decision rule
 
 After the shootout:
-1. Collect all candidates with `passed_quality_gate=True`
-2. Winner = highest `tokens_per_sec` among passing candidates
-3. If no candidate passes, fix issues and re-run — do not promote
+1. Collect all candidates with `promotion_eligible=True`
+   (requires: `logit_gate_passed=True`, `memory_gate_passed=True`,
+   real cache path used, no unsafe global monkey-patching)
+2. Winner = highest `tokens_per_sec` among eligible candidates
+3. If no candidate is eligible, the promotion report says so honestly
 
 See `docs/architecture.md` for the full promotion rule table.
 

@@ -16,7 +16,7 @@ PYTHONPATH=. pytest --collect-only -q tests rfsn_v11/tests
 # 3. CPU tests (no MLX required)
 echo "[3/7] CPU tests..."
 PYTHONPATH=. RFSN_BACKEND=numpy RFSN_TELEMETRY_HMAC_KEY=test-secret \
-  pytest -q tests -m "not db and not mlx and not slow"
+  pytest -q tests -m "not mlx and not slow and not benchmark and not experimental and not integration and not db"
 
 # 4. rfsn_v11 unit tests (skip MLX-dependent tests on non-MLX platforms)
 echo "[4/7] rfsn_v11 tests..."

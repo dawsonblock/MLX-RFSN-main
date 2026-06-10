@@ -104,7 +104,9 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
             "Pass it explicitly or check model.args."
         )
 
-    def _build_cache(self, model: Any, head_dim: int, use_rotation: bool) -> list:
+    def _build_cache(
+        self, model: Any, head_dim: int, use_rotation: bool
+    ) -> list:
         _ensure_ext_on_path()
         from turboquant.cache_v2 import TurboQuantKVCacheV2
 
@@ -139,7 +141,8 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
         for c in caches:
             if c.keys is not None:
                 T = c.offset
-                # keys[0] is the packed data tensor; shape = (B, H, capacity, packed_dim)
+                # keys[0] is the packed data tensor;
+                # shape = (B, H, capacity, packed_dim)
                 B, H = c.keys[0].shape[:2]
                 D = c.head_dim
                 # float16 = 2 bytes per element
@@ -182,10 +185,12 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 f"{'_rot' if use_rotation else '_norot'}"
             )
 
-            # Apply SDPA patch and force-sync all already-imported model modules.
-            # tq_patch.apply() only patches mlx_lm.models.base; any model module
-            # (e.g. qwen2) that was imported before the patch and holds a local
-            # reference to scaled_dot_product_attention needs to be updated too.
+            # Apply SDPA patch and force-sync all already-imported
+            # model modules. tq_patch.apply() only patches
+            # mlx_lm.models.base; any model module (e.g. qwen2)
+            # that was imported before the patch and holds a local
+            # reference to scaled_dot_product_attention needs to be
+            # updated too.
             tq_patch.apply()
             import mlx_lm.models.base as _base
             _patched_fn = _base.scaled_dot_product_attention
@@ -216,7 +221,14 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                     tokens.append(tok_id)
 
                 total_ms = (time.perf_counter() - t0) * 1000
-                mx.eval(*[c.keys[0] for c in caches if c.keys is not None][:1] or [mx.array(0)])
+                mx.eval(
+                    *[
+                        c.keys[0]
+                        for c in caches
+                        if c.keys is not None
+                    ][:1]
+                    or [mx.array(0)]
+                )
 
                 gen_tokens = max(len(tokens), 1)
                 tps = gen_tokens / (total_ms / 1000)
@@ -225,17 +237,25 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 # Real compression ratio from cache memory
                 compressed_bytes = self._cache_nbytes(caches)
                 fp16_bytes = self._cache_fp16_nbytes(caches)
-                if fp16_bytes > 0 and compressed_bytes > 0:
+                if (
+                    fp16_bytes > 0
+                    and compressed_bytes > 0
+                ):
                     size_ratio = round(compressed_bytes / fp16_bytes, 4)
                     compression_factor = round(fp16_bytes / compressed_bytes, 3)
+                    actual_kv_memory_mb = compressed_bytes / (1024 * 1024)
                 else:
                     size_ratio = None
                     compression_factor = None
+                    actual_kv_memory_mb = None
 
             finally:
                 tq_patch.revert()
-                # Re-sync all model modules to the now-reverted original
-                _orig_fn = _base.scaled_dot_product_attention
+                # Re-sync all model modules to the now-reverted
+                # original
+                _orig_fn = (
+                    _base.scaled_dot_product_attention
+                )
                 for _mod_name, _mod in list(sys.modules.items()):
                     if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
                         if hasattr(_mod, "scaled_dot_product_attention"):
@@ -251,14 +271,21 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=generated_text,
+                actual_kv_memory_mb=actual_kv_memory_mb,
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 candidate_status=self.candidate_status,
                 cache_backend_used="turboquant_v2",
-                cache_events=["prefill_compress", "decode_fetch", "attention_quantized_matmul"],
+                cache_events=[
+                    "prefill_compress",
+                    "decode_fetch",
+                    "attention_quantized_matmul",
+                ],
                 cache_bytes_written=int(compressed_bytes),
                 cache_bytes_read=int(compressed_bytes),
+                patch_scope="controlled_context",
+                global_patch_restored=True,
                 notes=(
                     f"TurboQuant V2: b{self.bits} gs{self.group_size} "
                     f"rotation={use_rotation} head_dim={head_dim}  "

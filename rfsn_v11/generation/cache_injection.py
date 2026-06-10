@@ -8,11 +8,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
 
 class RFSNV11CacheInjector:
-    """Wrapper to make RFSN v11 compression compatible with minimal_decode_loop.
+    """Wrapper to make RFSN v11 compression compatible with
+    minimal_decode_loop.
 
     This is NOT a global monkey-patch. It only affects the cache object
     passed into minimal_decode_loop.
@@ -58,5 +57,14 @@ class RFSNV11CacheInjector:
 
     @property
     def nbytes(self) -> int:
-        """Placeholder: real size requires knowing the compressed state."""
-        return 0
+        """Return estimated bytes of the last compressed KV state.
+
+        Raises NotImplementedError if memory accounting is not yet
+        available.  Do not return fake 0 — that breaks promotion
+        metrics that rely on honest memory reporting.
+        """
+        raise NotImplementedError(
+            "RFSN v11 cache injector memory accounting is not implemented. "
+            "This candidate remains OFFLINE_ONLY until real cache injection "
+            "and memory proof exist."
+        )

@@ -76,8 +76,15 @@ Response must include `requests_total`, `last_latency_ms`, `model_loaded`.
 rfsn-bench
 ```
 
-The winning candidate must have `passed_quality_gate=true` in `results.json`.
+The winning candidate must have:
+- `promotion_eligible=true`
+- `logit_gate_passed=true`
+- `memory_gate_passed=true`
+- real cache path used (`real_cache_used=true`)
+- `gate_status="PASS"`
+
 If the verdict is `PROMOTE`, update `docs/CANDIDATE_PROMOTION.md` status lines.
+If no candidate qualifies, the promotion report must say so honestly.
 
 ### 9. Proof regression
 

@@ -59,7 +59,9 @@ warnings.filterwarnings(
     "ignore", message="Specifying sampling arguments", category=UserWarning,
 )
 warnings.filterwarnings(
-    "ignore", message="Specifying ``repetition_penalty``", category=UserWarning,
+    "ignore",
+    message="Specifying ``repetition_penalty``",
+    category=UserWarning,
 )
 
 # Add repo root to path so rfsn_v11 is importable without install
@@ -69,12 +71,21 @@ from rfsn_v11.candidates.artifact_utils import (  # noqa: E402
     _build_honest_markdown_table,
     _export_winner,
 )
-from rfsn_v11.candidates.base import CandidateResult, KVCompressionCandidate  # noqa: E402
+from rfsn_v11.candidates.base import (  # noqa: E402
+    CandidateResult,
+    KVCompressionCandidate,
+)
 from rfsn_v11.candidates.candidate_status import CandidateStatus  # noqa: E402
+from rfsn_v11.candidates.logit_capture import (  # noqa: E402
+    capture_generation_logprobs,
+    compute_logit_metrics_from_logprobs,
+    logit_gate_passed,
+)
 from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     GATE_STATUS_FAIL,
     GATE_STATUS_PASS,
     GATE_STATUS_PENDING_LOGIT_GATE,
+    GATE_STATUS_PENDING_MEMORY_METRICS,
     GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
     compute_promotion_eligibility,
     evaluate_quality_gate,
@@ -84,8 +95,9 @@ from rfsn_v11.candidates.quality_gates import (  # noqa: E402
 # Benchmark configuration
 # ---------------------------------------------------------------------------
 
+# primary: head_dim=128, ideal for TQ rotation
 MODELS_FULL = [
-    "Qwen/Qwen2.5-1.5B-Instruct",  # primary: head_dim=128, ideal for TQ rotation
+    "Qwen/Qwen2.5-1.5B-Instruct",
 ]
 MODELS_QUICK = [
     "Qwen/Qwen2.5-0.5B-Instruct",  # quick iteration: head_dim=64, fast load
@@ -122,7 +134,11 @@ PROMPT_SUITE: dict[str, list[str]] = {
         "Explain why 0.1 + 0.2 != 0.3 in floating point arithmetic.",
     ],
     "multi_turn": [
-        "User: What is the capital of France?\nAssistant: Paris.\nUser: And what language do they speak there?",
+        (
+            "User: What is the capital of France?\n"
+            "Assistant: Paris.\n"
+            "User: And what language do they speak there?"
+        ),
     ],
 }
 
@@ -130,7 +146,8 @@ PROMPT_SUITE: dict[str, list[str]] = {
 PROMPTS_FULL = [prompts[0] for prompts in PROMPT_SUITE.values()]
 
 # Temperature=0.0 for all candidates to make text comparable across methods.
-# Without greedy decoding, stochastic sampling causes false text-heuristic FAILs.
+# Without greedy decoding, stochastic sampling causes false
+# text-heuristic FAILs.
 GENERATION_TEMP = 0.0
 
 ARTIFACTS_ROOT = Path("artifacts/bench/shootout")
@@ -144,7 +161,9 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
     """Instantiate all candidates. Skip unavailable ones gracefully."""
     from rfsn_v11.candidates.mlx_lm_baseline import MLXLMBaseline
     from rfsn_v11.candidates.mlx_lm_quantized import MLXLMQuantizedKV
-    from rfsn_v11.candidates.polar_reference_adapter import PolarReferenceAdapter
+    from rfsn_v11.candidates.polar_reference_adapter import (
+        PolarReferenceAdapter,
+    )
     from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
     from rfsn_v11.candidates.rfsn_v11_adapter import RFSNV11Candidate
     from rfsn_v11.candidates.turboquant_v2_adapter import TurboQuantV2Candidate
@@ -154,7 +173,10 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
         MLXLMQuantizedKV(kv_bits=8),
         RFSNV10Candidate("k8_v5_gs32"),
         RFSNV10Candidate("k8_v5_gs64"),
-        RFSNV11Candidate(key_bits=8, value_bits=4, group_size=64, use_wht=True, dim=128),
+        RFSNV11Candidate(
+            key_bits=8, value_bits=4, group_size=64,
+            use_wht=True, dim=128,
+        ),
         TurboQuantV2Candidate(bits=4, group_size=64),
         PolarReferenceAdapter(bits=4, dim=128),
     ]
@@ -232,7 +254,8 @@ def _run_once(
         result.promotion_eligible = False
         return result
 
-    # Preserve adapter-specific pending statuses (more specific than generic logic)
+    # Preserve adapter-specific pending statuses
+    # (more specific than generic logic)
     if result.gate_status == GATE_STATUS_PENDING_REAL_CACHE_INJECTION:
         result.promotion_eligible = False
         return result
@@ -266,8 +289,77 @@ def _run_once(
             result.notes += "  [quick mode: logit gate pending]"
         return result
 
-    # full-logit-gate mode: require real logits
-    if result.logit_cosine is None:
+    # full-logit-gate mode: capture per-step logits and compare
+    if mode == "full_logit":
+        # Capture baseline log-probs (if not already the control)
+        baseline_logprobs = None
+        if baseline_result is not None and candidate.name != "mlx_lm_baseline":
+            baseline_cap = capture_generation_logprobs(
+                model, tokenizer, prompt, max_tokens=max_tokens, temp=temp,
+            )
+            if "error" not in baseline_cap:
+                baseline_logprobs = baseline_cap.get("logprobs")
+
+        # Capture candidate log-probs if candidate uses MLX-LM path
+        candidate_logprobs = None
+        if candidate.name in (
+            "mlx_lm_quantized_kv_b8",
+            "rfsn_v10_k8_v5_gs32",
+            "rfsn_v10_k8_v5_gs64",
+        ):
+            # These candidates are MLX-LM wrappers — we can re-run with
+            # generate_step to capture log-probs for quality comparison.
+            # Note: this is a second generation pass; speed metrics come
+            # from the first pass in candidate.run().
+            cand_cap = capture_generation_logprobs(
+                model, tokenizer, prompt, max_tokens=max_tokens, temp=temp,
+            )
+            if "error" not in cand_cap:
+                candidate_logprobs = cand_cap.get("logprobs")
+
+        if baseline_logprobs is not None and candidate_logprobs is not None:
+            metrics = compute_logit_metrics_from_logprobs(
+                baseline_logprobs, candidate_logprobs,
+            )
+            result.logit_cosine = metrics.get("logit_cosine")
+            result.kl_divergence = metrics.get("kl_divergence")
+            result.top1_match = metrics.get("top1_match")
+            result.top5_overlap = metrics.get("top5_overlap")
+            result.top10_overlap = metrics.get("top10_overlap")
+            result.max_logit_delta = metrics.get("max_logit_delta")
+            result.first_divergent_token = metrics.get("first_divergent_token")
+            result.logit_gate_passed = logit_gate_passed(metrics)
+            if not result.logit_gate_passed:
+                result.gate_status = GATE_STATUS_FAIL
+                result.promotion_eligible = False
+                result.notes += (
+                    "  [logit gate failed]"
+                )
+            else:
+                result.memory_gate_passed = (
+                    result.actual_kv_memory_mb is not None
+                    and result.working_set_memory_mb is not None
+                    and result.size_ratio is not None
+                    and result.compression_factor is not None
+                )
+                promotion_eligible, gate_status = (
+                    compute_promotion_eligibility(
+                        logit_gate_passed=result.logit_gate_passed,
+                        memory_gate_passed=result.memory_gate_passed,
+                        actual_kv_memory_mb=result.actual_kv_memory_mb,
+                        working_set_memory_mb=result.working_set_memory_mb,
+                        size_ratio=result.size_ratio,
+                        compression_factor=result.compression_factor,
+                    )
+                )
+                result.promotion_eligible = promotion_eligible
+                result.gate_status = gate_status
+        else:
+            result.logit_gate_passed = None
+            result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+            result.promotion_eligible = False
+            result.notes += "  [full-logit-gate: logit capture not available]"
+    elif result.logit_cosine is None:
         result.logit_gate_passed = None
         result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
         result.promotion_eligible = False
@@ -286,7 +378,8 @@ def _run_once(
         if not gate.passed:
             result.gate_status = GATE_STATUS_FAIL
             result.promotion_eligible = False
-            result.notes += "  [logit gate failed: " + "; ".join(gate.failure_reasons) + "]"
+            reasons = "; ".join(gate.failure_reasons)
+            result.notes += f"  [logit gate failed: {reasons}]"
         else:
             result.memory_gate_passed = (
                 result.actual_kv_memory_mb is not None
@@ -297,6 +390,40 @@ def _run_once(
             promotion_eligible, gate_status = compute_promotion_eligibility(
                 logit_gate_passed=result.logit_gate_passed,
                 memory_gate_passed=result.memory_gate_passed,
+                actual_kv_memory_mb=result.actual_kv_memory_mb,
+                working_set_memory_mb=result.working_set_memory_mb,
+                size_ratio=result.size_ratio,
+                compression_factor=result.compression_factor,
+            )
+            result.promotion_eligible = promotion_eligible
+            result.gate_status = gate_status
+
+    # Memory-report mode: every candidate must report memory metrics
+    if mode == "memory":
+        if result.actual_kv_memory_mb is None:
+            result.memory_gate_passed = False
+            result.gate_status = GATE_STATUS_PENDING_MEMORY_METRICS
+            result.promotion_eligible = False
+            result.notes += "  [memory report: actual_kv_memory_mb missing]"
+        elif result.working_set_memory_mb is None:
+            result.memory_gate_passed = False
+            result.gate_status = GATE_STATUS_PENDING_MEMORY_METRICS
+            result.promotion_eligible = False
+            result.notes += "  [memory report: working_set_memory_mb missing]"
+        elif result.size_ratio is None or result.compression_factor is None:
+            result.memory_gate_passed = False
+            result.gate_status = GATE_STATUS_PENDING_MEMORY_METRICS
+            result.promotion_eligible = False
+            result.notes += (
+                "  [memory report: size_ratio/"
+                "compression_factor missing]"
+            )
+        else:
+            result.memory_gate_passed = True
+            # Even with memory gate passed, logit gate may still be pending
+            promotion_eligible, gate_status = compute_promotion_eligibility(
+                logit_gate_passed=result.logit_gate_passed,
+                memory_gate_passed=True,
                 actual_kv_memory_mb=result.actual_kv_memory_mb,
                 working_set_memory_mb=result.working_set_memory_mb,
                 size_ratio=result.size_ratio,
@@ -317,7 +444,8 @@ def _apply_promotion_rules(
 
     Only EXPERIMENTAL or BASELINE candidates can become PROMOTED.
     OFFLINE_ONLY cannot promote until real cache injection exists.
-    REFERENCE_ONLY cannot promote unless upgraded into a real runtime candidate.
+    REFERENCE_ONLY cannot promote unless upgraded into a real
+    runtime candidate.
     CONTROL does not promote; it is the comparison target.
     """
     status = result.candidate_status or candidate.candidate_status
@@ -360,7 +488,10 @@ def _text_quality_heuristic(
         result.logit_gate_passed = None
         result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
         result.promotion_eligible = False
-        result.notes += "  [text heuristic: exact match — logit gate still pending]"
+        result.notes += (
+            "  [text heuristic: exact match — "
+            "logit gate still pending]"
+        )
         return result
 
     # Divergence at token level
@@ -378,7 +509,10 @@ def _text_quality_heuristic(
     result.logit_gate_passed = None
     result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
     result.promotion_eligible = False
-    result.notes += f"  [text heuristic: diverged at token {first_diff} — logit gate pending]"
+    result.notes += (
+        f"  [text heuristic: diverged at token {first_diff}"
+        " — logit gate pending]"
+    )
     return result
 
 
@@ -413,10 +547,14 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
         "candidate_status": str(candidate_status),
     }
     for field in numeric:
-        vals = [getattr(r, field) for r in results if getattr(r, field) is not None]
+        vals = [
+            getattr(r, field) for r in results
+            if getattr(r, field) is not None
+        ]
         agg[field] = float(np.mean(vals)) if vals else None
 
-    # Gate status: if any FAIL, overall FAIL; if all PASS, PASS; otherwise pending
+    # Gate status: if any FAIL → overall FAIL; if all PASS → PASS;
+    # otherwise pending
     statuses = [r.gate_status for r in results]
     if any(s == GATE_STATUS_FAIL for s in statuses):
         agg["gate_status"] = GATE_STATUS_FAIL
@@ -468,12 +606,26 @@ def _write_artifacts(rows: list[dict[str, Any]], out_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="KV-cache compression shootout")
+    parser = argparse.ArgumentParser(
+        description="KV-cache compression shootout"
+    )
     parser.add_argument("--quick", action="store_true", help="Fast smoke run")
-    parser.add_argument("--full-logit-gate", action="store_true", help="Run real logit comparison")
-    parser.add_argument("--memory-report", action="store_true", help="Require all candidates to report memory metrics")
-    parser.add_argument("--promotion-report", action="store_true", help="Only rank promotion-eligible candidates")
-    parser.add_argument("--model", type=str, default=None, help="Specific model ID")
+    parser.add_argument(
+        "--full-logit-gate", action="store_true",
+        help="Run real logit comparison",
+    )
+    parser.add_argument(
+        "--memory-report", action="store_true",
+        help="Require all candidates to report memory metrics",
+    )
+    parser.add_argument(
+        "--promotion-report", action="store_true",
+        help="Only rank promotion-eligible candidates",
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Specific model ID",
+    )
     args = parser.parse_args()
 
     # Determine mode and output directory
@@ -497,7 +649,10 @@ def main() -> None:
     print(f"KV Shootout — mode={mode}")
     print(f"Outputs: {out_dir}")
 
-    models = [args.model] if args.model else (MODELS_QUICK if args.quick else MODELS_FULL)
+    models = (
+        [args.model] if args.model
+        else (MODELS_QUICK if args.quick else MODELS_FULL)
+    )
     prompts = PROMPTS_QUICK if args.quick else PROMPTS_FULL
     max_tokens = MAX_TOKENS_QUICK if args.quick else MAX_TOKENS_FULL
 

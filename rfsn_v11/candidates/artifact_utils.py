@@ -33,6 +33,17 @@ def _build_honest_markdown_table(rows: list[dict[str, Any]]) -> str:
     )
 
     for row in rows:
+        # Skipped artifact rows (e.g. SKIPPED_NO_MLX_LM)
+        if row.get("status", "").startswith("SKIPPED"):
+            status_label = row.get("status", "SKIPPED")
+            reason = row.get("reason", "")
+            lines.append(
+                f"| **{status_label}** | — | — | — | "
+                f"— | no | no |"
+            )
+            if reason:
+                lines.append(f"| *Reason:* {reason} | | | | | | |")
+            continue
         if "note" in row:
             lines.append(f"| {row['note']} | | | | | | |")
             continue
@@ -60,7 +71,9 @@ def _build_honest_markdown_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _export_winner(rows: list[dict[str, Any]], models_tested: list[str]) -> None:
+def _export_winner(
+    rows: list[dict[str, Any]], models_tested: list[str]
+) -> None:
     """Export winner artifacts when a candidate is promotion eligible."""
     eligible = [r for r in rows if r.get("promotion_eligible")]
     WINNER_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,8 +98,12 @@ def _export_winner(rows: list[dict[str, Any]], models_tested: list[str]) -> None
             ),
             "models_tested": models_tested,
             "artifacts": {
-                "full_logit": str(ARTIFACTS_ROOT / "full_logit" / "results.json"),
-                "memory": str(ARTIFACTS_ROOT / "memory" / "results.json"),
+                "full_logit": str(
+                    ARTIFACTS_ROOT / "full_logit" / "results.json"
+                ),
+                "memory": str(
+                    ARTIFACTS_ROOT / "memory" / "results.json"
+                ),
                 "promotion": str(
                     ARTIFACTS_ROOT / "promotion" / "results.json"
                 ),
@@ -109,7 +126,8 @@ def _export_winner(rows: list[dict[str, Any]], models_tested: list[str]) -> None
             fh.write(f"**Status:** {winner_data['status']}\n\n")
             fh.write(f"**Reason:** {winner_data['reason']}\n\n")
             fh.write(
-                f"**Models tested:** {', '.join(winner_data['models_tested'])}\n"
+                "**Models tested:** "
+                f"{', '.join(winner_data['models_tested'])}\n"
             )
 
     notes_path = WINNER_DIR / "integration_notes.md"

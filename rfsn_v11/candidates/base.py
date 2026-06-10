@@ -74,6 +74,10 @@ class CandidateResult:
     cache_bytes_written: int | None = None
     cache_bytes_read: int | None = None
 
+    # Patch safety proof (for candidates that patch SDPA)
+    patch_scope: str | None = None        # e.g. "controlled_context", "global"
+    global_patch_restored: bool | None = None
+
     # Free-form notes
     notes: str = ""
     error: str = ""
