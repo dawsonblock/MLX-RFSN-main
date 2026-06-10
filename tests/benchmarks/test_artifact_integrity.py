@@ -13,6 +13,7 @@ from rfsn_v11.candidates.artifact_utils import (
     _export_winner,
 )
 from rfsn_v11.candidates.candidate_status import CandidateStatus
+from rfsn_v11.candidates.json_utils import dump_json_strict
 
 
 def test_results_json_exists() -> None:
@@ -22,7 +23,7 @@ def test_results_json_exists() -> None:
         rows = [{"name": "test", "candidate_status": "EXPERIMENTAL"}]
         json_path = out_dir / "results.json"
         with json_path.open("w") as fh:
-            json.dump(rows, fh)
+            dump_json_strict(rows, fh)
         assert json_path.exists()
 
 
@@ -33,7 +34,7 @@ def test_results_csv_exists() -> None:
         rows = [{"name": "test", "candidate_status": "EXPERIMENTAL"}]
         json_path = out_dir / "results.json"
         with json_path.open("w") as fh:
-            json.dump(rows, fh)
+            dump_json_strict(rows, fh)
         # CSV is optional when rows exist
         assert json_path.exists()
 
@@ -131,33 +132,53 @@ def test_no_active_legacy_winner_artifact() -> None:
     assert not Path("artifacts/bench/shootout/results.csv").exists()
 
 
+def _get_results(payload: Any) -> list[dict[str, Any]]:
+    """Extract results list from v2 wrapped artifact or v1 bare list."""
+    if isinstance(payload, dict):
+        return payload.get("results", [])
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
 def test_promotion_artifact_exists() -> None:
-    # Promotion report must exist and contain eligible candidates
-    # (RFSN v10 passed full logit + memory gates)
+    # Promotion report must exist and contain candidates or a note.
+    # After methodology repair, there may be no eligible candidates
+    # until artifacts are regenerated under teacher_forced_logit_v1.
     promo_json = Path("artifacts/bench/shootout/promotion/results.json")
     promo_md = Path("artifacts/bench/shootout/promotion/results.md")
     assert promo_json.exists(), "Promotion JSON artifact missing"
     assert promo_md.exists(), "Promotion Markdown artifact missing"
-    data = json.loads(promo_json.read_text())
-    # Either a note row or actual rows with promotion eligible
-    has_note = any("note" in r for r in data if isinstance(r, dict))
-    has_eligible = any(
-        r.get("promotion_eligible") for r in data if isinstance(r, dict)
+    payload = json.loads(promo_json.read_text())
+    results = _get_results(payload)
+    # Either a note row, actual candidate rows, or metadata explaining status
+    has_note = any("note" in r for r in results if isinstance(r, dict))
+    has_candidates = any(
+        r.get("name") for r in results if isinstance(r, dict)
     )
-    assert has_note or has_eligible, (
+    assert has_note or has_candidates, (
         "Promotion artifact should contain candidates or a note"
     )
+    # v2 wrapped artifacts must have methodology metadata
+    if isinstance(payload, dict):
+        meta = payload.get("metadata", {})
+        assert meta.get("benchmark_methodology") == "teacher_forced_logit_v1"
 
 
 def test_winner_json_agrees_with_promotion_report() -> None:
     promo_json = Path("artifacts/bench/shootout/promotion/results.json")
-    promo_data = json.loads(promo_json.read_text())
+    promo_payload = json.loads(promo_json.read_text())
+    promo_results = _get_results(promo_payload)
     has_eligible = any(
-        r.get("promotion_eligible") for r in promo_data if isinstance(r, dict)
+        r.get("promotion_eligible") for r in promo_results if isinstance(r, dict)
     )
     winner_json = Path("artifacts/winner/winner.json")
     assert winner_json.exists(), "winner.json must exist"
     data = json.loads(winner_json.read_text())
+    # Winner must declare methodology
+    assert data.get("methodology") == "teacher_forced_logit_v1", (
+        "winner.json must declare teacher_forced_logit_v1 methodology"
+    )
     if has_eligible:
         assert data.get("winner") is not None, (
             "winner.json should name a winner when candidates are promoted"
@@ -166,3 +187,53 @@ def test_winner_json_agrees_with_promotion_report() -> None:
         assert data.get("winner") is None, (
             "winner.json should have null winner when no candidate is eligible"
         )
+
+
+def _scan_for_non_finite(obj: Any, path: str = "") -> list[str]:
+    """Recursively scan *obj* for NaN / Infinity and return error paths."""
+    import math
+    errors: list[str] = []
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            errors.append(f"{path}: NaN")
+        elif math.isinf(obj):
+            errors.append(f"{path}: Infinity")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            errors.extend(_scan_for_non_finite(v, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            errors.extend(_scan_for_non_finite(v, f"{path}[{i}]"))
+    return errors
+
+
+def test_active_artifacts_have_no_nan_or_infinity() -> None:
+    """All shipped JSON artifacts must be strict (no NaN / Infinity)."""
+    artifact_dirs = [
+        Path("artifacts/bench/shootout/quick"),
+        Path("artifacts/bench/shootout/full_logit"),
+        Path("artifacts/bench/shootout/memory"),
+        Path("artifacts/bench/shootout/promotion"),
+        Path("artifacts/winner"),
+    ]
+    all_errors: list[str] = []
+    for d in artifact_dirs:
+        if not d.exists():
+            continue
+        for p in d.rglob("*.json"):
+            payload = json.loads(p.read_text())
+            # Scan both metadata and results for v2 wrapped artifacts
+            if isinstance(payload, dict):
+                meta_errors = _scan_for_non_finite(
+                    payload.get("metadata", {}), str(p) + ":metadata"
+                )
+                all_errors.extend(meta_errors)
+                results_errors = _scan_for_non_finite(
+                    payload.get("results", []), str(p) + ":results"
+                )
+                all_errors.extend(results_errors)
+            else:
+                errors = _scan_for_non_finite(payload, str(p))
+                if errors:
+                    all_errors.extend(errors)
+    assert not all_errors, f"Non-finite floats found in artifacts: {all_errors}"

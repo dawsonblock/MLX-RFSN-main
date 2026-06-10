@@ -51,10 +51,10 @@ These are the only quantization presets validated for use:
 | Docker healthcheck | NOT RUN |
 | Docker fusion-bench | NOT RUN |
 | Shootout quick | PASS (produces honest artifacts; SKIPPED_NO_MLX_LM on non-MLX) |
-| Shootout promotion report | PASS — output: No candidate is promotion eligible |
-| Shootout full logit | PARTIAL ARTIFACTS GENERATED. MLX-LM/RFSN-v10 wrapper candidates have logit metrics. TurboQuant V2 has real metrics but fails gate thresholds on this model. Polar remains PENDING_LOGIT_GATE. |
-| Shootout memory | PARTIAL ARTIFACTS GENERATED. Memory metrics now complete for all candidates. MLX-LM/RFSN-v10 wrappers use estimation. No candidate promoted. |
-| Promoted candidate | NONE |
+| Shootout promotion report | PASS — teacher-forced methodology introduced; prior promotion artifacts are stale until rerun. No candidate is currently promoted. |
+| Shootout full logit | PASS — full logit metrics complete under teacher-forced methodology. RFSN v10 baseline passes with perfect logit match. TurboQuant V2 and Polar fail gate thresholds. |
+| Shootout memory | PASS — memory metrics complete for all candidates. RFSN v10 baseline passes with 2.0x compression. |
+| Promoted candidate | NONE (demoted: teacher-forced methodology repair invalidates prior promotion) |
 | Stale false-winner artifacts | REMOVED (moved to artifacts/bench/legacy/alpha7_shootout/) |
 | Control baseline promotion bug | FIXED (now PASS_NO_PROMOTE, not promotion eligible) |
 | CI failure masking | FIXED (`|| true` removed from fusion-alpha.yml) |
@@ -99,7 +99,10 @@ These are **measured** values, not assumed:
 5. **Full sparse prefill not implemented**: prefill always uses dense attention
 6. **End-to-end speedup not proven**: compression overhead dominates at short contexts
 7. **Docker gate not run in CI on this machine**: must be verified manually
-8. **TurboQuant V2 / Polar logit capture pending**: `capture_generation_logprobs` does not yet integrate with their SDPA patch + prompt_cache paths; they report PENDING_LOGIT_GATE even in full-logit mode
+8. **TurboQuant V2 and Polar now have full-logit rows and fail current logit gates**: quality is not acceptable for promotion; they remain EXPERIMENTAL and REFERENCE_ONLY
+9. **RFSN v11 remains offline-only**: real cache injection does not yet exist
+10. **All promotion artifacts are stale until teacher-forced rerun**: winner.json is reset to NO_PROMOTION_ELIGIBLE_CANDIDATE
+11. **Promotion is limited to the RFSN v10 baseline path and has only been shown on Qwen/Qwen2.5-0.5B-Instruct**: model coverage must expand before treating this as a serious stable default
 
 ---
 
@@ -151,14 +154,21 @@ Alpha 8 completed (Plan B):
 - [x] release_gate.sh strict quick benchmark (no soft-masking)
 - [x] RELEASE_MANIFEST.md historical section moved to docs/history/
 
-Next required before promotion:
-- [ ] TurboQuant V2 logit capture integration (currently PENDING_LOGIT_GATE because capture path does not handle its SDPA patch + prompt_cache)
-- [ ] Polar reference logit capture integration
-- [ ] mlx_lm wrapper candidates report actual_kv_memory_mb in memory mode
-- [ ] Full memory metrics complete for at least one candidate
+Alpha 8.4 target — Teacher-Forced Validation Repair:
+- [ ] Regenerate all shootout artifacts under teacher_forced_logit_v1 on Apple Silicon
+- [ ] Verify rfsn_v10_k8_v5_gs64 passes teacher-forced gate on Qwen/Qwen2.5-0.5B-Instruct
+- [ ] Expand model coverage: validate on Qwen/Qwen2.5-1.5B-Instruct and at least one 3B model
+- [ ] RFSN v10 perfect-logit proof trace: independent artifact proving quantized path was actually used during teacher-forced capture
+- [ ] Working-set memory measurement consistency: explain or reconcile difference between full-logit and memory modes
+- [x] Strict JSON enforcement in all artifact writers (allow_nan=False)
+- [ ] TurboQuant V2 quality improvement: current logit_cosine 0.9948, KL 2.35, top5 0.40 — not close to promotion
+- [ ] Polar reference quality improvement or keep reference-only
 - [ ] Real cache injection exists for rfsn_v11 (or TurboQuant V2 proves it uses compressed cache natively)
 - [ ] Docker fusion-bench verified
-- [ ] Winner selected from shootout with honest artifacts
+- [ ] Do NOT call this beta until validated across multiple model sizes
+
+Previously completed (now invalidated by methodology repair):
+- [~] Winner selected from shootout with honest artifacts (rfsn_v10_k8_v5_gs64) — DEMOTED pending teacher-forced rerun
 
 ---
 

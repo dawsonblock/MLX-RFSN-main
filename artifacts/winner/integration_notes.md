@@ -1,9 +1,10 @@
 # Integration Notes
 
-The promoted candidate `rfsn_v10_k8_v5_gs64` can be integrated via:
+No candidate promoted. Integration notes pending.
 
-```python
-from rfsn_v11.integrations.cache_policy import create_cache_policy
-policy = create_cache_policy("rfsn_v10_k8_v5_gs64")
-# model.generate(prompt, cache_policy=policy)
-```
+The teacher-forced logit gate has been introduced to fix the previous
+methodology. All candidates must be revalidated under the corrected gate
+before any promotion can occur.
+
+Current best baseline (not promoted):
+- rfsn_v10_k8_v5_gs64 — RFSN v10 8-bit grouped KV, gs=64

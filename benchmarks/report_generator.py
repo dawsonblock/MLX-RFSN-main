@@ -31,10 +31,14 @@ Outputs
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
 from .schemas import CandidateResult
 from .judge import Verdict, VerdictLabel
 
@@ -83,7 +87,7 @@ class ReportGenerator:
         json_ts = self.out_dir / f"{run_tag}_{timestamp}.json"
         json_latest = self.out_dir / f"{run_tag}_latest.json"
         for p in (json_ts, json_latest):
-            p.write_text(json.dumps(payload, indent=2, default=str))
+            p.write_text(dumps_json_strict(payload, indent=2, default=str))
 
         md = _build_markdown(candidates, baseline, verdicts, run_tag, timestamp)
         md_ts = self.report_dir / f"{run_tag}_{timestamp}.md"
@@ -104,7 +108,7 @@ class ReportGenerator:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         payload = _build_json_payload(candidates, baseline, verdicts, timestamp, metadata or {})
         p = self.out_dir / f"{run_tag}_latest.json"
-        p.write_text(json.dumps(payload, indent=2, default=str))
+        p.write_text(dumps_json_strict(payload, indent=2, default=str))
         return p
 
 

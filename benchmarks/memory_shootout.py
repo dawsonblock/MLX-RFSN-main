@@ -12,9 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from rfsn_v11.candidates.json_utils import dump_json_strict  # noqa: E402
 
 ARTIFACTS_ROOT = Path("artifacts/bench/memory")
 
@@ -121,7 +126,7 @@ def main() -> None:
     ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
     json_path = ARTIFACTS_ROOT / "results.json"
     with json_path.open("w", encoding="utf-8") as fh:
-        json.dump(results, fh, indent=2)
+        dump_json_strict(results, fh, indent=2)
 
     print(f"Wrote {json_path}")
     for r in results:

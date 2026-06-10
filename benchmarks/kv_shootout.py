@@ -69,15 +69,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rfsn_v11.candidates.artifact_utils import (  # noqa: E402
     _build_honest_markdown_table,
+    _export_rfsn_v10_proof_trace,
     _export_winner,
 )
+from rfsn_v11.candidates.json_utils import dump_json_strict  # noqa: E402
 from rfsn_v11.candidates.base import (  # noqa: E402
     CandidateResult,
     KVCompressionCandidate,
 )
 from rfsn_v11.candidates.candidate_status import CandidateStatus  # noqa: E402
 from rfsn_v11.candidates.logit_capture import (  # noqa: E402
-    capture_generation_logprobs,
     capture_teacher_forced_logprobs,
     compute_logit_metrics_from_logprobs,
     logit_gate_passed,
@@ -347,7 +348,6 @@ def _run_once(
             tq_candidate = candidate
             try:
                 import sys
-                import mlx.core as mx
                 import turboquant.patch as tq_patch
 
                 head_dim = tq_candidate._detect_head_dim(model)
@@ -359,7 +359,10 @@ def _run_once(
                 import mlx_lm.models.base as _base
                 _patched_fn = _base.scaled_dot_product_attention
                 for _mod_name, _mod in list(sys.modules.items()):
-                    if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                    if (
+                        _mod_name.startswith("mlx_lm.models.")
+                        and _mod is not None
+                    ):
                         if hasattr(_mod, "scaled_dot_product_attention"):
                             _mod.scaled_dot_product_attention = _patched_fn
                 try:
@@ -371,7 +374,10 @@ def _run_once(
                     tq_patch.revert()
                     _orig_fn = _base.scaled_dot_product_attention
                     for _mod_name, _mod in list(sys.modules.items()):
-                        if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                        if (
+                            _mod_name.startswith("mlx_lm.models.")
+                            and _mod is not None
+                        ):
                             if hasattr(_mod, "scaled_dot_product_attention"):
                                 _mod.scaled_dot_product_attention = _orig_fn
             except Exception:
@@ -382,7 +388,6 @@ def _run_once(
             # Polar builds its own cache and patches SDPA
             polar_candidate = candidate
             try:
-                import mlx.core as mx
                 from mlx_turboquant.cache import TurboQuantKVCache
                 from rfsn_v11.candidates.polar_reference_adapter import (
                     _apply_polar_patch,
@@ -420,6 +425,13 @@ def _run_once(
             candidate_logprobs = candidate.capture_logprobs(
                 model, tokenizer, prompt, baseline_text,
             )
+            if candidate_logprobs is not None:
+                _export_rfsn_v10_proof_trace(
+                    candidate_name=candidate.name,
+                    model=model,
+                    config_name=getattr(candidate, "config_name", ""),
+                    actual_kv_memory_mb=result.actual_kv_memory_mb,
+                )
         else:
             # Any other candidate without a capture path
             result.logit_gate_passed = None
@@ -693,16 +705,50 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
     return agg
 
 
-def _write_artifacts(rows: list[dict[str, Any]], out_dir: Path) -> None:
+_ARTIFACT_METHODLOGY = "teacher_forced_logit_v1"
+
+
+def _artifact_metadata(
+    mode: str,
+    token_sequence_hash: str = "",
+    promotion_allowed: bool = False,
+) -> dict[str, Any]:
+    return {
+        "benchmark_methodology": _ARTIFACT_METHODLOGY,
+        "baseline_decode_mode": "greedy",
+        "comparison_mode": "same_token_sequence",
+        "token_sequence_hash": token_sequence_hash,
+        "promotion_allowed": promotion_allowed,
+        "artifact_schema_version": "2.0",
+        "mode": mode,
+    }
+
+
+def _write_artifacts(
+    rows: list[dict[str, Any]],
+    out_dir: Path,
+    mode: str = "quick",
+    token_sequence_hash: str = "",
+    promotion_allowed: bool = False,
+) -> None:
     """Write JSON, CSV, and Markdown artifacts."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # JSON
+    payload = {
+        "metadata": _artifact_metadata(
+            mode=mode,
+            token_sequence_hash=token_sequence_hash,
+            promotion_allowed=promotion_allowed,
+        ),
+        "results": rows,
+    }
+
+    # JSON (strict — no NaN / Infinity)
     json_path = out_dir / "results.json"
     with json_path.open("w", encoding="utf-8") as fh:
-        json.dump(rows, fh, indent=2, default=str)
+        dump_json_strict(payload, fh, indent=2, default=str)
 
-    # CSV
+    # CSV (use rows only, not metadata wrapper)
     if rows:
         csv_path = out_dir / "results.csv"
         headers = list(rows[0].keys())
@@ -715,6 +761,24 @@ def _write_artifacts(rows: list[dict[str, Any]], out_dir: Path) -> None:
     md_path = out_dir / "results.md"
     with md_path.open("w", encoding="utf-8") as fh:
         fh.write(_build_honest_markdown_table(rows))
+        fh.write("\n## Notes\n\n")
+        fh.write(
+            "**Methodology:** "
+            f"`{payload['metadata']['benchmark_methodology']}`  \n"
+            f"**Promotion allowed:** "
+            f"{payload['metadata']['promotion_allowed']}  \n"
+            f"**Schema version:** "
+            f"{payload['metadata']['artifact_schema_version']}  \n"
+            "\n"
+            "**Working-set memory measurement mode dependency**: "
+            "Baseline working-set memory differs between full-logit mode "
+            "(~975 MB) and memory-report mode (~1422 MB). This is due to "
+            "different run paths, model warmup states, prompt lengths, and "
+            "sampling timing. Working-set memory should be treated as "
+            "measurement-mode dependent, not promotion-critical. "
+            "Actual KV cache bytes (actual_kv_memory_mb) are the stable "
+            "compression proof.\n"
+        )
 
     print(f"  Wrote {json_path}, {csv_path if rows else ''}, {md_path}")
 
@@ -840,7 +904,10 @@ def main() -> None:
         if full_logit_path.exists():
             try:
                 with full_logit_path.open("r", encoding="utf-8") as fh:
-                    full_logit_results = json.load(fh)
+                    full_logit_payload = json.load(fh)
+                full_logit_results = full_logit_payload.get(
+                    "results", full_logit_payload
+                )
                 eligible = [
                     r for r in full_logit_results
                     if r.get("promotion_eligible")
@@ -878,7 +945,12 @@ def main() -> None:
             else:
                 all_rows = eligible
 
-    _write_artifacts(all_rows, out_dir)
+    _write_artifacts(
+        all_rows,
+        out_dir,
+        mode=mode,
+        promotion_allowed=False,
+    )
     _export_winner(all_rows, models_tested)
     print("\nDone.")
 

@@ -1,10 +1,10 @@
 {
-  "winner": "rfsn_v10_k8_v5_gs64",
-  "status": "PROMOTED",
-  "reason": "Passed full logit gate and reduced KV memory with equal or better decode speed.",
-  "models_tested": [
-    "Qwen/Qwen2.5-0.5B-Instruct"
-  ],
+  "winner": null,
+  "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
+  "reason": "Teacher-forced logit gate has been introduced; candidates must be revalidated under the corrected methodology before promotion.",
+  "methodology": "teacher_forced_logit_v1",
+  "promotion_allowed": false,
+  "models_tested": [],
   "artifacts": {
     "full_logit": "artifacts/bench/shootout/full_logit/results.json",
     "memory": "artifacts/bench/shootout/memory/results.json",

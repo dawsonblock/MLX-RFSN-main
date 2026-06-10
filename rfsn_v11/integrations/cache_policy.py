@@ -1,4 +1,5 @@
-"""Cache policy abstraction for control, baseline, and promoted KV-compression policies.
+"""Cache policy abstraction for control, baseline, and promoted
+KV-compression policies.
 
 This module provides a clean internal abstraction so that candidate logic
 does not leak into integration layers. Even if MLX-LM does not support
@@ -12,7 +13,9 @@ Policies are split into three categories:
 No candidate is added to PROMOTED_POLICIES until winner.json says so.
 
 Example:
-    from rfsn_v11.integrations.cache_policy import CachePolicy, create_cache_policy
+    from rfsn_v11.integrations.cache_policy import (
+        CachePolicy, create_cache_policy,
+    )
 
     policy = create_cache_policy("rfsn_v10_k8_v5_gs32")
     # Future: model.generate(prompt, cache_policy=policy)
@@ -38,8 +41,9 @@ class CachePolicy:
     def __post_init__(self) -> None:
         if not self.supports_real_generation:
             raise ValueError(
-                f"CachePolicy '{self.name}' does not support real generation. "
-                "Only promoted candidates with real cache injection can create a policy."
+                f"CachePolicy '{self.name}' does not support real "
+                "generation. Only promoted candidates with real cache "
+                "injection can create a policy."
             )
 
 
@@ -66,9 +70,7 @@ CONTROL_POLICIES: dict[str, dict[str, Any]] = {
     },
 }
 
-BASELINE_POLICIES: dict[str, dict[str, Any]] = {}
-
-PROMOTED_POLICIES: dict[str, dict[str, Any]] = {
+BASELINE_POLICIES: dict[str, dict[str, Any]] = {
     "rfsn_v10_k8_v5_gs32": {
         "candidate_name": "rfsn_v10_k8_v5_gs32",
         "supports_real_generation": True,
@@ -86,6 +88,8 @@ PROMOTED_POLICIES: dict[str, dict[str, Any]] = {
         "config": {"default_bits": 8, "group_size": 64},
     },
 }
+
+PROMOTED_POLICIES: dict[str, dict[str, Any]] = {}
 
 _KNOWN_POLICIES: dict[str, dict[str, Any]] = {
     **CONTROL_POLICIES,

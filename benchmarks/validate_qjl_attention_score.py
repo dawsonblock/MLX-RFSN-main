@@ -26,8 +26,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
 
 import mlx.core as mx
 import numpy as np
@@ -180,7 +185,7 @@ def _run_qjl_validation(
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    out_path.write_text(dumps_json_strict(result, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote QJL validation to {out_path}")
     print(f"  base_mae={base_mae:.6f} qjl_mae={qjl_mae:.6f}")
     print(f"  base_kl={base_kl:.6f} qjl_kl={qjl_kl:.6f}")

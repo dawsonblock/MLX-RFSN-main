@@ -49,6 +49,7 @@ import numpy as np
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
 from benchmarks.schemas import CandidateResult
 
 # ---------------------------------------------------------------------------
@@ -495,7 +496,7 @@ def _save_results(
     ts_path = results_dir / f"baseline_mlx_{timestamp}.json"
     latest_json = results_dir / "baseline_mlx_latest.json"
     for p in (ts_path, latest_json):
-        p.write_text(json.dumps(payload, indent=2, default=str))
+        p.write_text(dumps_json_strict(payload, indent=2, default=str))
 
     # Markdown report
     md = _build_markdown_report(results, model_id, timestamp, smoke)
