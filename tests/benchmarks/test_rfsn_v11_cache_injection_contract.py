@@ -19,14 +19,14 @@ def test_minimal_decode_loop_importable():
     assert callable(minimal_decode_loop)
 
 
-@pytest.mark.unit
+@pytest.mark.mlx
 def test_no_global_monkey_patch():
     """Verify that importing the generation module does not patch mlx_lm globally."""
-    import mlx_lm.models.base as base_before
+    base_before = pytest.importorskip("mlx_lm.models.base")
     original_sdpa = base_before.scaled_dot_product_attention
 
     # Import should not change anything globally
-    from rfsn_v11.generation import minimal_decode, cache_injection  # noqa: F401
+    from rfsn_v11.generation import cache_injection, minimal_decode  # noqa: F401
 
-    import mlx_lm.models.base as base_after
+    base_after = pytest.importorskip("mlx_lm.models.base")
     assert base_after.scaled_dot_product_attention is original_sdpa

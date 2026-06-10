@@ -65,6 +65,10 @@ warnings.filterwarnings(
 # Add repo root to path so rfsn_v11 is importable without install
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from rfsn_v11.candidates.artifact_utils import (  # noqa: E402
+    _build_honest_markdown_table,
+    _export_winner,
+)
 from rfsn_v11.candidates.base import CandidateResult, KVCompressionCandidate  # noqa: E402
 from rfsn_v11.candidates.candidate_status import CandidateStatus  # noqa: E402
 from rfsn_v11.candidates.quality_gates import (  # noqa: E402
@@ -130,7 +134,6 @@ PROMPTS_FULL = [prompts[0] for prompts in PROMPT_SUITE.values()]
 GENERATION_TEMP = 0.0
 
 ARTIFACTS_ROOT = Path("artifacts/bench/shootout")
-WINNER_DIR = Path("artifacts/winner")
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +237,8 @@ def _run_once(
         result.promotion_eligible = False
         return result
 
-    # Baseline always passes logit gate by definition
+    # Baseline always passes logit gate by definition, but CONTROL never
+    # promotes — it is the comparison target, not a candidate.
     if candidate.name == "mlx_lm_baseline":
         result.logit_cosine = 1.0
         result.kl_divergence = 0.0
@@ -245,8 +249,9 @@ def _run_once(
         result.first_divergent_token = None
         result.logit_gate_passed = True
         result.memory_gate_passed = True
-        result.gate_status = GATE_STATUS_PASS
-        result.promotion_eligible = True
+        result.gate_status = "PASS_NO_PROMOTE"
+        result.promotion_eligible = False
+        result.candidate_status = CandidateStatus.CONTROL
         return result
 
     # In quick mode, we only have text heuristic — no real logit gate
@@ -458,108 +463,6 @@ def _write_artifacts(rows: list[dict[str, Any]], out_dir: Path) -> None:
     print(f"  Wrote {json_path}, {csv_path if rows else ''}, {md_path}")
 
 
-def _build_honest_markdown_table(rows: list[dict[str, Any]]) -> str:
-    """Build the honest benchmark table required by Plan B."""
-    lines: list[str] = ["# KV Shootout Results\n"]
-    if not rows:
-        lines.append("No results.\n")
-        return "\n".join(lines)
-
-    # Header
-    lines.append("## Honest Benchmark Table\n")
-    lines.append(
-        "| Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |"
-    )
-    lines.append(
-        "|-----------|--------|-------------|----------------|------------|-----------------|-----------|"
-    )
-
-    for row in rows:
-        if "note" in row:
-            lines.append(f"| {row['note']} | | | | | | |")
-            continue
-        name = row.get("name", "")
-        status = row.get("candidate_status", "—")
-        speed = f"{row.get('tokens_per_sec', 0):.2f}" if row.get("tokens_per_sec") is not None else "—"
-        mem = f"{row.get('size_ratio', 0):.3f}" if row.get("size_ratio") is not None else "baseline"
-        gate = row.get("gate_status", "—")
-        real_cache = "yes" if row.get("real_cache_used") else "no"
-        promo = "yes" if row.get("promotion_eligible") else "no"
-        lines.append(
-            f"| {name} | {status} | {speed} | {mem} | {gate} | {real_cache} | {promo} |"
-        )
-
-    lines.append("")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Winner export
-# ---------------------------------------------------------------------------
-
-def _export_winner(rows: list[dict[str, Any]], models_tested: list[str]) -> None:
-    """Export winner artifacts when a candidate is promotion eligible."""
-    eligible = [r for r in rows if r.get("promotion_eligible")]
-    WINNER_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not eligible:
-        winner_data = {
-            "winner": None,
-            "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
-            "reason": "No candidate has full logit, real cache, and memory proof.",
-        }
-    else:
-        # Pick the one with best tokens/sec among eligible
-        best = max(eligible, key=lambda r: r.get("tokens_per_sec") or 0)
-        winner_data = {
-            "winner": best.get("name"),
-            "status": "PROMOTED",
-            "reason": (
-                "Passed full logit gate and reduced KV memory with equal or better decode speed."
-            ),
-            "models_tested": models_tested,
-            "artifacts": {
-                "full_logit": str(ARTIFACTS_ROOT / "full_logit" / "results.json"),
-                "memory": str(ARTIFACTS_ROOT / "memory" / "results.json"),
-                "promotion": str(ARTIFACTS_ROOT / "promotion" / "results.json"),
-            },
-        }
-
-    json_path = WINNER_DIR / "winner.json"
-    with json_path.open("w", encoding="utf-8") as fh:
-        json.dump(winner_data, fh, indent=2)
-
-    md_path = WINNER_DIR / "winner.md"
-    with md_path.open("w", encoding="utf-8") as fh:
-        fh.write("# Winner Report\n\n")
-        if winner_data["winner"] is None:
-            fh.write("## No winner\n\n")
-            fh.write(f"**Status:** {winner_data['status']}\n\n")
-            fh.write(f"**Reason:** {winner_data['reason']}\n")
-        else:
-            fh.write(f"## Winner: {winner_data['winner']}\n\n")
-            fh.write(f"**Status:** {winner_data['status']}\n\n")
-            fh.write(f"**Reason:** {winner_data['reason']}\n\n")
-            fh.write(f"**Models tested:** {', '.join(winner_data['models_tested'])}\n")
-
-    notes_path = WINNER_DIR / "integration_notes.md"
-    with notes_path.open("w", encoding="utf-8") as fh:
-        fh.write("# Integration Notes\n\n")
-        if winner_data["winner"] is None:
-            fh.write("No candidate promoted. Integration notes pending.\n")
-        else:
-            fh.write(
-                f"The promoted candidate `{winner_data['winner']}` can be integrated via:\n\n"
-            )
-            fh.write("```python\n")
-            fh.write("from rfsn_v11.integrations.cache_policy import create_cache_policy\n")
-            fh.write(f'policy = create_cache_policy("{winner_data["winner"]}")\n')
-            fh.write("# model.generate(prompt, cache_policy=policy)\n")
-            fh.write("```\n")
-
-    print(f"  Wrote {json_path}, {md_path}, {notes_path}")
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -600,11 +503,13 @@ def main() -> None:
 
     all_rows: list[dict[str, Any]] = []
     models_tested: list[str] = []
+    any_model_loaded = False
 
     for model_id in models:
         model, tokenizer = _load_model(model_id)
         if model is None:
             continue
+        any_model_loaded = True
         models_tested.append(model_id)
 
         candidates = _build_candidates(quick=args.quick)
@@ -619,21 +524,40 @@ def main() -> None:
             baseline_result: CandidateResult | None = None
 
             for candidate in candidates:
-                print(f"    Running {candidate.name} ...", end=" ", flush=True)
+                print(
+                    f"    Running {candidate.name} ...",
+                    end=" ",
+                    flush=True,
+                )
                 result = _run_once(
                     candidate, model, tokenizer, prompt, max_tokens,
                     baseline_result=baseline_result, mode=mode,
                 )
-                per_candidate_results.setdefault(candidate.name, []).append(result)
+                per_candidate_results.setdefault(
+                    candidate.name, []
+                ).append(result)
 
                 if candidate.name == "mlx_lm_baseline":
                     baseline_result = result
 
-                print(f"{result.gate_status}  tps={result.tokens_per_sec or 'N/A'}")
+                print(
+                    f"{result.gate_status}  "
+                    f"tps={result.tokens_per_sec or 'N/A'}"
+                )
 
         for name, results in per_candidate_results.items():
             agg = _aggregate(results)
             all_rows.append(agg)
+
+    if not any_model_loaded:
+        print("\nNo model loaded — mlx_lm may not be installed.")
+        all_rows = [{
+            "status": "SKIPPED_NO_MLX_LM",
+            "reason": (
+                "mlx_lm is not installed; run on Apple Silicon "
+                "with pip install -e '.[fusion]'"
+            ),
+        }]
 
     # Filter for promotion report
     if mode == "promotion":

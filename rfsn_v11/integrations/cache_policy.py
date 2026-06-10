@@ -73,14 +73,9 @@ _KNOWN_POLICIES: dict[str, dict[str, Any]] = {
         "supports_state_restore": False,
         "config": {"default_bits": 8, "group_size": 64},
     },
-    "turboquant_v2_b4_gs64_rot": {
-        "candidate_name": "turboquant_v2_b4_gs64_rot",
-        "supports_real_generation": True,
-        "supports_prompt_cache": True,
-        "supports_streaming": True,
-        "supports_state_restore": False,
-        "config": {"bits": 4, "group_size": 64, "use_rotation": True},
-    },
+    # TurboQuant V2 is a promising experimental candidate but is NOT yet
+    # promoted. Do not add it here until artifacts/winner/winner.json
+    # says "status": "PROMOTED".
 }
 
 

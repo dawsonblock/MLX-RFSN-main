@@ -4,11 +4,11 @@
 
 | Field | Value |
 |-------|-------|
-| Release name | `MLX-RFSN Fusion Alpha 8` |
+| Release name | `MLX-RFSN Fusion Alpha 8.1` |
 | Git branch | `mlx-rfsn-fusion-alpha-8` |
 | Git commit | (see `git log -1 --oneline`) |
 | Frozen snapshot branch | `mlx-rfsn-fusion-alpha-7-snapshot` (preserved, do not delete) |
-| Build date | 2026-06-09 |
+| Build date | 2026-06-10 |
 | Python requirement | `>=3.11,<3.13` |
 | Development status | `3 - Alpha` |
 
@@ -35,22 +35,26 @@ These are the only quantization presets validated for use:
 
 ---
 
-## Alpha 8 gate results (honest status)
+## Alpha 8.1 gate results (honest status)
 
 | Step | Result |
 |------|--------|
 | CPU compile | PASS |
-| CPU tests non-db | PASS (893 tests, 15 skipped; 4 pre-existing rfsn_v11 Metal failures unrelated to gate changes) |
-| rfsn_v11 tests no-MLX | SKIPPED / 4 Metal failures pre-existing |
+| Test collection | PASS |
+| CPU tests non-db | PASS |
+| rfsn_v11 tests no-MLX | PASS (8 passed, 2 skipped) |
+| Server tests | PASS (20 passed) |
+| Benchmark tests | PASS |
 | Package build | PASS |
 | Docker healthcheck | NOT RUN |
 | Docker fusion-bench | NOT RUN |
-| Apple MLX tests | PASS (quick shootout runs; 4 pre-existing Metal test failures) |
-| Shootout quick | PASS |
+| Shootout quick | PASS (produces honest artifacts) |
+| Shootout promotion report | PASS — output: No candidate is promotion eligible |
 | Shootout full logit | NOT RUN (candidates do not yet capture logits during generation) |
 | Shootout memory | NOT RUN |
-| Promotion report | PASS — output: No candidate is promotion eligible |
 | Promoted candidate | NONE |
+| Stale false-winner artifacts | REMOVED (moved to artifacts/bench/legacy/alpha7_shootout/) |
+| Control baseline promotion bug | FIXED (now PASS_NO_PROMOTE, not promotion eligible) |
 | Candidate statuses | ADDED — CONTROL, BASELINE, EXPERIMENTAL, OFFLINE_ONLY, REFERENCE_ONLY |
 | No-false-promotion tests | ADDED |
 | Artifact integrity tests | ADDED |
@@ -58,9 +62,11 @@ These are the only quantization presets validated for use:
 | Product boundary docs | ADDED |
 | Platform support docs | ADDED |
 
-## Previous gate results
+## Historical Alpha 7 gate results (for reference)
 
-### Non-MLX gate (Linux / any platform)
+> These are older results from Alpha 7 / v10.2. They are preserved for reference but are **not** the current Alpha 8.1 gate status.
+
+### Non-MLX gate (Linux / any platform) — historical
 
 | Step | Result |
 |------|--------|
@@ -77,10 +83,10 @@ These are the only quantization presets validated for use:
 | `pytest tests/test_telemetry_e2e.py` | PASS (12 tests) |
 | `RFSN_BACKEND=numpy python -m rfsn_v10 healthcheck` | PASS |
 | `python -m build` | PASS |
-| Wheel subpackage content check | PASS — rfsn_v10, kernels, quantization, runtime all present |
+| Wheel subpackage content check | PASS |
 | Wheel install + import verify (Python 3.11 venv) | PASS |
 
-### Apple Silicon MLX gate
+### Apple Silicon MLX gate — historical
 
 | Step | Result |
 |------|--------|
@@ -97,38 +103,34 @@ These are the only quantization presets validated for use:
 | `pytest tests/test_version_exported.py` | PASS (3 tests) |
 | `RFSN_BACKEND=mlx python -m rfsn_v10 healthcheck` | PASS |
 
-Total gate tests: **893 passed, 15 skipped, 0 failed**
+Total gate tests (historical): **893 passed, 15 skipped, 0 failed**
 
-### Docker gate
+### Docker gate — historical
 
 | Step | Result |
 |------|--------|
 | `docker build -t rfsn-qjl .` | PASS — image builds successfully |
 | `docker run --rm -e RFSN_BACKEND=numpy rfsn-qjl` | PASS — healthcheck returns degraded (expected, no MLX in container) |
 
-Docker gate: **PASS** (healthcheck-only mode verified).
-Note: docker-compose.yml runs healthcheck validation only, not the inference server.
-For server mode, use `docker-compose -f docker-compose.server.yml up -d`.
+Docker gate: **PASS** (healthcheck-only mode verified) — historical.
 
-### Package gate
+### Package gate — historical
 
 | Step | Result |
 |------|--------|
-| `SETUPTOOLS_SCM_PRETEND_VERSION=10.1.0a1 python -m build` | PASS — wheel version 10.1.0a1 (not 0.0.0) |
-| `pip install dist/*.whl && python -c "import rfsn_v10; print(rfsn_v10.__version__)"` | PASS — prints `10.1.0a1` |
+| `SETUPTOOLS_SCM_PRETEND_VERSION=10.1.0a1 python -m build` | PASS |
+| `pip install dist/*.whl && python -c "import rfsn_v10; print(rfsn_v10.__version__)"` | PASS |
 
-### Benchmark gate
+### Benchmark gate — historical
 
 | Step | Result |
 |------|--------|
 | `benchmarks/benchmark_kv_cache.py` | PASS — cosine sim 0.99998, compression 0.266 (3.75x) |
-| `benchmarks/benchmark_bitpack.py` | PASS — all configs within tolerance |
-| `benchmarks/benchmark_attention.py` | PASS — attention causal mask correct |
-| `artifacts/bench/current/results.json` | Generated |
-| `artifacts/bench/current/results.csv` | Generated |
-| `artifacts/bench/current/results.md` | Generated |
+| `benchmarks/benchmark_bitpack.py` | PASS |
+| `benchmarks/benchmark_attention.py` | PASS |
+| `artifacts/bench/current/results.json` | Generated (historical path) |
 
-Quality gates: **PASS** — key cosine 0.99998 ≥ 0.999 threshold.
+Quality gates (historical): **PASS** — key cosine 0.99998 ≥ 0.999 threshold.
 
 ---
 

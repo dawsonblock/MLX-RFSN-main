@@ -8,7 +8,10 @@ import json
 import tempfile
 from pathlib import Path
 
-from benchmarks.kv_shootout import _build_honest_markdown_table, _export_winner
+from rfsn_v11.candidates.artifact_utils import (
+    _build_honest_markdown_table,
+    _export_winner,
+)
 from rfsn_v11.candidates.candidate_status import CandidateStatus
 
 
@@ -64,8 +67,14 @@ def test_all_candidates_have_status() -> None:
 
 def test_all_candidates_have_gate_status() -> None:
     rows = [
-        {"name": "mlx_lm_baseline", "gate_status": "PASS"},
-        {"name": "turboquant_v2", "gate_status": "PENDING_LOGIT_GATE"},
+        {
+            "name": "mlx_lm_baseline",
+            "gate_status": "PASS_NO_PROMOTE",
+        },
+        {
+            "name": "turboquant_v2",
+            "gate_status": "PENDING_LOGIT_GATE",
+        },
     ]
     for row in rows:
         assert "gate_status" in row
