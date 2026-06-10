@@ -76,6 +76,7 @@ from rfsn_v11.candidates.quality_gates import (
     GATE_STATUS_FAIL,
     GATE_STATUS_PENDING_LOGIT_GATE,
     GATE_STATUS_PENDING_MEMORY_METRICS,
+    GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
 )
 
 # ---------------------------------------------------------------------------
