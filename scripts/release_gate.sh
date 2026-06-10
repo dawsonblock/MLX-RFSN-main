@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release gate script for MLX-RFSN Fusion Alpha 8.1
+# Release gate script for MLX-RFSN Fusion Alpha 8.2
 # Runs on any platform (Linux, macOS, Windows with bash)
 set -euo pipefail
 
@@ -26,13 +26,10 @@ PYTHONPATH=. pytest -q rfsn_v11/tests -m "not mlx"
 echo "[5/7] Benchmark tests..."
 PYTHONPATH=. pytest -q tests/benchmarks
 
-# 6. Quick shootout smoke (optional — writes SKIPPED on non-MLX)
+# 6. Quick shootout smoke (strict — quick mode handles no-MLX gracefully)
 echo "[6/7] Quick shootout smoke..."
-if PYTHONPATH=. python benchmarks/kv_shootout.py --quick 2>/dev/null; then
-    echo "  Quick shootout completed."
-else
-    echo "  Quick shootout SKIPPED (mlx_lm not available or other issue)."
-fi
+PYTHONPATH=. python benchmarks/kv_shootout.py --quick
+echo "  Quick shootout completed."
 
 # 7. Build check
 echo "[7/7] Build check..."

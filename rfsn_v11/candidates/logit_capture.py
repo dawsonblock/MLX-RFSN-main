@@ -29,6 +29,7 @@ def capture_generation_logprobs(
     temp: float = 0.0,
     kv_bits: int | None = None,
     kv_group_size: int = 64,
+    prompt_cache: Any | None = None,
 ) -> dict[str, Any]:
     """Generate text while capturing per-step log-probability vectors.
 
@@ -51,6 +52,8 @@ def capture_generation_logprobs(
         compare baseline-quantized vs candidate).
     kv_group_size
         Group size when ``kv_bits`` is set.
+    prompt_cache
+        Optional per-layer prompt cache (e.g. TurboQuantKVCacheV2).
 
     Returns
     -------
@@ -77,11 +80,17 @@ def capture_generation_logprobs(
         if kv_bits is not None:
             gen_kwargs["kv_bits"] = kv_bits
             gen_kwargs["kv_group_size"] = kv_group_size
+        if prompt_cache is not None:
+            gen_kwargs["prompt_cache"] = prompt_cache
 
         for token, log_probs in generate_step(prompt_mx, model, **gen_kwargs):
-            tokens.append(int(token.item()))
-            # log_probs is shape (vocab,) — convert to numpy
-            lp_np = np.array(log_probs)
+            tokens.append(
+                int(token) if isinstance(token, int) else int(token.item())
+            )
+            # log_probs is shape (vocab,) — convert to numpy.
+            # mlx bfloat16 arrays cannot be passed directly to np.array();
+            # cast to float32 first.
+            lp_np = np.array(log_probs.astype(mx.float32))
             logprob_list.append(lp_np)
             if len(tokens) - len(prompt_ids) >= max_tokens:
                 break

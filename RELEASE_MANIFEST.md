@@ -52,8 +52,8 @@ These are the only quantization presets validated for use:
 | Docker fusion-bench | NOT RUN |
 | Shootout quick | PASS (produces honest artifacts; SKIPPED_NO_MLX_LM on non-MLX) |
 | Shootout promotion report | PASS — output: No candidate is promotion eligible |
-| Shootout full logit | INFRASTRUCTURE ADDED — requires Apple-Silicon run to populate artifacts |
-| Shootout memory | INFRASTRUCTURE ADDED — requires Apple-Silicon run to populate artifacts |
+| Shootout full logit | ARTIFACTS GENERATED on Apple Silicon (Qwen2.5-0.5B-Instruct, 50 tokens) — mlx_lm wrapper candidates show perfect logit match; TurboQuant V2 and Polar pending logit capture integration |
+| Shootout memory | ARTIFACTS GENERATED — memory mode enforces metrics; mlx_lm wrapper candidates pending actual_kv_memory_mb reporting |
 | Promoted candidate | NONE |
 | Stale false-winner artifacts | REMOVED (moved to artifacts/bench/legacy/alpha7_shootout/) |
 | Control baseline promotion bug | FIXED (now PASS_NO_PROMOTE, not promotion eligible) |
@@ -70,75 +70,11 @@ These are the only quantization presets validated for use:
 | Product boundary docs | ADDED |
 | Platform support docs | ADDED |
 
-## Historical Alpha 7 gate results (for reference)
+## Historical gate results
 
-> These are older results from Alpha 7 / v10.2. They are preserved for reference but are **not** the current Alpha 8.1 gate status.
-
-### Non-MLX gate (Linux / any platform) — historical
-
-| Step | Result |
-|------|--------|
-| `python -m compileall -q rfsn_v10 tests` | PASS |
-| `pytest --collect-only -q` | PASS — 67 files, 0 errors |
-| `pytest tests/test_no_placeholder_source.py` | PASS |
-| `pytest tests/test_runtime_import_contract.py` | PASS |
-| `pytest tests/test_config.py tests/test_config_strict.py` | PASS |
-| `pytest tests/test_health.py` | PASS |
-| `pytest tests/test_no_runtime_raw_sdpa.py` | PASS |
-| `pytest tests/test_experimental_flags.py` | PASS |
-| `pytest tests/test_quantization_lazy_imports.py` | PASS |
-| `pytest tests/test_clickhouse_security.py` | PASS (34 tests) |
-| `pytest tests/test_telemetry_e2e.py` | PASS (12 tests) |
-| `RFSN_BACKEND=numpy python -m rfsn_v10 healthcheck` | PASS |
-| `python -m build` | PASS |
-| Wheel subpackage content check | PASS |
-| Wheel install + import verify (Python 3.11 venv) | PASS |
-
-### Apple Silicon MLX gate — historical
-
-| Step | Result |
-|------|--------|
-| `pytest tests/test_attention.py` | PASS (12 tests) |
-| `pytest tests/test_attention_causal_mask.py` | PASS (6 tests) |
-| `pytest tests/test_bitpack.py` | PASS (28 tests) |
-| `pytest tests/test_bitpack_fuzz.py` | PASS (5 tests) |
-| `pytest tests/test_drift.py` | PASS (3 tests) |
-| `pytest tests/test_kv_manager.py` | PASS (47 tests) |
-| `pytest tests/test_short_prompt_decode_drift.py` | PASS (4 tests) |
-| `pytest tests/test_prefill_decode_split.py` | PASS (5 tests) |
-| `pytest tests/test_short_prompt_generation_regression.py` | PASS (4 tests) |
-| `pytest tests/test_server_backend_errors.py` | PASS (6 tests) |
-| `pytest tests/test_version_exported.py` | PASS (3 tests) |
-| `RFSN_BACKEND=mlx python -m rfsn_v10 healthcheck` | PASS |
-
-Total gate tests (historical): **893 passed, 15 skipped, 0 failed**
-
-### Docker gate — historical
-
-| Step | Result |
-|------|--------|
-| `docker build -t rfsn-qjl .` | PASS — image builds successfully |
-| `docker run --rm -e RFSN_BACKEND=numpy rfsn-qjl` | PASS — healthcheck returns degraded (expected, no MLX in container) |
-
-Docker gate: **PASS** (healthcheck-only mode verified) — historical.
-
-### Package gate — historical
-
-| Step | Result |
-|------|--------|
-| `SETUPTOOLS_SCM_PRETEND_VERSION=10.1.0a1 python -m build` | PASS |
-| `pip install dist/*.whl && python -c "import rfsn_v10; print(rfsn_v10.__version__)"` | PASS |
-
-### Benchmark gate — historical
-
-| Step | Result |
-|------|--------|
-| `benchmarks/benchmark_kv_cache.py` | PASS — cosine sim 0.99998, compression 0.266 (3.75x) |
-| `benchmarks/benchmark_bitpack.py` | PASS |
-| `benchmarks/benchmark_attention.py` | PASS |
-| `artifacts/bench/current/results.json` | Generated (historical path) |
-
-Quality gates (historical): **PASS** — key cosine 0.99998 ≥ 0.999 threshold.
+Older Alpha 7 / v10.2 gate results are preserved for reference in
+[`docs/history/alpha7_gate_results.md`](docs/history/alpha7_gate_results.md).
+They are **not** the current Alpha 8.2 gate status.
 
 ---
 
@@ -163,6 +99,7 @@ These are **measured** values, not assumed:
 5. **Full sparse prefill not implemented**: prefill always uses dense attention
 6. **End-to-end speedup not proven**: compression overhead dominates at short contexts
 7. **Docker gate not run in CI on this machine**: must be verified manually
+8. **TurboQuant V2 / Polar logit capture pending**: `capture_generation_logprobs` does not yet integrate with their SDPA patch + prompt_cache paths; they report PENDING_LOGIT_GATE even in full-logit mode
 
 ---
 
@@ -211,10 +148,13 @@ Alpha 8 completed (Plan B):
 - [x] No-false-promotion tests added
 - [x] Artifact integrity tests added
 - [x] release_gate.sh and mlx_gate.sh added
+- [x] release_gate.sh strict quick benchmark (no soft-masking)
+- [x] RELEASE_MANIFEST.md historical section moved to docs/history/
 
 Next required before promotion:
-- [ ] At least one candidate captures real logits during generation
-- [ ] Full logit gate passes for at least one candidate
+- [ ] TurboQuant V2 logit capture integration (currently PENDING_LOGIT_GATE because capture path does not handle its SDPA patch + prompt_cache)
+- [ ] Polar reference logit capture integration
+- [ ] mlx_lm wrapper candidates report actual_kv_memory_mb in memory mode
 - [ ] Full memory metrics complete for at least one candidate
 - [ ] Real cache injection exists for rfsn_v11 (or TurboQuant V2 proves it uses compressed cache natively)
 - [ ] Docker fusion-bench verified

@@ -108,7 +108,7 @@ PROMPTS_QUICK = [
     "Write a Python function that adds two numbers.",
 ]
 
-MAX_TOKENS_FULL = 200
+MAX_TOKENS_FULL = 50
 MAX_TOKENS_QUICK = 50
 
 PROMPT_SUITE: dict[str, list[str]] = {
