@@ -1,0 +1,390 @@
+"""RFSN benchmark judge.
+
+Given a CandidateResult and a baseline CandidateResult, emits one of four verdicts:
+
+    PROMOTE          — quality gates pass AND at least one improvement gate passes.
+                       Safe to move up the promotion ladder.
+
+    KEEP_EXPERIMENTAL — quality gates pass but no improvement gate passes, OR one
+                       or more required metrics are None (unmeasured).
+
+    REJECT           — any quality gate fails.  Method damages output quality.
+
+    REGRESSION       — all quality gates pass and there is improvement, but the
+                       candidate is worse than a previously stable method on a metric
+                       where the stable method passed.
+
+The judge never excuses quality damage because the method is "more advanced."
+
+Promotion gates (all must pass for PROMOTE):
+    logit_cosine              >= LOGIT_COSINE_MIN
+    top5_overlap              >= TOP5_OVERLAP_MIN
+    attention_score_cosine    >= ATTN_COSINE_MIN
+    attention_top5_overlap    >= ATTN_TOP5_MIN
+    perplexity_delta          <= PERPLEXITY_DELTA_MAX   (lower is better)
+    visible_output_drift_score <= DRIFT_MAX
+
+Improvement gates (at least one must pass for PROMOTE):
+    KV memory reduced by >= KV_MEMORY_IMPROVEMENT_MIN (fraction, e.g. 0.30)
+    peak memory reduced by >= PEAK_MEMORY_IMPROVEMENT_MIN
+    decode TPS improved by >= DECODE_TPS_IMPROVEMENT_MIN
+    enables longer context (snapkv_enabled=True and memory saved is positive)
+
+Required fields for promotion (None → KEEP_EXPERIMENTAL):
+    logit_cosine, top5_overlap, attention_score_cosine, attention_top5_overlap,
+    perplexity_delta, visible_output_drift_score,
+    peak_memory_mb, kv_cache_memory_mb, compressed_kv_memory_mb, decode_tps
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+from .schemas import CandidateResult
+
+# ---------------------------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------------------------
+
+LOGIT_COSINE_MIN: float = 0.995
+TOP5_OVERLAP_MIN: float = 0.95
+ATTN_COSINE_MIN: float = 0.995
+ATTN_TOP5_MIN: float = 0.95
+PERPLEXITY_DELTA_MAX: float = 0.02          # candidate ppl - baseline ppl
+DRIFT_MAX: float = 0.05                     # visible output drift score
+
+KV_MEMORY_IMPROVEMENT_MIN: float = 0.30    # KV memory reduced by >= 30 %
+PEAK_MEMORY_IMPROVEMENT_MIN: float = 0.20  # peak memory reduced by >= 20 %
+DECODE_TPS_IMPROVEMENT_MIN: float = 0.10   # decode TPS improved by >= 10 %
+
+# Required quality metrics whose absence blocks promotion
+_REQUIRED_QUALITY_FIELDS = (
+    "logit_cosine",
+    "top5_overlap",
+    "attention_score_cosine",
+    "attention_top5_overlap",
+    "perplexity_delta",
+    "visible_output_drift_score",
+)
+
+# Required memory/speed fields whose absence blocks promotion
+_REQUIRED_PERF_FIELDS = (
+    "peak_memory_mb",
+    "kv_cache_memory_mb",
+    "compressed_kv_memory_mb",
+    "decode_tps",
+)
+
+
+# ---------------------------------------------------------------------------
+# Verdict
+# ---------------------------------------------------------------------------
+
+class VerdictLabel(str, Enum):
+    PROMOTE = "PROMOTE"
+    KEEP_EXPERIMENTAL = "KEEP_EXPERIMENTAL"
+    REJECT = "REJECT"
+    REGRESSION = "REGRESSION"
+
+
+@dataclass
+class Verdict:
+    label: VerdictLabel
+    candidate_name: str
+    model_id: str
+    prompt_id: str
+
+    # Gates that failed (empty if PROMOTE or KEEP_EXPERIMENTAL for correct reasons)
+    quality_failures: list[str]
+    missing_required: list[str]
+    improvement_met: bool
+    improvement_notes: list[str]
+
+    # Human-readable summary
+    reason: str
+
+    def __str__(self) -> str:
+        lines = [
+            f"Verdict: {self.label.value}",
+            f"  candidate  : {self.candidate_name}",
+            f"  model      : {self.model_id}",
+            f"  prompt     : {self.prompt_id}",
+            f"  reason     : {self.reason}",
+        ]
+        if self.quality_failures:
+            lines.append("  quality failures:")
+            for f in self.quality_failures:
+                lines.append(f"    - {f}")
+        if self.missing_required:
+            lines.append("  missing required metrics:")
+            for f in self.missing_required:
+                lines.append(f"    - {f}")
+        if self.improvement_notes:
+            lines.append("  improvement gates:")
+            for n in self.improvement_notes:
+                lines.append(f"    - {n}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Judge
+# ---------------------------------------------------------------------------
+
+class Judge:
+    """Evaluate a CandidateResult against a dense baseline and emit a Verdict.
+
+    Parameters
+    ----------
+    stable_reference : CandidateResult, optional
+        A previously promoted stable method.  If provided, the judge will
+        emit REGRESSION instead of PROMOTE when the candidate is worse than
+        the stable reference on any critical metric.
+    """
+
+    def __init__(self, stable_reference: Optional[CandidateResult] = None) -> None:
+        self.stable_reference = stable_reference
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def evaluate(
+        self,
+        candidate: CandidateResult,
+        baseline: CandidateResult,
+    ) -> Verdict:
+        """Return a Verdict for *candidate* relative to *baseline*.
+
+        baseline should be the dense FP16 result for the same model/prompt.
+        """
+        quality_failures: list[str] = []
+        missing_required: list[str] = []
+        improvement_notes: list[str] = []
+
+        # 1. Check for missing required metrics
+        for fname in _REQUIRED_QUALITY_FIELDS + _REQUIRED_PERF_FIELDS:
+            val = getattr(candidate, fname, None)
+            if val is None:
+                missing_required.append(fname)
+
+        # 2. Quality gates (only if all fields present)
+        if not missing_required:
+            qf = _check_quality_gates(candidate)
+            quality_failures.extend(qf)
+
+        # 3. Determine verdict
+        if missing_required:
+            return Verdict(
+                label=VerdictLabel.KEEP_EXPERIMENTAL,
+                candidate_name=candidate.candidate_name,
+                model_id=candidate.model_id,
+                prompt_id=candidate.prompt_id,
+                quality_failures=[],
+                missing_required=missing_required,
+                improvement_met=False,
+                improvement_notes=[],
+                reason=f"missing required metric(s): {', '.join(missing_required)}",
+            )
+
+        if quality_failures:
+            return Verdict(
+                label=VerdictLabel.REJECT,
+                candidate_name=candidate.candidate_name,
+                model_id=candidate.model_id,
+                prompt_id=candidate.prompt_id,
+                quality_failures=quality_failures,
+                missing_required=[],
+                improvement_met=False,
+                improvement_notes=[],
+                reason=f"quality gate(s) failed: {'; '.join(quality_failures)}",
+            )
+
+        # 4. Improvement gates
+        improvement_met, improvement_notes = _check_improvement_gates(
+            candidate, baseline
+        )
+
+        if not improvement_met:
+            return Verdict(
+                label=VerdictLabel.KEEP_EXPERIMENTAL,
+                candidate_name=candidate.candidate_name,
+                model_id=candidate.model_id,
+                prompt_id=candidate.prompt_id,
+                quality_failures=[],
+                missing_required=[],
+                improvement_met=False,
+                improvement_notes=improvement_notes,
+                reason="quality-safe but no improvement gate met",
+            )
+
+        # 5. Regression check against stable reference
+        if self.stable_reference is not None:
+            regression_notes = _check_regression(candidate, self.stable_reference)
+            if regression_notes:
+                return Verdict(
+                    label=VerdictLabel.REGRESSION,
+                    candidate_name=candidate.candidate_name,
+                    model_id=candidate.model_id,
+                    prompt_id=candidate.prompt_id,
+                    quality_failures=[],
+                    missing_required=[],
+                    improvement_met=True,
+                    improvement_notes=regression_notes,
+                    reason=f"regresses vs stable reference: {'; '.join(regression_notes)}",
+                )
+
+        return Verdict(
+            label=VerdictLabel.PROMOTE,
+            candidate_name=candidate.candidate_name,
+            model_id=candidate.model_id,
+            prompt_id=candidate.prompt_id,
+            quality_failures=[],
+            missing_required=[],
+            improvement_met=True,
+            improvement_notes=improvement_notes,
+            reason="all quality gates and at least one improvement gate passed",
+        )
+
+    def evaluate_batch(
+        self,
+        candidates: list[CandidateResult],
+        baseline: CandidateResult,
+    ) -> list[Verdict]:
+        """Evaluate a list of candidates and return verdicts in order."""
+        return [self.evaluate(c, baseline) for c in candidates]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _check_quality_gates(c: CandidateResult) -> list[str]:
+    failures: list[str] = []
+
+    if c.logit_cosine is not None and c.logit_cosine < LOGIT_COSINE_MIN:
+        failures.append(
+            f"logit_cosine {c.logit_cosine:.5f} < {LOGIT_COSINE_MIN}"
+        )
+    if c.top5_overlap is not None and c.top5_overlap < TOP5_OVERLAP_MIN:
+        failures.append(
+            f"top5_overlap {c.top5_overlap:.3f} < {TOP5_OVERLAP_MIN}"
+        )
+    if c.attention_score_cosine is not None and c.attention_score_cosine < ATTN_COSINE_MIN:
+        failures.append(
+            f"attention_score_cosine {c.attention_score_cosine:.5f} < {ATTN_COSINE_MIN}"
+        )
+    if c.attention_top5_overlap is not None and c.attention_top5_overlap < ATTN_TOP5_MIN:
+        failures.append(
+            f"attention_top5_overlap {c.attention_top5_overlap:.3f} < {ATTN_TOP5_MIN}"
+        )
+    if c.perplexity_delta is not None and c.perplexity_delta > PERPLEXITY_DELTA_MAX:
+        failures.append(
+            f"perplexity_delta {c.perplexity_delta:.4f} > {PERPLEXITY_DELTA_MAX}"
+        )
+    if (
+        c.visible_output_drift_score is not None
+        and c.visible_output_drift_score > DRIFT_MAX
+    ):
+        failures.append(
+            f"visible_output_drift_score {c.visible_output_drift_score:.3f} > {DRIFT_MAX}"
+        )
+    return failures
+
+
+def _check_improvement_gates(
+    candidate: CandidateResult,
+    baseline: CandidateResult,
+) -> tuple[bool, list[str]]:
+    notes: list[str] = []
+    met = False
+
+    # KV memory reduction
+    if (
+        candidate.compressed_kv_memory_mb is not None
+        and baseline.kv_cache_memory_mb is not None
+        and baseline.kv_cache_memory_mb > 0
+    ):
+        kv_reduction = 1.0 - (
+            candidate.compressed_kv_memory_mb / baseline.kv_cache_memory_mb
+        )
+        if kv_reduction >= KV_MEMORY_IMPROVEMENT_MIN:
+            notes.append(
+                f"KV memory reduced by {kv_reduction * 100:.1f}% (>= {KV_MEMORY_IMPROVEMENT_MIN * 100:.0f}%)"
+            )
+            met = True
+        else:
+            notes.append(
+                f"KV memory reduced by only {kv_reduction * 100:.1f}% (need >= {KV_MEMORY_IMPROVEMENT_MIN * 100:.0f}%)"
+            )
+
+    # Peak memory reduction
+    if (
+        candidate.peak_memory_mb is not None
+        and baseline.peak_memory_mb is not None
+        and baseline.peak_memory_mb > 0
+    ):
+        peak_reduction = 1.0 - (candidate.peak_memory_mb / baseline.peak_memory_mb)
+        if peak_reduction >= PEAK_MEMORY_IMPROVEMENT_MIN:
+            notes.append(
+                f"peak memory reduced by {peak_reduction * 100:.1f}% (>= {PEAK_MEMORY_IMPROVEMENT_MIN * 100:.0f}%)"
+            )
+            met = True
+        else:
+            notes.append(
+                f"peak memory reduced by only {peak_reduction * 100:.1f}% (need >= {PEAK_MEMORY_IMPROVEMENT_MIN * 100:.0f}%)"
+            )
+
+    # Decode TPS improvement
+    if (
+        candidate.decode_tps is not None
+        and baseline.decode_tps is not None
+        and baseline.decode_tps > 0
+    ):
+        tps_gain = (candidate.decode_tps - baseline.decode_tps) / baseline.decode_tps
+        if tps_gain >= DECODE_TPS_IMPROVEMENT_MIN:
+            notes.append(
+                f"decode TPS improved by {tps_gain * 100:.1f}% (>= {DECODE_TPS_IMPROVEMENT_MIN * 100:.0f}%)"
+            )
+            met = True
+        else:
+            notes.append(
+                f"decode TPS improved by only {tps_gain * 100:.1f}% (need >= {DECODE_TPS_IMPROVEMENT_MIN * 100:.0f}%)"
+            )
+
+    # Long-context enablement (SnapKV)
+    if candidate.snapkv_enabled and (
+        candidate.snapkv_memory_saved_mb is not None
+        and candidate.snapkv_memory_saved_mb > 0
+    ):
+        notes.append(
+            f"enables longer context via SnapKV (memory saved: {candidate.snapkv_memory_saved_mb:.1f} MB)"
+        )
+        met = True
+
+    if not notes:
+        notes.append("no improvement gate measured")
+
+    return met, notes
+
+
+def _check_regression(
+    candidate: CandidateResult,
+    stable: CandidateResult,
+) -> list[str]:
+    """Return non-empty list if candidate is worse than the stable reference on key metrics."""
+    issues: list[str] = []
+
+    def _worse(c_val: Optional[float], s_val: Optional[float], name: str, higher_is_better: bool = True) -> None:
+        if c_val is None or s_val is None:
+            return
+        if higher_is_better and c_val < s_val - 1e-6:
+            issues.append(f"{name} {c_val:.5f} < stable {s_val:.5f}")
+        elif not higher_is_better and c_val > s_val + 1e-6:
+            issues.append(f"{name} {c_val:.5f} > stable {s_val:.5f}")
+
+    _worse(candidate.logit_cosine, stable.logit_cosine, "logit_cosine")
+    _worse(candidate.top5_overlap, stable.top5_overlap, "top5_overlap")
+    _worse(candidate.attention_score_cosine, stable.attention_score_cosine, "attention_score_cosine")
+    _worse(candidate.perplexity_delta, stable.perplexity_delta, "perplexity_delta", higher_is_better=False)
+    return issues

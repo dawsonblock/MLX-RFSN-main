@@ -6,18 +6,21 @@ speculative decoding.
 
 Bug fixes vs rfsn_v10/server/app.py
 ------------------------------------
-1. **cfg.__dict__ bug (line 226 in v10)**: ``generator.generate(prompt, **cfg.__dict__)``
-   passes Pydantic v2 internal dunder fields to the generator.
-   Fix: ``cfg.model_dump()`` returns only declared fields.
+1. **cfg.__dict__ bug (line 226 in v10)**:
+   ``generator.generate(prompt, **cfg.__dict__)`` passes Pydantic v2
+   internal dunder fields to the generator. Fix: ``cfg.model_dump()``
+   returns only declared fields.
 
-2. **Blocking non-streaming path (line 196 in v10)**: ``generator.chat(...)`` is a
-   synchronous call inside an async handler — blocks the event loop.
+2. **Blocking non-streaming path (line 196 in v10)**:
+   ``generator.chat(...)`` is a synchronous call inside an async
+   handler — blocks the event loop.
    Fix: ``await asyncio.to_thread(generator.chat, ...)``
 
-3. **Blocking streaming path (line 226 in v10)**: ``for token in generator.generate(...)``
-   runs the synchronous generator on the event loop thread.
-   Fix: Offload to a daemon thread via a queue; yield tokens across the event loop
-   with ``run_in_executor(None, queue.get)`` so other coroutines can run between tokens.
+3. **Blocking streaming path (line 226 in v10)**:
+   ``for token in generator.generate(...)`` runs the synchronous
+   generator on the event loop thread. Fix: offload to a daemon thread
+   via a queue; yield tokens across the event loop with
+   ``run_in_executor(None, queue.get)``.
 
 Run locally::
 
@@ -54,7 +57,7 @@ import os
 import queue
 import threading
 import time
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -122,8 +125,9 @@ class ClusterStatusResponse(BaseModel):
 class GenerationConfig(BaseModel):
     """Sampling parameters for text generation.
 
-    Uses Pydantic BaseModel so that model_dump() returns only the declared
-    fields, never dunder internals (unlike __dict__ on a dataclass-style object).
+    Uses Pydantic BaseModel so that model_dump() returns only the
+    declared fields, never dunder internals
+    (unlike __dict__ on a dataclass-style object).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -406,6 +410,180 @@ async def _sse_stream(
         idx += 1
 
     yield "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Module entry-point  (python -m rfsn_v11.server)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Benchmark endpoints (Step 25)
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+
+class BenchmarkRunRequest(BaseModel):
+    """Trigger a benchmark run."""
+    model_config = ConfigDict(extra="ignore")
+    candidate: str = Field(
+        default="A1_wht_grouped_k8v4_gs64",
+        description="Candidate name to benchmark",
+    )
+    prompt_id: str = Field(
+        default="short_chat_512",
+        description="Prompt ID from fixed prompt set",
+    )
+    output_tokens: int = Field(default=50, ge=1, le=256)
+    smoke: bool = Field(
+        default=False,
+        description="Use synthetic data (no model load)",
+    )
+
+
+class BenchmarkLatestResponse(BaseModel):
+    """Latest benchmark results."""
+    run_tag: str
+    timestamp: str
+    model_id: str
+    candidate: str
+    verdict: str
+    metrics: dict[str, Any]
+
+
+class DashboardResponse(BaseModel):
+    """Dashboard state."""
+    model_loaded: bool
+    model_id: str
+    mode: str
+    compression_candidate: str
+    context_length: int
+    decode_tps: float
+    peak_memory_mb: float
+    kv_memory_mb: float
+    last_verdict: str
+    last_error: str
+
+
+# Mutable dashboard state (updated by benchmark runs)
+_dashboard_state: dict[str, Any] = {
+    "model_loaded": False,
+    "model_id": "",
+    "mode": "dense",
+    "compression_candidate": "none",
+    "context_length": 0,
+    "decode_tps": 0.0,
+    "peak_memory_mb": 0.0,
+    "kv_memory_mb": 0.0,
+    "last_verdict": "",
+    "last_error": "",
+}
+
+
+@app.get("/rfsn/dashboard", response_model=DashboardResponse)
+async def dashboard() -> DashboardResponse:
+    """Dashboard: current server state and last benchmark results."""
+    return DashboardResponse(
+        model_loaded=_generator is not None,
+        model_id=_dashboard_state["model_id"] or os.environ.get("RFSN_MODEL_ID", ""),
+        mode=_dashboard_state["mode"],
+        compression_candidate=_dashboard_state["compression_candidate"],
+        context_length=_dashboard_state["context_length"],
+        decode_tps=_dashboard_state["decode_tps"],
+        peak_memory_mb=_dashboard_state["peak_memory_mb"],
+        kv_memory_mb=_dashboard_state["kv_memory_mb"],
+        last_verdict=_dashboard_state["last_verdict"],
+        last_error=_dashboard_state["last_error"],
+    )
+
+
+@app.get("/rfsn/benchmarks/latest")
+async def benchmark_latest() -> dict[str, Any]:
+    """Return the latest benchmark JSON artifact if available."""
+    results_dir = (
+        Path(__file__).parent.parent.parent / "benchmarks" / "results"
+    )
+    candidates = ["a1_latest.json", "baseline_mlx_latest.json"]
+    latest: dict[str, Any] = {}
+    for name in candidates:
+        path = results_dir / name
+        if path.exists():
+            try:
+                latest[name.replace("_latest.json", "")] = json.loads(
+                    path.read_text()
+                )
+            except (OSError, ValueError):
+                pass
+    return {"available": latest}
+
+
+@app.post("/rfsn/benchmarks/run")
+async def benchmark_run(request: BenchmarkRunRequest) -> dict[str, Any]:
+    """Trigger a benchmark run and return a summary."""
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).parent.parent.parent
+    sys.path.insert(0, str(repo_root))
+
+    if request.smoke:
+        # Synthetic run — no model needed
+        from benchmarks.run_a1 import _make_smoke_a1_result, _make_smoke_result
+        import numpy as np
+        rng = np.random.default_rng(42)
+        baseline = _make_smoke_result(
+            "smoke/Qwen2.5-0.5B",
+            request.prompt_id,
+            "test prompt",
+            request.output_tokens,
+            rng,
+        )
+        a1 = _make_smoke_a1_result(baseline, rng)
+        from benchmarks.judge import Judge
+        verdict = Judge().evaluate(a1, baseline)
+        _dashboard_state.update({
+            "mode": "benchmark",
+            "compression_candidate": request.candidate,
+            "context_length": baseline.context_length,
+            "decode_tps": a1.decode_tps or 0.0,
+            "peak_memory_mb": a1.peak_memory_mb or 0.0,
+            "kv_memory_mb": a1.kv_cache_memory_mb or 0.0,
+            "last_verdict": verdict.label.value,
+            "last_error": "",
+        })
+        return {
+            "status": "completed",
+            "smoke": True,
+            "verdict": verdict.label.value,
+            "reason": verdict.reason,
+        }
+
+    # Real model run (requires model loaded)
+    if _generator is None:
+        return {
+            "status": "error",
+            "message": (
+                "No model loaded. Set RFSN_MODEL_ID "
+                "and hit /v1/chat/completions first."
+            ),
+        }
+
+    _dashboard_state.update({
+        "mode": "benchmark",
+        "compression_candidate": request.candidate,
+        "last_verdict": "KEEP_EXPERIMENTAL",
+        "last_error": (
+            "Real benchmark run requires CLI invocation"
+            " (see benchmarks/run_a1.py)"
+        ),
+    })
+    return {
+        "status": "queued",
+        "message": (
+            "Real benchmark runs should be executed"
+            " via CLI: python benchmarks/run_a1.py"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
