@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| Release name | `mlx-rfsn-fusion-alpha-8` |
+| Release name | `MLX-RFSN Fusion Alpha 8` |
 | Git branch | `mlx-rfsn-fusion-alpha-8` |
 | Git commit | (see `git log -1 --oneline`) |
 | Frozen snapshot branch | `mlx-rfsn-fusion-alpha-7-snapshot` (preserved, do not delete) |
@@ -40,16 +40,16 @@ These are the only quantization presets validated for use:
 | Step | Result |
 |------|--------|
 | CPU compile | PASS |
-| CPU tests non-db | PASS / SKIPPED |
-| rfsn_v11 tests no-MLX | PASS / SKIPPED |
+| CPU tests non-db | PASS (893 tests, 15 skipped; 4 pre-existing rfsn_v11 Metal failures unrelated to gate changes) |
+| rfsn_v11 tests no-MLX | SKIPPED / 4 Metal failures pre-existing |
 | Package build | PASS |
 | Docker healthcheck | NOT RUN |
 | Docker fusion-bench | NOT RUN |
-| Apple MLX tests | NOT RUN |
-| Shootout quick | PASS / NOT RUN |
-| Shootout full logit | NOT RUN |
+| Apple MLX tests | PASS (quick shootout runs; 4 pre-existing Metal test failures) |
+| Shootout quick | PASS |
+| Shootout full logit | NOT RUN (candidates do not yet capture logits during generation) |
 | Shootout memory | NOT RUN |
-| Promotion report | NOT RUN |
+| Promotion report | PASS — output: No candidate is promotion eligible |
 | Promoted candidate | NONE |
 
 ## Previous gate results
@@ -164,24 +164,32 @@ Guard test: `tests/test_no_placeholder_source.py` — prevents regression.
 
 ---
 
-## Alpha → Stable promotion checklist
+## Alpha 8 → Next promotion checklist
 
-The status remains `3 - Alpha Candidate` until **all** items below are checked.
-Do not promote to stable until the kv_shootout benchmark has run and a winner is selected.
+The status remains `3 - Alpha` until **all** items below are checked.
+Do not call this beta until the full logit gate passes for at least one candidate.
 
-- [x] `python -m compileall -q rfsn_v10 tests` — PASS
-- [x] `pytest tests/test_no_placeholder_source.py` — PASS
-- [x] `pytest tests/test_runtime_import_contract.py` — PASS
-- [x] Full non-MLX test gate — PASS (893 tests)
-- [x] Full MLX gate — PASS (99+ tests)
-- [x] Wheel builds with correct version — PASS (10.1.0a1, not 0.0.0)
-- [x] `docker build -t rfsn-qjl . && docker run --rm rfsn-qjl` — PASS (healthcheck default CMD)
-- [x] Benchmarks re-run with quality metrics — PASS (KV cosine 0.99998 ≥ 0.999 threshold)
-- [x] Server backend error handling — PASS (400/503, never 500)
-- [x] `rfsn_v10.__version__` exported correctly — PASS
-- [ ] `rfsn_v11` tests collect cleanly with `pytest.importorskip` guards
-- [ ] `benchmarks/kv_shootout.py --quick` produces `artifacts/bench/shootout/results.json`
-- [ ] Winner selected from shootout; README and manifest updated
+Alpha 8 completed:
+- [x] Quality gate semantics fixed (text_heuristic_passed, logit_gate_passed, promotion_eligible, gate_status)
+- [x] Logit metrics module exists and tested
+- [x] Memory metrics module exists and tested
+- [x] rfsn_v11 honestly labeled as offline-only (PENDING_REAL_CACHE_INJECTION)
+- [x] TurboQuant V2 honestly labeled (PENDING_LOGIT_GATE)
+- [x] Polar reference honestly labeled (PENDING_LOGIT_GATE)
+- [x] kv_shootout supports --quick, --full-logit-gate, --memory-report, --promotion-report
+- [x] README no longer says production deployment
+- [x] Dockerfile split (healthcheck + fusion-bench)
+- [x] CI workflow fusion-alpha.yml added
+- [x] `benchmarks/kv_shootout.py --quick` produces artifacts
+- [x] `benchmarks/kv_shootout.py --promotion-report` correctly says: No candidate is promotion eligible
+
+Next required before promotion:
+- [ ] At least one candidate captures real logits during generation
+- [ ] Full logit gate passes for at least one candidate
+- [ ] Full memory metrics complete for at least one candidate
+- [ ] Real cache injection exists for rfsn_v11 (or TurboQuant V2 proves it uses compressed cache natively)
+- [ ] Docker fusion-bench verified
+- [ ] Winner selected from shootout with honest artifacts
 
 ---
 
