@@ -46,9 +46,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import sys
-import time
 import warnings
 from pathlib import Path
 from typing import Any
@@ -57,19 +55,18 @@ import numpy as np
 
 # Suppress mlx-lm legacy sampling-arg deprecation warnings emitted during
 # generation. These are known and do not affect results.
-warnings.filterwarnings("ignore", message="Specifying sampling arguments", category=UserWarning)
-warnings.filterwarnings("ignore", message="Specifying ``repetition_penalty``", category=UserWarning)
+warnings.filterwarnings(
+    "ignore", message="Specifying sampling arguments", category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore", message="Specifying ``repetition_penalty``", category=UserWarning,
+)
 
 # Add repo root to path so rfsn_v11 is importable without install
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rfsn_v11.candidates.base import CandidateResult, KVCompressionCandidate
-from rfsn_v11.candidates.quality_gates import (
-    LOGIT_COSINE_MIN,
-    KL_DIVERGENCE_MAX,
-    TOP5_OVERLAP_MIN,
-    TOP10_OVERLAP_MIN,
-    MAX_LOGIT_DELTA_MAX,
+from rfsn_v11.candidates.base import CandidateResult, KVCompressionCandidate  # noqa: E402
+from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     evaluate_quality_gate,
     compute_promotion_eligibility,
     GATE_STATUS_PASS,

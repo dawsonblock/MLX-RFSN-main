@@ -39,7 +39,8 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
-      - run: PYTHONPATH=. pytest -q rfsn_v11/tests || echo "v11 tests: some skipped on CPU"
+      - run: |
+          PYTHONPATH=. pytest -q rfsn_v11/tests || echo "v11 tests: some skipped on CPU"
 
   candidate-schema:
     runs-on: ubuntu-latest
