@@ -15,6 +15,7 @@ from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
 from .candidate_status import CandidateStatus
+from .logit_capture import capture_teacher_forced_logprobs
 from .memory_metrics import estimate_kv_memory_mb
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
@@ -47,6 +48,25 @@ class RFSNV10Candidate(KVCompressionCandidate):
             return True
         except ImportError:
             return False
+
+    def capture_logprobs(
+        self,
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        target_text: str,
+        max_tokens: int = 200,
+        temp: float = 0.0,
+    ) -> Any:
+        """Capture teacher-forced log-probs via standard MLX-LM path.
+
+        RFSN v10's current generation path (``enable_sparse_decode=False``)
+        delegates to ``mlx_lm.stream_generate`` without SDPA patching, so the
+        teacher-forced capture can use the standard MLX-LM forward pass.
+        """
+        return capture_teacher_forced_logprobs(
+            model, tokenizer, prompt, target_text,
+        )
 
     def run(
         self,
@@ -120,7 +140,9 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 notes=(
                     f"RFSN v10 stable baseline — config={self.config_name} "
                     f"bits={quant_kwargs['default_bits']} "
-                    f"gs={quant_kwargs['group_size']}"
+                    f"gs={quant_kwargs['group_size']}  "
+                    "Generation path currently delegates to mlx_lm.stream_generate; "
+                    "real RFSN v10 cache injection is pending."
                 ),
             )
         except Exception as exc:

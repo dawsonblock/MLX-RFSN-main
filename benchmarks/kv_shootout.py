@@ -410,8 +410,25 @@ def _run_once(
                     _revert_polar_patch()
             except Exception:
                 candidate_logprobs = None
+        elif candidate.name in (
+            "rfsn_v10_k8_v5_gs32",
+            "rfsn_v10_k8_v5_gs64",
+        ):
+            # RFSN v10 currently delegates to mlx_lm.stream_generate without
+            # SDPA patching, so teacher-forced capture uses the standard path.
+            if (
+                hasattr(candidate, "capture_logprobs")
+                and callable(getattr(candidate, "capture_logprobs", None))
+            ):
+                candidate_logprobs = candidate.capture_logprobs(
+                    model, tokenizer, prompt, baseline_text,
+                )
+            else:
+                candidate_logprobs = capture_teacher_forced_logprobs(
+                    model, tokenizer, prompt, baseline_text,
+                )
         else:
-            # RFSN v10 and any other candidate without a capture path
+            # Any other candidate without a capture path
             result.logit_gate_passed = None
             result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
             result.promotion_eligible = False
@@ -457,6 +474,20 @@ def _run_once(
                 )
                 result.promotion_eligible = promotion_eligible
                 result.gate_status = gate_status
+
+            # RFSN v10 generation path currently delegates to mlx_lm.stream_generate
+            # without active RFSN cache injection. Logit quality matches baseline,
+            # but promotion is blocked until real cache injection is implemented.
+            if candidate.name in (
+                "rfsn_v10_k8_v5_gs32",
+                "rfsn_v10_k8_v5_gs64",
+            ):
+                result.promotion_eligible = False
+                if result.logit_gate_passed:
+                    result.gate_status = "PASS_NO_PROMOTE"
+                result.notes += (
+                    "  [real RFSN v10 cache injection pending]"
+                )
         else:
             result.logit_gate_passed = None
             result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
