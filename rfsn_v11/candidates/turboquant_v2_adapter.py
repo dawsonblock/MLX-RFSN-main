@@ -150,6 +150,76 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
         return total
 
     # ------------------------------------------------------------------
+    # Logit capture (for full-logit-gate)
+    # ------------------------------------------------------------------
+
+    def capture_logprobs(
+        self,
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        max_tokens: int = 200,
+        temp: float = 0.0,
+    ) -> Any:
+        """Generate with TurboQuant cache and return log-probability array.
+
+        This is a second generation pass used *only* for logit-quality
+        comparison.  Speed metrics come from ``run()``.
+        """
+        if not self.is_available():
+            return None
+        try:
+            _ensure_ext_on_path()
+            import mlx.core as mx
+            import numpy as np
+            import turboquant.patch as tq_patch
+            from mlx_lm.sample_utils import make_sampler
+            from mlx_lm.utils import generate_step
+
+            head_dim = self._detect_head_dim(model)
+            use_rotation = head_dim >= 128
+
+            tq_patch.apply()
+            import mlx_lm.models.base as _base
+            _patched_fn = _base.scaled_dot_product_attention
+            for _mod_name, _mod in list(sys.modules.items()):
+                if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                    if hasattr(_mod, "scaled_dot_product_attention"):
+                        _mod.scaled_dot_product_attention = _patched_fn
+            try:
+                caches = self._build_cache(model, head_dim, use_rotation)
+                input_ids = mx.array(tokenizer.encode(prompt))
+                sampler = make_sampler(temp=temp)
+
+                logprob_list: list[Any] = []
+                for _token, log_probs in generate_step(
+                    prompt=input_ids,
+                    model=model,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    prompt_cache=caches,
+                ):
+                    # mlx bfloat16 arrays cannot be passed directly to
+                    # np.array(); cast to float32 first.
+                    lp_np = np.array(log_probs.astype(mx.float32))
+                    logprob_list.append(lp_np)
+                    if len(logprob_list) >= max_tokens:
+                        break
+
+                if not logprob_list:
+                    return None
+                return np.stack(logprob_list, axis=0)
+            finally:
+                tq_patch.revert()
+                _orig_fn = _base.scaled_dot_product_attention
+                for _mod_name, _mod in list(sys.modules.items()):
+                    if _mod_name.startswith("mlx_lm.models.") and _mod is not None:
+                        if hasattr(_mod, "scaled_dot_product_attention"):
+                            _mod.scaled_dot_product_attention = _orig_fn
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
     # Main run
     # ------------------------------------------------------------------
 

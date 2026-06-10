@@ -1,13 +1,20 @@
-"""Cache policy abstraction for promoted KV-compression candidates.
+"""Cache policy abstraction for control, baseline, and promoted KV-compression policies.
 
 This module provides a clean internal abstraction so that candidate logic
 does not leak into integration layers. Even if MLX-LM does not support
 custom cache policies directly yet, this is the target interface.
 
+Policies are split into three categories:
+- CONTROL_POLICIES: maintained upstream paths (mlx_lm baseline / quantized)
+- BASELINE_POLICIES: historically validated RFSN v10 configs
+- PROMOTED_POLICIES: candidates that have passed full logit + memory gates
+
+No candidate is added to PROMOTED_POLICIES until winner.json says so.
+
 Example:
     from rfsn_v11.integrations.cache_policy import CachePolicy, create_cache_policy
 
-    policy = create_cache_policy("turboquant_v2_b4_gs64_rot")
+    policy = create_cache_policy("rfsn_v10_k8_v5_gs32")
     # Future: model.generate(prompt, cache_policy=policy)
 """
 from __future__ import annotations
@@ -37,10 +44,10 @@ class CachePolicy:
 
 
 # ---------------------------------------------------------------------------
-# Registry of known policies (populated as candidates are promoted)
+# Policy registries
 # ---------------------------------------------------------------------------
 
-_KNOWN_POLICIES: dict[str, dict[str, Any]] = {
+CONTROL_POLICIES: dict[str, dict[str, Any]] = {
     "mlx_lm_fp16": {
         "candidate_name": "mlx_lm_baseline",
         "supports_real_generation": True,
@@ -57,6 +64,9 @@ _KNOWN_POLICIES: dict[str, dict[str, Any]] = {
         "supports_state_restore": False,
         "config": {"kv_bits": 8, "kv_group_size": 64},
     },
+}
+
+BASELINE_POLICIES: dict[str, dict[str, Any]] = {
     "rfsn_v10_k8_v5_gs32": {
         "candidate_name": "rfsn_v10_k8_v5_gs32",
         "supports_real_generation": True,
@@ -73,19 +83,30 @@ _KNOWN_POLICIES: dict[str, dict[str, Any]] = {
         "supports_state_restore": False,
         "config": {"default_bits": 8, "group_size": 64},
     },
-    # TurboQuant V2 is a promising experimental candidate but is NOT yet
-    # promoted. Do not add it here until artifacts/winner/winner.json
-    # says "status": "PROMOTED".
+}
+
+PROMOTED_POLICIES: dict[str, dict[str, Any]] = {}
+
+_KNOWN_POLICIES: dict[str, dict[str, Any]] = {
+    **CONTROL_POLICIES,
+    **BASELINE_POLICIES,
+    **PROMOTED_POLICIES,
 }
 
 
-def create_cache_policy(name: str, **overrides: Any) -> CachePolicy:
+def create_cache_policy(
+    name: str, *, allow_experimental: bool = False, **overrides: Any
+) -> CachePolicy:
     """Create a CachePolicy for a known candidate.
 
     Parameters
     ----------
     name
-        Canonical policy name (e.g. "turboquant_v2_b4_gs64_rot").
+        Canonical policy name (e.g. "rfsn_v10_k8_v5_gs32").
+    allow_experimental
+        If True, allow creating a policy for an unpromoted experimental
+        candidate. Default False — only control, baseline, and promoted
+        policies are permitted.
     **overrides
         Optional overrides for policy fields.
 
@@ -96,10 +117,21 @@ def create_cache_policy(name: str, **overrides: Any) -> CachePolicy:
         real generation.
     """
     if name not in _KNOWN_POLICIES:
-        raise ValueError(
-            f"Unknown cache policy: {name!r}\n"
-            f"Known policies: {list(_KNOWN_POLICIES.keys())}"
-        )
+        if not allow_experimental:
+            raise ValueError(
+                f"Unknown cache policy: {name!r}. "
+                f"Known policies: {list(_KNOWN_POLICIES.keys())}. "
+                f"Pass allow_experimental=True to allow unpromoted candidates."
+            )
+        # Experimental fallback — caller must provide full spec in overrides
+        spec = dict(overrides)
+        spec.setdefault("candidate_name", name)
+        spec.setdefault("supports_real_generation", True)
+        spec.setdefault("supports_prompt_cache", True)
+        spec.setdefault("supports_streaming", True)
+        spec.setdefault("supports_state_restore", False)
+        spec.setdefault("config", {})
+        return CachePolicy(name=name, **spec)
 
     spec = dict(_KNOWN_POLICIES[name])
     spec.update(overrides)
@@ -109,3 +141,8 @@ def create_cache_policy(name: str, **overrides: Any) -> CachePolicy:
 def list_policies() -> list[str]:
     """Return all known policy names."""
     return list(_KNOWN_POLICIES.keys())
+
+
+def is_promoted_policy(name: str) -> bool:
+    """Return True if the policy is in the promoted registry."""
+    return name in PROMOTED_POLICIES

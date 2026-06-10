@@ -300,22 +300,29 @@ def _run_once(
             if "error" not in baseline_cap:
                 baseline_logprobs = baseline_cap.get("logprobs")
 
-        # Capture candidate log-probs if candidate uses MLX-LM path
+        # Capture candidate log-probs.
+        # For MLX-LM built-in quantized KV we can re-run with generate_step
+        # and pass kv_bits so the capture uses the actual quantized cache.
+        # For candidates with custom cache paths (e.g. TurboQuant V2,
+        # Polar reference) we delegate to the candidate's own capture method
+        # so the log-probs come from the *real* cache path.
+        # RFSN v10 uses its own RFSNGenerator (not mlx_lm.generate_step)
+        # so logit capture is not yet available for it.
         candidate_logprobs = None
-        if candidate.name in (
-            "mlx_lm_quantized_kv_b8",
-            "rfsn_v10_k8_v5_gs32",
-            "rfsn_v10_k8_v5_gs64",
-        ):
-            # These candidates are MLX-LM wrappers — we can re-run with
-            # generate_step to capture log-probs for quality comparison.
-            # Note: this is a second generation pass; speed metrics come
-            # from the first pass in candidate.run().
+        if candidate.name == "mlx_lm_quantized_kv_b8":
             cand_cap = capture_generation_logprobs(
                 model, tokenizer, prompt, max_tokens=max_tokens, temp=temp,
+                kv_bits=8, kv_group_size=64,
             )
             if "error" not in cand_cap:
                 candidate_logprobs = cand_cap.get("logprobs")
+        elif (
+            hasattr(candidate, "capture_logprobs")
+            and callable(getattr(candidate, "capture_logprobs", None))
+        ):
+            candidate_logprobs = candidate.capture_logprobs(
+                model, tokenizer, prompt, max_tokens=max_tokens, temp=temp,
+            )
 
         if baseline_logprobs is not None and candidate_logprobs is not None:
             metrics = compute_logit_metrics_from_logprobs(
@@ -533,6 +540,8 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
     numeric = [
         "total_ms",
         "tokens_per_sec",
+        "actual_kv_memory_mb",
+        "working_set_memory_mb",
         "size_ratio",
         "compression_factor",
         "logit_cosine",

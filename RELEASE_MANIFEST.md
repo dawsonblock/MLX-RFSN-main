@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| Release name | `MLX-RFSN Fusion Alpha 8.2` |
+| Release name | `MLX-RFSN Fusion Alpha 8.3` |
 | Git branch | `mlx-rfsn-fusion-alpha-8` |
 | Git commit | (see `git log -1 --oneline`) |
 | Frozen snapshot branch | `mlx-rfsn-fusion-alpha-8-1-snapshot` (preserved, do not delete) |
@@ -35,7 +35,7 @@ These are the only quantization presets validated for use:
 
 ---
 
-## Alpha 8.2 gate results (honest status)
+## Alpha 8.3 gate results (honest status)
 
 | Step | Result |
 |------|--------|
@@ -52,8 +52,8 @@ These are the only quantization presets validated for use:
 | Docker fusion-bench | NOT RUN |
 | Shootout quick | PASS (produces honest artifacts; SKIPPED_NO_MLX_LM on non-MLX) |
 | Shootout promotion report | PASS — output: No candidate is promotion eligible |
-| Shootout full logit | ARTIFACTS GENERATED on Apple Silicon (Qwen2.5-0.5B-Instruct, 50 tokens) — mlx_lm wrapper candidates show perfect logit match; TurboQuant V2 and Polar pending logit capture integration |
-| Shootout memory | ARTIFACTS GENERATED — memory mode enforces metrics; mlx_lm wrapper candidates pending actual_kv_memory_mb reporting |
+| Shootout full logit | PARTIAL ARTIFACTS GENERATED. MLX-LM/RFSN-v10 wrapper candidates have logit metrics. TurboQuant V2 has real metrics but fails gate thresholds on this model. Polar remains PENDING_LOGIT_GATE. |
+| Shootout memory | PARTIAL ARTIFACTS GENERATED. Memory metrics now complete for all candidates. MLX-LM/RFSN-v10 wrappers use estimation. No candidate promoted. |
 | Promoted candidate | NONE |
 | Stale false-winner artifacts | REMOVED (moved to artifacts/bench/legacy/alpha7_shootout/) |
 | Control baseline promotion bug | FIXED (now PASS_NO_PROMOTE, not promotion eligible) |
@@ -62,10 +62,10 @@ These are the only quantization presets validated for use:
 | Candidate statuses | ADDED — CONTROL, BASELINE, EXPERIMENTAL, OFFLINE_ONLY, REFERENCE_ONLY |
 | No-false-promotion tests | ADDED |
 | Artifact integrity tests | ADDED |
-| Logit capture infrastructure | ADDED (`logit_capture.py` with `generate_step` hook) |
-| Memory report infrastructure | ADDED (memory mode enforces all metrics present) |
+| Logit capture infrastructure | ADDED (`logit_capture.py` with `generate_step` hook + `prompt_cache` support) |
+| Memory report infrastructure | ADDED (memory mode enforces all metrics present; estimation helper added) |
 | TurboQuant V2 proof fields | ADDED (`patch_scope`, `global_patch_restored`, `actual_kv_memory_mb`) |
-| Cache policy lock | ADDED (only promoted candidates exposed as policies) |
+| Cache policy lock | ADDED (CONTROL, BASELINE, PROMOTED registries; `allow_experimental` flag) |
 | Install modes | basic / fusion / memory |
 | Product boundary docs | ADDED |
 | Platform support docs | ADDED |

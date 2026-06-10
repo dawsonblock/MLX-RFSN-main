@@ -15,6 +15,7 @@ from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
 from .candidate_status import CandidateStatus
+from .memory_metrics import estimate_kv_memory_mb
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 
@@ -83,6 +84,12 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
             gen_tokens = max(len(output_ids) - len(input_ids), 1)
             tps = gen_tokens / (total_ms / 1000)
 
+            actual_kv_memory_mb = estimate_kv_memory_mb(
+                model, tokenizer, prompt, gen_tokens, bits=self.kv_bits,
+            )
+            size_ratio = self.kv_bits / 16.0
+            compression_factor = 16.0 / self.kv_bits
+
             return CandidateResult(
                 name=self.name,
                 model_id=getattr(model, "name_or_path", "unknown"),
@@ -91,6 +98,9 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=output,
+                actual_kv_memory_mb=actual_kv_memory_mb,
+                size_ratio=size_ratio,
+                compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 candidate_status=self.candidate_status,
                 cache_backend_used="mlx_lm_quantized_kv",

@@ -15,6 +15,7 @@ from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
 from .candidate_status import CandidateStatus
+from .memory_metrics import estimate_kv_memory_mb
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 # Map the human-readable preset names to actual QuantizationConfig kwargs.
@@ -94,6 +95,13 @@ class RFSNV10Candidate(KVCompressionCandidate):
             gen_tokens = max(len(tokens), 1)
             tps = gen_tokens / (total_ms / 1000)
 
+            actual_kv_memory_mb = estimate_kv_memory_mb(
+                model, tokenizer, prompt, gen_tokens,
+                bits=quant_kwargs["default_bits"],
+            )
+            size_ratio = quant_kwargs["default_bits"] / 16.0
+            compression_factor = 16.0 / quant_kwargs["default_bits"]
+
             return CandidateResult(
                 name=self.name,
                 model_id=getattr(model, "name_or_path", "unknown"),
@@ -102,6 +110,9 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=result_text,
+                actual_kv_memory_mb=actual_kv_memory_mb,
+                size_ratio=size_ratio,
+                compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 candidate_status=self.candidate_status,
                 cache_backend_used="rfsn_v10_quantized_kv",

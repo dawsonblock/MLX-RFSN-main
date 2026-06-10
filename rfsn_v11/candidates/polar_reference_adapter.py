@@ -191,6 +191,62 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 return hidden // n_heads
         return 128  # sensible fallback
 
+    def capture_logprobs(
+        self,
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        max_tokens: int = 200,
+        temp: float = 0.0,
+    ) -> Any:
+        """Generate with Polar cache and return log-probability array."""
+        if not self.is_available():
+            return None
+        try:
+            _ensure_ext_on_path()
+            _patch_polar_quant_vectorize()
+            import mlx.core as mx
+            import numpy as np
+            from mlx_lm.sample_utils import make_sampler
+            from mlx_lm.utils import generate_step
+            from mlx_turboquant.cache import TurboQuantKVCache
+
+            head_dim = self._detect_head_dim(model)
+            n_layers = len(model.layers)
+            caches = [
+                TurboQuantKVCache(
+                    bits=self.bits,
+                    head_dim=head_dim,
+                    key_seed=self.seed + i,
+                    value_seed=self.seed + i + 1000,
+                )
+                for i in range(n_layers)
+            ]
+
+            _apply_polar_patch()
+            try:
+                input_ids = mx.array(tokenizer.encode(prompt))
+                sampler = make_sampler(temp=temp)
+                logprob_list: list[Any] = []
+                for _token, log_probs in generate_step(
+                    prompt=input_ids,
+                    model=model,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    prompt_cache=caches,
+                ):
+                    lp_np = np.array(log_probs.astype(mx.float32))
+                    logprob_list.append(lp_np)
+                    if len(logprob_list) >= max_tokens:
+                        break
+                if not logprob_list:
+                    return None
+                return np.stack(logprob_list, axis=0)
+            finally:
+                _revert_polar_patch()
+        except Exception:
+            return None
+
     def run(
         self,
         model: Any,
@@ -268,9 +324,11 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 if fp16_bytes > 0 and compressed_bytes > 0:
                     size_ratio = round(compressed_bytes / fp16_bytes, 4)
                     compression_factor = round(fp16_bytes / compressed_bytes, 3)
+                    actual_kv_memory_mb = compressed_bytes / (1024 * 1024)
                 else:
                     size_ratio = None
                     compression_factor = None
+                    actual_kv_memory_mb = None
 
             finally:
                 _revert_polar_patch()
@@ -285,6 +343,7 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=generated_text,
+                actual_kv_memory_mb=actual_kv_memory_mb,
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,

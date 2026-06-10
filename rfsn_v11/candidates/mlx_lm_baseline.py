@@ -10,6 +10,7 @@ from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
 from .candidate_status import CandidateStatus
+from .memory_metrics import estimate_kv_memory_mb
 from .quality_gates import compute_promotion_eligibility
 
 
@@ -55,12 +56,17 @@ class MLXLMBaseline(KVCompressionCandidate):
             gen_tokens = max(len(output_ids) - len(input_ids), 1)
             tps = gen_tokens / (total_ms / 1000)
 
+            # Estimate baseline FP16 KV memory
+            actual_kv_memory_mb = estimate_kv_memory_mb(
+                model, tokenizer, prompt, gen_tokens, bits=16,
+            )
+
             # Baseline has perfect quality by definition
             promotion_eligible, gate_status = compute_promotion_eligibility(
                 logit_gate_passed=True,
                 memory_gate_passed=True,
-                actual_kv_memory_mb=None,  # baseline does not compress
-                working_set_memory_mb=None,
+                actual_kv_memory_mb=actual_kv_memory_mb,
+                working_set_memory_mb=actual_kv_memory_mb,
                 size_ratio=1.0,
                 compression_factor=1.0,
             )
@@ -73,6 +79,9 @@ class MLXLMBaseline(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=output,
+                actual_kv_memory_mb=actual_kv_memory_mb,
+                size_ratio=1.0,
+                compression_factor=1.0,
                 logit_cosine=1.0,
                 kl_divergence=0.0,
                 top1_match=1.0,
