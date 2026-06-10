@@ -5,6 +5,7 @@ Gates (initial thresholds — update after first full shootout run):
     KL divergence <= 1e-4
     top5_overlap  >= 0.95
     top10_overlap >= 0.98
+    max_logit_delta <= 0.05
 
 A candidate that fails any gate is labelled:
     experimental / failed quality gate
@@ -24,9 +25,22 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 LOGIT_COSINE_MIN: float = 0.999
-KL_MAX: float = 1e-4
-TOP5_MIN: float = 0.95
-TOP10_MIN: float = 0.98
+KL_DIVERGENCE_MAX: float = 1e-4
+TOP5_OVERLAP_MIN: float = 0.95
+TOP10_OVERLAP_MIN: float = 0.98
+MAX_LOGIT_DELTA_MAX: float = 0.05
+
+
+# ---------------------------------------------------------------------------
+# Allowed gate_status values
+# ---------------------------------------------------------------------------
+
+GATE_STATUS_PASS = "PASS"
+GATE_STATUS_FAIL = "FAIL"
+GATE_STATUS_PENDING_LOGIT_GATE = "PENDING_LOGIT_GATE"
+GATE_STATUS_PENDING_MEMORY_METRICS = "PENDING_MEMORY_METRICS"
+GATE_STATUS_PENDING_REAL_CACHE_INJECTION = "PENDING_REAL_CACHE_INJECTION"
+GATE_STATUS_ERROR = "ERROR"
 
 
 @dataclass
@@ -122,17 +136,20 @@ def evaluate_quality_gate(metrics: dict[str, float | None]) -> QualityGateResult
     kl = metrics.get("kl_divergence")
     top5 = metrics.get("top5_overlap")
     top10 = metrics.get("top10_overlap")
+    max_delta = metrics.get("max_logit_delta")
 
     if cosine is None or cosine < LOGIT_COSINE_MIN:
         failures.append(
             f"logit_cosine {cosine} < {LOGIT_COSINE_MIN}"
         )
-    if kl is None or kl > KL_MAX:
-        failures.append(f"KL {kl} > {KL_MAX}")
-    if top5 is None or top5 < TOP5_MIN:
-        failures.append(f"top5_overlap {top5} < {TOP5_MIN}")
-    if top10 is None or top10 < TOP10_MIN:
-        failures.append(f"top10_overlap {top10} < {TOP10_MIN}")
+    if kl is None or kl > KL_DIVERGENCE_MAX:
+        failures.append(f"KL {kl} > {KL_DIVERGENCE_MAX}")
+    if top5 is None or top5 < TOP5_OVERLAP_MIN:
+        failures.append(f"top5_overlap {top5} < {TOP5_OVERLAP_MIN}")
+    if top10 is None or top10 < TOP10_OVERLAP_MIN:
+        failures.append(f"top10_overlap {top10} < {TOP10_OVERLAP_MIN}")
+    if max_delta is None or max_delta > MAX_LOGIT_DELTA_MAX:
+        failures.append(f"max_logit_delta {max_delta} > {MAX_LOGIT_DELTA_MAX}")
 
     return QualityGateResult(
         passed=len(failures) == 0,
@@ -141,10 +158,34 @@ def evaluate_quality_gate(metrics: dict[str, float | None]) -> QualityGateResult
         top1_match=metrics.get("top1_match"),
         top5_overlap=top5,
         top10_overlap=top10,
-        max_logit_delta=metrics.get("max_logit_delta"),
+        max_logit_delta=max_delta,
         first_divergent_token=metrics.get("first_divergent_token"),
         failure_reasons=failures,
     )
+
+
+def compute_promotion_eligibility(
+    logit_gate_passed: bool | None,
+    memory_gate_passed: bool | None,
+    actual_kv_memory_mb: float | None,
+    working_set_memory_mb: float | None,
+    size_ratio: float | None,
+    compression_factor: float | None,
+) -> tuple[bool, str]:
+    """Return (promotion_eligible, gate_status)."""
+    if logit_gate_passed is not True:
+        return False, GATE_STATUS_PENDING_LOGIT_GATE
+    if memory_gate_passed is not True:
+        return False, GATE_STATUS_PENDING_MEMORY_METRICS
+    if actual_kv_memory_mb is None:
+        return False, GATE_STATUS_PENDING_MEMORY_METRICS
+    if working_set_memory_mb is None:
+        return False, GATE_STATUS_PENDING_MEMORY_METRICS
+    if size_ratio is None:
+        return False, GATE_STATUS_PENDING_MEMORY_METRICS
+    if compression_factor is None:
+        return False, GATE_STATUS_PENDING_MEMORY_METRICS
+    return True, GATE_STATUS_PASS
 
 
 def _safe_softmax(x: np.ndarray) -> np.ndarray:

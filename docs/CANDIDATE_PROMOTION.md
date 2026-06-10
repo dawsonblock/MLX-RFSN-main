@@ -72,6 +72,29 @@ A v11 fusion candidate can enter `rfsn_v10` when:
 - Has a rollback flag
 - Has docs
 
+## Promotion rule
+
+A candidate can be promoted only if:
+
+1. Full logit gate passes
+2. Memory metrics are complete
+3. Real generation path uses the candidate cache
+4. No global unsafe monkey-patching
+5. Benchmark artifacts exist
+6. Result beats baseline on at least one real axis:
+   - lower memory at same quality
+   - faster decode at same quality
+   - longer context at same quality
+
+## Non-promotion labels
+
+- `offline compression only`
+- `reference only`
+- `pending logit gate`
+- `pending memory metrics`
+- `pending real cache injection`
+- `failed quality gate`
+
 ## Automated Verdict System
 
 `benchmarks/kv_shootout.py` runs `_classify_candidate()` at the end of every
@@ -93,11 +116,14 @@ markdown report.
 | KV memory reduction | ≥ 30% | `size_ratio` |
 | Peak memory reduction | ≥ 20% | `working_set_memory_mb` vs baseline |
 | Latency regression limit | ≤ −10% tokens/s | `tokens_per_sec` vs baseline |
-| Logit cosine similarity | ≥ 0.995 | `logit_cosine` |
+| Logit cosine similarity | ≥ 0.999 | `logit_cosine` |
+| KL divergence | ≤ 1e-4 | `kl_divergence` |
 | Top-5 overlap | ≥ 0.95 | `top5_overlap` |
+| Top-10 overlap | ≥ 0.98 | `top10_overlap` |
+| Max logit delta | ≤ 0.05 | `max_logit_delta` |
 
-When a metric is `None` (not yet measured), the classifier conservatively
-assumes it is within spec for that single gate and uses other available gates.
+When a metric is `None` (not yet measured), the candidate is marked
+`PENDING_*` and is not promotion eligible.
 
 ## Running the shootout
 

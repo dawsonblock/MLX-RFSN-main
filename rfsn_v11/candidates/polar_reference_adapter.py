@@ -32,7 +32,7 @@ Source:
   external/mlx-turboquant/mlx_turboquant/polar_quant.py
   external/mlx-turboquant/mlx_turboquant/integration.py
 
-Status: experimental candidate — must pass quality gate before promotion.
+Status: reference candidate — not promotion eligible without full logit gate.
 """
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 _EXT_POLAR = str(
     Path(__file__).parent.parent.parent / "external" / "mlx-turboquant"
@@ -156,13 +157,13 @@ class PolarReferenceAdapter(KVCompressionCandidate):
     each key and value vector.
     """
 
-    name = "polar_reference"
+    name = "polar_reference_offline"
 
     def __init__(self, bits: int = 4, dim: int = 128, seed: int = 42) -> None:
         self.bits = bits
         self.dim = dim
         self.seed = seed
-        self.name = f"polar_reference_b{bits}_d{dim}"
+        self.name = f"polar_reference_offline_b{bits}_d{dim}"
 
     def is_available(self) -> bool:
         try:
@@ -200,7 +201,7 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error="mlx-turboquant or mlx/mlx_lm not available",
             )
         try:
@@ -283,11 +284,11 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 generated_text=generated_text,
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
-                passed_quality_gate=False,  # filled by shootout quality eval
+                gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 notes=(
-                    f"PolarQuant b{self.bits} d{head_dim}  "
-                    f"Real KV cache via TurboQuantKVCache (PolarQuant codebook).  "
-                    f"Source: external/mlx-turboquant/mlx_turboquant/cache.py"
+                    f"Polar reference dequantizes on fetch. It is a reference candidate "
+                    f"and is not promotion eligible unless full generation, logit, and "
+                    f"working-set metrics pass."
                 ),
             )
         except Exception as exc:
@@ -299,6 +300,6 @@ class PolarReferenceAdapter(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error=str(exc),
             )

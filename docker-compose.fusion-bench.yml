@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  fusion-bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.fusion-bench
+    environment:
+      - RFSN_BACKEND=numpy
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./artifacts:/app/artifacts
+    command: ["python", "benchmarks/kv_shootout.py", "--quick"]

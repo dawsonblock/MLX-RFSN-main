@@ -9,20 +9,24 @@ Usage
     # Quick sanity run (fewer prompts, small model only)
     python benchmarks/kv_shootout.py --quick
 
-    # Full run
-    python benchmarks/kv_shootout.py
+    # Full run with real logit gate
+    python benchmarks/kv_shootout.py --full-logit-gate
+
+    # Memory report
+    python benchmarks/kv_shootout.py --memory-report
+
+    # Promotion report (only promotion-eligible candidates)
+    python benchmarks/kv_shootout.py --promotion-report
 
     # Specific model only
     python benchmarks/kv_shootout.py --model Qwen/Qwen2.5-1.5B-Instruct
 
-    # Extended: 3B model
-    python benchmarks/kv_shootout.py --model Qwen/Qwen2.5-3B-Instruct
-
 Outputs
 -------
-    artifacts/bench/shootout/results.json
-    artifacts/bench/shootout/results.csv
-    artifacts/bench/shootout/results.md
+    artifacts/bench/shootout/quick/results.json
+    artifacts/bench/shootout/full_logit/results.json
+    artifacts/bench/shootout/memory/results.json
+    artifacts/bench/shootout/promotion/results.json
 
 Decision rule
 -------------
@@ -34,8 +38,8 @@ Metric definitions
 size_ratio        = compressed_size / baseline_size   (lower is better)
 compression_factor = baseline_size / compressed_size  (higher is better)
 
-Do NOT say "0.265× compression". Say:
-    Compressed size: 26.5% of FP16  (3.77× smaller)
+Do NOT say "0.265x compression". Say:
+    Compressed size: 26.5% of FP16  (3.77x smaller)
 """
 from __future__ import annotations
 
@@ -62,10 +66,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from rfsn_v11.candidates.base import CandidateResult, KVCompressionCandidate
 from rfsn_v11.candidates.quality_gates import (
     LOGIT_COSINE_MIN,
-    KL_MAX,
-    TOP5_MIN,
-    TOP10_MIN,
+    KL_DIVERGENCE_MAX,
+    TOP5_OVERLAP_MIN,
+    TOP10_OVERLAP_MIN,
+    MAX_LOGIT_DELTA_MAX,
     evaluate_quality_gate,
+    compute_promotion_eligibility,
+    GATE_STATUS_PASS,
+    GATE_STATUS_FAIL,
+    GATE_STATUS_PENDING_LOGIT_GATE,
+    GATE_STATUS_PENDING_MEMORY_METRICS,
 )
 
 # ---------------------------------------------------------------------------
@@ -121,7 +131,7 @@ PROMPTS_FULL = [prompts[0] for prompts in PROMPT_SUITE.values()]
 # Without greedy decoding, stochastic sampling causes false text-heuristic FAILs.
 GENERATION_TEMP = 0.0
 
-ARTIFACTS_DIR = Path("artifacts/bench/shootout")
+ARTIFACTS_ROOT = Path("artifacts/bench/shootout")
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +215,7 @@ def _run_once(
     max_tokens: int,
     baseline_result: CandidateResult | None,
     temp: float = GENERATION_TEMP,
+    mode: str = "quick",
 ) -> CandidateResult:
     """Run one candidate on one prompt and apply quality gate."""
     _reset_peak_memory()
@@ -213,14 +224,20 @@ def _run_once(
     if peak_mb is not None:
         result.working_set_memory_mb = peak_mb
 
-    # Quality gate: compare logits to baseline if available
-    # When logits are not captured (text-only), mark gate pending
+    # Error gate
     if result.error:
-        result.passed_quality_gate = False
+        result.gate_status = "ERROR"
+        result.promotion_eligible = False
         return result
 
+    # Preserve adapter-specific pending statuses (more specific than generic logic)
+    if result.gate_status == GATE_STATUS_PENDING_REAL_CACHE_INJECTION:
+        # Real cache injection is the blocker; do not overwrite with generic logit-pending
+        result.promotion_eligible = False
+        return result
+
+    # Baseline always passes logit gate by definition
     if candidate.name == "mlx_lm_baseline":
-        # Baseline always passes
         result.logit_cosine = 1.0
         result.kl_divergence = 0.0
         result.top1_match = 1.0
@@ -228,15 +245,65 @@ def _run_once(
         result.top10_overlap = 1.0
         result.max_logit_delta = 0.0
         result.first_divergent_token = None
-        result.passed_quality_gate = True
-    else:
-        # Without direct logit access (text-generation mode), we apply a
-        # heuristic: compare generated text token-by-token against baseline.
-        # Full logit comparison requires model internals — deferred to MLX gate.
+        result.logit_gate_passed = True
+        result.memory_gate_passed = True
+        result.gate_status = GATE_STATUS_PASS
+        result.promotion_eligible = True
+        return result
+
+    # In quick mode, we only have text heuristic — no real logit gate
+    if mode == "quick":
         if baseline_result is not None and baseline_result.generated_text:
             result = _text_quality_heuristic(result, baseline_result)
         else:
-            result.notes += "  [quality gate deferred: no baseline logits]"
+            result.text_heuristic_passed = None
+            result.logit_gate_passed = None
+            result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+            result.promotion_eligible = False
+            result.notes += "  [quick mode: logit gate pending]"
+        return result
+
+    # full-logit-gate mode: require real logits
+    # For now, most candidates do not capture logits during generation.
+    # Mark them as PENDING_LOGIT_GATE honestly.
+    if result.logit_cosine is None:
+        result.logit_gate_passed = None
+        result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+        result.promotion_eligible = False
+        result.notes += "  [full-logit-gate: no logits captured]"
+    else:
+        metrics = {
+            "logit_cosine": result.logit_cosine,
+            "kl_divergence": result.kl_divergence,
+            "top5_overlap": result.top5_overlap,
+            "top10_overlap": result.top10_overlap,
+            "max_logit_delta": result.max_logit_delta,
+            "first_divergent_token": result.first_divergent_token,
+        }
+        gate = evaluate_quality_gate(metrics)
+        result.logit_gate_passed = gate.passed
+        if not gate.passed:
+            result.gate_status = GATE_STATUS_FAIL
+            result.promotion_eligible = False
+            result.notes += "  [logit gate failed: " + "; ".join(gate.failure_reasons) + "]"
+        else:
+            # Check memory gate for promotion eligibility
+            result.memory_gate_passed = (
+                result.actual_kv_memory_mb is not None
+                and result.working_set_memory_mb is not None
+                and result.size_ratio is not None
+                and result.compression_factor is not None
+            )
+            promotion_eligible, gate_status = compute_promotion_eligibility(
+                logit_gate_passed=result.logit_gate_passed,
+                memory_gate_passed=result.memory_gate_passed,
+                actual_kv_memory_mb=result.actual_kv_memory_mb,
+                working_set_memory_mb=result.working_set_memory_mb,
+                size_ratio=result.size_ratio,
+                compression_factor=result.compression_factor,
+            )
+            result.promotion_eligible = promotion_eligible
+            result.gate_status = gate_status
 
     return result
 
@@ -245,285 +312,139 @@ def _text_quality_heuristic(
     result: CandidateResult,
     baseline: CandidateResult,
 ) -> CandidateResult:
-    """Approximate quality using token-level text comparison.
+    """Compare generated text to baseline without real logits.
 
-    This is a heuristic — full logit comparison runs in the MLX gate.
-    A candidate that produces identical text to baseline trivially passes.
-    A candidate with large text drift is flagged for investigation.
+    This is a heuristic only. A candidate that passes here is NOT
+    promotion eligible until the real logit gate runs.
     """
-    try:
-        b_tokens = baseline.generated_text.split()
-        c_tokens = result.generated_text.split()
-        min_len = min(len(b_tokens), len(c_tokens))
-        if min_len == 0:
-            result.notes += "  [empty output — gate FAIL]"
-            result.passed_quality_gate = False
-            return result
+    if not baseline.generated_text or not result.generated_text:
+        result.text_heuristic_passed = None
+        result.logit_gate_passed = None
+        result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+        result.promotion_eligible = False
+        result.notes += "  [text heuristic: no text to compare]"
+        return result
 
-        matches = sum(b == c for b, c in zip(b_tokens[:min_len], c_tokens[:min_len]))
-        top1_heuristic = matches / min_len
+    baseline_tokens = baseline.generated_text.split()
+    result_tokens = result.generated_text.split()
 
-        # Find first divergent word position
-        divergent = next(
-            (i for i, (b, c) in enumerate(zip(b_tokens, c_tokens)) if b != c),
-            None,
-        )
-        result.first_divergent_token = divergent
-        result.top1_match = top1_heuristic
+    # Exact match check
+    if baseline.generated_text == result.generated_text:
+        result.text_heuristic_passed = True
+        result.logit_gate_passed = None
+        result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+        result.promotion_eligible = False
+        result.notes += "  [text heuristic: exact match — logit gate still pending]"
+        return result
 
-        # Autoregressive token divergence accumulates: even 8-bit quantization
-        # can cause text divergence while logit distributions remain close.
-        # We cannot reliably gate on word-match alone — full logit comparison
-        # is required.  Mark candidates as pending unless output is empty.
-        if top1_heuristic >= 0.95:
-            result.passed_quality_gate = True
-            result.notes += "  [text match PASS — confirm with MLX logit gate]"
-        elif top1_heuristic > 0.0:
-            # Text diverged but candidate produced output — gate deferred to
-            # full logit comparison.  Mark PASS with a warning so candidates
-            # are not excluded from the speed ranking prematurely.
-            result.passed_quality_gate = True
-            result.notes += (
-                f"  [text drift word_match={top1_heuristic:.3f} — "
-                "PENDING full logit gate; run MLX gate for confirmation]"
-            )
-        else:
-            result.passed_quality_gate = False
-            result.notes += "  [no output generated — gate FAIL]"
-    except Exception as exc:
-        result.notes += f"  [quality heuristic error: {exc}]"
-        result.passed_quality_gate = False
+    # Divergence at token level
+    first_diff = None
+    for i, (b, r) in enumerate(zip(baseline_tokens, result_tokens)):
+        if b != r:
+            first_diff = i
+            break
+
+    if first_diff is None and len(baseline_tokens) != len(result_tokens):
+        first_diff = min(len(baseline_tokens), len(result_tokens))
+
+    result.first_divergent_token = first_diff
+    result.text_heuristic_passed = False
+    result.logit_gate_passed = None
+    result.gate_status = GATE_STATUS_PENDING_LOGIT_GATE
+    result.promotion_eligible = False
+    result.notes += f"  [text heuristic: diverged at token {first_diff} — logit gate pending]"
     return result
 
 
 # ---------------------------------------------------------------------------
-# Promotion classifier
+# Aggregated reporting
 # ---------------------------------------------------------------------------
 
-# Numeric gates from CANDIDATE_PROMOTION.md
-_PROMOTE_KV_MEM_REDUCTION = 0.30      # KV mem reduction >= 30%
-_PROMOTE_PEAK_MEM_REDUCTION = 0.20    # Peak mem reduction >= 20%
-_PROMOTE_LATENCY_REGRESSION = 0.10    # Latency regression no worse than +10%
-_PROMOTE_COSINE_MIN = 0.995
-_PROMOTE_TOP5_MIN = 0.95
+def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
+    """Aggregate a list of per-prompt results into one summary row."""
+    if not results:
+        return {}
+
+    name = results[0].name
+    model_id = results[0].model_id
+
+    # Average numeric fields
+    numeric = [
+        "total_ms",
+        "tokens_per_sec",
+        "size_ratio",
+        "compression_factor",
+        "logit_cosine",
+        "kl_divergence",
+        "top5_overlap",
+        "top10_overlap",
+        "max_logit_delta",
+    ]
+    agg: dict[str, Any] = {"name": name, "model_id": model_id}
+    for field in numeric:
+        vals = [getattr(r, field) for r in results if getattr(r, field) is not None]
+        agg[field] = float(np.mean(vals)) if vals else None
+
+    # Gate status: if any FAIL, overall FAIL; if all PASS, PASS; otherwise pending
+    statuses = [r.gate_status for r in results]
+    if any(s == GATE_STATUS_FAIL for s in statuses):
+        agg["gate_status"] = GATE_STATUS_FAIL
+    elif all(s == GATE_STATUS_PASS for s in statuses):
+        agg["gate_status"] = GATE_STATUS_PASS
+    else:
+        # Use the most common pending status
+        pending = [s for s in statuses if s != GATE_STATUS_PASS]
+        agg["gate_status"] = pending[0] if pending else GATE_STATUS_PASS
+
+    agg["promotion_eligible"] = all(r.promotion_eligible for r in results)
+    agg["count"] = len(results)
+    agg["notes"] = " | ".join({r.notes for r in results if r.notes})
+    return agg
 
 
-def _classify_candidate(
-    result: CandidateResult,
-    baseline: "CandidateResult | None",
-) -> str:
-    """Return a promotion verdict for *result* against *baseline*.
-
-    Verdicts
-    --------
-    PROMOTE          — all numeric gates pass; safe to enable by default
-    KEEP_EXPERIMENTAL — quality passes but performance gate uncertain
-    REJECT           — failed quality gate or produced no output
-    REGRESSION       — slower or higher memory than baseline (quality aside)
-    BASELINE         — this is the baseline, no verdict required
-    """
-    if result.name == "mlx_lm_baseline":
-        return "BASELINE"
-    if result.error or not result.passed_quality_gate:
-        return "REJECT"
-
-    if baseline is None:
-        return "KEEP_EXPERIMENTAL"
-
-    # Quality checks
-    cosine_ok = (
-        result.logit_cosine is None  # not measured yet; don't reject on absence
-        or result.logit_cosine >= _PROMOTE_COSINE_MIN
-    )
-    top5_ok = (
-        result.top5_overlap is None
-        or result.top5_overlap >= _PROMOTE_TOP5_MIN
-    )
-    if not (cosine_ok and top5_ok):
-        return "REJECT"
-
-    # Speed regression check
-    if baseline.tokens_per_sec and result.tokens_per_sec:
-        speed_ratio = result.tokens_per_sec / baseline.tokens_per_sec
-        if speed_ratio < (1.0 - _PROMOTE_LATENCY_REGRESSION):
-            return "REGRESSION"
-
-    # Memory gate: KV memory reduction
-    kv_gate_passed = False
-    if result.size_ratio is not None:
-        kv_gate_passed = (1.0 - result.size_ratio) >= _PROMOTE_KV_MEM_REDUCTION
-
-    # Peak memory reduction
-    peak_gate_passed = False
-    if baseline.working_set_memory_mb and result.working_set_memory_mb:
-        peak_reduction = (
-            (baseline.working_set_memory_mb - result.working_set_memory_mb)
-            / baseline.working_set_memory_mb
-        )
-        peak_gate_passed = peak_reduction >= _PROMOTE_PEAK_MEM_REDUCTION
-
-    if kv_gate_passed and peak_gate_passed:
-        return "PROMOTE"
-    return "KEEP_EXPERIMENTAL"
-
-
-# ---------------------------------------------------------------------------
-# Output formatting
-# ---------------------------------------------------------------------------
-
-def _result_to_dict(r: CandidateResult) -> dict:
-    d = {
-        "name": r.name,
-        "model_id": r.model_id,
-        "prompt": r.prompt[:60],
-        "actual_kv_memory_mb": r.actual_kv_memory_mb,
-        "working_set_memory_mb": r.working_set_memory_mb,
-        "size_ratio": r.size_ratio,
-        "compression_factor": r.compression_factor,
-        "prefill_ms": r.prefill_ms,
-        "decode_ms": r.decode_ms,
-        "total_ms": r.total_ms,
-        "tokens_per_sec": r.tokens_per_sec,
-        "generated_tokens": r.generated_tokens,
-        "logit_cosine": r.logit_cosine,
-        "kl_divergence": r.kl_divergence,
-        "top1_match": r.top1_match,
-        "top5_overlap": r.top5_overlap,
-        "top10_overlap": r.top10_overlap,
-        "max_logit_delta": r.max_logit_delta,
-        "first_divergent_token": r.first_divergent_token,
-        "passed_quality_gate": r.passed_quality_gate,
-        "notes": r.notes,
-        "error": r.error,
-        "promotion_verdict": getattr(r, "_promotion_verdict", None),
-    }
-    return d
-
-
-def _write_results(
-    results: list[CandidateResult],
-    out_dir: Path,
-) -> None:
+def _write_artifacts(rows: list[dict[str, Any]], out_dir: Path) -> None:
+    """Write JSON, CSV, and Markdown artifacts."""
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = [_result_to_dict(r) for r in results]
 
     # JSON
     json_path = out_dir / "results.json"
-    with open(json_path, "w") as f:
-        json.dump(rows, f, indent=2, default=str)
-    print(f"\nWrote {json_path}")
+    with json_path.open("w", encoding="utf-8") as fh:
+        json.dump(rows, fh, indent=2, default=str)
 
     # CSV
-    csv_path = out_dir / "results.csv"
     if rows:
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        csv_path = out_dir / "results.csv"
+        headers = list(rows[0].keys())
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=headers)
             writer.writeheader()
             writer.writerows(rows)
-        print(f"Wrote {csv_path}")
 
     # Markdown
     md_path = out_dir / "results.md"
-    _write_markdown(results, md_path)
-    print(f"Wrote {md_path}")
+    with md_path.open("w", encoding="utf-8") as fh:
+        fh.write("# KV Shootout Results\n\n")
+        if not rows:
+            fh.write("No results.\n")
+            return
 
+        # Header
+        headers = list(rows[0].keys())
+        fh.write("| " + " | ".join(headers) + " |\n")
+        fh.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
+        for row in rows:
+            cells = []
+            for h in headers:
+                v = row.get(h, "")
+                if v is None:
+                    cells.append("—")
+                elif isinstance(v, float):
+                    cells.append(f"{v:.4f}")
+                else:
+                    cells.append(str(v))
+            fh.write("| " + " | ".join(cells) + " |\n")
 
-def _write_markdown(results: list[CandidateResult], path: Path) -> None:
-    lines = ["# KV-Cache Compression Shootout Results\n"]
-    lines.append(
-        "**Metric definitions**\n"
-        "- `size_ratio` = compressed_size / baseline_size (lower is better)\n"
-        "- `compression_factor` = baseline_size / compressed_size (higher is better)\n"
-        "- Example: size_ratio=0.265 → *Compressed size: 26.5% of FP16 (3.77× smaller)*\n\n"
-    )
-    lines.append(
-        "**Quality gate thresholds**\n"
-        f"- logit_cosine ≥ {LOGIT_COSINE_MIN}\n"
-        f"- KL divergence ≤ {KL_MAX}\n"
-        f"- top5_overlap ≥ {TOP5_MIN}\n"
-        f"- top10_overlap ≥ {TOP10_MIN}\n\n"
-    )
-
-    # Group by model
-    models = sorted(set(r.model_id for r in results))
-    for model_id in models:
-        model_results = [r for r in results if r.model_id == model_id]
-        lines.append(f"## {model_id}\n")
-
-        header = (
-            "| Candidate | Prompt | Gate | tokens/s | total_ms | "
-            "size_ratio | compression_factor | cosine | KL | top5 | notes |\n"
-        )
-        sep = "|---|---|---|---|---|---|---|---|---|---|---|\n"
-        lines.append(header)
-        lines.append(sep)
-
-        for r in model_results:
-            gate = "PASS" if r.passed_quality_gate else ("ERR" if r.error else "FAIL")
-            tps = f"{r.tokens_per_sec:.1f}" if r.tokens_per_sec else "—"
-            ms = f"{r.total_ms:.0f}" if r.total_ms else "—"
-            sr = f"{r.size_ratio:.3f}" if r.size_ratio is not None else "—"
-            cf = f"{r.compression_factor:.2f}×" if r.compression_factor is not None else "—"
-            cos = f"{r.logit_cosine:.5f}" if r.logit_cosine is not None else "—"
-            kl = f"{r.kl_divergence:.2e}" if r.kl_divergence is not None else "—"
-            top5 = f"{r.top5_overlap:.3f}" if r.top5_overlap is not None else "—"
-            prompt_short = r.prompt[:30].replace("|", "\\|")
-            note_short = r.notes[:50].replace("|", "\\|") if r.notes else ""
-            lines.append(
-                f"| {r.name} | {prompt_short} | {gate} | {tps} | {ms} | "
-                f"{sr} | {cf} | {cos} | {kl} | {top5} | {note_short} |\n"
-            )
-        lines.append("\n")
-
-    # Promotion summary per candidate
-    lines.append("## Promotion Summary\n\n")
-    lines.append("| Candidate | Verdict | Tokens/s | Quality Gate |\n")
-    lines.append("|---|---|---|---|\n")
-    seen_names: set[str] = set()
-    baseline_result = next(
-        (r for r in results if r.name == "mlx_lm_baseline"), None
-    )
-    for r in results:
-        if r.name in seen_names:
-            continue
-        seen_names.add(r.name)
-        verdict = _classify_candidate(r, baseline_result)
-        r._promotion_verdict = verdict  # attach for JSON output
-        gate = "PASS" if r.passed_quality_gate else ("ERR" if r.error else "FAIL")
-        tps = f"{r.tokens_per_sec:.1f}" if r.tokens_per_sec else "—"
-        lines.append(f"| {r.name} | {verdict} | {tps} | {gate} |\n")
-    lines.append("\n")
-
-    # Decision summary
-    lines.append("## Decision\n\n")
-    passed = [r for r in results if r.passed_quality_gate and r.tokens_per_sec]
-    if not passed:
-        lines.append(
-            "No candidate passed all quality gates in this run.\n"
-            "Check `error` fields. Re-run after fixing issues.\n"
-        )
-    else:
-        winner = max(passed, key=lambda r: r.tokens_per_sec or 0.0)
-        winner_verdict = _classify_candidate(winner, baseline_result)
-        lines.append(
-            f"**Winner: `{winner.name}`** — "
-            f"{winner.tokens_per_sec:.1f} tokens/s, "
-            f"quality gate PASS, verdict **{winner_verdict}**\n\n"
-        )
-        if winner_verdict == "PROMOTE":
-            lines.append(
-                "> All gates passed. Candidate is eligible for promotion.\n"
-                "> See `docs/CANDIDATE_PROMOTION.md` for promotion steps.\n"
-            )
-        else:
-            lines.append(
-                "> Candidate requires further validation before promotion.\n"
-                "> See `docs/CANDIDATE_PROMOTION.md`.\n"
-            )
-
-    with open(path, "w") as f:
-        f.writelines(lines)
+    print(f"  Wrote {json_path}, {csv_path if rows else ''}, {md_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -531,133 +452,85 @@ def _write_markdown(results: list[CandidateResult], path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="KV-cache compression candidate shootout"
-    )
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help="Quick run: fewer prompts, small model, 50 tokens",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Run a single specific model ID",
-    )
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=str(ARTIFACTS_DIR),
-        help="Output directory for results",
-    )
-    parser.add_argument(
-        "--categories",
-        type=str,
-        default=None,
-        help=(
-            "Comma-separated PROMPT_SUITE categories to run "
-            "(default: all). Available: "
-            + ", ".join(PROMPT_SUITE.keys())
-        ),
-    )
-    parser.add_argument(
-        "--all-prompts",
-        action="store_true",
-        default=False,
-        help="Run every prompt in each selected category (default: first prompt only)",
-    )
+    parser = argparse.ArgumentParser(description="KV-cache compression shootout")
+    parser.add_argument("--quick", action="store_true", help="Fast smoke run")
+    parser.add_argument("--full-logit-gate", action="store_true", help="Run real logit comparison")
+    parser.add_argument("--memory-report", action="store_true", help="Require all candidates to report memory metrics")
+    parser.add_argument("--promotion-report", action="store_true", help="Only rank promotion-eligible candidates")
+    parser.add_argument("--model", type=str, default=None, help="Specific model ID")
     args = parser.parse_args()
 
-    models = [args.model] if args.model else (MODELS_QUICK if args.quick else MODELS_FULL)
-    max_tokens = MAX_TOKENS_QUICK if args.quick else MAX_TOKENS_FULL
-    out_dir = Path(args.out)
-
-    if args.quick:
-        prompts = PROMPTS_QUICK
-    elif args.categories:
-        selected = [c.strip() for c in args.categories.split(",")]
-        if args.all_prompts:
-            prompts = [p for k in selected for p in PROMPT_SUITE.get(k, [])]
-        else:
-            prompts = [PROMPT_SUITE[k][0] for k in selected if k in PROMPT_SUITE]
-    elif args.all_prompts:
-        prompts = [p for ps in PROMPT_SUITE.values() for p in ps]
+    # Determine mode and output directory
+    if args.promotion_report:
+        mode = "promotion"
+        out_dir = ARTIFACTS_ROOT / "promotion"
+    elif args.memory_report:
+        mode = "memory"
+        out_dir = ARTIFACTS_ROOT / "memory"
+    elif args.full_logit_gate:
+        mode = "full_logit"
+        out_dir = ARTIFACTS_ROOT / "full_logit"
+    elif args.quick:
+        mode = "quick"
+        out_dir = ARTIFACTS_ROOT / "quick"
     else:
-        prompts = PROMPTS_FULL
+        mode = "quick"
+        out_dir = ARTIFACTS_ROOT / "quick"
+        print("No mode specified; defaulting to --quick")
 
-    print("=" * 60)
-    print("MLX-RFSN KV-Cache Compression Shootout")
-    print(f"Mode: {'quick' if args.quick else 'full'}")
-    print(f"Models: {models}")
-    print(f"Prompts: {len(prompts)}")
-    print(f"Max tokens: {max_tokens}")
-    print(f"Output: {out_dir}")
-    print("=" * 60)
+    print(f"KV Shootout — mode={mode}")
+    print(f"Outputs: {out_dir}")
 
-    print("\nBuilding candidate list ...")
-    candidates = _build_candidates(quick=args.quick)
-    print(f"Candidates: {[c.name for c in candidates]}")
+    models = [args.model] if args.model else (MODELS_QUICK if args.quick else MODELS_FULL)
+    prompts = PROMPTS_QUICK if args.quick else PROMPTS_FULL
+    max_tokens = MAX_TOKENS_QUICK if args.quick else MAX_TOKENS_FULL
 
-    all_results: list[CandidateResult] = []
+    all_rows: list[dict[str, Any]] = []
 
     for model_id in models:
         model, tokenizer = _load_model(model_id)
         if model is None:
-            print(f"Skipping {model_id} — load failed")
             continue
 
+        candidates = _build_candidates(quick=args.quick)
+        if not candidates:
+            print("  No candidates available.")
+            continue
+
+        per_candidate_results: dict[str, list[CandidateResult]] = {}
+
         for prompt in prompts:
-            print(f"\n--- prompt: {prompt[:40]!r} ---")
+            print(f"\n  Prompt: {prompt[:60]}...")
             baseline_result: CandidateResult | None = None
 
             for candidate in candidates:
-                print(f"  Running {candidate.name} ...", end=" ", flush=True)
-                t0 = time.perf_counter()
+                print(f"    Running {candidate.name} ...", end=" ", flush=True)
                 result = _run_once(
-                    candidate,
-                    model,
-                    tokenizer,
-                    prompt,
-                    max_tokens,
-                    baseline_result=baseline_result,
+                    candidate, model, tokenizer, prompt, max_tokens,
+                    baseline_result=baseline_result, mode=mode,
                 )
-                elapsed = time.perf_counter() - t0
-                result.model_id = model_id
+                per_candidate_results.setdefault(candidate.name, []).append(result)
 
-                gate_str = "PASS" if result.passed_quality_gate else ("ERR" if result.error else "FAIL")
-                tps_str = f"{result.tokens_per_sec:.1f} tok/s" if result.tokens_per_sec else "?"
-                print(f"[{gate_str}] {tps_str}  ({elapsed:.1f}s)")
-
-                if result.error:
-                    print(f"    ERROR: {result.error[:120]}")
-
-                # First successful run is the baseline
-                if candidate.name == "mlx_lm_baseline" and not result.error:
+                if candidate.name == "mlx_lm_baseline":
                     baseline_result = result
 
-                all_results.append(result)
+                print(f"{result.gate_status}  tps={result.tokens_per_sec or 'N/A'}")
 
-        # Unload model to free memory before next
-        try:
-            import mlx.core as mx
-            del model
-            mx.metal.clear_cache()
-        except Exception:
-            pass
+        for name, results in per_candidate_results.items():
+            agg = _aggregate(results)
+            all_rows.append(agg)
 
-    print(f"\n{'=' * 60}")
-    print("Writing results ...")
-    _write_results(all_results, out_dir)
+    # Filter for promotion report
+    if mode == "promotion":
+        eligible = [r for r in all_rows if r.get("promotion_eligible")]
+        if not eligible:
+            print("\nNo candidate is promotion eligible.")
+            all_rows = [{"note": "No candidate is promotion eligible."}]
+        else:
+            all_rows = eligible
 
-    # Print final decision
-    passed = [r for r in all_results if r.passed_quality_gate and r.tokens_per_sec]
-    if passed:
-        winner = max(passed, key=lambda r: r.tokens_per_sec or 0.0)
-        print(f"\nWinner: {winner.name}  ({winner.tokens_per_sec:.1f} tok/s, gate PASS)")
-    else:
-        print("\nNo candidate passed all quality gates. See results for details.")
-    print("Done.")
+    _write_artifacts(all_rows, out_dir)
+    print("\nDone.")
 
 
 if __name__ == "__main__":

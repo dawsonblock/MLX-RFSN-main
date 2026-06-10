@@ -68,7 +68,7 @@ It outputs:
 | `top1_match`            | (recorded)    | Higher better |
 | `top5_overlap`          | ≥ 0.95        | Higher better |
 | `top10_overlap`         | ≥ 0.98        | Higher better |
-| `max_logit_delta`       | (recorded)    | Lower better |
+| `max_logit_delta`       | ≤ 0.05        | Lower better |
 | `first_divergent_token` | (recorded)    | Later better |
 
 ## Quality gates
@@ -80,6 +80,7 @@ logit_cosine  >= 0.999
 kl_divergence <= 1e-4
 top5_overlap  >= 0.95
 top10_overlap >= 0.98
+max_logit_delta <= 0.05
 ```
 
 A candidate that fails any gate is labelled:
@@ -87,8 +88,17 @@ A candidate that fails any gate is labelled:
 experimental / failed quality gate
 ```
 
-Failures are never hidden. The `passed_quality_gate` field in results.json
+Failures are never hidden. The `gate_status` field in results.json
 is always set honestly.
+
+## Gate statuses
+
+- `PASS` — all required gates passed
+- `FAIL` — at least one required gate failed
+- `PENDING_LOGIT_GATE` — text heuristic or quick run; real logit comparison not yet done
+- `PENDING_MEMORY_METRICS` — actual KV memory or working-set memory not yet measured
+- `PENDING_REAL_CACHE_INJECTION` — compression measured offline; generation does not use the candidate cache directly
+- `ERROR` — candidate crashed or could not run
 
 ## Gate levels
 

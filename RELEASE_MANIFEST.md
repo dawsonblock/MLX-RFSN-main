@@ -4,13 +4,13 @@
 
 | Field | Value |
 |-------|-------|
-| Release name | `mlx-rfsn-fusion-alpha-1` |
-| Git branch | `mlx-rfsn-fusion-cleanup` |
+| Release name | `mlx-rfsn-fusion-alpha-8` |
+| Git branch | `mlx-rfsn-fusion-alpha-8` |
 | Git commit | (see `git log -1 --oneline`) |
-| Frozen snapshot branch | `mlx-rfsn-current-snapshot` (preserved, do not delete) |
-| Build date | 2026-06-08 |
+| Frozen snapshot branch | `mlx-rfsn-fusion-alpha-7-snapshot` (preserved, do not delete) |
+| Build date | 2026-06-09 |
 | Python requirement | `>=3.11,<3.13` |
-| Development status | `3 - Alpha Candidate` |
+| Development status | `3 - Alpha` |
 
 ---
 
@@ -35,7 +35,24 @@ These are the only quantization presets validated for use:
 
 ---
 
-## Gate results
+## Alpha 8 gate results (honest status)
+
+| Step | Result |
+|------|--------|
+| CPU compile | PASS |
+| CPU tests non-db | PASS / SKIPPED |
+| rfsn_v11 tests no-MLX | PASS / SKIPPED |
+| Package build | PASS |
+| Docker healthcheck | NOT RUN |
+| Docker fusion-bench | NOT RUN |
+| Apple MLX tests | NOT RUN |
+| Shootout quick | PASS / NOT RUN |
+| Shootout full logit | NOT RUN |
+| Shootout memory | NOT RUN |
+| Promotion report | NOT RUN |
+| Promoted candidate | NONE |
+
+## Previous gate results
 
 ### Non-MLX gate (Linux / any platform)
 

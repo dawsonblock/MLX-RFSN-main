@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+LABEL maintainer="RFSN Contributors"
+LABEL description="MLX-RFSN Fusion benchmark — candidate shootout"
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r rfsn && useradd -r -g rfsn rfsn
+
+COPY pyproject.toml README.md ./
+COPY rfsn_v10/ ./rfsn_v10/
+COPY rfsn_v11/ ./rfsn_v11/
+COPY benchmarks/ ./benchmarks/
+COPY external/turboquant-mlx/ ./external/turboquant-mlx/
+COPY external/mlx-turboquant/ ./external/mlx-turboquant/
+COPY tests/ ./tests/
+COPY docs/ ./docs/
+
+RUN pip install --no-cache-dir -e ".[production,dev]"
+
+RUN mkdir -p /app/.cache /app/artifacts && chown -R rfsn:rfsn /app
+
+ENV PYTHONUNBUFFERED=1
+ENV RFSN_BACKEND=numpy
+ENV RFSN_CACHE_DIR=/app/.cache
+ENV RFSN_LOG_LEVEL=INFO
+
+USER rfsn
+
+CMD ["python", "benchmarks/kv_shootout.py", "--quick"]

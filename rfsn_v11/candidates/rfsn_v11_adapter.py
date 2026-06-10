@@ -1,4 +1,4 @@
-"""Candidate: RFSN v11 fusion prototype.
+"""Candidate: RFSN v11 fusion prototype (offline compression only).
 
 Tests the rfsn_v11 asymmetric K/V compression path:
   - WHT key quantization (KeyQuant)
@@ -17,7 +17,7 @@ The compression metrics (size_ratio, compression_factor) reflect what v11
 achieves on the KV data; the generation speed reflects baseline mlx_lm at
 comparable bit-width.  This is the honest measurement given current API limits.
 
-Status: experimental — must beat rfsn_v10 in shootout before promotion.
+Status: PENDING_REAL_CACHE_INJECTION — not promotion eligible.
 """
 from __future__ import annotations
 
@@ -27,10 +27,11 @@ from typing import Any
 import numpy as np
 
 from .base import CandidateResult, KVCompressionCandidate
+from .quality_gates import GATE_STATUS_PENDING_REAL_CACHE_INJECTION
 
 
 class RFSNV11Candidate(KVCompressionCandidate):
-    """RFSN v11 fusion compressor."""
+    """RFSN v11 fusion compressor (offline metrics only)."""
 
     def __init__(
         self,
@@ -46,9 +47,9 @@ class RFSNV11Candidate(KVCompressionCandidate):
         self.use_wht = use_wht
         self.dim = dim
         self.name = (
-            f"rfsn_v11_k{key_bits}v{value_bits}"
+            f"rfsn_v11_offline_asymmetric_kv"
+            f"_k{key_bits}v{value_bits}"
             f"_gs{group_size}"
-            f"{'_wht' if use_wht else ''}"
         )
 
     def is_available(self) -> bool:
@@ -72,7 +73,7 @@ class RFSNV11Candidate(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error="rfsn_v11 quant module or mlx_lm not importable",
             )
         try:
@@ -153,13 +154,12 @@ class RFSNV11Candidate(KVCompressionCandidate):
                 size_ratio=round(size_ratio, 4),
                 compression_factor=round(compression_factor, 3),
                 logit_cosine=round(cosine_k, 5),
-                passed_quality_gate=False,  # filled by shootout quality eval
+                promotion_eligible=False,
+                gate_status=GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
                 notes=(
-                    f"RFSN v11 fusion k{self.key_bits}v{self.value_bits} "
-                    f"gs{self.group_size} wht={self.use_wht}  "
-                    f"KV cosine={cosine_k:.4f}  "
-                    f"size_ratio={size_ratio:.3f} ({compression_factor:.2f}x smaller)  "
-                    "Generation via mlx_lm kv_bits (direct cache injection pending)"
+                    "RFSN v11 compression is measured offline. Generation path is not yet "
+                    "using direct RFSN v11 cache injection. Not promotion eligible until "
+                    "direct injection exists."
                 ),
             )
         except Exception as exc:
@@ -167,6 +167,6 @@ class RFSNV11Candidate(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error=str(exc),
             )

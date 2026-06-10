@@ -17,7 +17,7 @@ Source: external/turboquant-mlx/turboquant/cache_v2.py
         external/turboquant-mlx/turboquant/patch.py
         external/turboquant-mlx/run_llm.py
 
-Status: experimental candidate — must pass quality gate before promotion.
+Status: experimental candidate — must pass full logit gate before promotion.
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 # Absolute path to external/turboquant-mlx so the import works regardless
 # of working directory.
@@ -159,7 +160,7 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error="turboquant-mlx or mlx/mlx_lm not available",
             )
         try:
@@ -249,7 +250,7 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 generated_text=generated_text,
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
-                passed_quality_gate=False,  # filled by shootout quality eval
+                gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 notes=(
                     f"TurboQuant V2: b{self.bits} gs{self.group_size} "
                     f"rotation={use_rotation} head_dim={head_dim}  "
@@ -275,6 +276,6 @@ class TurboQuantV2Candidate(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error=str(exc),
             )

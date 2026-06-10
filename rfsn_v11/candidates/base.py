@@ -11,14 +11,14 @@ compression_factor
     baseline_size / compressed_size   (higher is better)
 
 Example: size_ratio=0.265 means "compressed size is 26.5% of FP16"
-         compression_factor=3.77 means "3.77× smaller than FP16"
+         compression_factor=3.77 means "3.77x smaller than FP16"
 
-Do NOT report these as "0.265× compression" — that is misleading.
+Do NOT report these as "0.265x compression" — that is misleading.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -26,35 +26,40 @@ class CandidateResult:
     # Identity
     name: str
     model_id: str
-    prompt: str
+    prompt_id: str = ""
+    prompt: str = ""
 
     # Memory
-    actual_kv_memory_mb: float | None = None
-    working_set_memory_mb: float | None = None
+    actual_kv_memory_mb: Optional[float] = None
+    working_set_memory_mb: Optional[float] = None
 
     # Compression
-    size_ratio: float | None = None          # compressed / baseline (lower is better)
-    compression_factor: float | None = None  # baseline / compressed (higher is better)
+    size_ratio: Optional[float] = None          # compressed / baseline (lower is better)
+    compression_factor: Optional[float] = None  # baseline / compressed (higher is better)
 
     # Timing (milliseconds)
-    prefill_ms: float | None = None
-    decode_ms: float | None = None
-    total_ms: float | None = None
+    prefill_ms: Optional[float] = None
+    decode_ms: Optional[float] = None
+    total_ms: Optional[float] = None
 
     # Throughput
-    tokens_per_sec: float | None = None
+    tokens_per_sec: Optional[float] = None
 
     # Quality vs. FP16 baseline
-    logit_cosine: float | None = None
-    kl_divergence: float | None = None
-    top1_match: float | None = None
-    top5_overlap: float | None = None
-    top10_overlap: float | None = None
-    max_logit_delta: float | None = None
-    first_divergent_token: int | None = None
+    logit_cosine: Optional[float] = None
+    kl_divergence: Optional[float] = None
+    top1_match: Optional[float] = None
+    top5_overlap: Optional[float] = None
+    top10_overlap: Optional[float] = None
+    max_logit_delta: Optional[float] = None
+    first_divergent_token: Optional[int] = None
 
-    # Gate outcome
-    passed_quality_gate: bool = False
+    # Gate outcomes
+    text_heuristic_passed: Optional[bool] = None
+    logit_gate_passed: Optional[bool] = None
+    memory_gate_passed: Optional[bool] = None
+    promotion_eligible: bool = False
+    gate_status: str = "PENDING_LOGIT_GATE"
 
     # Free-form notes
     notes: str = ""
@@ -81,7 +86,7 @@ class CandidateResult:
             parts.append(f"KL={self.kl_divergence:.2e}")
         if self.top5_overlap is not None:
             parts.append(f"top5={self.top5_overlap:.3f}")
-        gate = "PASS" if self.passed_quality_gate else "FAIL"
+        gate = self.gate_status
         return f"[{gate}] " + "  ".join(parts) if parts else f"[{gate}]"
 
 

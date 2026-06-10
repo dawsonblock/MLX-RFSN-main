@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 # Map the human-readable preset names to actual QuantizationConfig kwargs.
 # rfsn_v10.config.RFSNConfig has no from_preset() — we build it directly.
@@ -56,7 +57,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error="rfsn_v10 or mlx_lm not importable",
             )
         try:
@@ -97,7 +98,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=result_text,
-                passed_quality_gate=False,  # filled by shootout quality eval
+                gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 notes=(
                     f"RFSN v10 stable baseline — config={self.config_name} "
                     f"bits={quant_kwargs['default_bits']} "
@@ -109,6 +110,6 @@ class RFSNV10Candidate(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error=str(exc),
             )

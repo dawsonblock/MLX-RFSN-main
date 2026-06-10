@@ -3,8 +3,8 @@
 ## Status: RFSN v10.2 Stable Alpha
 
 **Stable alpha.** Critical packaging and deployment issues resolved, server hardening
-completed, and comprehensive test coverage added. Ready for local Apple Silicon MLX research
-server deployment with proper wheel installation and release tooling.
+completed, and comprehensive test coverage added. This is a research and benchmarking system for comparing KV-cache compression
+candidates on Apple Silicon. It is not production-ready.
 
 To verify the current state locally:
 
@@ -25,7 +25,7 @@ python scripts/release_gate.py --cpu-only        # must print: Gate: 9 passed, 0
 | CUDA backend | **Not implemented** |
 | Full portable runtime | Not implemented — MLX required for core runtime |
 | End-to-end speedup | Not proven — decode TPS comparable, compression overhead makes total slower at short contexts |
-| Production deployment | FastAPI server — `/v1/chat/completions` with SSE streaming, authentication, and proper wheel packaging (mlx/numpy) |
+| Research server | FastAPI server — `/v1/chat/completions` with SSE streaming, authentication, and proper wheel packaging (mlx/numpy). Not production-hardened. |
 | Docker | Healthcheck validation + ClickHouse telemetry (CPU-only, no inference) |
 | >8-bit compression | Uses raw uint32 fallback — bit-packing is real for 2-8 bit only |
 | Experimental Metal | No Metal kernels exist for the experimental quantization paths |
@@ -174,7 +174,7 @@ FP32 reference) measured with `tests/test_short_prompt_decode_drift.py`.
 2. **QJL correction is disabled by default.** Experimental — not validated.
 3. **Experimental configs may degrade logits.** Short-prompt drift under active investigation.
 4. **Full runtime requires MLX.** Apple Silicon is mandatory for the core runtime.
-5. **Docker service mode is not production hardened.** CLI health check only; no HTTP service exposed.
+5. **Docker service mode is a research/local test server only.** Not production-hardened. CLI health check only; no HTTP service exposed in default image.
 6. **CUDA not implemented.** Do not depend on it.
 7. **End-to-end speedup not proven.** Decode TPS is comparable; compression overhead makes total time slower at short contexts.
 8. **macOS x86 Metal not supported.** MLX is ARM-only; Intel Mac users get NumPy backend only.

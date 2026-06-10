@@ -8,10 +8,11 @@ from __future__ import annotations
 import time
 from typing import Any
 
-import numpy as np
-
 from .base import CandidateResult, KVCompressionCandidate
-from .quality_gates import evaluate_quality_gate, logit_quality_metrics
+from .quality_gates import (
+    GATE_STATUS_PASS,
+    compute_promotion_eligibility,
+)
 
 
 class MLXLMBaseline(KVCompressionCandidate):
@@ -57,6 +58,16 @@ class MLXLMBaseline(KVCompressionCandidate):
             gen_tokens = max(len(output_ids) - len(input_ids), 1)
             tps = gen_tokens / (total_ms / 1000)
 
+            # Baseline has perfect quality by definition
+            promotion_eligible, gate_status = compute_promotion_eligibility(
+                logit_gate_passed=True,
+                memory_gate_passed=True,
+                actual_kv_memory_mb=None,  # baseline does not compress
+                working_set_memory_mb=None,
+                size_ratio=1.0,
+                compression_factor=1.0,
+            )
+
             return CandidateResult(
                 name=self.name,
                 model_id=getattr(model, "name_or_path", "unknown"),
@@ -65,7 +76,6 @@ class MLXLMBaseline(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=output,
-                # Baseline has perfect quality by definition
                 logit_cosine=1.0,
                 kl_divergence=0.0,
                 top1_match=1.0,
@@ -73,7 +83,10 @@ class MLXLMBaseline(KVCompressionCandidate):
                 top10_overlap=1.0,
                 max_logit_delta=0.0,
                 first_divergent_token=None,
-                passed_quality_gate=True,
+                logit_gate_passed=True,
+                memory_gate_passed=True,
+                promotion_eligible=promotion_eligible,
+                gate_status=gate_status,
                 notes="FP16 baseline — no compression applied",
             )
         except Exception as exc:
@@ -81,6 +94,6 @@ class MLXLMBaseline(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error=str(exc),
             )

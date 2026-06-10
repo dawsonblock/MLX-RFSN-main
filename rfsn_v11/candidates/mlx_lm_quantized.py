@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
+from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 
 class MLXLMQuantizedKV(KVCompressionCandidate):
@@ -49,7 +50,7 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 notes=(
                     "mlx_lm.utils.generate_step does not expose kv_bits. "
                     "Upgrade mlx-lm or skip this candidate."
@@ -87,7 +88,7 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=output,
-                passed_quality_gate=False,  # filled by shootout quality eval
+                gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 notes=f"MLX-LM built-in {self.kv_bits}-bit KV quantization",
             )
         except Exception as exc:
@@ -95,6 +96,6 @@ class MLXLMQuantizedKV(KVCompressionCandidate):
                 name=self.name,
                 model_id="unknown",
                 prompt=prompt,
-                passed_quality_gate=False,
+                gate_status="ERROR",
                 error=str(exc),
             )

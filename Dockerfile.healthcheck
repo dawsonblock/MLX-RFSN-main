@@ -1,0 +1,34 @@
+FROM python:3.11-slim
+
+LABEL maintainer="RFSN Contributors"
+LABEL description="MLX-RFSN healthcheck — stable baseline only"
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r rfsn && useradd -r -g rfsn rfsn
+
+COPY pyproject.toml README.md ./
+COPY rfsn_v10/ ./rfsn_v10/
+COPY agent_core/ ./agent_core/
+COPY tools/ ./tools/
+
+RUN pip install --no-cache-dir -e ".[production]"
+
+RUN mkdir -p /app/.cache /app/artifacts && chown -R rfsn:rfsn /app
+
+ENV PYTHONUNBUFFERED=1
+ENV RFSN_BACKEND=numpy
+ENV RFSN_CACHE_DIR=/app/.cache
+ENV RFSN_LOG_LEVEL=INFO
+
+USER rfsn
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -m rfsn_v10 healthcheck
+
+CMD ["python", "-m", "rfsn_v10", "healthcheck"]

@@ -46,6 +46,12 @@
 
 ## General
 
-- RFSN is **not production-ready**.
+- MLX-RFSN Fusion is **not production-ready**.
 - Default config remains `k8_v5_gs64` on the stable path.
 - Experimental quantizers exist for research but are not the default runtime.
+- rfsn_v11 fusion compressor is experimental — not promotion eligible without real cache injection.
+- TurboQuant V2 adapter is experimental — not promotion eligible without full logit gate.
+- Polar reference adapter is reference-only — not promotion eligible without full metrics.
+- QJL is experimental — disabled by default.
+- sparse decode is experimental — disabled by default.
+- server deployment is a research/local test server only.
