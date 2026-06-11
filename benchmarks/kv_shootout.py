@@ -175,6 +175,8 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
     from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
     from rfsn_v11.candidates.rfsn_v11_adapter import RFSNV11Candidate
     from rfsn_v11.candidates.turboquant_v2_adapter import TurboQuantV2Candidate
+    from rfsn_v11.candidates.turbo_polar_adapter import TurboPolarAdapter
+    from rfsn_v11.candidates.turbo_polar_config import TurboPolarConfig
 
     all_candidates: list[KVCompressionCandidate] = [
         MLXLMBaseline(),
@@ -187,6 +189,7 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
         ),
         TurboQuantV2Candidate(bits=4, group_size=64),
         PolarReferenceAdapter(bits=4, dim=128),
+        TurboPolarAdapter(TurboPolarConfig()),
     ]
 
     available = []
@@ -715,7 +718,9 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
     for r in results:
         if r.failed_gate_reasons:
             all_reasons.extend(r.failed_gate_reasons)
-    agg["failed_gate_reasons"] = sorted(set(all_reasons)) if all_reasons else []
+    agg["failed_gate_reasons"] = (
+        sorted(set(all_reasons)) if all_reasons else []
+    )
     return agg
 
 
@@ -839,7 +844,9 @@ def _write_artifacts(
             "Actual KV cache bytes (actual_kv_memory_mb) are the stable "
             "compression proof.\n"
         )
-        token_sequence_hash = payload["metadata"].get("token_sequence_hash", "")
+        token_sequence_hash = payload["metadata"].get(
+            "token_sequence_hash", ""
+        )
         if token_sequence_hash:
             fh.write(
                 f"**Token sequence hash:** `{token_sequence_hash}`  \n"
@@ -1026,7 +1033,9 @@ def main() -> None:
                     else:
                         full_logit_valid = True
             except Exception as exc:
-                validation_reason = f"full_logit artifact validation error: {exc}"
+                validation_reason = (
+                    f"full_logit artifact validation error: {exc}"
+                )
 
         if full_logit_valid:
             try:

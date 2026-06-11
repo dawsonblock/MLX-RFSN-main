@@ -32,6 +32,11 @@ CANDIDATE_STATUSES: dict[str, CandidateStatus] = {
     "turboquant_v2_b4_gs64_rot": CandidateStatus.EXPERIMENTAL,
     "turboquant_v2_b4_gs64_norot": CandidateStatus.EXPERIMENTAL,
     "polar_reference_offline_b4_d128": CandidateStatus.REFERENCE_ONLY,
+    # Alpha 9 TurboPolar — all experimental until gates pass
+    "turbo_polar_offline": CandidateStatus.OFFLINE_ONLY,
+    "turbo_polar_qjl": CandidateStatus.EXPERIMENTAL,
+    "turbo_polar_metal_qk": CandidateStatus.EXPERIMENTAL,
+    "turbo_polar_online_attention": CandidateStatus.EXPERIMENTAL,
 }
 
 

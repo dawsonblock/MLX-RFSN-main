@@ -154,6 +154,20 @@ class ExperimentalConfig(BaseModel):
         description="IsoQuant/hybrid-polar-cartesian paths (unvalidated in v11)",
     )
 
+    # Alpha 9 TurboPolar gates (all disabled by default — EXPERIMENTAL)
+    enable_turbo_polar_offline: bool = Field(
+        default=False,
+        description="TurboPolar offline PolarQuant encoder/decoder (EXPERIMENTAL)",
+    )
+    enable_turbo_polar_qjl: bool = Field(
+        default=False,
+        description="TurboPolar QJL residual score correction (EXPERIMENTAL)",
+    )
+    enable_turbo_polar_metal: bool = Field(
+        default=False,
+        description="TurboPolar fused Metal dequant-QK + attention kernels (EXPERIMENTAL_METAL)",
+    )
+
 
 class RuntimeConfig(BaseModel):
     """Runtime flags."""
@@ -273,6 +287,18 @@ class RFSNConfig(BaseModel):
                     os.getenv("RFSN_EXPERIMENTAL_ISOQUANT", "false").lower()
                     == "true"
                 ),
+                enable_turbo_polar_offline=(
+                    os.getenv("RFSN_EXPERIMENTAL_TURBO_POLAR_OFFLINE", "false").lower()
+                    == "true"
+                ),
+                enable_turbo_polar_qjl=(
+                    os.getenv("RFSN_EXPERIMENTAL_TURBO_POLAR_QJL", "false").lower()
+                    == "true"
+                ),
+                enable_turbo_polar_metal=(
+                    os.getenv("RFSN_EXPERIMENTAL_TURBO_POLAR_METAL", "false").lower()
+                    == "true"
+                ),
             ),
         )
 
@@ -347,6 +373,10 @@ def require_experimental(feature: str, config: RFSNConfig | None = None) -> None
         "qjl_prod": exp.enable_qjl_prod,
         "sub4bit_small_head": exp.enable_sub4bit_small_head,
         "isoquant": exp.enable_isoquant,
+        # Alpha 9 TurboPolar gates
+        "turbo_polar_offline": exp.enable_turbo_polar_offline,
+        "turbo_polar_qjl": exp.enable_turbo_polar_qjl,
+        "turbo_polar_metal": exp.enable_turbo_polar_metal,
     }
 
     if feature not in enabled:
