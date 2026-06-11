@@ -11,6 +11,11 @@ from typing import Any
 
 import numpy as np
 
+from rfsn_v11.candidates.teacher_forcing import (
+    expected_logprob_count,
+    forced_input_tokens_for_generated,
+)
+
 
 class FakeTokenizer:
     """Minimal tokenizer for testing."""
@@ -85,8 +90,8 @@ def _simulate_teacher_forced_loop(
     model(np.array(prompt_ids)[None])
     # logprob_list gets first entry from prefill final call
 
-    # Teacher-forced decode: feed gen_ids[:-1]
-    for forced_token_id in gen_ids[:-1]:
+    # Teacher-forced decode: feed all but the last generated token
+    for forced_token_id in forced_input_tokens_for_generated(gen_ids):
         model(np.array([forced_token_id])[None])
 
     return model.received_tokens
@@ -194,6 +199,19 @@ def test_correct_loop_length_assertion() -> None:
 
         # Total log-probs = 1 (prefill) + len(gen_ids)-1 = len(gen_ids)
         # We can't check logprob_list directly, but call_count is a proxy.
+
+
+def test_teacher_forced_alignment_uses_previous_generated_tokens() -> None:
+    """forced_input_tokens_for_generated must return all but the last token."""
+    gen_ids = [101, 102, 103, 104]
+    assert forced_input_tokens_for_generated(gen_ids) == [101, 102, 103]
+
+
+def test_teacher_forced_logprob_count_matches_generated_count() -> None:
+    """After prefill, the number of log-prob vectors equals len(gen_ids)."""
+    assert expected_logprob_count([101, 102, 103]) == 3
+    assert expected_logprob_count([]) == 0
+    assert expected_logprob_count([101]) == 1
 
 
 def test_teacher_forced_alignment_with_varying_lengths() -> None:

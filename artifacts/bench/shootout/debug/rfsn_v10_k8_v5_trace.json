@@ -1,6 +1,8 @@
 {
-  "candidate_name": "rfsn_v10_k8_v5_gs64",
-  "config_name": "k8_v5_gs64",
+  "trace_type": "estimated",
+  "promotion_valid": false,
+  "candidate_name": "rfsn_v10_k8_v5_gs32",
+  "config_name": "k8_v5_gs32",
   "cache_backend_used": "rfsn_v10_quantized_kv",
   "cache_events": [
     "prefill_quantize",
@@ -10,8 +12,8 @@
   "patch_restored": true,
   "layers_wrapped": 24,
   "teacher_forced_capture_used_rfsn_path": true,
-  "bytes_written": 2774016.0,
-  "bytes_read": 2774016.0,
+  "bytes_written": 3397632.0,
+  "bytes_read": 3397632.0,
   "cache_bytes_written_actual": null,
   "cache_bytes_read_actual": null,
   "prefill_quantize_events": null,
@@ -19,6 +21,5 @@
   "layers_wrapped_actual": null,
   "patch_enter_count": null,
   "patch_exit_count": null,
-  "notes": "TRACE IS ESTIMATED \u2014 NOT INSTRUMENTED.  bytes_written and bytes_read are derived from actual_kv_memory_mb, not runtime counters.  Promotion must be blocked until real instrumentation (cache_bytes_written_actual, cache_bytes_read_actual, prefill_quantize_events, decode_quantized_fetch_events, layers_wrapped_actual, patch_enter_count, patch_exit_count) replaces these estimates.",
-  "trace_type": "estimated"
+  "notes": "TRACE IS ESTIMATED \u2014 NOT INSTRUMENTED.  bytes_written and bytes_read are derived from actual_kv_memory_mb, not runtime counters.  Promotion must be blocked until real instrumentation (cache_bytes_written_actual, cache_bytes_read_actual, prefill_quantize_events, decode_quantized_fetch_events, layers_wrapped_actual, patch_enter_count, patch_exit_count) replaces these estimates."
 }

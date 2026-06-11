@@ -35,6 +35,26 @@ TOP10_OVERLAP_MIN: float = 0.90
 MAX_LOGIT_DELTA_MAX: float = 10.0
 
 
+@dataclass(frozen=True)
+class LogitGateThresholds:
+    """Single source of truth for full-logit quality gate thresholds."""
+
+    logit_cosine_min: float = 0.999
+    kl_divergence_max: float = 0.1
+    top5_overlap_min: float = 0.85
+    top10_overlap_min: float = 0.90
+    max_logit_delta_max: float = 10.0
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "logit_cosine_min": self.logit_cosine_min,
+            "kl_divergence_max": self.kl_divergence_max,
+            "top5_overlap_min": self.top5_overlap_min,
+            "top10_overlap_min": self.top10_overlap_min,
+            "max_logit_delta_max": self.max_logit_delta_max,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Allowed gate_status values
 # ---------------------------------------------------------------------------

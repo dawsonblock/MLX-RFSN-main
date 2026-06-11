@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from .logit_metrics import cosine_similarity
+from .teacher_forcing import forced_input_tokens_for_generated
 from .quality_gates import (
     KL_DIVERGENCE_MAX,
     LOGIT_COSINE_MIN,
@@ -339,8 +340,7 @@ def capture_teacher_forced_logprobs(
         # Teacher-forced decode: feed known generated tokens one by one.
         # After prefill we already have the log-prob for predicting the FIRST
         # generated token (g1).  To get the log-prob for predicting g2 we
-        # must feed g1 into the model, to get g3 we feed g2, etc.  So the
-        # loop iterates over gen_ids[:-1] — every token except the last one.
+        # must feed g1 into the model, to get g3 we feed g2, etc.
         #
         # Example: gen_ids = [g1, g2, g3, g4]
         #   prefill  → logprobs for g1  (already in logprob_list)
@@ -348,7 +348,7 @@ def capture_teacher_forced_logprobs(
         #   feed g2  → logprobs for g3
         #   feed g3  → logprobs for g4
         # Result: 4 log-prob vectors matching the 4 generated tokens.
-        for forced_token_id in gen_ids[:-1]:
+        for forced_token_id in forced_input_tokens_for_generated(gen_ids):
             logits = model(
                 mx.array([forced_token_id])[None], cache=cache_list
             )

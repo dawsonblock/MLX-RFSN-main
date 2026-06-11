@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| Release name | `MLX-RFSN Fusion Alpha 8.3` |
+| Release name | `MLX-RFSN Fusion Alpha 8.4` |
 | Git branch | `mlx-rfsn-fusion-alpha-8` |
 | Git commit | (see `git log -1 --oneline`) |
 | Frozen snapshot branch | `mlx-rfsn-fusion-alpha-8-1-snapshot` (preserved, do not delete) |
@@ -35,7 +35,7 @@ These are the only quantization presets validated for use:
 
 ---
 
-## Alpha 8.3 gate results (honest status)
+## Alpha 8.4 gate results (honest status)
 
 | Step | Result |
 |------|--------|

@@ -126,6 +126,7 @@ def _export_rfsn_v10_proof_trace(
 
     trace = {
         "trace_type": "estimated",
+        "promotion_valid": False,
         "candidate_name": candidate_name,
         "config_name": config_name,
         "cache_backend_used": "rfsn_v10_quantized_kv",
@@ -165,22 +166,29 @@ def _export_rfsn_v10_proof_trace(
 
 
 def _export_winner(
-    rows: list[dict[str, Any]], models_tested: list[str]
+    rows: list[dict[str, Any]],
+    models_tested: list[str],
+    methodology_status: str = "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION",
+    promotion_allowed: bool = False,
 ) -> None:
     """Export winner artifacts when a candidate is promotion eligible."""
     eligible = [r for r in rows if r.get("promotion_eligible")]
     WINNER_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not eligible:
+    # Global promotion lock: even if candidates pass gates, promotion
+    # remains disabled until runtime-instrumented traces and token
+    # provenance are fully validated.
+    if not promotion_allowed or not eligible:
         winner_data = {
             "winner": None,
             "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
             "reason": (
-                "Teacher-forced logit gate has been introduced; "
-                "candidates must be revalidated under the corrected "
-                "methodology before promotion."
+                "Teacher-forced validation artifacts are present, but "
+                "promotion remains disabled until token provenance and "
+                "runtime-instrumented cache traces are complete."
             ),
             "methodology": "teacher_forced_logit_v1",
+            "methodology_status": methodology_status,
             "promotion_allowed": False,
         }
     else:
@@ -194,6 +202,7 @@ def _export_winner(
                 "equal or better decode speed."
             ),
             "methodology": "teacher_forced_logit_v1",
+            "methodology_status": methodology_status,
             "promotion_allowed": True,
             "models_tested": models_tested,
             "artifacts": {

@@ -1,13 +1,8 @@
 {
   "winner": null,
   "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
-  "reason": "Teacher-forced logit gate has been introduced; candidates must be revalidated under the corrected methodology before promotion.",
+  "reason": "Teacher-forced validation artifacts are present, but promotion remains disabled until token provenance and runtime-instrumented cache traces are complete.",
   "methodology": "teacher_forced_logit_v1",
-  "promotion_allowed": false,
-  "models_tested": [],
-  "artifacts": {
-    "full_logit": "artifacts/bench/shootout/full_logit/results.json",
-    "memory": "artifacts/bench/shootout/memory/results.json",
-    "promotion": "artifacts/bench/shootout/promotion/results.json"
-  }
+  "methodology_status": "TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION",
+  "promotion_allowed": false
 }

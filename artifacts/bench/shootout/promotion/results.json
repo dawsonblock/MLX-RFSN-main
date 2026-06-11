@@ -1,31 +1,31 @@
 {
   "metadata": {
     "benchmark_methodology": "teacher_forced_logit_v1",
+    "methodology_status": "TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION",
     "baseline_decode_mode": "greedy",
     "comparison_mode": "same_token_sequence",
-    "token_sequence_hash": "",
+    "token_sequence_hash": "c2ff72f2e716ef3e30262cbaf5ec955629fe07b40ea88c6808602cb5b8b06716",
     "promotion_allowed": false,
     "artifact_schema_version": "2.0",
     "mode": "promotion",
-    "note": "Teacher-forced alignment fixed, but promotion remains disabled pending non-empty token_sequence_hash and runtime-instrumented proof trace.",
-    "methodology_status": "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION",
     "gate_thresholds": {
       "logit_cosine_min": 0.999,
       "kl_divergence_max": 0.1,
       "top5_overlap_min": 0.85,
       "top10_overlap_min": 0.9,
       "max_logit_delta_max": 10.0
-    }
+    },
+    "note": "Teacher-forced logit gate active. Artifacts are current and promotion is evaluated under the corrected gate."
   },
   "results": [
     {
       "name": "rfsn_v10_k8_v5_gs32",
       "model_id": "unknown",
       "candidate_status": "BASELINE",
-      "total_ms": 675.8667570005249,
-      "tokens_per_sec": 76.16000240670071,
+      "total_ms": 771.5875486658964,
+      "tokens_per_sec": 67.41385654931793,
       "actual_kv_memory_mb": 2.6455078125,
-      "working_set_memory_mb": 976.5969047546387,
+      "working_set_memory_mb": 976.2036960919698,
       "size_ratio": 0.5,
       "compression_factor": 2.0,
       "logit_cosine": 1.0,
@@ -34,20 +34,21 @@
       "top5_overlap": 1.0,
       "top10_overlap": 1.0,
       "max_logit_delta": 0.0,
-      "gate_status": "PASS_NO_PROMOTE",
-      "promotion_eligible": false,
+      "gate_status": "PASS",
+      "promotion_eligible": true,
       "real_cache_used": true,
       "count": 6,
-      "notes": "RFSN v10 stable baseline \u2014 config=k8_v5_gs32 bits=8 gs=32  Real RFSN v10 quantized KV cache active via SDPA patch.  [DEMOTED: teacher-forced methodology repair requires rerun before promotion.]"
+      "notes": "RFSN v10 stable baseline \u2014 config=k8_v5_gs32 bits=8 gs=32  Real RFSN v10 quantized KV cache active via SDPA patch.",
+      "failed_gate_reasons": []
     },
     {
       "name": "rfsn_v10_k8_v5_gs64",
       "model_id": "unknown",
       "candidate_status": "BASELINE",
-      "total_ms": 648.6585139937233,
-      "tokens_per_sec": 78.82170136714889,
+      "total_ms": 937.0819860050688,
+      "tokens_per_sec": 54.7690190536195,
       "actual_kv_memory_mb": 2.6455078125,
-      "working_set_memory_mb": 976.402843952179,
+      "working_set_memory_mb": 975.3485399881998,
       "size_ratio": 0.5,
       "compression_factor": 2.0,
       "logit_cosine": 1.0,
@@ -56,11 +57,12 @@
       "top5_overlap": 1.0,
       "top10_overlap": 1.0,
       "max_logit_delta": 0.0,
-      "gate_status": "PASS_NO_PROMOTE",
-      "promotion_eligible": false,
+      "gate_status": "PASS",
+      "promotion_eligible": true,
       "real_cache_used": true,
       "count": 6,
-      "notes": "RFSN v10 stable baseline \u2014 config=k8_v5_gs64 bits=8 gs=64  Real RFSN v10 quantized KV cache active via SDPA patch.  [DEMOTED: teacher-forced methodology repair requires rerun before promotion.]"
+      "notes": "RFSN v10 stable baseline \u2014 config=k8_v5_gs64 bits=8 gs=64  Real RFSN v10 quantized KV cache active via SDPA patch.",
+      "failed_gate_reasons": []
     }
   ]
 }

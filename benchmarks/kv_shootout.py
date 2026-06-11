@@ -92,6 +92,7 @@ from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
     KL_DIVERGENCE_MAX,
     LOGIT_COSINE_MIN,
+    LogitGateThresholds,
     MAX_LOGIT_DELTA_MAX,
     TOP5_OVERLAP_MIN,
     TOP10_OVERLAP_MIN,
@@ -786,13 +787,7 @@ def _write_artifacts(
     """Write JSON, CSV, and Markdown artifacts."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gate_thresholds = {
-        "logit_cosine_min": LOGIT_COSINE_MIN,
-        "kl_divergence_max": KL_DIVERGENCE_MAX,
-        "top5_overlap_min": TOP5_OVERLAP_MIN,
-        "top10_overlap_min": TOP10_OVERLAP_MIN,
-        "max_logit_delta_max": MAX_LOGIT_DELTA_MAX,
-    }
+    gate_thresholds = LogitGateThresholds().to_dict()
 
     payload = {
         "metadata": _artifact_metadata(
@@ -1121,14 +1116,26 @@ def main() -> None:
             except Exception:
                 pass
 
+    promotion_allowed = False
+    if promotion_allowed:
+        methodology_status = _METHODOLOGY_STATUS_RERUN_PROMO
+    elif not token_sequence_hash:
+        methodology_status = _METHODOLOGY_STATUS_RERUN_INCOMPLETE_NO_PROMO
+    else:
+        methodology_status = _METHODOLOGY_STATUS_RERUN_NO_PROMO
+
     _write_artifacts(
         all_rows,
         out_dir,
         mode=mode,
         token_sequence_hash=token_sequence_hash,
-        promotion_allowed=False,
+        promotion_allowed=promotion_allowed,
     )
-    _export_winner(all_rows, models_tested)
+    _export_winner(
+        all_rows, models_tested,
+        methodology_status=methodology_status,
+        promotion_allowed=promotion_allowed,
+    )
     print("\nDone.")
 
 

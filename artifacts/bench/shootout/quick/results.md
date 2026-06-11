@@ -4,13 +4,14 @@
 
 | Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |
 |-----------|--------|-------------|----------------|------------|-----------------|-----------|
-| mlx_lm_baseline | CONTROL | 56.56 | 1.000 | PASS_NO_PROMOTE | yes | no |
-| mlx_lm_quantized_kv_b8 | CONTROL | 51.09 | 0.500 | PENDING_LOGIT_GATE | yes | no |
-| rfsn_v10_k8_v5_gs32 | BASELINE | 92.16 | 0.500 | PENDING_LOGIT_GATE | yes | no |
-| rfsn_v10_k8_v5_gs64 | BASELINE | 84.55 | 0.500 | PENDING_LOGIT_GATE | yes | no |
-| rfsn_v11_offline_asymmetric_kv_k8v4_gs64 | OFFLINE_ONLY | 47.84 | 0.398 | PENDING_REAL_CACHE_INJECTION | no | no |
-| turboquant_v2_b4_gs64_norot | EXPERIMENTAL | 64.84 | 0.281 | PENDING_LOGIT_GATE | yes | no |
-| polar_reference_offline_b4_d128 | REFERENCE_ONLY | 16.46 | 0.121 | PENDING_LOGIT_GATE | yes | no |
+| mlx_lm_baseline | CONTROL | 45.36 | 1.000 | PASS_NO_PROMOTE | yes | no |
+| mlx_lm_quantized_kv_b8 | CONTROL | 42.04 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| rfsn_v10_k8_v5_gs32 | BASELINE | 61.77 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| rfsn_v10_k8_v5_gs64 | BASELINE | 71.26 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| rfsn_v11_offline_asymmetric_kv_k8v4_gs64 | OFFLINE_ONLY | 28.26 | 0.398 | PENDING_REAL_CACHE_INJECTION | no | no |
+| turboquant_v2_b4_gs64_norot | EXPERIMENTAL | 54.64 | 0.281 | PENDING_LOGIT_GATE | yes | no |
+| polar_reference_offline_b4_d128 | REFERENCE_ONLY | 13.56 | 0.121 | PENDING_LOGIT_GATE | yes | no |
+| turbo_polar_k4_qjl64 | EXPERIMENTAL | 0.00 | baseline | PENDING_LOGIT_GATE | yes | no |
 
 | *Summary* | — | — | — | — | — | **No candidate is promotion eligible.** |
 
@@ -21,5 +22,5 @@
 **Schema version:** 2.0  
 
 **Working-set memory measurement mode dependency**: Baseline working-set memory differs between full-logit mode (~975 MB) and memory-report mode (~1422 MB). This is due to different run paths, model warmup states, prompt lengths, and sampling timing. Working-set memory should be treated as measurement-mode dependent, not promotion-critical. Actual KV cache bytes (actual_kv_memory_mb) are the stable compression proof.
-**Token sequence hash:** *empty* — promotion blocked until teacher-forced rerun produces a non-empty hash.
+**Token sequence hash:** `c2ff72f2e716ef3e30262cbaf5ec955629fe07b40ea88c6808602cb5b8b06716`  
 **Current status:** No candidate is promotion eligible. Official promoted candidate: NONE.
