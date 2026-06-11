@@ -154,6 +154,24 @@ class RFSNV10Candidate(KVCompressionCandidate):
                     f"Teacher-forced length mismatch: "
                     f"{len(logprob_list)} log-probs for {len(gen_ids)} tokens"
                 )
+
+                # Collect runtime counters from the RFSNRuntime
+                if generator._runtime is not None:
+                    counters = generator._runtime.get_counters()
+                    # Count prefill events: each prefill chunk processes all layers.
+                    # The RFSNRuntime is only active during decode, so prefill
+                    # events are counted here from the adapter side.
+                    try:
+                        n_layers = len(model.layers)
+                    except Exception:
+                        n_layers = 0
+                    prefill_chunks = max(1, (len(prompt_ids) + 511) // 512)
+                    counters.prefill_quantize_events = n_layers * prefill_chunks
+                    counters.layers_wrapped_actual = n_layers
+                    self._last_runtime_counters = counters.as_dict()
+                else:
+                    self._last_runtime_counters = None
+
                 return np.stack(logprob_list, axis=0)
             finally:
                 _unwrap_layers_for_rfsn(model)

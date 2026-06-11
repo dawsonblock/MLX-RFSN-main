@@ -70,7 +70,8 @@ def _rfsn_sdpa_wrapper(
         and queries is not None
         and queries.ndim == 4
         and queries.shape[2] == 1
-        and queries.shape[1] == keys.shape[1]  # same head count (no GQA)
+        and keys.ndim == 4
+        and values.ndim == 4
     ):
         try:
             output, _info = runtime.execute_decode_step(
@@ -100,6 +101,8 @@ class _RFSNSDPAPatcher:
 
     def __enter__(self):
         try:
+            import sys
+
             import mlx_lm.models.base as base_module
 
             self._original = base_module.scaled_dot_product_attention
@@ -111,7 +114,17 @@ class _RFSNSDPAPatcher:
                 )
 
             base_module.scaled_dot_product_attention = _patched
+            # Many model modules import scaled_dot_product_attention directly
+            # (from .base import scaled_dot_product_attention).  Patch those
+            # local references too so the intercept actually fires.
+            for mod_name, mod in list(sys.modules.items()):
+                if mod_name.startswith("mlx_lm.models.") and hasattr(mod, "scaled_dot_product_attention"):
+                    if getattr(mod, "scaled_dot_product_attention", None) is original:
+                        mod.scaled_dot_product_attention = _patched
+
             _rfsn_thread_local.runtime = self.runtime
+            if self.runtime is not None:
+                self.runtime.counters.patch_enter_count += 1
         except Exception:
             # If patching fails, silently degrade to upstream path.
             pass
@@ -120,11 +133,19 @@ class _RFSNSDPAPatcher:
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if self._original is not None:
+                import sys
+
                 import mlx_lm.models.base as base_module
 
                 base_module.scaled_dot_product_attention = self._original
+                for mod_name, mod in list(sys.modules.items()):
+                    if mod_name.startswith("mlx_lm.models.") and hasattr(mod, "scaled_dot_product_attention"):
+                        if getattr(mod, "scaled_dot_product_attention", None) is not self._original:
+                            mod.scaled_dot_product_attention = self._original
         except Exception:
             pass
+        if self.runtime is not None:
+            self.runtime.counters.patch_exit_count += 1
         _rfsn_thread_local.runtime = None
         return False
 

@@ -1,5 +1,5 @@
 {
-  "trace_type": "estimated",
+  "trace_type": "runtime_instrumented",
   "promotion_valid": false,
   "candidate_name": "rfsn_v10_k8_v5_gs64",
   "config_name": "k8_v5_gs64",
@@ -12,14 +12,13 @@
   "patch_restored": true,
   "layers_wrapped": 24,
   "teacher_forced_capture_used_rfsn_path": true,
-  "bytes_written": 3182592.0,
-  "bytes_read": 3182592.0,
-  "cache_bytes_written_actual": null,
-  "cache_bytes_read_actual": null,
-  "prefill_quantize_events": null,
-  "decode_quantized_fetch_events": null,
-  "layers_wrapped_actual": null,
-  "patch_enter_count": null,
-  "patch_exit_count": null,
-  "notes": "TRACE IS ESTIMATED \u2014 NOT INSTRUMENTED.  bytes_written and bytes_read are derived from actual_kv_memory_mb, not runtime counters.  Promotion must be blocked until real instrumentation (cache_bytes_written_actual, cache_bytes_read_actual, prefill_quantize_events, decode_quantized_fetch_events, layers_wrapped_actual, patch_enter_count, patch_exit_count) replaces these estimates."
+  "cache_bytes_written_actual": 589632,
+  "cache_bytes_read_actual": 0,
+  "prefill_quantize_events": 24,
+  "decode_quantized_fetch_events": 0,
+  "decode_quantized_store_events": 49,
+  "layers_wrapped_actual": 24,
+  "patch_enter_count": 1,
+  "patch_exit_count": 1,
+  "notes": "Runtime-instrumented trace. Counters collected from RFSNRuntime during teacher-forced capture. Promotion remains blocked until full validation completes."
 }

@@ -105,6 +105,7 @@ def _export_rfsn_v10_proof_trace(
     model: Any,
     config_name: str,
     actual_kv_memory_mb: float | None,
+    runtime_counters: dict[str, Any] | None = None,
 ) -> None:
     """Write a debug proof trace proving the RFSN v10 quantized
     path was active.
@@ -118,45 +119,72 @@ def _export_rfsn_v10_proof_trace(
     except Exception:
         n_layers = 0
 
-    bytes_written = 0.0
-    bytes_read = 0.0
-    if actual_kv_memory_mb is not None:
-        bytes_written = actual_kv_memory_mb * 1024 * 1024
-        bytes_read = bytes_written
+    if runtime_counters is not None:
+        trace = {
+            "trace_type": "runtime_instrumented",
+            "promotion_valid": False,
+            "candidate_name": candidate_name,
+            "config_name": config_name,
+            "cache_backend_used": "rfsn_v10_quantized_kv",
+            "cache_events": ["prefill_quantize", "decode_quantized_fetch"],
+            "patch_active": True,
+            "patch_restored": True,
+            "layers_wrapped": n_layers,
+            "teacher_forced_capture_used_rfsn_path": True,
+            "cache_bytes_written_actual": runtime_counters.get("cache_bytes_written_actual"),
+            "cache_bytes_read_actual": runtime_counters.get("cache_bytes_read_actual"),
+            "prefill_quantize_events": runtime_counters.get("prefill_quantize_events"),
+            "decode_quantized_fetch_events": runtime_counters.get("decode_quantized_fetch_events"),
+            "decode_quantized_store_events": runtime_counters.get("decode_quantized_store_events"),
+            "layers_wrapped_actual": runtime_counters.get("layers_wrapped_actual"),
+            "patch_enter_count": runtime_counters.get("patch_enter_count"),
+            "patch_exit_count": runtime_counters.get("patch_exit_count"),
+            "notes": (
+                "Runtime-instrumented trace. Counters collected from "
+                "RFSNRuntime during teacher-forced capture. Promotion "
+                "remains blocked until full validation completes."
+            ),
+        }
+    else:
+        bytes_written = 0.0
+        bytes_read = 0.0
+        if actual_kv_memory_mb is not None:
+            bytes_written = actual_kv_memory_mb * 1024 * 1024
+            bytes_read = bytes_written
 
-    trace = {
-        "trace_type": "estimated",
-        "promotion_valid": False,
-        "candidate_name": candidate_name,
-        "config_name": config_name,
-        "cache_backend_used": "rfsn_v10_quantized_kv",
-        "cache_events": ["prefill_quantize", "decode_quantized_fetch"],
-        "patch_active": True,
-        "patch_restored": True,
-        "layers_wrapped": n_layers,
-        "teacher_forced_capture_used_rfsn_path": True,
-        # Estimated counters (derived from memory, not runtime)
-        "bytes_written": bytes_written,
-        "bytes_read": bytes_read,
-        # Runtime counter scaffolding — all None until instrumented
-        "cache_bytes_written_actual": None,
-        "cache_bytes_read_actual": None,
-        "prefill_quantize_events": None,
-        "decode_quantized_fetch_events": None,
-        "layers_wrapped_actual": None,
-        "patch_enter_count": None,
-        "patch_exit_count": None,
-        "notes": (
-            "TRACE IS ESTIMATED — NOT INSTRUMENTED.  "
-            "bytes_written and bytes_read are derived from "
-            "actual_kv_memory_mb, not runtime counters.  "
-            "Promotion must be blocked until real instrumentation "
-            "(cache_bytes_written_actual, cache_bytes_read_actual, "
-            "prefill_quantize_events, decode_quantized_fetch_events, "
-            "layers_wrapped_actual, patch_enter_count, patch_exit_count) "
-            "replaces these estimates."
-        ),
-    }
+        trace = {
+            "trace_type": "estimated",
+            "promotion_valid": False,
+            "candidate_name": candidate_name,
+            "config_name": config_name,
+            "cache_backend_used": "rfsn_v10_quantized_kv",
+            "cache_events": ["prefill_quantize", "decode_quantized_fetch"],
+            "patch_active": True,
+            "patch_restored": True,
+            "layers_wrapped": n_layers,
+            "teacher_forced_capture_used_rfsn_path": True,
+            # Estimated counters (derived from memory, not runtime)
+            "bytes_written": bytes_written,
+            "bytes_read": bytes_read,
+            # Runtime counter scaffolding — all None until instrumented
+            "cache_bytes_written_actual": None,
+            "cache_bytes_read_actual": None,
+            "prefill_quantize_events": None,
+            "decode_quantized_fetch_events": None,
+            "layers_wrapped_actual": None,
+            "patch_enter_count": None,
+            "patch_exit_count": None,
+            "notes": (
+                "TRACE IS ESTIMATED — NOT INSTRUMENTED.  "
+                "bytes_written and bytes_read are derived from "
+                "actual_kv_memory_mb, not runtime counters.  "
+                "Promotion must be blocked until real instrumentation "
+                "(cache_bytes_written_actual, cache_bytes_read_actual, "
+                "prefill_quantize_events, decode_quantized_fetch_events, "
+                "layers_wrapped_actual, patch_enter_count, patch_exit_count) "
+                "replaces these estimates."
+            ),
+        }
 
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     json_path = DEBUG_DIR / "rfsn_v10_k8_v5_trace.json"

@@ -427,19 +427,26 @@ def _run_once(
         elif candidate.name in (
             "rfsn_v10_k8_v5_gs32",
             "rfsn_v10_k8_v5_gs64",
+            "turbo_polar_k4_qjl64",
         ):
             # RFSN v10 with enable_sparse_decode=True activates the SDPA
             # patch so the RFSNRuntime + KVManager are used during both
             # generation and teacher-forced capture.
+            # TurboPolar uses a custom MLX-LM cache adapter that compresses
+            # keys with PolarQuant and stores values dense.
             candidate_logprobs = candidate.capture_logprobs(
                 model, tokenizer, prompt, baseline_text,
             )
-            if candidate_logprobs is not None:
+            if candidate_logprobs is not None and candidate.name.startswith("rfsn_v10"):
+                runtime_counters = getattr(
+                    candidate, "_last_runtime_counters", None
+                )
                 _export_rfsn_v10_proof_trace(
                     candidate_name=candidate.name,
                     model=model,
                     config_name=getattr(candidate, "config_name", ""),
                     actual_kv_memory_mb=result.actual_kv_memory_mb,
+                    runtime_counters=runtime_counters,
                 )
         else:
             # Any other candidate without a capture path

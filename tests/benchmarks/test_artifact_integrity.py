@@ -244,3 +244,22 @@ def test_active_artifacts_have_no_nan_or_infinity() -> None:
     assert not all_errors, (
         f"Non-finite floats found in artifacts: {all_errors}"
     )
+
+
+def test_rfsn_v10_trace_is_runtime_instrumented() -> None:
+    """RFSN v10 proof trace must be runtime-instrumented, not estimated."""
+    trace_path = Path("artifacts/bench/shootout/debug/rfsn_v10_k8_v5_trace.json")
+    if not trace_path.exists():
+        pytest.skip("RFSN v10 trace not generated yet")
+    trace = json.loads(trace_path.read_text())
+    assert trace.get("trace_type") == "runtime_instrumented", (
+        "RFSN v10 trace must be runtime_instrumented, not estimated"
+    )
+    # Key counters must be populated (not None)
+    assert trace.get("cache_bytes_written_actual") is not None
+    assert trace.get("cache_bytes_read_actual") is not None
+    assert trace.get("prefill_quantize_events") is not None
+    assert trace.get("decode_quantized_store_events") is not None
+    assert trace.get("patch_enter_count") == 1
+    assert trace.get("patch_exit_count") == 1
+    assert trace.get("layers_wrapped_actual") is not None
