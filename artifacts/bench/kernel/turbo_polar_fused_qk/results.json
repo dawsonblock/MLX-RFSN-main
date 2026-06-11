@@ -1,0 +1,12 @@
+{
+  "candidate": "turbo_polar_metal_qk",
+  "kernel_name": "tqpolar_fused_dequant_qk",
+  "gate_status": "PASS",
+  "used_metal": false,
+  "score_cosine": 1.0000000651140692,
+  "top10_overlap": 1.0,
+  "max_abs_error": 0.0,
+  "nan_inf_detected": false,
+  "fallback_used": true,
+  "notes": "Python/MLX reference path passes gate. Metal kernel is EXPERIMENTAL and disabled by default."
+}
