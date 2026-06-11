@@ -284,7 +284,10 @@ def capture_teacher_forced_logprobs(
     try:
         import mlx.core as mx
         from mlx_lm.models import cache as mlx_cache
-        from mlx_lm.utils import maybe_quantize_kv_cache
+        try:
+            from mlx_lm.utils import maybe_quantize_kv_cache
+        except ImportError:
+            maybe_quantize_kv_cache = None
 
         prompt_ids = tokenizer.encode(prompt)
         target_ids = tokenizer.encode(target_text)
@@ -318,9 +321,10 @@ def capture_teacher_forced_logprobs(
         y = mx.array(prompt_ids)
         while y.size > prefill_step_size:
             model(y[:prefill_step_size][None], cache=cache_list)
-            maybe_quantize_kv_cache(
-                cache_list, 0, kv_group_size, kv_bits,
-            )
+            if maybe_quantize_kv_cache is not None:
+                maybe_quantize_kv_cache(
+                    cache_list, 0, kv_group_size, kv_bits,
+                )
             mx.eval([c.state for c in cache_list])
             y = y[prefill_step_size:]
 
@@ -332,9 +336,10 @@ def capture_teacher_forced_logprobs(
         lp_np = np.array(logprobs.astype(mx.float32).squeeze(0))
         logprob_list: list[np.ndarray] = [lp_np]
 
-        maybe_quantize_kv_cache(
-            cache_list, 0, kv_group_size, kv_bits,
-        )
+        if maybe_quantize_kv_cache is not None:
+            maybe_quantize_kv_cache(
+                cache_list, 0, kv_group_size, kv_bits,
+            )
         mx.eval([c.state for c in cache_list])
 
         # Teacher-forced decode: feed known generated tokens one by one.
@@ -357,9 +362,10 @@ def capture_teacher_forced_logprobs(
             lp_np = np.array(logprobs.astype(mx.float32).squeeze(0))
             logprob_list.append(lp_np)
 
-            maybe_quantize_kv_cache(
-                cache_list, 0, kv_group_size, kv_bits,
-            )
+            if maybe_quantize_kv_cache is not None:
+                maybe_quantize_kv_cache(
+                    cache_list, 0, kv_group_size, kv_bits,
+                )
 
         assert len(logprob_list) == len(gen_ids), (
             f"Teacher-forced length mismatch: "

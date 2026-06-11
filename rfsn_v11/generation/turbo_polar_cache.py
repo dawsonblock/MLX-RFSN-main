@@ -5,13 +5,17 @@ Phase 5: K-only compressed cache.
   - Values stored dense fp16.
   - Real bytes_written / bytes_read counters.
 
-No promotion until real counters are proven and teacher-forced logit gate passes.
+No promotion until real counters are proven and teacher-forced
+logit gate passes.
 """
 from __future__ import annotations
 
 from typing import Any
 
-import mlx.core as mx
+try:
+    import mlx.core as mx
+except ImportError:
+    mx = None
 
 from rfsn_v11.quant.polar.encoder import PolarQuantEncoder
 from rfsn_v11.quant.polar.decoder import PolarQuantDecoder

@@ -96,10 +96,10 @@ class RFSNV11Candidate(KVCompressionCandidate):
                 skip_quality_gate=True,  # gate already passed in tests
             )
 
-            rng = np.random.RandomState(42)
+            rng = np.random.default_rng(42)
             batch = 256
-            keys_np = rng.randn(batch, self.dim).astype(np.float32)
-            vals_np = rng.randn(batch, self.dim).astype(np.float32)
+            keys_np = rng.standard_normal((batch, self.dim)).astype(np.float32)
+            vals_np = rng.standard_normal((batch, self.dim)).astype(np.float32)
             keys = mx.array(keys_np)
             vals = mx.array(vals_np)
 
@@ -108,7 +108,8 @@ class RFSNV11Candidate(KVCompressionCandidate):
             mx.eval(keys_rec, vals_rec)
 
             # Compute size ratio: count stored elements
-            fp16_bytes = 2 * batch * self.dim * 2  # keys + values, float16
+            # float16 = 2 bytes per element; keys + values = 2 tensors
+            fp16_bytes = batch * self.dim * 2 * 2
             # Key: codes (k_bits per element) + scales (float32 per group)
             k_code_bytes = batch * self.dim * self.key_bits / 8
             k_scale_bytes = (batch * self.dim / self.group_size) * 4

@@ -102,12 +102,13 @@ def _patch_polar_quant_vectorize() -> None:
 # -----------------------------------------------------------------------
 
 _polar_original_sdpa: Any = None
+_polar_patched_fn: Any = None
 _polar_patched = False
 
 
 def _apply_polar_patch() -> None:
     """Patch mlx_lm SDPA to accept TurboQuantKVCache (standard path)."""
-    global _polar_original_sdpa, _polar_patched
+    global _polar_original_sdpa, _polar_patched_fn, _polar_patched
     if _polar_patched:
         return
     import mlx_lm.models.base as base
@@ -119,6 +120,7 @@ def _apply_polar_patch() -> None:
         # so keys/values here are plain mx.array — standard SDPA applies.
         return _polar_original_sdpa(queries, keys, values, cache, scale, mask)
 
+    _polar_patched_fn = _patched
     base.scaled_dot_product_attention = _patched
     # Also patch any already-imported model modules
     import sys as _sys
@@ -134,7 +136,7 @@ def _apply_polar_patch() -> None:
 
 
 def _revert_polar_patch() -> None:
-    global _polar_original_sdpa, _polar_patched
+    global _polar_original_sdpa, _polar_patched_fn, _polar_patched
     if not _polar_patched or _polar_original_sdpa is None:
         return
     import sys as _sys
@@ -142,13 +144,19 @@ def _revert_polar_patch() -> None:
     import mlx_lm.models.base as base
 
     orig = _polar_original_sdpa
-    base.scaled_dot_product_attention = orig
+    patched = _polar_patched_fn
+    # Safety: only revert if our patch is still in place.
+    # If another candidate patched after us, leave their patch alone.
+    if base.scaled_dot_product_attention is patched:
+        base.scaled_dot_product_attention = orig
     for _name, _mod in list(_sys.modules.items()):
         if _name.startswith("mlx_lm.models.") and _mod is not None:
             if hasattr(_mod, "scaled_dot_product_attention"):
-                _mod.scaled_dot_product_attention = orig
+                if getattr(_mod, "scaled_dot_product_attention") is patched:
+                    _mod.scaled_dot_product_attention = orig
     _polar_patched = False
     _polar_original_sdpa = None
+    _polar_patched_fn = None
 
 
 class PolarReferenceAdapter(KVCompressionCandidate):

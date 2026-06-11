@@ -113,11 +113,29 @@ class RFSNV10Candidate(KVCompressionCandidate):
                         for _ in range(len(model.layers))
                     ]
 
+                try:
+                    from mlx_lm.utils import maybe_quantize_kv_cache
+                except ImportError:
+                    maybe_quantize_kv_cache = None
+
                 # Prefill
                 y = mx.array(prompt_ids)
                 while y.size > 512:
                     model(y[:512][None], cache=cache_list)
+                    if maybe_quantize_kv_cache is not None:
+                        maybe_quantize_kv_cache(
+                            cache_list, 0, quant_kwargs["group_size"],
+                            quant_kwargs.get("default_bits", 8),
+                        )
+                    mx.eval([c.state for c in cache_list])
                     y = y[512:]
+
+                if maybe_quantize_kv_cache is not None:
+                    maybe_quantize_kv_cache(
+                        cache_list, 0, quant_kwargs["group_size"],
+                        quant_kwargs.get("default_bits", 8),
+                    )
+                    mx.eval([c.state for c in cache_list])
 
                 patcher = _RFSNSDPAPatcher(generator._runtime)
                 patcher.__enter__()

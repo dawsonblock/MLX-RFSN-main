@@ -605,6 +605,12 @@ def _apply_promotion_rules(
         result.gate_status = GATE_STATUS_PENDING_REAL_CACHE_INJECTION
     elif status == CandidateStatus.FAILED:
         result.promotion_eligible = False
+    elif status in (
+        CandidateStatus.PROMOTED,
+        CandidateStatus.PROMOTION_ELIGIBLE,
+    ):
+        # Already elevated; preserve computed eligibility
+        pass
     # EXPERIMENTAL and BASELINE keep their computed eligibility
     return result
 
@@ -1065,17 +1071,30 @@ def main() -> None:
                         {"note": "No candidate passed quality gate."}
                     ]
             except Exception:
+                # Fallback: scan the already-loaded full_logit_payload
+                if isinstance(full_logit_payload, dict):
+                    fallback_results = full_logit_payload.get("results", [])
+                elif isinstance(full_logit_payload, list):
+                    fallback_results = full_logit_payload
+                else:
+                    fallback_results = []
+                _pass_statuses = (GATE_STATUS_PASS, "PASS_NO_PROMOTE")
                 quality_passed = [
-                    r for r in all_rows
-                    if r.get("gate_status") in (GATE_STATUS_PASS, "PASS_NO_PROMOTE")
+                    r for r in fallback_results
+                    if r.get("gate_status") in _pass_statuses
                 ]
-                if not quality_passed:
+                if quality_passed:
+                    _n = len(quality_passed)
+                    print(
+                        f"\nUsing full_logit artifacts: "
+                        f"{_n} candidate(s) passed quality gate."
+                    )
+                    all_rows = quality_passed
+                else:
                     print("\nNo candidate passed quality gate.")
                     all_rows = [
                         {"note": "No candidate passed quality gate."}
                     ]
-                else:
-                    all_rows = quality_passed
         else:
             print(
                 f"\nNo candidate is promotion eligible. "

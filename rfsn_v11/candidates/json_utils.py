@@ -8,6 +8,8 @@ import json
 import math
 from typing import Any
 
+__all__ = ["dump_json_strict", "dumps_json_strict"]
+
 
 def _sanitize_non_finite(obj: Any) -> Any:
     """Recursively replace non-finite floats with None."""
@@ -47,4 +49,6 @@ def dumps_json_strict(
     Non-finite floats are recursively replaced with ``None``.
     """
     sanitized = _sanitize_non_finite(obj)
-    return json.dumps(sanitized, indent=indent, default=default, allow_nan=False)
+    return json.dumps(
+        sanitized, indent=indent, default=default, allow_nan=False,
+    )

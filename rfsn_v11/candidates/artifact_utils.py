@@ -187,7 +187,8 @@ def _export_rfsn_v10_proof_trace(
         }
 
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    json_path = DEBUG_DIR / "rfsn_v10_k8_v5_trace.json"
+    safe_name = candidate_name.replace("_", "-").replace("/", "-").replace("\\", "-")
+    json_path = DEBUG_DIR / f"{safe_name}_trace.json"
     with json_path.open("w", encoding="utf-8") as fh:
         dump_json_strict(trace, fh, indent=2)
     print(f"  Wrote proof trace {json_path}")
