@@ -7,8 +7,8 @@
     "promotion_allowed": false,
     "artifact_schema_version": "2.0",
     "mode": "promotion",
-    "note": "Teacher-forced logit gate was introduced to fix prior methodology. All candidates demoted pending rerun under corrected gate.",
-    "methodology_status": "TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION",
+    "note": "Teacher-forced alignment fixed, but promotion remains disabled pending non-empty token_sequence_hash and runtime-instrumented proof trace.",
+    "methodology_status": "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION",
     "gate_thresholds": {
       "logit_cosine_min": 0.999,
       "kl_divergence_max": 0.1,

@@ -136,3 +136,34 @@ def test_promotion_allowed_true_respects_row_flag() -> None:
     md = _build_honest_markdown_table(rows, promotion_allowed=True)
     assert "| yes |" in md
     assert "No candidate is promotion eligible" not in md
+
+
+def test_markdown_no_stale_promotion_free_text() -> None:
+    """Free-text notes must not claim promotion when winner.json disagrees."""
+    winner_json = Path("artifacts/winner/winner.json")
+    if not winner_json.exists():
+        return
+    winner_data = json.loads(winner_json.read_text(encoding="utf-8"))
+    winner_null = winner_data.get("winner") is None
+    promotion_blocked = winner_data.get("promotion_allowed") is False
+    if not winner_null and not promotion_blocked:
+        return
+
+    banned_phrases = [
+        "Promoted candidate:",
+        "Promotion status:",
+        "Promotion result:",
+        "promotion eligible under Alpha 8.3 rules",
+        "promotion eligible under Alpha 8.4 rules",
+    ]
+    for mode in ("quick", "full_logit", "memory", "promotion"):
+        md_path = Path(f"artifacts/bench/shootout/{mode}/results.md")
+        if not md_path.exists():
+            continue
+        md_text = md_path.read_text(encoding="utf-8")
+        for phrase in banned_phrases:
+            assert phrase not in md_text, (
+                f"{md_path} contains stale promotion text: {phrase!r} "
+                f"but winner.json says winner={winner_data.get('winner')} "
+                f"promotion_allowed={winner_data.get('promotion_allowed')}"
+            )

@@ -7,8 +7,8 @@
     "promotion_allowed": false,
     "artifact_schema_version": "2.0",
     "mode": "full_logit",
-    "note": "Teacher-forced logit gate was introduced to fix prior methodology. These artifacts are considered stale until regenerated under the corrected gate. Promotion is not allowed until rerun.",
-    "methodology_status": "TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION",
+    "note": "Teacher-forced alignment fixed, but promotion remains disabled pending non-empty token_sequence_hash and runtime-instrumented proof trace.",
+    "methodology_status": "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION",
     "gate_thresholds": {
       "logit_cosine_min": 0.999,
       "kl_divergence_max": 0.1,
@@ -56,11 +56,12 @@
       "top5_overlap": 0.8886666666666665,
       "top10_overlap": 0.9036666666666666,
       "max_logit_delta": 7.458333333333333,
-      "gate_status": "FAIL",
+      "gate_status": "PASS_NO_PROMOTE",
       "promotion_eligible": false,
       "real_cache_used": true,
       "count": 6,
-      "notes": "MLX-LM built-in 8-bit KV quantization  [logit gate failed] | MLX-LM built-in 8-bit KV quantization  [PENDING_RERUN: teacher-forced methodology repair]"
+      "failed_gate_reasons": [],
+      "notes": "MLX-LM built-in 8-bit KV quantization  [CONTROL candidate: metrics pass but cannot promote] | MLX-LM built-in 8-bit KV quantization  [PENDING_RERUN: teacher-forced methodology repair]"
     },
     {
       "name": "rfsn_v10_k8_v5_gs32",
@@ -148,6 +149,13 @@
       "promotion_eligible": false,
       "real_cache_used": true,
       "count": 6,
+      "failed_gate_reasons": [
+        "logit_cosine 0.9947557747364044 < 0.999",
+        "KL 2.3515718976656594 > 0.1",
+        "top5_overlap 0.4046666666666667 < 0.85",
+        "top10_overlap 0.4043333333333334 < 0.9",
+        "max_logit_delta 27.989583333333332 > 10.0"
+      ],
       "notes": "TurboQuant V2: b4 gs64 rotation=False head_dim=64  Real KV cache via TurboQuantKVCacheV2 + SDPA patch.  Source: external/turboquant-mlx/turboquant/cache_v2.py  [logit gate failed]  [PENDING_RERUN: teacher-forced methodology repair]"
     },
     {
@@ -170,6 +178,13 @@
       "promotion_eligible": false,
       "real_cache_used": true,
       "count": 6,
+      "failed_gate_reasons": [
+        "logit_cosine 0.9953124821186066 < 0.999",
+        "KL 1.9279045859972637 > 0.1",
+        "top5_overlap 0.45999999999999996 < 0.85",
+        "top10_overlap 0.46166666666666667 < 0.9",
+        "max_logit_delta 26.018045743306477 > 10.0"
+      ],
       "notes": "Polar reference dequantizes on fetch. It is a reference candidate and is not promotion eligible unless full generation, logit, and working-set metrics pass.  [logit gate failed]  [PENDING_RERUN: teacher-forced methodology repair]"
     }
   ]

@@ -12,6 +12,13 @@
   "teacher_forced_capture_used_rfsn_path": true,
   "bytes_written": 2774016.0,
   "bytes_read": 2774016.0,
-  "notes": "TRACE IS ESTIMATED \u2014 NOT INSTRUMENTED.  bytes_written and bytes_read are derived from actual_kv_memory_mb, not runtime counters.  Promotion must be blocked until real instrumentation (cache_bytes_written_actual, cache_bytes_read_actual, prefill_quantize_events, decode_quantized_fetch_events) replaces these estimates.",
+  "cache_bytes_written_actual": null,
+  "cache_bytes_read_actual": null,
+  "prefill_quantize_events": null,
+  "decode_quantized_fetch_events": null,
+  "layers_wrapped_actual": null,
+  "patch_enter_count": null,
+  "patch_exit_count": null,
+  "notes": "TRACE IS ESTIMATED \u2014 NOT INSTRUMENTED.  bytes_written and bytes_read are derived from actual_kv_memory_mb, not runtime counters.  Promotion must be blocked until real instrumentation (cache_bytes_written_actual, cache_bytes_read_actual, prefill_quantize_events, decode_quantized_fetch_events, layers_wrapped_actual, patch_enter_count, patch_exit_count) replaces these estimates.",
   "trace_type": "estimated"
 }

@@ -7,8 +7,8 @@
     "promotion_allowed": false,
     "artifact_schema_version": "2.0",
     "mode": "memory",
-    "note": "Teacher-forced logit gate was introduced to fix prior methodology. These artifacts are considered stale until regenerated under the corrected gate. Promotion is not allowed until rerun.",
-    "methodology_status": "TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION",
+    "note": "Teacher-forced alignment fixed, but promotion remains disabled pending non-empty token_sequence_hash and runtime-instrumented proof trace.",
+    "methodology_status": "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION",
     "gate_thresholds": {
       "logit_cosine_min": 0.999,
       "kl_divergence_max": 0.1,

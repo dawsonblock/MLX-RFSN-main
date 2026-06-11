@@ -709,6 +709,13 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
     )
     agg["count"] = len(results)
     agg["notes"] = " | ".join({r.notes for r in results if r.notes})
+
+    # Aggregate failed_gate_reasons from all per-prompt results
+    all_reasons: list[str] = []
+    for r in results:
+        if r.failed_gate_reasons:
+            all_reasons.extend(r.failed_gate_reasons)
+    agg["failed_gate_reasons"] = sorted(set(all_reasons)) if all_reasons else []
     return agg
 
 
@@ -722,6 +729,9 @@ _METHODOLOGY_STATUS_RERUN_NO_PROMO = (
 _METHODOLOGY_STATUS_RERUN_PROMO = (
     "TEACHER_FORCED_RERUN_COMPLETE_PROMOTION_ALLOWED"
 )
+_METHODOLOGY_STATUS_RERUN_INCOMPLETE_NO_PROMO = (
+    "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION"
+)
 _METHODOLOGY_STATUS_RERUN_FAILED = "TEACHER_FORCED_RERUN_FAILED"
 
 
@@ -731,13 +741,15 @@ def _artifact_metadata(
     promotion_allowed: bool = False,
     gate_thresholds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    if promotion_allowed:
+        methodology_status = _METHODOLOGY_STATUS_RERUN_PROMO
+    elif not token_sequence_hash:
+        methodology_status = _METHODOLOGY_STATUS_RERUN_INCOMPLETE_NO_PROMO
+    else:
+        methodology_status = _METHODOLOGY_STATUS_RERUN_NO_PROMO
     return {
         "benchmark_methodology": _ARTIFACT_METHODLOGY,
-        "methodology_status": (
-            _METHODOLOGY_STATUS_RERUN_PROMO
-            if promotion_allowed
-            else _METHODOLOGY_STATUS_RERUN_NO_PROMO
-        ),
+        "methodology_status": methodology_status,
         "baseline_decode_mode": "greedy",
         "comparison_mode": "same_token_sequence",
         "token_sequence_hash": token_sequence_hash,
@@ -745,6 +757,17 @@ def _artifact_metadata(
         "artifact_schema_version": "2.0",
         "mode": mode,
         "gate_thresholds": gate_thresholds or {},
+        "note": (
+            "Teacher-forced alignment fixed, but promotion remains disabled "
+            "pending non-empty token_sequence_hash and "
+            "runtime-instrumented proof trace."
+            if not token_sequence_hash
+            else (
+                "Teacher-forced logit gate active. "
+                "Artifacts are current and promotion is evaluated "
+                "under the corrected gate."
+            )
+        ),
     }
 
 
@@ -816,6 +839,23 @@ def _write_artifacts(
             "Actual KV cache bytes (actual_kv_memory_mb) are the stable "
             "compression proof.\n"
         )
+        token_sequence_hash = payload["metadata"].get("token_sequence_hash", "")
+        if token_sequence_hash:
+            fh.write(
+                f"**Token sequence hash:** `{token_sequence_hash}`  \n"
+            )
+        else:
+            fh.write(
+                "**Token sequence hash:** *empty* — promotion blocked until "
+                "teacher-forced rerun produces a non-empty hash.\n"
+            )
+        # Defensive: never write stale promotion claims when
+        # promotion is globally disallowed.
+        if not promotion_allowed:
+            fh.write(
+                "**Current status:** No candidate is promotion eligible. "
+                "Official promoted candidate: NONE.\n"
+            )
 
     print(f"  Wrote {json_path}, {csv_path if rows else ''}, {md_path}")
 
@@ -942,12 +982,54 @@ def main() -> None:
     # Filter for promotion report
     if mode == "promotion":
         # Promotion eligibility requires full logit gate data.
-        # If full_logit artifacts exist, use those as the authority.
+        # If full_logit artifacts exist, validate them before use.
         full_logit_path = ARTIFACTS_ROOT / "full_logit" / "results.json"
+        full_logit_valid = False
+        validation_reason = "full_logit artifact not found"
         if full_logit_path.exists():
             try:
                 with full_logit_path.open("r", encoding="utf-8") as fh:
                     full_logit_payload = json.load(fh)
+                meta = full_logit_payload.get("metadata", {})
+                if meta.get("benchmark_methodology") != _ARTIFACT_METHODLOGY:
+                    validation_reason = (
+                        "full_logit artifact methodology mismatch: "
+                        f"{meta.get('benchmark_methodology')}"
+                    )
+                elif not meta.get("token_sequence_hash"):
+                    validation_reason = (
+                        "full_logit artifact token_sequence_hash is empty"
+                    )
+                elif meta.get("artifact_schema_version") != "2.0":
+                    validation_reason = (
+                        "full_logit artifact schema version mismatch: "
+                        f"{meta.get('artifact_schema_version')}"
+                    )
+                else:
+                    stale_phrases = [
+                        "stale until regenerated",
+                        "Promoted candidate:",
+                        "promotion eligible under Alpha 8.3 rules",
+                    ]
+                    full_md_path = (
+                        ARTIFACTS_ROOT / "full_logit" / "results.md"
+                    )
+                    md_text = (
+                        full_md_path.read_text(encoding="utf-8")
+                        if full_md_path.exists()
+                        else ""
+                    )
+                    if any(p in md_text for p in stale_phrases):
+                        validation_reason = (
+                            "full_logit markdown contains stale promotion text"
+                        )
+                    else:
+                        full_logit_valid = True
+            except Exception as exc:
+                validation_reason = f"full_logit artifact validation error: {exc}"
+
+        if full_logit_valid:
+            try:
                 full_logit_results = full_logit_payload.get(
                     "results", full_logit_payload
                 )
@@ -967,7 +1049,6 @@ def main() -> None:
                         {"note": "No candidate is promotion eligible."}
                     ]
             except Exception:
-                # Fall through to quick-mode fallback
                 eligible = [
                     r for r in all_rows if r.get("promotion_eligible")
                 ]
@@ -979,14 +1060,18 @@ def main() -> None:
                 else:
                     all_rows = eligible
         else:
-            eligible = [r for r in all_rows if r.get("promotion_eligible")]
-            if not eligible:
-                print("\nNo candidate is promotion eligible.")
-                all_rows = [
-                    {"note": "No candidate is promotion eligible."}
-                ]
-            else:
-                all_rows = eligible
+            print(
+                f"\nNo candidate is promotion eligible. "
+                f"Reason: {validation_reason}"
+            )
+            all_rows = [
+                {
+                    "note": (
+                        "No candidate is promotion eligible. "
+                        f"Reason: {validation_reason}"
+                    )
+                }
+            ]
 
     # Compute token-sequence hash from the last baseline result if
     # available.  Requires MLX + tokenizer; on CPU-only sandboxes the
@@ -1012,6 +1097,20 @@ def main() -> None:
                 )
         except Exception:
             pass
+    elif mode in ("memory", "quick", "promotion"):
+        # Non-full-logit modes should inherit the hash from full_logit
+        # artifacts so that promotion validation can cross-check.
+        full_logit_json = ARTIFACTS_ROOT / "full_logit" / "results.json"
+        if full_logit_json.exists():
+            try:
+                with full_logit_json.open("r", encoding="utf-8") as fh:
+                    full_payload = json.load(fh)
+                token_sequence_hash = (
+                    full_payload.get("metadata", {})
+                    .get("token_sequence_hash", "")
+                )
+            except Exception:
+                pass
 
     _write_artifacts(
         all_rows,

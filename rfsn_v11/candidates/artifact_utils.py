@@ -134,15 +134,25 @@ def _export_rfsn_v10_proof_trace(
         "patch_restored": True,
         "layers_wrapped": n_layers,
         "teacher_forced_capture_used_rfsn_path": True,
+        # Estimated counters (derived from memory, not runtime)
         "bytes_written": bytes_written,
         "bytes_read": bytes_read,
+        # Runtime counter scaffolding — all None until instrumented
+        "cache_bytes_written_actual": None,
+        "cache_bytes_read_actual": None,
+        "prefill_quantize_events": None,
+        "decode_quantized_fetch_events": None,
+        "layers_wrapped_actual": None,
+        "patch_enter_count": None,
+        "patch_exit_count": None,
         "notes": (
             "TRACE IS ESTIMATED — NOT INSTRUMENTED.  "
             "bytes_written and bytes_read are derived from "
             "actual_kv_memory_mb, not runtime counters.  "
             "Promotion must be blocked until real instrumentation "
             "(cache_bytes_written_actual, cache_bytes_read_actual, "
-            "prefill_quantize_events, decode_quantized_fetch_events) "
+            "prefill_quantize_events, decode_quantized_fetch_events, "
+            "layers_wrapped_actual, patch_enter_count, patch_exit_count) "
             "replaces these estimates."
         ),
     }
