@@ -38,6 +38,7 @@
       "promotion_eligible": false,
       "real_cache_used": true,
       "count": 6,
+      "failed_gate_reasons": [],
       "notes": "FP16 baseline \u2014 no compression applied  [PENDING_RERUN: teacher-forced methodology repair]"
     },
     {
@@ -83,6 +84,7 @@
       "promotion_eligible": false,
       "real_cache_used": true,
       "count": 6,
+      "failed_gate_reasons": [],
       "notes": "RFSN v10 stable baseline \u2014 config=k8_v5_gs32 bits=8 gs=32  Real RFSN v10 quantized KV cache active via SDPA patch.  [PENDING_RERUN: teacher-forced methodology repair]"
     },
     {
@@ -105,6 +107,7 @@
       "promotion_eligible": false,
       "real_cache_used": true,
       "count": 6,
+      "failed_gate_reasons": [],
       "notes": "RFSN v10 stable baseline \u2014 config=k8_v5_gs64 bits=8 gs=64  Real RFSN v10 quantized KV cache active via SDPA patch.  [PENDING_RERUN: teacher-forced methodology repair]"
     },
     {
@@ -127,6 +130,7 @@
       "promotion_eligible": false,
       "real_cache_used": false,
       "count": 6,
+      "failed_gate_reasons": [],
       "notes": "RFSN v11 compression is measured offline. Generation path is not yet using direct RFSN v11 cache injection. Not promotion eligible until direct injection exists.  [PENDING_RERUN: teacher-forced methodology repair]"
     },
     {
