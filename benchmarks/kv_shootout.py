@@ -809,7 +809,8 @@ def _write_artifacts(
     # CSV (use rows only, not metadata wrapper)
     if rows:
         csv_path = out_dir / "results.csv"
-        headers = list(rows[0].keys())
+        # Union of all keys across rows so extra fields don't crash the writer
+        headers = sorted({k for row in rows for k in row.keys()})
         with csv_path.open("w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=headers)
             writer.writeheader()
@@ -1039,32 +1040,35 @@ def main() -> None:
                 full_logit_results = full_logit_payload.get(
                     "results", full_logit_payload
                 )
-                eligible = [
+                # Show candidates whose quality gate passed (PASS or
+                # PASS_NO_PROMOTE), not only those with promotion_eligible.
+                quality_passed = [
                     r for r in full_logit_results
-                    if r.get("promotion_eligible")
+                    if r.get("gate_status") in (GATE_STATUS_PASS, "PASS_NO_PROMOTE")
                 ]
-                if eligible:
+                if quality_passed:
                     print(
                         f"\nUsing full_logit artifacts: "
-                        f"{len(eligible)} candidate(s) promotion eligible."
+                        f"{len(quality_passed)} candidate(s) passed quality gate."
                     )
-                    all_rows = eligible
+                    all_rows = quality_passed
                 else:
-                    print("\nNo candidate is promotion eligible.")
+                    print("\nNo candidate passed quality gate.")
                     all_rows = [
-                        {"note": "No candidate is promotion eligible."}
+                        {"note": "No candidate passed quality gate."}
                     ]
             except Exception:
-                eligible = [
-                    r for r in all_rows if r.get("promotion_eligible")
+                quality_passed = [
+                    r for r in all_rows
+                    if r.get("gate_status") in (GATE_STATUS_PASS, "PASS_NO_PROMOTE")
                 ]
-                if not eligible:
-                    print("\nNo candidate is promotion eligible.")
+                if not quality_passed:
+                    print("\nNo candidate passed quality gate.")
                     all_rows = [
-                        {"note": "No candidate is promotion eligible."}
+                        {"note": "No candidate passed quality gate."}
                     ]
                 else:
-                    all_rows = eligible
+                    all_rows = quality_passed
         else:
             print(
                 f"\nNo candidate is promotion eligible. "
@@ -1125,6 +1129,22 @@ def main() -> None:
         methodology_status = _METHODOLOGY_STATUS_RERUN_INCOMPLETE_NO_PROMO
     else:
         methodology_status = _METHODOLOGY_STATUS_RERUN_NO_PROMO
+
+    # Global promotion lock: if promotion is globally disabled, force every
+    # row to be non-promotable regardless of individual gate results.
+    if not promotion_allowed:
+        for row in all_rows:
+            if not isinstance(row, dict) or row.get("status", "").startswith("SKIPPED"):
+                continue
+            if "note" in row:
+                continue
+            if row.get("gate_status") == GATE_STATUS_PASS:
+                row["gate_status"] = "PASS_NO_PROMOTE"
+                row["promotion_blocked_reason"] = (
+                    "global promotion lock active; "
+                    "token provenance and runtime-instrumented traces incomplete"
+                )
+            row["promotion_eligible"] = False
 
     _write_artifacts(
         all_rows,

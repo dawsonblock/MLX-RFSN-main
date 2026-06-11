@@ -126,3 +126,31 @@ def test_no_promotion_when_roadmap_says_none() -> None:
         assert data.get("winner") is None, (
             "RELEASE_MANIFEST says NONE but winner.json names a winner"
         )
+
+
+def test_global_promotion_lock_forces_all_rows_non_promotable() -> None:
+    """If promotion_allowed=false, no row may claim promotion_eligible=true."""
+    for art_dir in [
+        Path("artifacts/bench/shootout/quick"),
+        Path("artifacts/bench/shootout/full_logit"),
+        Path("artifacts/bench/shootout/memory"),
+        Path("artifacts/bench/shootout/promotion"),
+    ]:
+        json_path = art_dir / "results.json"
+        if not json_path.exists():
+            continue
+        payload = _read_shootout_payload(json_path)
+        meta = payload.get("metadata", {})
+        if meta.get("promotion_allowed") is False:
+            rows = payload.get("results", [])
+            for row in rows:
+                if not isinstance(row, dict) or "note" in row:
+                    continue
+                assert row.get("promotion_eligible") is not True, (
+                    f"{art_dir.name} row {row.get('name')} has "
+                    f"promotion_eligible=true but promotion_allowed=false"
+                )
+                assert row.get("gate_status") != "PASS", (
+                    f"{art_dir.name} row {row.get('name')} has "
+                    f"gate_status=PASS while promotion is globally locked"
+                )

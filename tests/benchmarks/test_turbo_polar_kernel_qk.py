@@ -16,20 +16,16 @@ from __future__ import annotations
 import json
 import pathlib
 
-import mlx.core as mx
 import numpy as np
 import pytest
+
+pytestmark = [pytest.mark.mlx, pytest.mark.experimental]
+mx = pytest.importorskip("mlx.core", reason="MLX not available")
 
 from rfsn_v11.quant.polar.encoder import PolarQuantEncoder
 from rfsn_v11.quant.polar.decoder import PolarQuantDecoder
 from rfsn_v11.kernels.turbo_polar.metal import fused_dequant_qk
 from rfsn_v11.quant.qjl.encoder import QJLEncoder
-
-
-pytestmark = pytest.mark.skipif(
-    not hasattr(mx, "array"),
-    reason="MLX not available",
-)
 
 
 def _synthetic_keys(tokens: int = 64, dim: int = 128) -> mx.array:
