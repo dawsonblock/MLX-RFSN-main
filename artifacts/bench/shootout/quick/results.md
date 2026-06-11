@@ -4,13 +4,13 @@
 
 | Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |
 |-----------|--------|-------------|----------------|------------|-----------------|-----------|
-| mlx_lm_baseline | CONTROL | 45.36 | 1.000 | PASS_NO_PROMOTE | yes | no |
-| mlx_lm_quantized_kv_b8 | CONTROL | 42.04 | 0.500 | PENDING_LOGIT_GATE | yes | no |
-| rfsn_v10_k8_v5_gs32 | BASELINE | 61.77 | 0.500 | PENDING_LOGIT_GATE | yes | no |
-| rfsn_v10_k8_v5_gs64 | BASELINE | 71.26 | 0.500 | PENDING_LOGIT_GATE | yes | no |
-| rfsn_v11_offline_asymmetric_kv_k8v4_gs64 | OFFLINE_ONLY | 28.26 | 0.398 | PENDING_REAL_CACHE_INJECTION | no | no |
-| turboquant_v2_b4_gs64_norot | EXPERIMENTAL | 54.64 | 0.281 | PENDING_LOGIT_GATE | yes | no |
-| polar_reference_offline_b4_d128 | REFERENCE_ONLY | 13.56 | 0.121 | PENDING_LOGIT_GATE | yes | no |
+| mlx_lm_baseline | CONTROL | 28.12 | 1.000 | PASS_NO_PROMOTE | yes | no |
+| mlx_lm_quantized_kv_b8 | CONTROL | 19.26 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| rfsn_v10_k8_v5_gs32 | BASELINE | 33.20 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| rfsn_v10_k8_v5_gs64 | BASELINE | 35.24 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| rfsn_v11_offline_asymmetric_kv_k8v4_gs64 | OFFLINE_ONLY | 17.14 | 0.398 | PENDING_REAL_CACHE_INJECTION | no | no |
+| turboquant_v2_b4_gs64_norot | EXPERIMENTAL | 30.96 | 0.281 | PENDING_LOGIT_GATE | yes | no |
+| polar_reference_offline_b4_d128 | REFERENCE_ONLY | 8.86 | 0.121 | PENDING_LOGIT_GATE | yes | no |
 | turbo_polar_k4_qjl64 | EXPERIMENTAL | 0.00 | baseline | PENDING_LOGIT_GATE | yes | no |
 
 | *Summary* | — | — | — | — | — | **No candidate is promotion eligible.** |

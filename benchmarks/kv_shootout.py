@@ -82,7 +82,6 @@ from rfsn_v11.candidates.logit_capture import (  # noqa: E402
     capture_teacher_forced_logprobs,
     compute_logit_metrics_from_logprobs,
     compute_token_sequence_hash,
-    logit_gate_passed,
 )
 from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     GATE_STATUS_FAIL,
@@ -463,12 +462,15 @@ def _run_once(
             result.top10_overlap = metrics.get("top10_overlap")
             result.max_logit_delta = metrics.get("max_logit_delta")
             result.first_divergent_token = metrics.get("first_divergent_token")
-            result.logit_gate_passed = logit_gate_passed(metrics)
-            if not result.logit_gate_passed:
+            gate = evaluate_quality_gate(metrics)
+            result.logit_gate_passed = gate.passed
+            if not gate.passed:
                 result.gate_status = GATE_STATUS_FAIL
                 result.promotion_eligible = False
+                result.failed_gate_reasons = gate.failure_reasons
+                reasons = "; ".join(gate.failure_reasons)
                 result.notes += (
-                    "  [logit gate failed]"
+                    f"  [logit gate failed: {reasons}]"
                 )
             else:
                 result.memory_gate_passed = (
