@@ -4,8 +4,8 @@
 
 | Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |
 |-----------|--------|-------------|----------------|------------|-----------------|-----------|
-| rfsn_v10_k8_v5_gs32 | BASELINE | 67.41 | 0.500 | PASS | yes | no |
-| rfsn_v10_k8_v5_gs64 | BASELINE | 54.77 | 0.500 | PASS | yes | no |
+| rfsn_v10_k8_v5_gs32 | BASELINE | 118.66 | 0.500 | PASS | yes | no |
+| rfsn_v10_k8_v5_gs64 | BASELINE | 114.84 | 0.500 | PASS | yes | no |
 
 | *Summary* | — | — | — | — | — | **No candidate is promotion eligible.** |
 

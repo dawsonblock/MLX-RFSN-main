@@ -181,13 +181,16 @@ def test_winner_json_agrees_with_promotion_report() -> None:
     assert data.get("methodology") == "teacher_forced_logit_v1", (
         "winner.json must declare teacher_forced_logit_v1 methodology"
     )
-    if has_eligible:
+    # Global promotion lock: when promotion_allowed is false, winner must be
+    # null even if individual candidates pass quality gates.
+    promotion_allowed = data.get("promotion_allowed", False)
+    if promotion_allowed and has_eligible:
         assert data.get("winner") is not None, (
-            "winner.json should name a winner when candidates are promoted"
+            "winner.json should name a winner when promotion is allowed"
         )
     else:
         assert data.get("winner") is None, (
-            "winner.json should have null winner when no candidate is eligible"
+            "winner.json should have null winner when promotion is disallowed"
         )
 
 

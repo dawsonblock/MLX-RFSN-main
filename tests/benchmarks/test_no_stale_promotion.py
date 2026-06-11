@@ -38,14 +38,12 @@ def test_promotion_artifact_disallows_promotion_if_mismatch() -> None:
     payload = _read_shootout_payload(promo_json)
     meta = payload.get("metadata", {})
     if meta.get("promotion_allowed") is False:
-        results = payload.get("results", [])
-        has_eligible = any(
-            r.get("promotion_eligible")
-            for r in results
-            if isinstance(r, dict)
-        )
-        assert not has_eligible, (
-            "promotion_allowed=false but artifact has eligible"
+        # Global promotion lock: winner.json must be null even if the
+        # promotion report lists gate-passing candidates.
+        winner_json = Path("artifacts/winner/winner.json")
+        data = json.loads(winner_json.read_text())
+        assert data.get("winner") is None, (
+            "promotion_allowed=false but winner.json names a winner"
         )
 
 
