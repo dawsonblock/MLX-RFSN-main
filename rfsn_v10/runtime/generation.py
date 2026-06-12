@@ -5,26 +5,25 @@ a loaded model and tokenizer with:
 
 - Prefill (dense causal attention for the initial prompt)
 - Decode loop (streaming token generation)
-- RFSNRuntime integration hooks for KV-cache + sparse attention
+- Explicit per-layer quantized KV cache via ``RfsnMLXModelAdapter``
 - Temperature / top-p / repetition-penalty sampling
-- Telemetry collection per decode step
+- Telemetry / proof counters per generation
 
 The generator is backend-agnostic: it works with ``mlx-lm`` models on
 Apple Silicon or ``transformers`` models on any platform.
+
+**No global monkeypatching.**  The MLX path creates one
+``RfsnQuantizedKVCache`` per transformer layer and passes them to
+``mlx_lm.utils.stream_generate`` via ``prompt_cache``.  This avoids
+process-global SDPA mutation and is safe for concurrent serving.
 """
 from __future__ import annotations
 
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator
 
 from ..config import RFSNConfig, load_config
-from ..kv_manager import RFSNTurboQuantKVManager
-
-
-# Thread-local storage for RFSNRuntime SDPA patching context.
-_rfsn_thread_local = threading.local()
 
 
 try:
@@ -48,158 +47,6 @@ try:
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
-
-
-def _rfsn_sdpa_wrapper(
-    original_sdpa,
-    queries,
-    keys,
-    values,
-    cache,
-    scale,
-    mask,
-    sinks=None,
-):
-    """Intercept SDPA for decode steps and route through RFSNRuntime when active."""
-    runtime = getattr(_rfsn_thread_local, "runtime", None)
-    layer_id = getattr(_rfsn_thread_local, "layer_id", "unknown")
-    # Only intercept single-token decode steps with an active runtime.
-    # QuantizedKVCache (from maybe_quantize_kv_cache) passes keys/values as
-    # tuples of quantized arrays rather than plain arrays.  The RFSNRuntime
-    # cannot handle those yet, so fall through to the original SDPA.
-    if (
-        runtime is not None
-        and cache is not None
-        and queries is not None
-        and isinstance(queries, mx.array)
-        and queries.ndim == 4
-        and queries.shape[2] == 1
-        and isinstance(keys, mx.array)
-        and keys.ndim == 4
-        and isinstance(values, mx.array)
-        and values.ndim == 4
-    ):
-        try:
-            output, _info = runtime.execute_decode_step(
-                skill_pattern="decode",
-                layer_id=layer_id,
-                batch_id="batch_0",
-                queries=queries,
-                keys=keys,
-                values=values,
-            )
-            return output
-        except Exception:
-            # Telemetry / audit failures should not crash generation.
-            pass
-    # Fallback to original SDPA.
-    if sinks is not None:
-        return original_sdpa(queries, keys, values, cache, scale, mask, sinks)
-    return original_sdpa(queries, keys, values, cache, scale, mask)
-
-
-class _RFSNSDPAPatcher:
-    """Context manager that patches mlx_lm SDPA for RFSNRuntime decode steps."""
-
-    def __init__(self, runtime) -> None:
-        self.runtime = runtime
-        self._original: Any = None
-
-    def __enter__(self):
-        try:
-            import sys
-
-            import mlx_lm.models.base as base_module
-
-            self._original = base_module.scaled_dot_product_attention
-            original = self._original
-
-            def _patched(queries, keys, values, cache, scale, mask, sinks=None):
-                return _rfsn_sdpa_wrapper(
-                    original, queries, keys, values, cache, scale, mask, sinks
-                )
-
-            base_module.scaled_dot_product_attention = _patched
-            # Many model modules import scaled_dot_product_attention directly
-            # (from .base import scaled_dot_product_attention).  Patch those
-            # local references too so the intercept actually fires.
-            for mod_name, mod in list(sys.modules.items()):
-                if mod_name.startswith("mlx_lm.models.") and hasattr(mod, "scaled_dot_product_attention"):
-                    if getattr(mod, "scaled_dot_product_attention", None) is original:
-                        mod.scaled_dot_product_attention = _patched
-
-            _rfsn_thread_local.runtime = self.runtime
-            if self.runtime is not None:
-                self.runtime.counters.patch_enter_count += 1
-        except Exception:
-            # If patching fails, silently degrade to upstream path.
-            pass
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if self._original is not None:
-                import sys
-
-                import mlx_lm.models.base as base_module
-
-                base_module.scaled_dot_product_attention = self._original
-                for mod_name, mod in list(sys.modules.items()):
-                    if mod_name.startswith("mlx_lm.models.") and hasattr(mod, "scaled_dot_product_attention"):
-                        if getattr(mod, "scaled_dot_product_attention", None) is not self._original:
-                            mod.scaled_dot_product_attention = self._original
-        except Exception:
-            pass
-        if self.runtime is not None:
-            self.runtime.counters.patch_exit_count += 1
-        _rfsn_thread_local.runtime = None
-        return False
-
-
-def _wrap_layers_for_rfsn(model: Any) -> None:
-    """Wrap model attention layers to set layer_id before each forward."""
-    inner = model
-    if hasattr(model, "model"):
-        inner = model.model
-    if not hasattr(inner, "layers"):
-        return
-    for idx, layer in enumerate(inner.layers):
-        if not hasattr(layer, "self_attn"):
-            continue
-        attn = layer.self_attn
-        if hasattr(attn, "_rfsn_original_call"):
-            continue
-        original = attn.__call__
-        attn._rfsn_original_call = original
-
-        def _make_wrapper(orig, lid):
-            def wrapper(x, mask=None, cache=None):
-                old = getattr(_rfsn_thread_local, "layer_id", None)
-                _rfsn_thread_local.layer_id = lid
-                try:
-                    return orig(x, mask, cache)
-                finally:
-                    _rfsn_thread_local.layer_id = old
-
-            return wrapper
-
-        attn.__call__ = _make_wrapper(original, f"layer_{idx}")
-
-
-def _unwrap_layers_for_rfsn(model: Any) -> None:
-    """Restore original attention layer call methods."""
-    inner = model
-    if hasattr(model, "model"):
-        inner = model.model
-    if not hasattr(inner, "layers"):
-        return
-    for layer in inner.layers:
-        if not hasattr(layer, "self_attn"):
-            continue
-        attn = layer.self_attn
-        if hasattr(attn, "_rfsn_original_call"):
-            attn.__call__ = attn._rfsn_original_call
-            delattr(attn, "_rfsn_original_call")
 
 
 @dataclass
@@ -226,7 +73,7 @@ class GenerationResult:
 
 
 class RFSNGenerator:
-    """High-level inference generator with RFSN runtime integration.
+    """High-level inference generator with explicit per-layer quantized KV.
 
     Usage (MLX) ::
 
@@ -249,52 +96,46 @@ class RFSNGenerator:
         model: Any,
         tokenizer: Any,
         config: RFSNConfig | None = None,
-        kv_manager: RFSNTurboQuantKVManager | None = None,
-        enable_sparse_decode: bool = False,
         enable_quantized_kv: bool = True,
+        key_bits: int = 8,
+        value_bits: int = 5,
+        group_size: int = 64,
+        staging_capacity: int = 64,
+        dense_residual_window: int = 0,
+        # Deprecated no-ops (kept for backward compatibility)
+        enable_sparse_decode: bool = False,
         audit_mode: bool = False,
         use_compressed_on_miss: bool = False,
+        kv_manager: Any | None = None,
     ):
         """
         Args:
             model: Loaded model (``mlx-lm`` or ``transformers``).
             tokenizer: Matching tokenizer.
             config: RFSN runtime configuration.  Loaded from env when ``None``.
-            kv_manager: Optional KV-cache manager.  Created automatically when
-                ``None`` and ``enable_quantized_kv`` is ``True``.
-            enable_sparse_decode: Whether to enable RFSN sparse decode.
             enable_quantized_kv: Whether to use quantized KV-cache.
-            audit_mode: Enable per-step quality auditing.
-            use_compressed_on_miss: If True, after storing compressed KV,
-                immediately retrieve and use it for attention.  This proves
-                the round-trip dequantization path is exercised.
+            key_bits: Quantization bits for keys.
+            value_bits: Quantization bits for values.
+            group_size: Group size for symmetric quantization.
+            staging_capacity: Tokens accumulated before encoding a sealed block.
+            dense_residual_window: Keep last N tokens in dense FP16 (0 disables).
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or load_config()
-        self.enable_sparse_decode = enable_sparse_decode
         self.enable_quantized_kv = enable_quantized_kv
-        self.audit_mode = audit_mode
 
-        self._kv_manager = kv_manager
-        if kv_manager is None and enable_quantized_kv:
-            self._kv_manager = RFSNTurboQuantKVManager(
-                k_bits=8,
-                v_bits=5,
-                group_size=32,
-            )
-
-        self._runtime = None
-        if self._kv_manager is not None:
-            from .engine import RFSNRuntime
-            self._runtime = RFSNRuntime(
-                kv_manager=self._kv_manager,
-                model_id=getattr(
-                    tokenizer, "name_or_path", "unknown"
-                ),
-                enable_sparse_decode=enable_sparse_decode,
-                audit_mode=audit_mode,
-                use_compressed_on_miss=use_compressed_on_miss,
+        self._adapter = None
+        if MLX_LM_AVAILABLE and enable_quantized_kv:
+            from ..integrations.mlx_lm_adapter.adapter import RfsnMLXModelAdapter
+            self._adapter = RfsnMLXModelAdapter(
+                model=model,
+                tokenizer=tokenizer,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                group_size=group_size,
+                staging_capacity=staging_capacity,
+                dense_residual_window=dense_residual_window,
             )
 
         self._telemetry_log: list[dict] = []
@@ -469,39 +310,61 @@ class RFSNGenerator:
             yield response.text
 
     def _mlx_gen_iter(self, prompt: str, cfg: GenerationConfig):
-        """Yield ``GenerationResponse`` from ``mlx_lm``, optionally via
-        RFSNRuntime."""
+        """Yield ``GenerationResponse`` from ``mlx_lm``, via explicit cache adapter."""
         assert MLX_LM_AVAILABLE and _mlx_stream_generate is not None
-        gen_iter = _mlx_stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt,
+
+        gen_kwargs = dict(
             max_tokens=cfg.max_new_tokens,
             temp=cfg.temperature,
             top_p=cfg.top_p,
             repetition_penalty=cfg.repetition_penalty,
         )
-        if self._runtime is not None and self.enable_sparse_decode:
-            with _RFSNSDPAPatcher(self._runtime):
-                _wrap_layers_for_rfsn(self.model)
-                try:
-                    yield from gen_iter
-                finally:
-                    _unwrap_layers_for_rfsn(self.model)
+
+        if self._adapter is not None and self.enable_quantized_kv:
+            # Explicit per-layer cache path — no monkeypatching.
+            from ..integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache
+
+            session = self._adapter._new_session()
+            cache_list = [
+                RfsnQuantizedKVCache(
+                    layer_cache=session.get_layer_cache(i),
+                    session=session,
+                )
+                for i in range(self._adapter.num_layers)
+            ]
+            gen_iter = _mlx_stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                prompt_cache=cache_list,
+                **gen_kwargs,
+            )
+            try:
+                yield from gen_iter
+            finally:
+                self._last_counters = session.counters()
+                session.destroy()
         else:
+            # Plain dense path
+            gen_iter = _mlx_stream_generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                **gen_kwargs,
+            )
             yield from gen_iter
 
     # ------------------------------------------------------------------
-    # Telemetry
+    # Telemetry / proof counters
     # ------------------------------------------------------------------
 
     def get_telemetry(self) -> list[dict]:
-        """Return accumulated telemetry from the runtime (if any)."""
-        if self._runtime is not None:
-            return [ev.__dict__ for ev in self._runtime.get_telemetry()]
+        """Return accumulated proof counters from the last generation."""
+        counters = getattr(self, "_last_counters", {})
+        if counters:
+            return [dict(counters)]
         return []
 
     def clear_telemetry(self) -> None:
-        """Clear telemetry log."""
-        if self._runtime is not None:
-            self._runtime.clear_telemetry()
+        """Clear telemetry / counters."""
+        self._last_counters = {}

@@ -59,35 +59,36 @@ class RFSNV10Candidate(KVCompressionCandidate):
     ) -> Any:
         """Capture teacher-forced log-probs with RFSN v10 real cache active.
 
-        Creates an RFSNGenerator with ``enable_sparse_decode=True`` so the
-        SDPA patch routes through RFSNRuntime and the quantized KV cache.
-        The teacher-forced loop then feeds the exact baseline token sequence
-        through the model and captures per-step log-probability vectors.
+        Uses the explicit per-layer quantized KV cache adapter (no monkeypatching).
+        The teacher-forced loop feeds the exact baseline token sequence through
+        the model and captures per-step log-probability vectors.
         """
         try:
             import numpy as np
             import mlx.core as mx
-            from mlx_lm.models import cache as mlx_cache
-            from rfsn_v10.config import QuantizationConfig, RFSNConfig
-            from rfsn_v10.runtime.generation import (
-                RFSNGenerator,
-                _RFSNSDPAPatcher,
-                _unwrap_layers_for_rfsn,
-                _wrap_layers_for_rfsn,
-            )
+            from rfsn_v10.cache.cartesian_codec import CartesianCodec
+            from rfsn_v10.cache.session import GenerationCacheSession
+            from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache
 
             quant_kwargs = _PRESET_MAP[self.config_name]
-            cfg = RFSNConfig(
-                quantization=QuantizationConfig(**quant_kwargs),
+            bits = quant_kwargs["default_bits"]
+            group_size = quant_kwargs["group_size"]
+
+            key_codec = CartesianCodec(bits=bits, group_size=group_size)
+            value_codec = CartesianCodec(bits=5, group_size=group_size)
+            session = GenerationCacheSession(
+                name="v11_teacher_forced",
+                num_layers=len(model.layers),
+                key_codec=key_codec,
+                value_codec=value_codec,
             )
-            generator = RFSNGenerator(
-                model,
-                tokenizer,
-                cfg,
-                enable_quantized_kv=True,
-                enable_sparse_decode=True,
-                use_compressed_on_miss=True,
-            )
+            cache_list = [
+                RfsnQuantizedKVCache(
+                    layer_cache=session.get_layer_cache(i),
+                    session=session,
+                )
+                for i in range(len(model.layers))
+            ]
 
             prompt_ids = tokenizer.encode(prompt)
             target_ids = tokenizer.encode(target_text)
@@ -104,90 +105,53 @@ class RFSNV10Candidate(KVCompressionCandidate):
             if not gen_ids:
                 return None
 
-            _wrap_layers_for_rfsn(model)
+            # Prefill
+            y = mx.array(prompt_ids)
+            while y.size > 512:
+                model(y[:512][None], cache=cache_list)
+                y = y[512:]
+            prefill_logits = model(y[None], cache=cache_list)
+            prefill_logits = prefill_logits[:, -1, :]
+            prefill_logprobs = prefill_logits - mx.logsumexp(
+                prefill_logits, keepdims=True
+            )
+            first_lp = np.array(
+                prefill_logprobs.astype(mx.float32).squeeze(0)
+            )
+
+            # Teacher-forced decode.
+            # After prefill we already have the log-prob for predicting
+            # the FIRST generated token (g1).  To get the log-prob for
+            # predicting g2 we feed g1, for g3 we feed g2, etc.
+            logprob_list: list[np.ndarray] = [first_lp]
+            for forced_token_id in gen_ids[:-1]:
+                logits = model(
+                    mx.array([forced_token_id])[None], cache=cache_list
+                )
+                logits = logits[:, -1, :]
+                logprobs = logits - mx.logsumexp(
+                    logits, keepdims=True
+                )
+                lp_np = np.array(
+                    logprobs.astype(mx.float32).squeeze(0)
+                )
+                logprob_list.append(lp_np)
+
+            assert len(logprob_list) == len(gen_ids), (
+                f"Teacher-forced length mismatch: "
+                f"{len(logprob_list)} log-probs for {len(gen_ids)} tokens"
+            )
+
+            # Collect proof counters from the session
+            counters = session.counters()
             try:
-                if hasattr(model, "make_cache"):
-                    cache_list = model.make_cache()
-                else:
-                    cache_list = [
-                        mlx_cache.KVCache()
-                        for _ in range(len(model.layers))
-                    ]
+                n_layers = len(model.layers)
+            except Exception:
+                n_layers = 0
+            counters["layers_active"] = n_layers
+            self._last_runtime_counters = counters
 
-                # Prefill (outside patcher — prefill does not use SDPA decode path).
-                # We intentionally do NOT call maybe_quantize_kv_cache here.
-                # RFSN v10's own RFSNTurboQuantKVManager (inside RFSNRuntime)
-                # handles quantization during decode-step interception.
-                # Calling mlx_lm's maybe_quantize_kv_cache would replace the
-                # caches with QuantizedKVCache, whose update_and_fetch returns
-                # tuples that the RFSNRuntime SDPA wrapper cannot handle,
-                # causing the wrapper to fall through and producing zero counters.
-                y = mx.array(prompt_ids)
-                while y.size > 512:
-                    model(y[:512][None], cache=cache_list)
-                    y = y[512:]
-                # Final prefill chunk (also the only chunk for short prompts).
-                # Capture logits for the first generated token here.
-                prefill_logits = model(y[None], cache=cache_list)
-                prefill_logits = prefill_logits[:, -1, :]
-                prefill_logprobs = prefill_logits - mx.logsumexp(
-                    prefill_logits, keepdims=True
-                )
-                first_lp = np.array(
-                    prefill_logprobs.astype(mx.float32).squeeze(0)
-                )
-
-                patcher = _RFSNSDPAPatcher(generator._runtime)
-                patcher.__enter__()
-                logprob_list: list[np.ndarray] = [first_lp]
-                try:
-                    # Teacher-forced decode.
-                    # After prefill we already have the log-prob for predicting
-                    # the FIRST generated token (g1).  To get the log-prob for
-                    # predicting g2 we feed g1, for g3 we feed g2, etc.
-                    # Loop over gen_ids[:-1] — every token except the last.
-                    for forced_token_id in gen_ids[:-1]:
-                        logits = model(
-                            mx.array([forced_token_id])[None], cache=cache_list
-                        )
-                        logits = logits[:, -1, :]
-                        logprobs = logits - mx.logsumexp(
-                            logits, keepdims=True
-                        )
-                        lp_np = np.array(
-                            logprobs.astype(mx.float32).squeeze(0)
-                        )
-                        logprob_list.append(lp_np)
-                finally:
-                    patcher.__exit__(None, None, None)
-
-                assert len(logprob_list) == len(gen_ids), (
-                    f"Teacher-forced length mismatch: "
-                    f"{len(logprob_list)} log-probs for {len(gen_ids)} tokens"
-                )
-
-                # Collect runtime counters from the RFSNRuntime
-                if generator._runtime is not None:
-                    counters = generator._runtime.get_counters()
-                    try:
-                        n_layers = len(model.layers)
-                    except Exception:
-                        n_layers = 0
-                    # Count prefill events: each prefill chunk processes all layers.
-                    # The RFSNRuntime is only active during decode, so prefill
-                    # events are reported via record_prefill_quantize.
-                    prefill_chunks = max(1, (len(prompt_ids) + 511) // 512)
-                    generator._runtime.record_prefill_quantize(
-                        n_layers * prefill_chunks
-                    )
-                    counters.layers_wrapped_actual = n_layers
-                    self._last_runtime_counters = counters.as_dict()
-                else:
-                    self._last_runtime_counters = None
-
-                return np.stack(logprob_list, axis=0)
-            finally:
-                _unwrap_layers_for_rfsn(model)
+            return np.stack(logprob_list, axis=0)
         except Exception:
             return None
 
@@ -265,7 +229,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
                     f"RFSN v10 stable baseline — config={self.config_name} "
                     f"bits={quant_kwargs['default_bits']} "
                     f"gs={quant_kwargs['group_size']}  "
-                    "Real RFSN v10 quantized KV cache active via SDPA patch."
+                    "Real RFSN v10 quantized KV cache via explicit adapter."
                 ),
             )
         except Exception as exc:

@@ -155,14 +155,13 @@ class RfsnQuantizedKVCache:
             v_reshaped = v_flat.reshape(B, Hkv, block_T, D)
             value_parts.append(v_reshaped)
 
-        # Staging
-        stage_k, stage_v, stage_n = self.layer_cache.get_staging()
+        # Staging — already full-shaped (B, Hkv, staged_T, D)
+        stage_k, stage_v, _stage_n = self.layer_cache.get_staging()
         if stage_k is not None:
-            stage_T = stage_n
-            key_parts.append(stage_k.reshape(B, Hkv, stage_T, D))
-            value_parts.append(stage_v.reshape(B, Hkv, stage_T, D))
+            key_parts.append(stage_k)
+            value_parts.append(stage_v)
 
-        # Dense residual
+        # Dense residual — already full-shaped (B, Hkv, dense_T, D)
         dense_k, dense_v = self.layer_cache.get_dense_residual()
         if dense_k is not None:
             key_parts.append(dense_k)
@@ -177,6 +176,20 @@ class RfsnQuantizedKVCache:
         full_k = mx.concatenate(key_parts, axis=2)
         full_v = mx.concatenate(value_parts, axis=2)
         return full_k, full_v
+
+    def blockwise_attention(
+        self,
+        queries: Any,  # (B, Hq, Lq, D)
+        scale: float,
+        mask: Any | None = None,
+    ) -> Any:
+        """Compute attention directly on quantized blocks without dense reconstruction.
+
+        Returns shape ``(B, Hq, Lq, D)``.
+        """
+        if not HAS_MLX:
+            raise RuntimeError("MLX is not installed")
+        return self.layer_cache.blockwise_attention(queries, scale, mask)
 
 
 class RfsnMLXModelAdapter:

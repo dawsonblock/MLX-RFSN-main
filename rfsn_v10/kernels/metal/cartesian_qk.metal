@@ -1,10 +1,13 @@
 // Cartesian QK kernel for grouped symmetric quantization.
-// One thread computes one (b, hq, k_pos) score.
+// One thread computes scores for one KV token position (b, hq, k_pos)
+// across ALL query positions (q_pos = 0 .. Lq-1).
+//
+// Dispatch grid: (Lkv, Hq, B)
 //
 // Generated signature by mlx.core.fast.metal_kernel:
 //   device const float*    queries       [[buffer(0)]]
 //   device const uint32_t* packed_codes   [[buffer(1)]]
-//   device const float*    scales         [[buffer(2)]]
+//   device const float*    scales         [[buffer(2)]]   // (B, Hkv, Lkv, n_groups)
 //   device const int*      bits_buf      [[buffer(3)]]
 //   device const int*      group_buf     [[buffer(4)]]
 //   device const float*    scale_buf     [[buffer(5)]]
@@ -55,7 +58,6 @@ kernel void cartesian_qk(
 
     int hkv = hq * Hkv / Hq;
 
-    int q_offset = ((b * Hq + hq) * Lq) * D;
     int kv_offset = ((b * Hkv + hkv) * Lkv + k_pos);
 
     int codes_per_word = 32 / bits;
@@ -64,26 +66,32 @@ kernel void cartesian_qk(
     int qmax = (1 << (bits - 1)) - 1;
     int n_groups = (D + group_size - 1) / group_size;
 
-    float score = 0.0f;
+    // Precompute scale offset for this (b, hkv, k_pos) — per-token scales
+    int scale_base = ((b * Hkv + hkv) * Lkv + k_pos) * n_groups;
 
-    for (int d = 0; d < D; ++d) {
-        int word_idx = d / codes_per_word;
-        int bit_offset = (d % codes_per_word) * bits;
+    for (int q_pos = 0; q_pos < Lq; ++q_pos) {
+        int q_offset = ((b * Hq + hq) * Lq + q_pos) * D;
 
-        int packed_idx = kv_offset * words_per_vec + word_idx;
-        uint32_t word = packed_codes[packed_idx];
-        int code = int((word >> bit_offset) & mask);
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            int word_idx = d / codes_per_word;
+            int bit_offset = (d % codes_per_word) * bits;
 
-        int group_idx = d / group_size;
-        float scale = scales[((b * Hkv + hkv) * n_groups) + group_idx];
-        float k_val = (float(code) - float(qmax)) * scale;
+            int packed_idx = kv_offset * words_per_vec + word_idx;
+            uint32_t word = packed_codes[packed_idx];
+            int code = int((word >> bit_offset) & mask);
 
-        float q_val = queries[q_offset + d];
-        score += q_val * k_val;
+            int group_idx = d / group_size;
+            float scale = scales[scale_base + group_idx];
+            float k_val = (float(code) - float(qmax)) * scale;
+
+            float q_val = queries[q_offset + d];
+            score += q_val * k_val;
+        }
+
+        score *= scale_factor;
+
+        int out_idx = ((b * Hq + hq) * Lq + q_pos) * Lkv + k_pos;
+        scores[out_idx] = score;
     }
-
-    score *= scale_factor;
-
-    int out_idx = ((b * Hq + hq) * Lq) * Lkv + k_pos;
-    scores[out_idx] = score;
 }

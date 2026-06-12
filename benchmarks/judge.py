@@ -140,10 +140,19 @@ class Judge:
         A previously promoted stable method.  If provided, the judge will
         emit REGRESSION instead of PROMOTE when the candidate is worse than
         the stable reference on any critical metric.
+    strict : bool
+        If ``True``, governance and proof-counter violations become hard
+        ``REJECT`` verdicts instead of ``KEEP_EXPERIMENTAL``.  Used for
+        benchmark harnesses that must fail closed.
     """
 
-    def __init__(self, stable_reference: Optional[CandidateResult] = None) -> None:
+    def __init__(
+        self,
+        stable_reference: Optional[CandidateResult] = None,
+        strict: bool = False,
+    ) -> None:
         self.stable_reference = stable_reference
+        self.strict = strict
 
     # ------------------------------------------------------------------
     # Public API
@@ -165,8 +174,9 @@ class Judge:
         # ---- Phase 1 governance checks (before any quality gates) ----
         gov = self._check_governance(candidate)
         if gov:
+            label = VerdictLabel.REJECT if self.strict else VerdictLabel.KEEP_EXPERIMENTAL
             return Verdict(
-                label=VerdictLabel.KEEP_EXPERIMENTAL,
+                label=label,
                 candidate_name=candidate.candidate_name,
                 model_id=candidate.model_id,
                 prompt_id=candidate.prompt_id,
@@ -176,6 +186,22 @@ class Judge:
                 improvement_notes=[],
                 reason=f"governance block: {gov}",
             )
+
+        # ---- Phase 1b strict proof-counter checks ----
+        if self.strict:
+            proof_failures = self._check_proof_counters(candidate)
+            if proof_failures:
+                return Verdict(
+                    label=VerdictLabel.REJECT,
+                    candidate_name=candidate.candidate_name,
+                    model_id=candidate.model_id,
+                    prompt_id=candidate.prompt_id,
+                    quality_failures=[],
+                    missing_required=[],
+                    improvement_met=False,
+                    improvement_notes=[],
+                    reason=f"proof failure: {'; '.join(proof_failures)}",
+                )
 
         # 1. Check for missing required metrics
         for fname in _REQUIRED_QUALITY_FIELDS + _REQUIRED_PERF_FIELDS:
@@ -272,6 +298,45 @@ class Judge:
         if candidate.source_type != "installed_wheel":
             return "installed-wheel execution required for promotion"
         return ""
+
+    def _check_proof_counters(self, candidate: CandidateResult) -> list[str]:
+        """In strict mode, proof counters must prove correct runtime structure.
+
+        Returns a list of failure reason strings; empty list means clean.
+        """
+        failures: list[str] = []
+        counters = candidate.proof_counters or {}
+
+        if candidate.executed_backend == "fallback":
+            failures.append("executed_backend is fallback")
+
+        if (
+            candidate.requested_backend == "metal"
+            and not candidate.metal_executed
+        ):
+            failures.append("metal requested but not executed")
+
+        if counters.get("requantized_tokens", 0) > 0:
+            failures.append(
+                f"requantized_tokens={counters['requantized_tokens']} > 0"
+            )
+
+        if counters.get("fallback_attention_calls", 0) > 0:
+            failures.append(
+                f"fallback_attention_calls={counters['fallback_attention_calls']} > 0"
+            )
+
+        if counters.get("dense_shadow_bytes", 0) > 0:
+            failures.append(
+                f"dense_shadow_bytes={counters['dense_shadow_bytes']} > 0"
+            )
+
+        if counters.get("unknown_layer_events", 0) > 0:
+            failures.append(
+                f"unknown_layer_events={counters['unknown_layer_events']} > 0"
+            )
+
+        return failures
 
     def evaluate_batch(
         self,

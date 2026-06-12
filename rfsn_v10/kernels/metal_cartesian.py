@@ -43,12 +43,22 @@ def _load_metal_source(filename: str) -> str:
 def cartesian_qk_metal(
     queries: Any,          # (B, Hq, Lq, D)
     packed_codes: Any,     # (B, Hkv, Lkv, words_per_vec)
-    scales: Any,           # (B, Hkv, n_groups)
+    scales: Any,           # (B, Hkv, Lkv, n_groups) — per-token scales
     bits: int,
     group_size: int,
     scale_factor: float,
 ) -> Any:
-    """Compute QK scores via Metal kernel."""
+    """Compute QK scores via Metal kernel.
+
+    The shader loops over all query positions inside each thread, so it
+    is valid for any ``Lq``.  For decode ``Lq == 1`` this is a single
+    iteration; for prefill ``Lq > 1`` each thread computes all query
+    positions for its assigned KV token.
+
+    ``scales`` must have shape ``(B, Hkv, Lkv, n_groups)`` — one scale
+    group per KV token.  The caller is responsible for concatenating
+    per-block scales into this flat layout.
+    """
     if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
         raise KernelRouteError("metal_kernel_api_unavailable")
 
@@ -105,12 +115,17 @@ def cartesian_qk_metal(
 def cartesian_sv_metal(
     weights: Any,          # (B, Hq, Lq, Lkv)
     packed_codes: Any,     # (B, Hkv, Lkv, words_per_vec)
-    scales: Any,           # (B, Hkv, n_groups)
+    scales: Any,           # (B, Hkv, Lkv, n_groups) — per-token scales
     bits: int,
     group_size: int,
     head_dim: int,
 ) -> Any:
-    """Compute weighted value sum via Metal kernel."""
+    """Compute weighted value sum via Metal kernel.
+
+    ``scales`` must have shape ``(B, Hkv, Lkv, n_groups)`` — one scale
+    group per KV token.  The caller is responsible for concatenating
+    per-block scales into this flat layout.
+    """
     if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
         raise KernelRouteError("metal_kernel_api_unavailable")
 

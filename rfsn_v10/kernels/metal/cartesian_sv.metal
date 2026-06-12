@@ -4,7 +4,7 @@
 // Generated signature:
 //   device const float*    weights       [[buffer(0)]]
 //   device const uint32_t* packed_codes   [[buffer(1)]]
-//   device const float*    scales         [[buffer(2)]]
+//   device const float*    scales         [[buffer(2)]]   // (B, Hkv, Lkv, n_groups)
 //   device const int*      bits_buf      [[buffer(3)]]
 //   device const int*      group_buf     [[buffer(4)]]
 //   device const int*      b_buf         [[buffer(5)]]
@@ -72,7 +72,8 @@ kernel void cartesian_sv(
         int code = int((word >> bit_offset) & mask);
 
         int group_idx = d / group_size;
-        float scale = scales[((b * Hkv + hkv) * n_groups) + group_idx];
+        // Per-token scale indexing: (b, hkv, k_pos, group)
+        float scale = scales[(((b * Hkv + hkv) * Lkv + k_pos) * n_groups) + group_idx];
         float v_val = (float(code) - float(qmax)) * scale;
 
         int w_idx = ((b * Hq + hq) * Lq + q_pos) * Lkv + k_pos;

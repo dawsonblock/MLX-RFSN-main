@@ -152,45 +152,42 @@ class CartesianCodec:
 
     @staticmethod
     def apply_wht(x: Any) -> Any:
-        """Apply Walsh-Hadamard Transform (WHT-64) using v10 kernels.
+        """Apply Walsh-Hadamard Transform (WHT-64).
 
-        Falls back to a pure-MLX reference if Metal is unavailable.
+        Uses the pure-MLX reference implementation.  The Metal kernel path is
+        currently disabled pending correctness validation (see WHT identity tests).
         """
-        from rfsn_v10.kernels import wht64_metal, maybe_supports_metal_kernels
-
-        if maybe_supports_metal_kernels():
-            return wht64_metal(x)
         return _reference_wht64(x)
 
     @staticmethod
     def apply_hash_signs(x: Any, seed: int = 42) -> Any:
         """Apply deterministic hash-based sign randomisation.
 
-        Uses the v10 Metal kernel if available, otherwise reference.
+        Uses the pure-MLX reference implementation.  The Metal kernel path is
+        currently disabled pending correctness validation.
         """
-        from rfsn_v10.kernels import apply_hash_signs_metal, maybe_supports_metal_kernels
-
-        if maybe_supports_metal_kernels():
-            return apply_hash_signs_metal(x, seed)
         return _reference_hash_signs(x, seed)
 
 
 def _reference_wht64(x: Any) -> Any:
     """Pure-MLX reference WHT-64.
 
-    Iterative in-place butterfly.  Slow but correct.
+    Iterative vectorised butterfly.  Preserves input shape.
     """
     h = x.astype(mx.float32)
     n = int(h.shape[-1])
     if n < 2:
         return h
+    original_shape = h.shape
     step = 1
     while step < n:
-        half = step
-        # Vectorised butterfly
-        a = h[..., ::2 * half]
-        b = h[..., half::2 * half]
+        # Reshape so we can vectorise the butterfly on pairs separated by `step`
+        h_reshaped = h.reshape(*h.shape[:-1], -1, 2 * step)
+        a = h_reshaped[..., :step]
+        b = h_reshaped[..., step:]
         h = mx.concatenate([a + b, a - b], axis=-1)
+        # Flatten back to the original rank so the next iteration works
+        h = h.reshape(*original_shape)
         step *= 2
     return h
 
@@ -199,8 +196,8 @@ def _reference_hash_signs(x: Any, seed: int) -> Any:
     """Pure-MLX reference hash signs.
 
     Deterministic: same (shape, seed) always produces the same signs.
+    Uses a PRNG key derived from ``seed``; does not mutate global state.
     """
-    shape = x.shape
-    rng = mx.random.state(seed)
-    signs = mx.where(mx.random.normal(shape=shape) > 0, 1.0, -1.0)
+    key = mx.random.key(seed)
+    signs = mx.where(mx.random.normal(shape=x.shape, key=key) > 0, 1.0, -1.0)
     return x * signs

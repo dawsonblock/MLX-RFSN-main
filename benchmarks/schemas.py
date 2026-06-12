@@ -149,6 +149,11 @@ class CandidateResult:
     estimated_memory: bool = False                  # True if memory was estimated (not measured)
 
     # ------------------------------------------------------------------
+    # Proof counters (strict mode validation)
+    # ------------------------------------------------------------------
+    proof_counters: dict[str, Any] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
     # Errors / notes
     # ------------------------------------------------------------------
     error: str = ""

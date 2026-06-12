@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""RFSN v10 — Generation loop integration tests."""
+"""RFSN v10 — Generation loop integration tests.
+
+These tests verify the explicit per-layer cache adapter path.
+The global SDPA monkeypatch layer has been removed.
+"""
 
 from __future__ import annotations
 
-from rfsn_v10.runtime.generation import (
-    RFSNGenerator,
-    _rfsn_sdpa_wrapper,
-    _wrap_layers_for_rfsn,
-    _unwrap_layers_for_rfsn,
-)
+from rfsn_v10.runtime.generation import RFSNGenerator
 
 
 class FakeModel:
@@ -48,71 +47,54 @@ class FakeTokenizer:
 
 
 # ------------------------------------------------------------------
-# RFSNGenerator construction
+# RFSNGenerator construction (explicit adapter path)
 # ------------------------------------------------------------------
 
 
-def test_generator_initializes_runtime_when_kv_enabled():
+def test_generator_creates_adapter_when_kv_enabled() -> None:
     gen = RFSNGenerator(
         model=FakeModel(),
         tokenizer=FakeTokenizer(),
         enable_quantized_kv=True,
-        enable_sparse_decode=True,
     )
-    assert gen._runtime is not None
-    assert gen._kv_manager is not None
+    assert gen._adapter is not None
 
 
-def test_generator_no_runtime_when_quantized_kv_disabled():
+def test_generator_no_adapter_when_kv_disabled() -> None:
     gen = RFSNGenerator(
         model=FakeModel(),
         tokenizer=FakeTokenizer(),
         enable_quantized_kv=False,
     )
-    assert gen._runtime is None
-    assert gen._kv_manager is None
+    assert gen._adapter is None
 
 
-# ------------------------------------------------------------------
-# Layer wrapping / unwrapping helpers
-# ------------------------------------------------------------------
-
-
-def test_wrap_and_unwrap_layers():
-    model = FakeModel(num_layers=3)
-    _wrap_layers_for_rfsn(model)
-
-    for _layer in model.model.layers:
-        assert hasattr(_layer.self_attn, "_rfsn_original_call")
-
-    _unwrap_layers_for_rfsn(model)
-
-    for _layer in model.model.layers:
-        assert not hasattr(_layer.self_attn, "_rfsn_original_call")
-
-
-def test_wrap_is_idempotent():
-    model = FakeModel(num_layers=2)
-    _wrap_layers_for_rfsn(model)
-    _wrap_layers_for_rfsn(model)  # second call should be a no-op
-    assert hasattr(model.model.layers[0].self_attn, "_rfsn_original_call")
-
-
-# ------------------------------------------------------------------
-# SDPA wrapper fallback behaviour
-# ------------------------------------------------------------------
-
-
-def test_rfsn_sdpa_wrapper_falls_back_when_no_runtime():
-    """When thread-local runtime is absent, wrapper must call original."""
-    calls = []
-
-    def original(_q, _k, _v, _cache, _scale, _mask, _sinks=None):
-        calls.append("original")
-        return "original_output"
-
-    result = _rfsn_sdpa_wrapper(
-        original, "q", "k", "v", cache="cache", scale=1.0, mask=None
+def test_generator_accepts_backward_compat_kwargs() -> None:
+    """Deprecated kwargs (enable_sparse_decode, audit_mode, etc.) must not raise."""
+    gen = RFSNGenerator(
+        model=FakeModel(),
+        tokenizer=FakeTokenizer(),
+        enable_quantized_kv=True,
+        enable_sparse_decode=True,  # deprecated no-op
+        audit_mode=True,              # deprecated no-op
+        use_compressed_on_miss=True,  # deprecated no-op
     )
-    assert result == "original_output"
-    assert calls == ["original"]
+    assert gen._adapter is not None
+
+
+# ------------------------------------------------------------------
+# No monkeypatching
+# ------------------------------------------------------------------
+
+
+def test_generator_does_not_mutate_model_layers() -> None:
+    """The explicit adapter must not wrap or mutate model attention layers."""
+    model = FakeModel(num_layers=3)
+    gen = RFSNGenerator(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        enable_quantized_kv=True,
+    )
+    # No monkeypatch artifacts
+    for layer in model.model.layers:
+        assert not hasattr(layer.self_attn, "_rfsn_original_call")
