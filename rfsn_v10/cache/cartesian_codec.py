@@ -149,13 +149,13 @@ class CartesianCodec:
         if block.wht_applied:
             restored = CartesianCodec.apply_wht(restored)
 
-        # Flatten and trim group padding
+        # Flatten and trim group padding (V2 only; V1 blocks have num_elements==0)
         flat_restored = restored.reshape(-1)
         if block.num_elements > 0 and block.num_elements < int(flat_restored.size):
             flat_restored = flat_restored[:block.num_elements]
 
-        # Restore original dtype if V2 metadata is present
-        if block.original_dtype:
+        # Restore original dtype only for V2+ blocks (V1 default is unreliable)
+        if block.format_version >= 2 and block.original_dtype:
             target_dtype = _str_to_mlx_dtype(block.original_dtype)
             if target_dtype is not None:
                 flat_restored = flat_restored.astype(target_dtype)

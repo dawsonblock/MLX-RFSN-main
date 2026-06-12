@@ -205,3 +205,47 @@ def test_decode_restores_original_dtype() -> None:
     decoded_reshaped = decoded.reshape(x.shape)
     max_err = mx.max(mx.abs(x.astype(mx.float32) - decoded_reshaped.astype(mx.float32))).item()
     assert max_err < 0.5, f"float16 roundtrip max_err={max_err}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_decode_restores_dtype_and_trims_padding() -> None:
+    """V2 decode must restore dtype AND trim padding simultaneously."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+
+    codec = CartesianCodec(bits=8, group_size=64)
+    # 65 elements → 63 pad → 128 total; not a multiple of 64
+    x = mx.random.normal(shape=(65,)).astype(mx.float16)
+
+    block = codec.encode(x)
+    assert block.original_dtype == "float16"
+    assert block.num_elements == 65
+
+    decoded = codec.decode(block)
+    assert decoded.dtype == mx.float16, f"Expected float16, got {decoded.dtype}"
+    assert int(decoded.size) == 65, f"Expected 65, got {decoded.size}"
+    assert mx.max(mx.abs(decoded.astype(mx.float32) - x.astype(mx.float32))).item() < 0.5
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_decode_v1_block_no_dtype_restore() -> None:
+    """V1 blocks must not have dtype restored (num_elements==0, version==1)."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.contracts import PackedBlock
+
+    codec = CartesianCodec(bits=8, group_size=64)
+    x = mx.random.normal(shape=(128, 64)).astype(mx.float32)
+    block_v2 = codec.encode(x)
+
+    # Simulate a V1 block by resetting format_version and num_elements
+    import dataclasses
+    block_v1 = dataclasses.replace(
+        block_v2,
+        format_version=1,
+        num_elements=0,
+        original_dtype="float16",  # V1 default
+    )
+
+    decoded = codec.decode(block_v1)
+    # V1 block should return float32 (no dtype restoration), not float16
+    assert decoded.dtype == mx.float32, f"V1 block should stay float32, got {decoded.dtype}"
+    assert int(decoded.size) == 128 * 64  # no trimming for V1

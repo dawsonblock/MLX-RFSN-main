@@ -125,3 +125,34 @@ def test_reset_clears_all_state() -> None:
     cache.reset()
     assert cache.total_token_count() == 0
     assert cache.payload_bytes() == 0
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_logical_start_increments_correctly_across_flushes() -> None:
+    """Block logical_start must be monotonic and correctly offset across flushes."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=32)
+
+    # First append: 48 tokens → one 32-token block, 16 staged
+    cache.append(
+        mx.random.normal(shape=(1, 2, 48, 64)).astype(mx.float32),
+        mx.random.normal(shape=(1, 2, 48, 64)).astype(mx.float32),
+    )
+    assert cache.encoded_token_count == 32
+    assert cache.stats().staged_tokens == 16
+
+    # Second append: 32 tokens → staged(16) + new(32) = 48 → another 32-token block, 16 staged
+    cache.append(
+        mx.random.normal(shape=(1, 2, 32, 64)).astype(mx.float32),
+        mx.random.normal(shape=(1, 2, 32, 64)).astype(mx.float32),
+    )
+    assert cache.encoded_token_count == 64
+    assert cache.stats().staged_tokens == 16
+
+    # Verify logical_start values
+    logical_starts = [b.logical_start for b in cache.iter_key_blocks()]
+    assert logical_starts == [0, 32], f"Unexpected logical_starts: {logical_starts}"
