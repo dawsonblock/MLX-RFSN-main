@@ -131,6 +131,17 @@ class RFSNRuntime:
         """Return a snapshot of current runtime counters."""
         return self.counters
 
+    def record_prefill_quantize(self, count: int = 1) -> None:
+        """Record prefill quantize events from external callers.
+
+        The RFSNRuntime is only active during decode steps (via the SDPA
+        patch).  Prefill quantize events happen outside the runtime in the
+        adapter / generator prefill path.  This method lets those paths
+        report real prefill counts back into the same counter object so
+        the exported trace is fully runtime-instrumented.
+        """
+        self.counters.prefill_quantize_events += int(count)
+
     @staticmethod
     def _make_cache_key(
         model_id: str,
@@ -291,7 +302,11 @@ class RFSNRuntime:
         kv_cache_hit = False
         if quantized_enabled:
             t_retrieve_start = time.monotonic()
-            kv_result = self.kv_manager.retrieve(cache_key, out_dtype=keys.dtype)
+            # RFSNTurboQuantKVManager reconstruct kernels only support float32
+            # and float16.  The model may use bfloat16, so request float32 and
+            # the caller can cast if needed.
+            retrieve_dtype = keys.dtype if str(keys.dtype) in ("float32", "float16") else mx.float32
+            kv_result = self.kv_manager.retrieve(cache_key, out_dtype=retrieve_dtype)
             retrieve_latency_ms = (time.monotonic() - t_retrieve_start) * 1000.0
 
             kv_cache_hit = kv_result is not None
@@ -332,10 +347,20 @@ class RFSNRuntime:
 
                 if allow_store and self.use_compressed_on_miss:
                     t_retrieve_check_start = time.monotonic()
-                    kv_result = self.kv_manager.retrieve(cache_key, out_dtype=keys.dtype)
+                    kv_result = self.kv_manager.retrieve(cache_key, out_dtype=retrieve_dtype)
                     retrieve_latency_ms += (time.monotonic() - t_retrieve_check_start) * 1000.0
                     if kv_result is not None:
                         keys, values = kv_result
+                        # Count this as a fetch event — the compressed cache was
+                        # stored and then immediately read back for attention.
+                        self.counters.decode_quantized_fetch_events += 1
+                        est_fetch_bytes = self.kv_manager.estimate_compressed_bytes_for_shape(
+                            shape=tuple(keys.shape),
+                            k_bits=self.kv_manager.k_bits,
+                            v_bits=self.kv_manager.v_bits,
+                            group_size=self.kv_manager.group_size,
+                        )
+                        self.counters.cache_bytes_read_actual += int(est_fetch_bytes)
             else:
                 if kv_result is None:
                     raise RuntimeError("KV cache reported hit but retrieve returned None")

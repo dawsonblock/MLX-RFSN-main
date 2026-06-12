@@ -4,19 +4,31 @@
 
 ## Current Reality (Alpha 8.4)
 
-**No candidate is promotion eligible.  Promotion is disabled until teacher-forced alignment is fixed and artifacts are regenerated.**
+**No candidate is promotion eligible.  Teacher-forced alignment is fixed, runtime path is instrumented, and honest artifacts are regenerated.**
 
 | Candidate | Logit Gate | Memory Gate | Real Cache | Blocker |
 |-----------|------------|-------------|------------|---------|
 | mlx_lm_baseline | CONTROL | — | yes | Not a candidate |
-| mlx_lm_quantized_kv_b8 | **FAIL** | PASS | yes | Teacher-forced alignment bug (off-by-one token feed) |
-| rfsn_v10_k8_v5_gs32 | PENDING | PASS | yes | Custom generator + alignment bug |
-| rfsn_v10_k8_v5_gs64 | PENDING | PASS | yes | Custom generator + alignment bug |
+| mlx_lm_quantized_kv_b8 | **FAIL** | PASS | yes | Per-prompt gate failures (aggregate is close) |
+| rfsn_v10_k8_v5_gs32 | **FAIL** | FAIL | yes | Severe quality degradation when runtime path is exercised |
+| rfsn_v10_k8_v5_gs64 | **FAIL** | FAIL | yes | Severe quality degradation when runtime path is exercised |
 | rfsn_v11_offline_asymmetric | PENDING | PENDING | **no** | Offline-only, no injection |
-| turboquant_v2_b4_gs64 | **FAIL** | PASS | yes | Teacher-forced alignment bug |
-| polar_reference_offline_b4 | **FAIL** | PASS | yes | Teacher-forced alignment bug |
+| turboquant_v2_b4_gs64 | **FAIL** | PASS | yes | Quality fails gate thresholds |
+| polar_reference_offline_b4 | **FAIL** | PASS | yes | Quality fails gate thresholds |
+| turbo_polar_k4_qjl64 | **FAIL** | PASS | yes | Quality fails gate thresholds |
 
-**The common failure mode:** The teacher-forced logit comparison loop was feeding `gen_ids[1:]` instead of `gen_ids[:-1]`.  This means the model was fed token g2 to predict g3, g3 to predict g4, etc. — but the prefill already predicted g1, so the captured log-probabilities do not align with the actual generated token sequence.  All full-logit artifacts produced under this bug are stale and must be regenerated.
+**Critical discovery:** Previous artifacts claiming RFSN v10 "perfect 1.0 logit match" were invalid. The `capture_logprobs` adapter was silently failing (returning `None`) due to:
+1. `mx.eval([c.state for c in cache_list])` crashing on fresh `KVCache` objects before prefill (`keys` is `None`)
+2. After fixing prefill order, `maybe_quantize_kv_cache` replacing caches with `QuantizedKVCache` whose `update_and_fetch` returns tuples, crashing the SDPA wrapper (`'tuple' object has no attribute 'ndim'`)
+
+After fixing both bugs, the RFSN v10 runtime path is actually exercised and produces honest metrics:
+- `logit_cosine` ~0.98 (threshold 0.999)
+- `KL` ~13.5 (threshold 0.1)
+- `top5_overlap` ~0.02 (threshold 0.85)
+- Speed ~5.5 tps vs baseline ~50 tps (10x slower)
+- Working-set memory ~1526 MB vs baseline ~975 MB (higher, due to per-step full-shape cache storage)
+
+This means the RFSN v10 runtime path is functionally broken for production use. The `BASELINE_POLICIES` registry retains the config as a historically validated preset, but it has **not** been proven to work through its own runtime instrumentation.
 
 **Status:**
 - Teacher-forced capture scaffold exists.
@@ -27,7 +39,7 @@
 - `token_sequence_hash` field added; promotion blocked when empty.
 - Gate thresholds are single-source-of-truth in `quality_gates.py` and included in artifact metadata.
 - `failed_gate_reasons` added to every failing row.
-- RFSN v10 proof trace marked as `trace_type: estimated`; promotion blocked until runtime counters replace estimates.
+- RFSN v10 proof trace is `trace_type: runtime_instrumented` with honest non-zero counters (`cache_bytes_read_actual > 0`, `decode_quantized_fetch_events > 0`), but quality is unacceptable for promotion.
 - `cache_policy.py` PROMOTED_POLICIES is empty; rfsn_v10 is in BASELINE_POLICIES only.
 - `winner.json` reset to `NO_PROMOTION_ELIGIBLE_CANDIDATE`.
 
@@ -60,31 +72,33 @@ This measures: "Given the same context, how much does the candidate's logit dist
 - **FIXED:** Loop was feeding `gen_ids[1:]` instead of `gen_ids[:-1]`.  Now feeds the correct token at each step.
 - **TEST ADDED:** `tests/benchmarks/test_teacher_forced_alignment.py` proves correct feeding.
 
-### A2. Enable logit capture for RFSN v10 custom generator (IN PROGRESS)
+### A2. Enable logit capture for RFSN v10 custom generator (COMPLETED — REVEALS CRITICAL BUG)
 - RFSN v10 uses `RFSNGenerator.generate()` which is a custom loop.
-- `capture_logprobs` in `rfsn_v10_adapter.py` now uses the corrected teacher-forced loop.
-- **PENDING:** Must be revalidated on Apple Silicon after the alignment fix.
+- `capture_logprobs` in `rfsn_v10_adapter.py` was silently failing due to `KVCache.state` crash on fresh caches and `QuantizedKVCache` tuple return breaking the SDPA wrapper.
+- **FIXED:** Prefill order corrected; `maybe_quantize_kv_cache` removed so RFSNRuntime's own KVManager handles quantization; wrapper updated to fall through on tuple keys/values.
+- **HONEST RESULT:** RFSN v10 runtime path is now exercised and produces terrible quality (logit_cosine ~0.98, KL ~13.5, top5 ~0.02). The previous "perfect 1.0" was a measurement artifact caused by silent adapter failure.
 
-### A3. Validate thresholds on known-good configurations (PENDING RERUN)
-- Run corrected teacher-forced comparison on `mlx_lm_quantized_kv_b8`.
-- If it still fails, the thresholds are too strict.
-- If it passes, we have a validated methodology.
-- **BLOCKED:** Requires Apple Silicon + MLX runtime.
+### A3. Validate thresholds on known-good configurations (COMPLETED)
+- Corrected teacher-forced comparison run on `mlx_lm_quantized_kv_b8`.
+- Result: aggregate metrics are close, but strict per-prompt gate still fails on some prompts.
+- This is a conservative (not buggy) result — thresholds may be too strict for upstream quantized KV.
+- **Status:** Methodology is validated; thresholds may need tuning for promotion.
 
-### A4. Re-run full logit gate with fixed methodology (PENDING RERUN)
-- Regenerate all artifacts under corrected teacher-forced gate.
-- Expected outcome: mlx_lm_quantized_kv_b8 passes (it should — it's maintained upstream).
-- Expected outcome: TurboQuant V2 either passes or fails for real quality reasons, not methodology artifacts.
-- **BLOCKED:** Requires Apple Silicon + MLX runtime.
+### A4. Re-run full logit gate with fixed methodology (COMPLETED)
+- All artifacts regenerated under corrected teacher-forced gate.
+- Actual outcome: mlx_lm_quantized_kv_b8 fails strict per-prompt gate (aggregate is close).
+- Actual outcome: TurboQuant V2 and Polar fail for real quality reasons, not methodology artifacts.
+- **Status:** Teacher-forced rerun complete; artifacts are honest.
 
-### A5. Post-rerun promotion validation (NOT STARTED)
-- Only after rerun passes can any candidate be promoted.
-- `methodology_status` must change to `TEACHER_FORCED_RERUN_COMPLETE_PROMOTION_ALLOWED`.
-- `token_sequence_hash` must be non-empty.
-- `PROMOTED_POLICIES` in `cache_policy.py` must match `winner.json`.
+### A5. Post-rerun promotion validation (COMPLETED — BLOCKED BY QUALITY)
+- Rerun is complete; runtime counters prove the compressed path was exercised (`cache_bytes_read_actual > 0`, `decode_quantized_fetch_events > 0`).
+- `methodology_status` is `TEACHER_FORCED_RERUN_COMPLETE_NO_PROMOTION`.
+- `token_sequence_hash` is non-empty.
+- `PROMOTED_POLICIES` in `cache_policy.py` remains empty; matches `winner.json` (no winner).
+- **Remaining blocker:** RFSN v10 runtime path quality is unacceptable (logit_cosine ~0.98, KL ~13.5, top5 ~0.02, 10x slower, higher memory). Promotion is impossible until the runtime quantization algorithm is fixed or replaced.
 
-**Timeline:** 1-2 weeks after alignment fix is merged and Apple Silicon rerun is available.
-**Risk:** Low. This is a measurement fix, not an algorithm change.
+**Timeline:** Next milestone is Alpha 8.5 or 9.0 — fix RFSN v10 runtime quantization quality, OR pivot to a candidate that actually passes gates.
+**Risk:** High. The RFSN v10 runtime quantization path may need fundamental redesign.
 
 ## Phase B — Candidate Hardening (Depends on Phase A)
 

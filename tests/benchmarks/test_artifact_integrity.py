@@ -263,3 +263,11 @@ def test_rfsn_v10_trace_is_runtime_instrumented() -> None:
     assert trace.get("patch_enter_count") == 1
     assert trace.get("patch_exit_count") == 1
     assert trace.get("layers_wrapped_actual") is not None
+    # Promotion-grade traces must prove the compressed cache was both
+    # written and read during the teacher-forced capture.
+    assert trace.get("cache_bytes_read_actual", 0) > 0, (
+        "trace cache_bytes_read_actual must be > 0 for promotion"
+    )
+    assert trace.get("decode_quantized_fetch_events", 0) > 0, (
+        "trace decode_quantized_fetch_events must be > 0 for promotion"
+    )

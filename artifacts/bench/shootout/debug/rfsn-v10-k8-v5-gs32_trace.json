@@ -1,8 +1,8 @@
 {
   "trace_type": "runtime_instrumented",
   "promotion_valid": false,
-  "candidate_name": "rfsn_v10_k8_v5_gs64",
-  "config_name": "k8_v5_gs64",
+  "candidate_name": "rfsn_v10_k8_v5_gs32",
+  "config_name": "k8_v5_gs32",
   "cache_backend_used": "rfsn_v10_quantized_kv",
   "cache_events": [
     "prefill_quantize",
@@ -13,9 +13,9 @@
   "layers_wrapped": 24,
   "teacher_forced_capture_used_rfsn_path": true,
   "cache_bytes_written_actual": 589632,
-  "cache_bytes_read_actual": 589632,
+  "cache_bytes_read_actual": 14151168,
   "prefill_quantize_events": 24,
-  "decode_quantized_fetch_events": 49,
+  "decode_quantized_fetch_events": 1176,
   "decode_quantized_store_events": 49,
   "layers_wrapped_actual": 24,
   "patch_enter_count": 1,

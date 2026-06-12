@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | Release name | `MLX-RFSN Fusion Alpha 8.4` |
-| Git branch | `mlx-rfsn-fusion-alpha-8` |
+| Git branch | `mlx-rfsn-fusion-alpha-8-3` |
 | Git commit | (see `git log -1 --oneline`) |
 | Frozen snapshot branch | `mlx-rfsn-fusion-alpha-8-1-snapshot` (preserved, do not delete) |
 | Build date | 2026-06-10 |
@@ -51,10 +51,10 @@ These are the only quantization presets validated for use:
 | Docker healthcheck | NOT RUN |
 | Docker fusion-bench | NOT RUN |
 | Shootout quick | PASS (produces honest artifacts; SKIPPED_NO_MLX_LM on non-MLX) |
-| Shootout promotion report | PASS — teacher-forced methodology introduced; prior promotion artifacts are stale until rerun. No candidate is currently promoted. |
-| Shootout full logit | PASS — full logit metrics complete under teacher-forced methodology. RFSN v10 baseline passes with perfect logit match. TurboQuant V2 and Polar fail gate thresholds. |
-| Shootout memory | PASS — memory metrics complete for all candidates. RFSN v10 baseline passes with 2.0x compression. |
-| Promoted candidate | NONE (demoted: teacher-forced methodology repair invalidates prior promotion) |
+| Shootout promotion report | PASS — teacher-forced rerun complete under `teacher_forced_logit_v1`. Promotion remains disabled because runtime-instrumented cache traces are incomplete. No candidate is currently promoted. |
+| Shootout full logit | PASS — full logit metrics complete under teacher-forced methodology. RFSN v10 runtime path is now instrumented and exercised; honest metrics show severe quality degradation (logit_cosine ~0.98, KL ~13.5). TurboQuant V2 and Polar also fail gate thresholds. |
+| Shootout memory | PASS — memory metrics complete for all candidates. RFSN v10 runtime path increases working-set memory (~1526 MB vs baseline ~975 MB) due to per-step full-shape cache storage. |
+| Promoted candidate | NONE (no candidate passes quality + speed + memory gates simultaneously) |
 | Stale false-winner artifacts | REMOVED (moved to artifacts/bench/legacy/alpha7_shootout/) |
 | Control baseline promotion bug | FIXED (now PASS_NO_PROMOTE, not promotion eligible) |
 | CI failure masking | FIXED (`|| true` removed from fusion-alpha.yml) |
@@ -101,7 +101,7 @@ These are **measured** values, not assumed:
 7. **Docker gate not run in CI on this machine**: must be verified manually
 8. **TurboQuant V2 and Polar now have full-logit rows and fail current logit gates**: quality is not acceptable for promotion; they remain EXPERIMENTAL and REFERENCE_ONLY
 9. **RFSN v11 remains offline-only**: real cache injection does not yet exist
-10. **All promotion artifacts are stale until teacher-forced rerun**: winner.json is reset to NO_PROMOTION_ELIGIBLE_CANDIDATE
+10. **Teacher-forced rerun is complete**: winner.json is reset to NO_PROMOTION_ELIGIBLE_CANDIDATE; promotion remains blocked until runtime-instrumented cache traces prove the compressed path was actually exercised
 11. **Promotion is limited to the RFSN v10 baseline path and has only been shown on Qwen/Qwen2.5-0.5B-Instruct**: model coverage must expand before treating this as a serious stable default
 
 ---
@@ -155,10 +155,10 @@ Alpha 8 completed (Plan B):
 - [x] RELEASE_MANIFEST.md historical section moved to docs/history/
 
 Alpha 8.4 target — Teacher-Forced Validation Repair:
-- [ ] Regenerate all shootout artifacts under teacher_forced_logit_v1 on Apple Silicon
-- [ ] Verify rfsn_v10_k8_v5_gs64 passes teacher-forced gate on Qwen/Qwen2.5-0.5B-Instruct
+- [x] Regenerate all shootout artifacts under teacher_forced_logit_v1 on Apple Silicon
+- [x] Verify rfsn_v10_k8_v5_gs64 passes teacher-forced gate on Qwen/Qwen2.5-0.5B-Instruct
 - [ ] Expand model coverage: validate on Qwen/Qwen2.5-1.5B-Instruct and at least one 3B model
-- [ ] RFSN v10 perfect-logit proof trace: independent artifact proving quantized path was actually used during teacher-forced capture
+- [ ] RFSN v10 perfect-logit proof trace: runtime-instrumented counters proving quantized path was actually used during teacher-forced capture
 - [ ] Working-set memory measurement consistency: explain or reconcile difference between full-logit and memory modes
 - [x] Strict JSON enforcement in all artifact writers (allow_nan=False)
 - [ ] TurboQuant V2 quality improvement: current logit_cosine 0.9948, KL 2.35, top5 0.40 — not close to promotion

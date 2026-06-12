@@ -64,13 +64,19 @@ def _rfsn_sdpa_wrapper(
     runtime = getattr(_rfsn_thread_local, "runtime", None)
     layer_id = getattr(_rfsn_thread_local, "layer_id", "unknown")
     # Only intercept single-token decode steps with an active runtime.
+    # QuantizedKVCache (from maybe_quantize_kv_cache) passes keys/values as
+    # tuples of quantized arrays rather than plain arrays.  The RFSNRuntime
+    # cannot handle those yet, so fall through to the original SDPA.
     if (
         runtime is not None
         and cache is not None
         and queries is not None
+        and isinstance(queries, mx.array)
         and queries.ndim == 4
         and queries.shape[2] == 1
+        and isinstance(keys, mx.array)
         and keys.ndim == 4
+        and isinstance(values, mx.array)
         and values.ndim == 4
     ):
         try:
@@ -247,6 +253,7 @@ class RFSNGenerator:
         enable_sparse_decode: bool = False,
         enable_quantized_kv: bool = True,
         audit_mode: bool = False,
+        use_compressed_on_miss: bool = False,
     ):
         """
         Args:
@@ -258,6 +265,9 @@ class RFSNGenerator:
             enable_sparse_decode: Whether to enable RFSN sparse decode.
             enable_quantized_kv: Whether to use quantized KV-cache.
             audit_mode: Enable per-step quality auditing.
+            use_compressed_on_miss: If True, after storing compressed KV,
+                immediately retrieve and use it for attention.  This proves
+                the round-trip dequantization path is exercised.
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -284,6 +294,7 @@ class RFSNGenerator:
                 ),
                 enable_sparse_decode=enable_sparse_decode,
                 audit_mode=audit_mode,
+                use_compressed_on_miss=use_compressed_on_miss,
             )
 
         self._telemetry_log: list[dict] = []
