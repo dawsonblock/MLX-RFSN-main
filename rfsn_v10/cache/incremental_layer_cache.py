@@ -130,6 +130,7 @@ class QuantizedLayerCache:
 
         import dataclasses
 
+        base_offset = self._encoded_tokens
         for i in range(n_full_blocks):
             start = i * block_size
             end = start + block_size
@@ -139,7 +140,7 @@ class QuantizedLayerCache:
             key_block_raw = self.key_codec.encode(keys_slice)
             value_block_raw = self.value_codec.encode(values_slice)
 
-            logical_start = self._encoded_tokens + i * block_size
+            logical_start = base_offset + start
             key_block = dataclasses.replace(
                 key_block_raw,
                 token_count=block_size,
@@ -159,7 +160,8 @@ class QuantizedLayerCache:
 
             self._key_blocks.append(key_block)
             self._value_blocks.append(value_block)
-            self._encoded_tokens += block_size
+
+        self._encoded_tokens += n_full_blocks * block_size
 
         # Keep remainder in staging
         if remainder > 0:

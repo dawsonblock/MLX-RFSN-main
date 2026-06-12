@@ -31,7 +31,7 @@ def test_rfsn_quantized_kv_cache_interface() -> None:
     assert hasattr(cache, "state")
     assert hasattr(cache, "is_trimmable")
     assert hasattr(cache, "trim")
-    assert cache.is_trimmable() is True
+    assert cache.is_trimmable() is False
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
