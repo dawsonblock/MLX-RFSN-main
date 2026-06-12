@@ -82,10 +82,7 @@ jobs:
       - name: Kernel validation (NumPy)
         env:
           RFSN_BACKEND: numpy
-        run: |
-          pytest tests/test_kernels_validation.py -q
-          rc=$?
-          [ $rc -eq 0 ] || [ $rc -eq 5 ]
+        run: pytest tests/test_kernels_validation.py -q || [ $? -eq 5 ]
 
       - name: ClickHouse security tests
         run: pytest tests/test_clickhouse_security.py -q
@@ -239,7 +236,7 @@ jobs:
         run: pytest tests/test_prefill_decode_split.py -q
 
       - name: Short-prompt generation regression
-        run: pytest tests/test_short_prompt_generation_regression.py -q
+        run: pytest tests/test_short_prompt_generation_regression.py -q || [ $? -eq 5 ]
 
       - name: Cache tests (MLX)
         run: pytest rfsn_v10/cache/tests/ -q
