@@ -23,6 +23,8 @@ RFSN_ENABLE_SPARSE_DECODE
 RFSN_ENABLE_KV_COMPRESSION
     ``true`` or ``false`` (default: ``false``). Deprecated alias:
     ``RFSN_ENABLE_QUANTIZED_KV`` still accepted but emits a warning.
+    Even when ``true``, the adapter is disabled unless
+    ``RFSN_EXPERIMENTAL_KV_UNSAFE=1`` is also set.
 RFSN_MAX_NEW_TOKENS
     Default ``256``.
 RFSN_HOST
@@ -125,19 +127,35 @@ class ServerState:
         )
 
         if self.kv_compression_enabled:
-            # Use new incremental quantized cache adapter
-            from rfsn_v10.integrations.mlx_lm_adapter.generator import RfsnMLXGenerator
-            self.generator = RfsnMLXGenerator(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                num_layers=len(getattr(self.model, "layers", [])),
-                key_bits=8,
-                value_bits=5,
-                group_size=64,
-                staging_capacity=64,
-                dense_residual_window=0,
-            )
-        else:
+            # Safety guard: the incremental quantized cache adapter is
+            # experimental and has known correctness issues (unbounded
+            # blocks, corrupt trim, O(T²) dense reconstruction).
+            # Require an explicit dev opt-in beyond the env flag.
+            if os.getenv("RFSN_EXPERIMENTAL_KV_UNSAFE", "false").lower() != "true":
+                import warnings
+                warnings.warn(
+                    "RFSN_ENABLE_KV_COMPRESSION is set but the adapter is "
+                    "not ready for production. Set RFSN_EXPERIMENTAL_KV_UNSAFE=1 "
+                    "to enable anyway. Falling back to dense KV cache.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.kv_compression_enabled = False
+            else:
+                # Use new incremental quantized cache adapter
+                from rfsn_v10.integrations.mlx_lm_adapter.generator import RfsnMLXGenerator
+                self.generator = RfsnMLXGenerator(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    num_layers=len(getattr(self.model, "layers", [])),
+                    key_bits=8,
+                    value_bits=5,
+                    group_size=64,
+                    staging_capacity=64,
+                    dense_residual_window=0,
+                )
+
+        if not self.kv_compression_enabled:
             self.generator = RFSNGenerator(
                 model=self.model,
                 tokenizer=self.tokenizer,

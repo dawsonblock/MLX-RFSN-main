@@ -102,11 +102,12 @@ def test_multiple_appends_and_flush_preserves_identity() -> None:
         all_values.append(values)
         cache.append(keys, values)
 
-    # 5 x 10 = 50 tokens.  Flush triggered at 40 (>= 32), leaving 10 in staging.
+    # 5 x 10 = 50 tokens.  Fixed-size flush encodes one 32-token block,
+    # leaving 18 tokens in staging.
     stats = cache.stats()
-    assert stats.staged_tokens == 10
+    assert stats.staged_tokens == 18
     assert stats.sealed_blocks == 1
-    assert stats.tokens_encoded == 40
+    assert stats.tokens_encoded == 32
     assert stats.tokens_requantized == 0
 
     # Reconstruct sealed blocks + staging via adapter-like logic
@@ -301,6 +302,47 @@ def test_trim_across_regions() -> None:
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_partial_staging_trim() -> None:
+    """Partial trim of staging must retain exactly the requested token count."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64, dense_residual_window=0)
+
+    B, Hkv, D = 1, 2, 64
+
+    # Build: 64 sealed (flush) + 12 staged = 76 total
+    keys1 = _make_identity_tensor(B, Hkv, 64, D, layer_id=0)
+    cache.append(keys1, keys1)
+
+    keys2 = _make_identity_tensor(B, Hkv, 12, D, layer_id=1)
+    cache.append(keys2, keys2)
+
+    assert cache.total_token_count() == 76
+    assert cache.stats().tokens_encoded == 64
+    assert cache.stats().staged_tokens == 12
+
+    # Trim to 68 (inside staging — should keep 4 staged tokens)
+    cache.trim(68)
+    assert cache.total_token_count() == 68
+    assert cache.stats().tokens_encoded == 64
+    assert cache.stats().staged_tokens == 4
+
+    # Verify the 4 retained staging tokens are the first 4 of keys2
+    stage_k, stage_v, stage_n = cache.get_staging()
+    assert stage_k is not None
+    assert stage_k.shape == (B, Hkv, 4, D)
+    for h in range(Hkv):
+        for t in range(4):
+            for d in range(D):
+                exp = keys2[0, h, t, d].item()
+                act = stage_k[0, h, t, d].item()
+                assert act == pytest.approx(exp, abs=1.5)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_many_kv_heads() -> None:
     """Verify correct ordering with 8 KV heads."""
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
@@ -392,7 +434,7 @@ def test_blockwise_attention_matches_dense() -> None:
     # Blockwise
     out_bw = cache.blockwise_attention(queries, scale=scale)
 
-    # Dense reference
+    # Dense reference (sealed blocks + staging)
     parts_k = []
     parts_v = []
     for kb in cache.iter_key_blocks():
@@ -401,6 +443,10 @@ def test_blockwise_attention_matches_dense() -> None:
     for vb in cache.iter_value_blocks():
         v_flat = v_codec.decode(vb)
         parts_v.append(v_flat.reshape(1, 2, vb.token_count, 64))
+    stage_k, stage_v, _stage_n = cache.get_staging()
+    if stage_k is not None:
+        parts_k.append(stage_k)
+        parts_v.append(stage_v)
     full_k = mx.concatenate(parts_k, axis=2)
     full_v = mx.concatenate(parts_v, axis=2)
 

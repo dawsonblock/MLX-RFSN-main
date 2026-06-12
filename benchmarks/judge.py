@@ -86,6 +86,8 @@ class VerdictLabel(str, Enum):
     KEEP_EXPERIMENTAL = "KEEP_EXPERIMENTAL"
     REJECT = "REJECT"
     REGRESSION = "REGRESSION"
+    SMOKE_PASS = "SMOKE_PASS"
+    SMOKE_FAIL = "SMOKE_FAIL"
 
 
 @dataclass
@@ -166,7 +168,18 @@ class Judge:
         """Return a Verdict for *candidate* relative to *baseline*.
 
         baseline should be the dense FP16 result for the same model/prompt.
+        Smoke runs are remapped to SMOKE_PASS / SMOKE_FAIL so they never
+        produce a real PROMOTE verdict.
         """
+        verdict = self._evaluate_inner(candidate, baseline)
+        return self._remap_smoke(verdict, candidate)
+
+    def _evaluate_inner(
+        self,
+        candidate: CandidateResult,
+        baseline: CandidateResult,
+    ) -> Verdict:
+        """Core evaluation logic (no smoke remapping)."""
         quality_failures: list[str] = []
         missing_required: list[str] = []
         improvement_notes: list[str] = []
@@ -285,6 +298,30 @@ class Judge:
             improvement_met=True,
             improvement_notes=improvement_notes,
             reason="all quality gates and at least one improvement gate passed",
+        )
+
+    def _remap_smoke(self, verdict: Verdict, candidate: CandidateResult) -> Verdict:
+        """Remap smoke-run verdicts so they never produce real PROMOTE/REJECT."""
+        if getattr(candidate, "run_type", None) != "smoke":
+            return verdict
+
+        if verdict.label in (VerdictLabel.PROMOTE, VerdictLabel.KEEP_EXPERIMENTAL):
+            new_label = VerdictLabel.SMOKE_PASS
+            new_reason = "smoke run — harness validated (not promotion evidence)"
+        else:
+            new_label = VerdictLabel.SMOKE_FAIL
+            new_reason = "smoke run — harness failure"
+
+        return Verdict(
+            label=new_label,
+            candidate_name=verdict.candidate_name,
+            model_id=verdict.model_id,
+            prompt_id=verdict.prompt_id,
+            quality_failures=verdict.quality_failures,
+            missing_required=verdict.missing_required,
+            improvement_met=verdict.improvement_met,
+            improvement_notes=verdict.improvement_notes,
+            reason=new_reason,
         )
 
     def _check_governance(self, candidate: CandidateResult) -> str:

@@ -37,14 +37,15 @@ def test_append_flushes_at_capacity() -> None:
     v_codec = CartesianCodec(bits=5, group_size=64)
     cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=32)
 
-    # Append 40 tokens → staging reaches 40 (>= 32), flushes all 40
+    # Append 40 tokens → staging reaches 40 (>= 32).
+    # Fixed-size flush encodes one 32-token block and keeps 8 in staging.
     for _ in range(4):
         keys = mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32)
         values = mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32)
         cache.append(keys, values)
 
-    assert cache.encoded_token_count == 40
-    assert cache.stats().staged_tokens == 0
+    assert cache.encoded_token_count == 32
+    assert cache.stats().staged_tokens == 8
     assert cache.stats().sealed_blocks == 1
     assert cache.requantized_token_count == 0
 

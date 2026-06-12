@@ -109,43 +109,68 @@ class QuantizedLayerCache:
             self._flush_staging()
 
     def _flush_staging(self) -> None:
-        """Encode staged tokens into immutable blocks and clear staging."""
+        """Encode staged tokens into fixed-size immutable blocks.
+
+        Staging is chunked into blocks of at most ``staging_capacity`` tokens.
+        Any remainder stays in staging for the next append.
+        """
         if self._stage_token_count == 0:
             return
 
         # Concatenate full-shaped staging tensors along token axis (2).
-        # This produces head-major flat ordering when reshaped.
         keys_full = mx.concatenate(self._stage_keys, axis=2)
         values_full = mx.concatenate(self._stage_values, axis=2)
 
         B, Hkv, stage_T, D = keys_full.shape
         assert B == 1
 
-        # Flatten for codec: head-major ordering (all tokens of head0, then head1, ...)
-        keys_flat = keys_full.reshape(-1, D)
-        values_flat = values_full.reshape(-1, D)
+        block_size = self.staging_capacity
+        n_full_blocks = stage_T // block_size
+        remainder = stage_T % block_size
 
-        # Encode
-        key_block_raw = self.key_codec.encode(keys_flat)
-        value_block_raw = self.value_codec.encode(values_flat)
-
-        # Override token_count to the actual number of tokens (not flattened elements)
         import dataclasses
-        key_block = dataclasses.replace(key_block_raw, token_count=stage_T)
-        value_block = dataclasses.replace(value_block_raw, token_count=stage_T)
 
-        # Append immutable blocks
-        self._key_blocks.append(key_block)
-        self._value_blocks.append(value_block)
+        for i in range(n_full_blocks):
+            start = i * block_size
+            end = start + block_size
+            keys_slice = keys_full[:, :, start:end, :].reshape(-1, D)
+            values_slice = values_full[:, :, start:end, :].reshape(-1, D)
 
-        # Update counters
-        self._encoded_tokens += stage_T
-        # Requantize count stays 0 — we never recompress sealed history
+            key_block_raw = self.key_codec.encode(keys_slice)
+            value_block_raw = self.value_codec.encode(values_slice)
 
-        # Clear staging
-        self._stage_keys.clear()
-        self._stage_values.clear()
-        self._stage_token_count = 0
+            logical_start = self._encoded_tokens + i * block_size
+            key_block = dataclasses.replace(
+                key_block_raw,
+                token_count=block_size,
+                batch_size=B,
+                n_kv_heads=Hkv,
+                head_dim=D,
+                logical_start=logical_start,
+            )
+            value_block = dataclasses.replace(
+                value_block_raw,
+                token_count=block_size,
+                batch_size=B,
+                n_kv_heads=Hkv,
+                head_dim=D,
+                logical_start=logical_start,
+            )
+
+            self._key_blocks.append(key_block)
+            self._value_blocks.append(value_block)
+            self._encoded_tokens += block_size
+
+        # Keep remainder in staging
+        if remainder > 0:
+            start = n_full_blocks * block_size
+            self._stage_keys = [keys_full[:, :, start:, :]]
+            self._stage_values = [values_full[:, :, start:, :]]
+            self._stage_token_count = remainder
+        else:
+            self._stage_keys.clear()
+            self._stage_values.clear()
+            self._stage_token_count = 0
 
     def _update_dense_residual(
         self, keys: Any, values: Any
@@ -330,9 +355,13 @@ class QuantizedLayerCache:
         # remaining > 0: keep some staged and/or dense
         if self._stage_token_count > 0:
             if remaining < self._stage_token_count:
-                # Trim staged tokens
-                self._stage_keys = self._stage_keys[:remaining]
-                self._stage_values = self._stage_values[:remaining]
+                # Trim staged tokens — concatenate then slice along token axis.
+                # _stage_keys is a list of tensors, not a list of individual tokens,
+                # so list slicing would retain too much.
+                keys_full = mx.concatenate(self._stage_keys, axis=2)
+                values_full = mx.concatenate(self._stage_values, axis=2)
+                self._stage_keys = [keys_full[:, :, :remaining, :]]
+                self._stage_values = [values_full[:, :, :remaining, :]]
                 self._stage_token_count = remaining
                 self._dense_keys = None
                 self._dense_values = None

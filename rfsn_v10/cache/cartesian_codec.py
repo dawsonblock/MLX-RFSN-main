@@ -33,7 +33,14 @@ class CartesianCodec:
         Minimum scale to avoid division by zero.
     """
 
-    def __init__(self, bits: int = 8, group_size: int = 64, eps: float = 1e-8) -> None:
+    def __init__(
+        self,
+        bits: int = 8,
+        group_size: int = 64,
+        eps: float = 1e-8,
+        use_wht: bool = False,
+        sign_seed: int = 42,
+    ) -> None:
         if not (2 <= bits <= 16):
             raise ValueError(f"bits must be in [2,16]; got {bits}")
         if group_size <= 0:
@@ -41,6 +48,8 @@ class CartesianCodec:
         self.bits = bits
         self.group_size = group_size
         self.eps = eps
+        self.use_wht = use_wht
+        self.sign_seed = sign_seed
         self.qmax = (1 << (bits - 1)) - 1
 
     # ------------------------------------------------------------------
@@ -72,6 +81,13 @@ class CartesianCodec:
 
         # Grouped quantization
         grouped = flat.reshape(-1, self.group_size)
+
+        # Optional WHT + deterministic signs
+        if self.use_wht:
+            grouped = CartesianCodec.apply_wht(grouped)
+        if self.sign_seed != 0:
+            grouped = CartesianCodec.apply_hash_signs(grouped, self.sign_seed)
+
         max_abs = mx.maximum(mx.max(mx.abs(grouped), axis=1), mx.array(self.eps, dtype=mx.float32))
         scale = max_abs / float(self.qmax)
         q_signed = mx.round(grouped / scale[:, None])
@@ -92,6 +108,8 @@ class CartesianCodec:
             bits=self.bits,
             group_size=self.group_size,
             n_values=n_values,
+            wht_applied=self.use_wht,
+            sign_seed=self.sign_seed if self.sign_seed != 0 else 0,
         )
 
     # ------------------------------------------------------------------
@@ -121,6 +139,13 @@ class CartesianCodec:
         grouped = flat.reshape(-1, block.group_size)
         q_signed = grouped - float(qmax)
         restored = q_signed * block.scales[:, None]
+
+        # Inverse hash signs and WHT (both are self-inverse when normalized)
+        if block.sign_seed != 0:
+            restored = CartesianCodec.apply_hash_signs(restored, block.sign_seed)
+        if block.wht_applied:
+            restored = CartesianCodec.apply_wht(restored)
+
         return restored.reshape(-1)
 
     # ------------------------------------------------------------------
@@ -170,9 +195,10 @@ class CartesianCodec:
 
 
 def _reference_wht64(x: Any) -> Any:
-    """Pure-MLX reference WHT-64.
+    """Pure-MLX reference WHT-64 (orthonormal, self-inverse).
 
     Iterative vectorised butterfly.  Preserves input shape.
+    Normalised by sqrt(n) so that ``WHT(WHT(x)) == x``.
     """
     h = x.astype(mx.float32)
     n = int(h.shape[-1])
@@ -189,7 +215,7 @@ def _reference_wht64(x: Any) -> Any:
         # Flatten back to the original rank so the next iteration works
         h = h.reshape(*original_shape)
         step *= 2
-    return h
+    return h / math.sqrt(n)
 
 
 def _reference_hash_signs(x: Any, seed: int) -> Any:

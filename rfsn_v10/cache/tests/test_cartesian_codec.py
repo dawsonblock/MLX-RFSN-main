@@ -1,6 +1,7 @@
 """Tests for CartesianCodec — stateless K8/V5 codec."""
 from __future__ import annotations
 
+import math
 import pytest
 
 try:
@@ -127,16 +128,14 @@ def test_wht_reference_preserves_shape() -> None:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_wht_double_transform_approximates_identity() -> None:
-    """WHT(WHT(x)) ≈ n * x for unnormalised transform."""
+    """WHT(WHT(x)) ≈ x for orthonormal transform."""
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
 
     x = mx.random.normal(shape=(2, 64)).astype(mx.float32)
     y = CartesianCodec.apply_wht(x)
     z = CartesianCodec.apply_wht(y)
-    # For unnormalised WHT, WHT(WHT(x)) = n * x
-    n = x.shape[-1]
-    expected = x * n
-    max_err = mx.max(mx.abs(z - expected)).item()
+    # For orthonormal WHT, WHT(WHT(x)) = x
+    max_err = mx.max(mx.abs(z - x)).item()
     assert max_err < 1e-3, f"WHT(WHT(x)) max_err={max_err}"
 
 
@@ -147,7 +146,26 @@ def test_wht_orthogonality_constant_signal() -> None:
 
     x = mx.ones((1, 64)).astype(mx.float32)
     y = CartesianCodec.apply_wht(x)
-    # First element should be large (sum of all ones)
-    assert y[0, 0].item() == pytest.approx(64.0, abs=1e-4)
+    # First element should be sum of all ones / sqrt(n)
+    n = x.shape[-1]
+    assert y[0, 0].item() == pytest.approx(n / math.sqrt(n), abs=1e-4)
     # Remaining elements should be zero (differences cancel)
     assert mx.max(mx.abs(y[0, 1:])).item() < 1e-4
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_wht_sign_roundtrip() -> None:
+    """Encode/decode with WHT and signs must roundtrip within quant error."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+
+    codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+    x = mx.random.normal(shape=(128, 64)).astype(mx.float32)
+
+    block = codec.encode(x)
+    assert block.wht_applied is True
+    assert block.sign_seed == 42
+
+    decoded = codec.decode(block)
+    decoded_reshaped = decoded.reshape(x.shape)
+    max_err = mx.max(mx.abs(x - decoded_reshaped)).item()
+    assert max_err < 0.5, f"WHT+sign roundtrip max_err={max_err}"

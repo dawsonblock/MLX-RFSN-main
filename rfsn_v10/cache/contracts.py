@@ -29,6 +29,16 @@ class PackedBlock:
     group_size: int         # Elements per scale
     n_values: int           # Original number of quantized values
 
+    # Self-describing metadata so the decoder does not need external guesses
+    batch_size: int = 1
+    n_kv_heads: int = 0
+    head_dim: int = 0
+    logical_start: int = 0          # Global sequence position of first token
+    original_dtype: str = "float16"
+    format_version: int = 1
+    wht_applied: bool = False
+    sign_seed: int = 0
+
     def payload_bytes(self) -> int:
         """Exact bytes from the stored arrays."""
         if HAS_MLX and self.packed_codes is not None:

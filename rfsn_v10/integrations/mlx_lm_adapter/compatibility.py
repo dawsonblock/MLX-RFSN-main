@@ -5,7 +5,8 @@ Major version changes may break the cache interface.
 """
 from __future__ import annotations
 
-MIN_MLX_LM_VERSION = "0.21.0"
+MIN_MLX_LM_VERSION = "0.19.0"
+MAX_MLX_LM_VERSION = "0.22.0"
 
 
 def check_mlx_lm_version() -> tuple[bool, str]:
@@ -28,10 +29,16 @@ def check_mlx_lm_version() -> tuple[bool, str]:
 
     installed = version.parse(mlx_lm.__version__)
     minimum = version.parse(MIN_MLX_LM_VERSION)
+    maximum = version.parse(MAX_MLX_LM_VERSION)
 
     if installed < minimum:
         return (
             False,
             f"mlx-lm {installed} < minimum {MIN_MLX_LM_VERSION}"
+        )
+    if installed >= maximum:
+        return (
+            False,
+            f"mlx-lm {installed} >= maximum {MAX_MLX_LM_VERSION}"
         )
     return True, f"mlx-lm {installed} is compatible"

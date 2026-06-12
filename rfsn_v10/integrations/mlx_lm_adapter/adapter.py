@@ -115,7 +115,9 @@ class RfsnQuantizedKVCache:
             )
 
     def is_trimmable(self) -> bool:
-        return True
+        # Partial trim of sealed blocks drops whole blocks rather than
+        # re-encoding a partial block.  Return False until this is fixed.
+        return False
 
     def trim(self, n: int) -> int:
         """Trim the last n tokens from the cache."""

@@ -27,8 +27,8 @@ Outputs
 
 Exit codes
 ----------
-    0  PROMOTE or KEEP_EXPERIMENTAL
-    1  REJECT or REGRESSION
+    0  PROMOTE, KEEP_EXPERIMENTAL, or SMOKE_PASS
+    1  REJECT, REGRESSION, or SMOKE_FAIL
     2  Error / missing dependency
 """
 from __future__ import annotations
@@ -77,6 +77,7 @@ def _make_smoke_a1_result(
         key_bits=8.0,
         value_bits=4.0,
         group_size=64,
+        run_type="smoke",
         logit_cosine=float(rng.uniform(0.997, 0.9999)),
         top1_match_rate=float(rng.uniform(0.96, 0.999)),
         top5_overlap=float(rng.uniform(0.97, 0.999)),
@@ -212,10 +213,14 @@ def main() -> int:
         worst = max(all_verdicts, key=lambda v: {
             VerdictLabel.PROMOTE: 0,
             VerdictLabel.KEEP_EXPERIMENTAL: 1,
+            VerdictLabel.SMOKE_PASS: 1,
             VerdictLabel.REGRESSION: 2,
+            VerdictLabel.SMOKE_FAIL: 3,
             VerdictLabel.REJECT: 3,
         }.get(v.label, 1))
-        return 1 if worst.label in (VerdictLabel.REJECT, VerdictLabel.REGRESSION) else 0
+        return 1 if worst.label in (
+            VerdictLabel.REJECT, VerdictLabel.REGRESSION, VerdictLabel.SMOKE_FAIL
+        ) else 0
 
     # ------------------------------------------------------------------
     # Real model run
@@ -309,10 +314,14 @@ def main() -> int:
     worst = max(all_verdicts, key=lambda v: {
         VerdictLabel.PROMOTE: 0,
         VerdictLabel.KEEP_EXPERIMENTAL: 1,
+        VerdictLabel.SMOKE_PASS: 1,
         VerdictLabel.REGRESSION: 2,
+        VerdictLabel.SMOKE_FAIL: 3,
         VerdictLabel.REJECT: 3,
     }.get(v.label, 1))
-    return 1 if worst.label in (VerdictLabel.REJECT, VerdictLabel.REGRESSION) else 0
+    return 1 if worst.label in (
+        VerdictLabel.REJECT, VerdictLabel.REGRESSION, VerdictLabel.SMOKE_FAIL
+    ) else 0
 
 
 def _print_summary(verdicts: list) -> None:
