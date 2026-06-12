@@ -249,3 +249,40 @@ def test_decode_v1_block_no_dtype_restore() -> None:
     # V1 block should return float32 (no dtype restoration), not float16
     assert decoded.dtype == mx.float32, f"V1 block should stay float32, got {decoded.dtype}"
     assert int(decoded.size) == 128 * 64  # no trimming for V1
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_v3_block_validate_rejects_negative_token_count() -> None:
+    from rfsn_v10.cache.contracts import PackedBlock
+    import mlx.core as mx
+
+    block = PackedBlock(
+        packed_codes=mx.array([0], dtype=mx.uint32),
+        scales=mx.array([1.0], dtype=mx.float32),
+        token_count=-1,
+        bits=8,
+        group_size=64,
+        n_values=64,
+        format_version=3,
+    )
+    with pytest.raises(ValueError, match="token_count"):
+        block.validate()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_v3_block_validate_rejects_mismatched_n_values() -> None:
+    from rfsn_v10.cache.contracts import PackedBlock
+    import mlx.core as mx
+
+    block = PackedBlock(
+        packed_codes=mx.array([0] * 32, dtype=mx.uint32),
+        scales=mx.array([1.0], dtype=mx.float32),
+        token_count=1,
+        bits=8,
+        group_size=64,
+        n_values=100,  # Wrong: 65 elements padded to 128
+        num_elements=65,
+        format_version=3,
+    )
+    with pytest.raises(ValueError, match="n_values"):
+        block.validate()

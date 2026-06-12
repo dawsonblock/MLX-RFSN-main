@@ -17,42 +17,64 @@ except ImportError:  # pragma: no cover
 
 @dataclass(frozen=True)
 class PackedBlock:
-    """One immutable sealed block of packed quantized data (format version 2).
+    """Immutable sealed block (format version 3).
 
-    A block corresponds to a fixed number of tokens (the group_size or
-    a multiple thereof).  Once sealed, a block never changes.
-
-    V2 additions over V1:
-      * ``num_elements`` — original scalar count before group padding,
-        so the decoder can trim padding exactly.
-      * ``original_dtype`` / ``batch_size`` / ``n_kv_heads`` / ``head_dim`` /
-        ``logical_start`` — fully self-describing for direct decode.
+    V3 changes over V2:
+      * ``format_version`` defaults to 3.
+      * ``vector_alignment`` — required SIMD alignment (64 for K8/V5).
+      * ``validate()`` — strict range checks on every field.
     """
-    packed_codes: Any       # mx.array uint32, shape (n_words,)
-    scales: Any             # mx.array float32, shape (n_groups,)
-    token_count: int        # Number of tokens represented
-    bits: int               # Bit width per coordinate
-    group_size: int         # Elements per scale
-    n_values: int           # Original number of quantized values
+    packed_codes: Any       # mx.array uint32
+    scales: Any             # mx.array float32
+    token_count: int
+    bits: int
+    group_size: int
+    n_values: int
 
-    # Self-describing metadata so the decoder does not need external guesses
     batch_size: int = 1
     n_kv_heads: int = 0
     head_dim: int = 0
-    logical_start: int = 0          # Global sequence position of first token
+    logical_start: int = 0
     original_dtype: str = "float16"
-    format_version: int = 2
-    num_elements: int = 0           # Original scalar count before padding
+    format_version: int = 3
+    num_elements: int = 0
     wht_applied: bool = False
     sign_seed: int = 0
+    vector_alignment: int = 64  # NEW in V3
 
     def payload_bytes(self) -> int:
-        """Exact bytes from the stored arrays."""
         if HAS_MLX and self.packed_codes is not None:
             code_bytes = int(self.packed_codes.size) * 4
             scale_bytes = int(self.scales.size) * 4
             return code_bytes + scale_bytes
         return 0
+
+    def validate(self) -> None:
+        """Fail-fast validation. Call immediately after construction."""
+        if self.bits not in (2, 3, 4, 5, 6, 7, 8, 16):
+            raise ValueError(f"Unsupported bits: {self.bits}")
+        if self.group_size <= 0:
+            raise ValueError(f"Invalid group_size: {self.group_size}")
+        if self.token_count < 0:
+            raise ValueError(f"Invalid token_count: {self.token_count}")
+        if self.n_values < 0:
+            raise ValueError(f"Invalid n_values: {self.n_values}")
+        if self.num_elements < 0:
+            raise ValueError(f"Invalid num_elements: {self.num_elements}")
+        if self.logical_start < 0:
+            raise ValueError(f"Invalid logical_start: {self.logical_start}")
+        if self.vector_alignment <= 0:
+            raise ValueError(f"Invalid vector_alignment: {self.vector_alignment}")
+        # Payload sanity: n_values should be close to num_elements when no WHT
+        if self.num_elements > 0 and self.n_values > 0:
+            padded = self.num_elements + (
+                (self.group_size - (self.num_elements % self.group_size)) % self.group_size
+            )
+            if self.n_values != padded and not self.wht_applied:
+                raise ValueError(
+                    f"n_values ({self.n_values}) != padded ({padded}) for "
+                    f"num_elements={self.num_elements}, group_size={self.group_size}"
+                )
 
 
 def validate_block_positions(blocks: list[PackedBlock]) -> None:

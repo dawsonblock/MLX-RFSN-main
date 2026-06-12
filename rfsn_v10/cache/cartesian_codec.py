@@ -102,19 +102,22 @@ class CartesianCodec:
             packed = codes.astype(mx.uint32)
             n_values = int(codes.size)
 
-        return PackedBlock(
+        block = PackedBlock(
             packed_codes=packed,
             scales=scale,
             token_count=0,               # caller sets semantic token count
             bits=self.bits,
             group_size=self.group_size,
             n_values=n_values,
-            format_version=2,
+            format_version=3,          # BUMP
             num_elements=original_size,
             original_dtype=original_dtype_str,
             wht_applied=self.use_wht,
             sign_seed=self.sign_seed if self.sign_seed != 0 else 0,
+            vector_alignment=64,       # NEW
         )
+        block.validate()               # NEW: fail fast
+        return block
 
     # ------------------------------------------------------------------
     # Decode
@@ -123,8 +126,10 @@ class CartesianCodec:
     def decode(self, block: PackedBlock) -> Any:
         """Reconstruct the original tensor from a PackedBlock.
 
-        Trims group padding and restores the original dtype from V2 metadata.
+        Trims group padding and restores the original dtype from V2/V3 metadata.
         """
+        if block.format_version not in (1, 2, 3):
+            raise ValueError(f"Unsupported PackedBlock version: {block.format_version}")
         if block.bits != self.bits:
             raise ValueError(f"Block bits={block.bits}, codec bits={self.bits}")
 
