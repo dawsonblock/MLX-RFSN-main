@@ -6,6 +6,9 @@ Uses create_app() factory for per-test isolation.
 from __future__ import annotations
 
 import pytest
+
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 
 from rfsn_v10.config import RFSNConfig
