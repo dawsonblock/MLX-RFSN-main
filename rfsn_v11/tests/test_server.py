@@ -13,6 +13,8 @@ import threading
 import time
 import pytest
 
+pytest.importorskip("fastapi")
+
 from rfsn_v11.server.app import GenerationConfig
 
 
