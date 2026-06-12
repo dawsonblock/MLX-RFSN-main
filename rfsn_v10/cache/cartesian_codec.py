@@ -104,10 +104,12 @@ class CartesianCodec:
         return PackedBlock(
             packed_codes=packed,
             scales=scale,
-            token_count=original_size,  # caller translates elements → tokens
+            token_count=0,               # caller sets semantic token count
             bits=self.bits,
             group_size=self.group_size,
             n_values=n_values,
+            format_version=2,
+            num_elements=original_size,
             wht_applied=self.use_wht,
             sign_seed=self.sign_seed if self.sign_seed != 0 else 0,
         )

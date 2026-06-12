@@ -17,10 +17,16 @@ except ImportError:  # pragma: no cover
 
 @dataclass(frozen=True)
 class PackedBlock:
-    """One immutable sealed block of packed quantized data.
+    """One immutable sealed block of packed quantized data (format version 2).
 
     A block corresponds to a fixed number of tokens (the group_size or
     a multiple thereof).  Once sealed, a block never changes.
+
+    V2 additions over V1:
+      * ``num_elements`` — original scalar count before group padding,
+        so the decoder can trim padding exactly.
+      * ``original_dtype`` / ``batch_size`` / ``n_kv_heads`` / ``head_dim`` /
+        ``logical_start`` — fully self-describing for direct decode.
     """
     packed_codes: Any       # mx.array uint32, shape (n_words,)
     scales: Any             # mx.array float32, shape (n_groups,)
@@ -35,7 +41,8 @@ class PackedBlock:
     head_dim: int = 0
     logical_start: int = 0          # Global sequence position of first token
     original_dtype: str = "float16"
-    format_version: int = 1
+    format_version: int = 2
+    num_elements: int = 0           # Original scalar count before padding
     wht_applied: bool = False
     sign_seed: int = 0
 
