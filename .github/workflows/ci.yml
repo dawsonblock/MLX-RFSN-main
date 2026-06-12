@@ -51,6 +51,12 @@ jobs:
       - name: Collection check — all tests discoverable without PYTHONPATH hack
         run: pytest --collect-only -q
 
+      - name: Cache oracle tests (NumPy, no MLX required)
+        run: pytest rfsn_v10/cache/tests/test_numpy_oracle.py rfsn_v10/cache/tests/test_session.py -q
+
+      - name: Adapter interface tests (MLX tests auto-skip)
+        run: pytest rfsn_v10/integrations/mlx_lm_adapter/tests/test_adapter.py -q
+
       - name: Source integrity — no placeholder text in .py files
         run: pytest tests/test_no_placeholder_source.py -q
 
@@ -230,6 +236,12 @@ jobs:
 
       - name: Short-prompt generation regression
         run: pytest tests/test_short_prompt_generation_regression.py -q
+
+      - name: Cache tests (MLX)
+        run: pytest rfsn_v10/cache/tests/ -q
+
+      - name: Adapter tests (MLX)
+        run: pytest rfsn_v10/integrations/mlx_lm_adapter/tests/ -q
 
       - name: healthcheck CLI (MLX backend)
         env:

@@ -130,7 +130,7 @@ fallback_version = "10.1.0.dev0"
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"
-testpaths = ["tests", "rfsn_v11/tests"]
+testpaths = ["tests", "rfsn_v11/tests", "rfsn_v10/cache/tests", "rfsn_v10/integrations/mlx_lm_adapter/tests"]
 timeout = 300
 filterwarnings = [
     "ignore::DeprecationWarning:mlx",
