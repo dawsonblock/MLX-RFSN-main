@@ -2,36 +2,36 @@
 
 This is the correctness oracle for every Metal kernel.  It is pure Python
 + MLX, slow, but mathematically exact relative to the quantization contract.
+
+Important: ``PolarQuantizer.dequantize()`` already applies the inverse
+rotation, returning vectors in the original basis.  Therefore this class
+performs standard attention on the dequantized K/V without any extra
+rotations.  The rotations are an implementation detail of the quantizer.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from .codebooks import get_default_codebook_registry
 from .contracts import AttentionOutputResult, QuantizedVectors
 from .quantize import PolarQuantizer
-from .rotations import get_default_rotation_registry
 
 # MLX optional at import time
 try:
     import mlx.core as mx
-    import mlx.nn as nn
 except ImportError:  # pragma: no cover
     mx = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
 
 
 class NaivePolarAttention:
     """Reference attention that dequantizes the full cache each step.
 
     Pipeline:
-        queries
-          → key-basis rotation
-          → QK with dequantized keys
-          → mask + softmax
-          → SV with dequantized values
-          → value inverse rotation
-          → output
+        keys, values = dequantize(quantized_cache)
+        scores = softmax(scale * queries @ keys.T)
+        output = scores @ values
+
+    No extra rotations are applied — ``dequantize()`` already returns
+    vectors in the original (unrotated) basis.
     """
 
     def __init__(
@@ -46,20 +46,6 @@ class NaivePolarAttention:
         self.value_q = value_quantizer
         self.scale = scale
 
-        # Rotation matrices
-        self.Rk_T = get_default_rotation_registry().get_transpose(
-            key_quantizer.head_dim, key_quantizer.rotation_seed
-        )
-        self.Rk = get_default_rotation_registry().get(
-            key_quantizer.head_dim, key_quantizer.rotation_seed
-        )
-        self.Rv_T = get_default_rotation_registry().get_transpose(
-            value_quantizer.head_dim, value_quantizer.rotation_seed
-        )
-        self.Rv = get_default_rotation_registry().get(
-            value_quantizer.head_dim, value_quantizer.rotation_seed
-        )
-
     def attend(
         self,
         queries: Any,
@@ -72,11 +58,11 @@ class NaivePolarAttention:
         Parameters
         ----------
         queries
-            Shape ``(batch, n_q_heads, 1, head_dim)`` for decode step.
+            Shape ``(batch, n_q_heads, Lq, head_dim)``.
         key_qv, value_qv
             Quantized cache for all prior tokens.
         mask
-            Optional causal mask.
+            Optional attention mask.
 
         Returns
         -------
@@ -85,8 +71,8 @@ class NaivePolarAttention:
         if mx is None:
             raise RuntimeError("MLX is not installed")
 
-        # Dequantize full cache
-        keys = self.key_q.dequantize(key_qv)   # (B, H_kv, L, D)
+        # Dequantize full cache (already in original basis)
+        keys = self.key_q.dequantize(key_qv)     # (B, H_kv, L, D)
         values = self.value_q.dequantize(value_qv)  # (B, H_kv, L, D)
 
         # GQA: map query heads to KV heads
@@ -102,12 +88,11 @@ class NaivePolarAttention:
         keys = mx.repeat(keys, repeats, axis=1)
         values = mx.repeat(values, repeats, axis=1)
 
-        # Rotate queries into key basis
-        q_rot = queries @ self.Rk_T  # (B, Hq, 1, D)
-
-        # QK
-        # scores[b, h, q_pos, k_pos] = q_rot[b, h, q_pos, :] · keys[b, h, k_pos, :]
-        scores = mx.matmul(q_rot, keys.transpose(0, 1, 3, 2))
+        # Standard attention with dequantized K/V
+        scores = mx.matmul(
+            queries,
+            keys.transpose(0, 1, 3, 2)
+        )
 
         # Scale
         head_dim = queries.shape[-1]
@@ -121,11 +106,8 @@ class NaivePolarAttention:
         # Softmax
         weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(queries.dtype)
 
-        # SV in value basis
-        out_rot = mx.matmul(weights, values)  # (B, Hq, 1, D)
-
-        # Inverse rotation back to original basis
-        output = out_rot @ self.Rv
+        # SV
+        output = mx.matmul(weights, values)
 
         return AttentionOutputResult(
             output=output,

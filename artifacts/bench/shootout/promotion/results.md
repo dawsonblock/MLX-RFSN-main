@@ -4,7 +4,7 @@
 
 | Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |
 |-----------|--------|-------------|----------------|------------|-----------------|-----------|
-| mlx_lm_baseline | CONTROL | 50.27 | 1.000 | PASS_NO_PROMOTE | yes | no |
+| mlx_lm_baseline | CONTROL | 45.40 | 1.000 | PASS_NO_PROMOTE | yes | no |
 
 | *Summary* | — | — | — | — | — | **No candidate is promotion eligible.** |
 

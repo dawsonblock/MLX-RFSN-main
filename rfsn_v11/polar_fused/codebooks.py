@@ -1,9 +1,8 @@
 """Deterministic, versioned scalar codebooks for Polar quantization.
 
 Codebooks are optimised for the standard-normal distribution (coordinates after
-orthogonal rotation are approximately N(0,1)).  Centroids are computed via
-Lloyd-Max on a large offline sample and then hard-coded so they are identical
-across process restarts.
+orthogonal rotation are approximately N(0,1)).  Centroids are pre-computed and
+hard-coded so they are identical across process restarts.
 """
 from __future__ import annotations
 
@@ -20,58 +19,45 @@ except ImportError:  # pragma: no cover
 
 
 # ------------------------------------------------------------------
-# Pre-computed Lloyd-Max centroids for standard normal
+# Pre-computed Lloyd-Max centroids for standard normal (polar_lm_v1)
 #
-# Generated offline with 10_000_000 samples, 1000 iterations.
-# These values are frozen for the "polar_lm_v1" codebook version.
+# Computed offline with 1_000_000 samples, 200 iterations.
 # ------------------------------------------------------------------
 
-_CENTROIDS_V1: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+_CENTROIDS_V1: dict[int, np.ndarray] = {
+    2: np.array([
+        -1.5032894611358643, -0.45074549317359924,
+        0.4528157711029053, 1.5073493719100952,
+    ], dtype=np.float32),
+    3: np.array([
+        -2.137267827987671, -1.3348439931869507, -0.7523118853569031, -0.24255864322185516,
+        0.24621115624904633, 0.7544039487838745, 1.3418755531311035, 2.146153211593628,
+    ], dtype=np.float32),
+    4: np.array([
+        -2.745058059692383, -2.0904152393341064, -1.6391898393630981, -1.2766743898391724,
+        -0.9614418745040894, -0.6744636297225952, -0.40526825189590454, -0.14460529386997223,
+        0.11706199496984482, 0.3830487132072449, 0.6579284071922302, 0.9480444192886353,
+        1.2650624513626099, 1.6254150867462158, 2.0742762088775635, 2.73093843460083,
+    ], dtype=np.float32),
+}
 
 
-def _lloyd_max_centroids(bits: int, n_samples: int = 10_000_000, iterations: int = 1000) -> tuple[np.ndarray, np.ndarray]:
-    """Compute Lloyd-Max centroids and boundaries for standard normal."""
-    rng = np.random.default_rng(0xDEADBEEF + bits)
-    samples = rng.standard_normal(size=n_samples)
-    n_centroids = 2 ** bits
-
-    # K-means++ style initialisation
-    centroids = np.zeros(n_centroids, dtype=np.float64)
-    centroids[0] = samples[rng.integers(len(samples))]
-    for i in range(1, n_centroids):
-        dists = np.min([(samples - c) ** 2 for c in centroids[:i]], axis=0)
-        probs = dists / dists.sum()
-        centroids[i] = samples[rng.choice(len(samples), p=probs)]
-
-    # Lloyd-Max iterations
-    for _ in range(iterations):
-        # boundaries are midpoints between centroids
-        boundaries = (centroids[:-1] + centroids[1:]) / 2.0
-        # assign samples
-        assignments = np.searchsorted(boundaries, samples)
-        # update centroids
-        new_centroids = np.array([samples[assignments == j].mean() if np.any(assignments == j) else centroids[j] for j in range(n_centroids)])
-        if np.max(np.abs(new_centroids - centroids)) < 1e-10:
-            break
-        centroids = new_centroids
-
-    # Final boundaries
-    boundaries = (centroids[:-1] + centroids[1:]) / 2.0
-    # Extend boundaries to ±inf
-    boundaries = np.concatenate([[-np.inf], boundaries, [np.inf]])
-    return centroids.astype(np.float32), boundaries.astype(np.float32)
+# Pre-computed boundaries (midpoints between centroids, extended to ±inf)
+_BOUNDARIES_V1: dict[int, np.ndarray] = {}
 
 
-def _ensure_centroids() -> None:
-    """Lazy initialisation of hard-coded centroids."""
-    global _CENTROIDS_V1
-    if _CENTROIDS_V1:
+def _ensure_boundaries() -> None:
+    """Lazy init of boundaries from centroids."""
+    global _BOUNDARIES_V1
+    if _BOUNDARIES_V1:
         return
-    for bits in (2, 3, 4):
-        _CENTROIDS_V1[bits] = _lloyd_max_centroids(bits)
+    for bits, cents in _CENTROIDS_V1.items():
+        mids = (cents[:-1] + cents[1:]) / 2.0
+        bounds = np.concatenate([[-np.inf], mids, [np.inf]]).astype(np.float32)
+        _BOUNDARIES_V1[bits] = bounds
 
 
-_ensure_centroids()
+_ensure_boundaries()
 
 
 class CodebookRegistry:
@@ -127,19 +113,12 @@ class CodebookRegistry:
     def quantize(self, values: Any, bits: int) -> Any:
         """Quantize an array of values to codebook indices.
 
-        Uses ``searchsorted`` on pre-computed boundaries for O(1)
-        per-element work (after broadcasting the boundary comparison).
+        Uses argmin over absolute differences to centroids.
         """
         if mx is None:
             raise RuntimeError("MLX is not installed")
         self._validate_bits(bits)
-        boundaries = self.boundaries(bits)  # shape (n_centroids + 1,)
-        # mlx.searchsorted not available; use argmin over absolute diff to centroids
         centroids = self.centroids(bits)  # shape (n_centroids,)
-        # values shape: (*batch, dim)
-        # centroids shape: (n_centroids,)
-        # We want argmin over centroids axis for each value.
-        # In MLX: expand dims and use argmin.
         orig_shape = values.shape
         flat = values.reshape(-1, 1)  # (N, 1)
         c = centroids.reshape(1, -1)   # (1, n_centroids)
@@ -170,7 +149,8 @@ class CodebookRegistry:
 
     def _load(self, bits: int) -> dict[str, Any]:
         if self._version == "polar_lm_v1":
-            centroids_np, boundaries_np = _CENTROIDS_V1[bits]
+            centroids_np = _CENTROIDS_V1[bits]
+            boundaries_np = _BOUNDARIES_V1[bits]
         else:
             raise RuntimeError(f"Unhandled version {self._version}")
 

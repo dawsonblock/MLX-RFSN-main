@@ -1,2 +1,2 @@
 actual_kv_memory_mb,candidate_status,compression_factor,count,failed_gate_reasons,gate_status,kl_divergence,logit_cosine,max_logit_delta,model_id,name,notes,promotion_eligible,real_cache_used,size_ratio,tokens_per_sec,top10_overlap,top1_match,top5_overlap,total_ms,working_set_memory_mb
-0.5859375,CONTROL,1.0,6,[],PASS_NO_PROMOTE,0.0,1.0,0.0,unknown,mlx_lm_baseline,FP16 baseline — no compression applied,False,True,1.0,50.268280493121125,1.0,1.0,1.0,760.2151598339333,975.3234980901083
+0.5859375,CONTROL,1.0,6,[],PASS_NO_PROMOTE,0.0,1.0,0.0,unknown,mlx_lm_baseline,FP16 baseline — no compression applied,False,True,1.0,45.400753732533076,1.0,1.0,1.0,1015.8930901670828,975.2498388290405
