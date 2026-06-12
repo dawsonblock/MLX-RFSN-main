@@ -286,3 +286,18 @@ def test_v3_block_validate_rejects_mismatched_n_values() -> None:
     )
     with pytest.raises(ValueError, match="n_values"):
         block.validate()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_group_size_must_be_vector_aligned() -> None:
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    with pytest.raises(ValueError, match="group_size"):
+        CartesianCodec(bits=8, group_size=32)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_default_codec_has_wht_enabled() -> None:
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    codec = CartesianCodec()
+    assert codec.use_wht is True
+    assert codec.sign_seed == 42

@@ -38,13 +38,17 @@ class CartesianCodec:
         bits: int = 8,
         group_size: int = 64,
         eps: float = 1e-8,
-        use_wht: bool = False,
+        use_wht: bool = True,
         sign_seed: int = 42,
     ) -> None:
         if not (2 <= bits <= 16):
             raise ValueError(f"bits must be in [2,16]; got {bits}")
         if group_size <= 0:
             raise ValueError(f"group_size must be positive; got {group_size}")
+        if group_size % 64 != 0:
+            raise ValueError(
+                f"group_size must be a multiple of 64 for vector alignment; got {group_size}"
+            )
         self.bits = bits
         self.group_size = group_size
         self.eps = eps

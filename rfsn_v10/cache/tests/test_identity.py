@@ -276,28 +276,12 @@ def test_trim_across_regions() -> None:
 
     assert cache.total_token_count() == 40
 
-    # Trim to 32 (exact block boundary — keeps sealed, drops staging)
-    cache.trim(32)
-    assert cache.total_token_count() == 32
-    assert cache.stats().tokens_encoded == 32
-    assert cache.stats().staged_tokens == 0
+    # Trim is disabled in this release
+    with pytest.raises(NotImplementedError):
+        cache.trim(32)
 
-    # Verify the sealed block still has the right identity
-    key_parts = []
-    for kb in cache.iter_key_blocks():
-        k_flat = k_codec.decode(kb)
-        k_reshaped = k_flat.reshape(B, Hkv, kb.token_count, D)
-        key_parts.append(k_reshaped)
-    full_k = mx.concatenate(key_parts, axis=2)
-    for h in range(Hkv):
-        for t in range(32):
-            for d in range(D):
-                exp = keys1[0, h, t, d].item()
-                act = full_k[0, h, t, d].item()
-                assert act == pytest.approx(exp, abs=0.01)
-
-    # Trim to 0
-    cache.trim(0)
+    # Reset still works
+    cache.reset()
     assert cache.total_token_count() == 0
 
 
@@ -324,22 +308,14 @@ def test_partial_staging_trim() -> None:
     assert cache.stats().tokens_encoded == 64
     assert cache.stats().staged_tokens == 12
 
-    # Trim to 68 (inside staging — should keep 4 staged tokens)
-    cache.trim(68)
-    assert cache.total_token_count() == 68
-    assert cache.stats().tokens_encoded == 64
-    assert cache.stats().staged_tokens == 4
+    # Trim is disabled in this release
+    with pytest.raises(NotImplementedError):
+        cache.trim(68)
 
-    # Verify the 4 retained staging tokens are the first 4 of keys2
+    # Verify staging still intact (12 tokens)
     stage_k, stage_v, stage_n = cache.get_staging()
     assert stage_k is not None
-    assert stage_k.shape == (B, Hkv, 4, D)
-    for h in range(Hkv):
-        for t in range(4):
-            for d in range(D):
-                exp = keys2[0, h, t, d].item()
-                act = stage_k[0, h, t, d].item()
-                assert act == pytest.approx(exp, abs=1.5)
+    assert stage_k.shape == (B, Hkv, 12, D)
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
