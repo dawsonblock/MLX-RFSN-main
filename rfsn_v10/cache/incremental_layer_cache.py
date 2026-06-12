@@ -71,6 +71,9 @@ class QuantizedLayerCache:
         self._dense_values: Any | None = None
         self._dense_token_count: int = 0
 
+        # Geometry freeze (validated on first append)
+        self._geometry: tuple[int, int, int] | None = None  # (B, Hkv, D)
+
         # Counters for proof
         self._encoded_tokens: int = 0
         self._requantized_tokens: int = 0
@@ -89,6 +92,16 @@ class QuantizedLayerCache:
         """
         B, Hkv, new_T, D = keys.shape
         assert B == 1, "Batch size must be 1"
+
+        if self._geometry is None:
+            self._geometry = (B, Hkv, D)
+        else:
+            expected_B, expected_Hkv, expected_D = self._geometry
+            if (B, Hkv, D) != (expected_B, expected_Hkv, expected_D):
+                raise ValueError(
+                    f"Geometry mismatch: expected {(expected_B, expected_Hkv, expected_D)}, "
+                    f"got {(B, Hkv, D)}"
+                )
 
         if self.dense_residual_window > 0:
             # Recent tokens go to dense residual; evicted tokens are staged.
@@ -141,6 +154,7 @@ class QuantizedLayerCache:
             value_block_raw = self.value_codec.encode(values_slice)
 
             logical_start = base_offset + start
+            assert logical_start == base_offset + i * block_size
             key_block = dataclasses.replace(
                 key_block_raw,
                 token_count=block_size,
@@ -302,84 +316,15 @@ class QuantizedLayerCache:
         )
 
     def trim(self, new_token_count: int) -> None:
-        """Trim cache to retain only first N tokens."""
-        if new_token_count >= self.total_token_count():
-            return
-        if new_token_count <= 0:
-            self.reset()
-            return
+        """Trim is disabled until position-partition validation is complete.
 
-        # Strategy: encoded → staged → dense (outer to inner).
-        # Trim from the outside in.
-        if new_token_count < self._encoded_tokens:
-            # Trim into sealed blocks — keep full blocks until trim point
-            keep_blocks = 0
-            cumulative = 0
-            for kb in self._key_blocks:
-                if cumulative + kb.token_count > new_token_count:
-                    break
-                cumulative += kb.token_count
-                keep_blocks += 1
-
-            self._key_blocks = self._key_blocks[:keep_blocks]
-            self._value_blocks = self._value_blocks[:keep_blocks]
-            self._encoded_tokens = cumulative
-            # Everything after sealed blocks is dropped
-            self._stage_keys.clear()
-            self._stage_values.clear()
-            self._stage_token_count = 0
-            self._dense_keys = None
-            self._dense_values = None
-            self._dense_token_count = 0
-            return
-
-        # Trim point is after sealed blocks; may need to trim staged/dense
-        remaining = new_token_count - self._encoded_tokens
-        if remaining < 0:
-            # Should not happen because new_token_count < _encoded_tokens is handled above
-            self._stage_keys.clear()
-            self._stage_values.clear()
-            self._stage_token_count = 0
-            self._dense_keys = None
-            self._dense_values = None
-            self._dense_token_count = 0
-            return
-        if remaining == 0:
-            # Exact block boundary: keep sealed, drop everything else
-            self._stage_keys.clear()
-            self._stage_values.clear()
-            self._stage_token_count = 0
-            self._dense_keys = None
-            self._dense_values = None
-            self._dense_token_count = 0
-            return
-
-        # remaining > 0: keep some staged and/or dense
-        if self._stage_token_count > 0:
-            if remaining < self._stage_token_count:
-                # Trim staged tokens — concatenate then slice along token axis.
-                # _stage_keys is a list of tensors, not a list of individual tokens,
-                # so list slicing would retain too much.
-                keys_full = mx.concatenate(self._stage_keys, axis=2)
-                values_full = mx.concatenate(self._stage_values, axis=2)
-                self._stage_keys = [keys_full[:, :, :remaining, :]]
-                self._stage_values = [values_full[:, :, :remaining, :]]
-                self._stage_token_count = remaining
-                self._dense_keys = None
-                self._dense_values = None
-                self._dense_token_count = 0
-                return
-            remaining -= self._stage_token_count
-
-        # Now remaining applies to dense residual
-        if remaining <= 0:
-            self._dense_keys = None
-            self._dense_values = None
-            self._dense_token_count = 0
-        elif remaining < self._dense_token_count:
-            self._dense_keys = self._dense_keys[:, :, :remaining, :]
-            self._dense_values = self._dense_values[:, :, :remaining, :]
-            self._dense_token_count = remaining
+        Raises:
+            NotImplementedError: Always, to prevent data loss from the
+                known-buggy trim implementation.
+        """
+        raise NotImplementedError(
+            "trim() is disabled in this release. Use reset() and re-prefill."
+        )
 
     # ------------------------------------------------------------------
     # Blockwise attention (direct packed path — no full dense reconstruction)

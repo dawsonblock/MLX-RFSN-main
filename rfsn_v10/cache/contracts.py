@@ -55,6 +55,19 @@ class PackedBlock:
         return 0
 
 
+def validate_block_positions(blocks: list[PackedBlock]) -> None:
+    """Validate that blocks are ordered and non-overlapping."""
+    for i in range(1, len(blocks)):
+        prev = blocks[i - 1]
+        curr = blocks[i]
+        prev_end = prev.logical_start + prev.token_count
+        if curr.logical_start != prev_end:
+            raise ValueError(
+                f"Block position gap/overlap at index {i}: "
+                f"prev ends at {prev_end}, curr starts at {curr.logical_start}"
+            )
+
+
 @dataclass(frozen=True)
 class CacheStats:
     """Runtime statistics for a layer cache."""

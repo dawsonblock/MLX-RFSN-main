@@ -156,3 +156,66 @@ def test_logical_start_increments_correctly_across_flushes() -> None:
     # Verify logical_start values
     logical_starts = [b.logical_start for b in cache.iter_key_blocks()]
     assert logical_starts == [0, 32], f"Unexpected logical_starts: {logical_starts}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_trim_disabled_raises() -> None:
+    """trim() must raise NotImplementedError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    keys = mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32)
+    values = mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32)
+    cache.append(keys, values)
+
+    with pytest.raises(NotImplementedError):
+        cache.trim(5)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_geometry_frozen_after_first_append() -> None:
+    """Appending mismatched geometry must raise ValueError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    cache.append(
+        mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32),
+        mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32),
+    )
+
+    with pytest.raises(ValueError):
+        cache.append(
+            mx.random.normal(shape=(1, 4, 10, 64)).astype(mx.float32),  # Hkv mismatch
+            mx.random.normal(shape=(1, 4, 10, 64)).astype(mx.float32),
+        )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_block_positions_are_monotonic_and_contiguous() -> None:
+    """After multiple flushes, block positions must be contiguous."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+    from rfsn_v10.cache.contracts import validate_block_positions
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=32)
+
+    for _ in range(6):
+        cache.append(
+            mx.random.normal(shape=(1, 2, 16, 64)).astype(mx.float32),
+            mx.random.normal(shape=(1, 2, 16, 64)).astype(mx.float32),
+        )
+
+    key_blocks = list(cache.iter_key_blocks())
+    validate_block_positions(key_blocks)
+    logical_starts = [b.logical_start for b in key_blocks]
+    assert logical_starts == [0, 32, 64], f"Unexpected positions: {logical_starts}"
