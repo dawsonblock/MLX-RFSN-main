@@ -285,3 +285,44 @@ def test_numpy_attention_matches_simple_computation() -> None:
     expected = np.einsum("bhqt,bhtd->bhqd", weights, values)
 
     np.testing.assert_allclose(output, expected, atol=1e-5)
+
+
+def test_numpy_attention_matches_manual_computation() -> None:
+    """NumpyLayerCache.numpy_attention must match a manual single-block attention."""
+    from rfsn_v10.cache.numpy_oracle import NumpyLayerCache
+
+    cache = NumpyLayerCache(staging_capacity=64)
+    B, Hq, Hkv, T, D = 1, 8, 2, 16, 64
+    queries = np.random.randn(B, Hq, 1, D).astype(np.float32)
+    keys = np.random.randn(B, Hkv, T, D).astype(np.float32)
+    values = np.random.randn(B, Hkv, T, D).astype(np.float32)
+    cache.append(keys, values)
+
+    out = cache.numpy_attention(queries, scale=D ** -0.5)
+    assert out.shape == (B, Hq, 1, D)
+    assert np.all(np.isfinite(out))
+
+    # Compare against dense oracle
+    k_exp = np.repeat(keys, Hq // Hkv, axis=1)
+    v_exp = np.repeat(values, Hq // Hkv, axis=1)
+    scores = np.matmul(queries, k_exp.transpose(0, 1, 3, 2)) * (D ** -0.5)
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores.astype(np.float32) - max_scores)
+    weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+    expected = np.matmul(weights, v_exp)
+    np.testing.assert_allclose(out, expected, atol=1e-4)
+
+
+def test_numpy_oracle_sealed_blocks_are_exactly_staging_capacity() -> None:
+    """After flush, every sealed block must be exactly staging_capacity tokens."""
+    from rfsn_v10.cache.numpy_oracle import NumpyLayerCache
+
+    cache = NumpyLayerCache(staging_capacity=32)
+    for _ in range(6):
+        cache.append(
+            np.random.randn(1, 2, 16, 64).astype(np.float32),
+            np.random.randn(1, 2, 16, 64).astype(np.float32),
+        )
+
+    for kb in cache.iter_key_blocks():
+        assert kb.shape[2] == 32, f"Expected 32, got {kb.shape[2]}"

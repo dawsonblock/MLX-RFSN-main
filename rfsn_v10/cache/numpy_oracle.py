@@ -268,6 +268,79 @@ class NumpyLayerCache:
         full_v = np.concatenate(value_parts, axis=2)
         return full_k, full_v
 
+    def numpy_attention(
+        self,
+        queries: np.ndarray,
+        scale: float | None = None,
+    ) -> np.ndarray:
+        """Pure-NumPy blockwise attention (reference for MLX path).
+
+        Returns shape (B, Hq, Lq, D).
+        """
+        B, Hq, Lq, D = queries.shape
+        s = scale if scale is not None else (D ** -0.5)
+
+        # GQA: infer repeats from first block
+        n_kv_heads = None
+        for kb in self.iter_key_blocks():
+            n_kv_heads = kb.shape[1]
+            break
+        if n_kv_heads is None:
+            sk, _, _ = self.get_staging()
+            if sk is not None:
+                n_kv_heads = sk.shape[1]
+        if n_kv_heads is None:
+            dk, _ = self.get_dense_residual()
+            if dk is not None:
+                n_kv_heads = dk.shape[1]
+        if n_kv_heads is None:
+            return np.zeros((B, Hq, Lq, D), dtype=queries.dtype)
+
+        repeats = Hq // n_kv_heads
+
+        m = np.full((B, Hq, Lq, 1), -1e9, dtype=np.float32)
+        sum_exp = np.zeros((B, Hq, Lq, 1), dtype=np.float32)
+        out = np.zeros((B, Hq, Lq, D), dtype=np.float32)
+
+        def _process(k_block: np.ndarray, v_block: np.ndarray, block_T: int) -> None:
+            nonlocal m, sum_exp, out
+            k_expanded = np.repeat(k_block, repeats, axis=1)
+            v_expanded = np.repeat(v_block, repeats, axis=1)
+
+            scores = np.matmul(queries, k_expanded.transpose(0, 1, 3, 2)) * s
+
+            block_max = np.max(scores, axis=-1, keepdims=True)
+            m_new = np.maximum(m, block_max)
+
+            exp_diff_m = np.exp(m - m_new)
+            sum_exp = sum_exp * exp_diff_m
+            out = out * exp_diff_m
+
+            exp_scores = np.exp(scores.astype(np.float32) - m_new)
+            sum_exp = sum_exp + np.sum(exp_scores, axis=-1, keepdims=True)
+
+            block_contrib = np.matmul(exp_scores, v_expanded)
+            out = out + block_contrib
+            m = m_new
+
+        # Sealed blocks
+        for kb, vb in zip(self.iter_key_blocks(), self.iter_value_blocks()):
+            _process(kb, vb, kb.shape[2])
+
+        # Staging
+        sk, sv, sn = self.get_staging()
+        if sk is not None:
+            _process(sk, sv, sn)
+
+        # Dense residual
+        dk, dv = self.get_dense_residual()
+        if dk is not None:
+            _process(dk, dv, dk.shape[2])
+
+        # Final normalisation
+        output = out / sum_exp
+        return output.astype(queries.dtype)
+
 
 # ------------------------------------------------------------------
 # Reference attention (NumPy)
