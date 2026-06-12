@@ -575,4 +575,7 @@ def quantized_attention_decode_metal(
 def maybe_supports_metal_kernels() -> bool:
     if not MLX_AVAILABLE:
         return False
-    return hasattr(mx, "fast") and hasattr(mx.fast, "metal_kernel")
+    try:
+        return hasattr(mx, "fast") and hasattr(mx.fast, "metal_kernel")
+    except Exception:
+        return False

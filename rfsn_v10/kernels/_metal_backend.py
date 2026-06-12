@@ -18,7 +18,10 @@ class MetalBackend:
     def available(cls) -> bool:
         if not MLX_AVAILABLE:
             return False
-        return hasattr(mx, "fast") and hasattr(mx.fast, "metal_kernel")
+        try:
+            return hasattr(mx, "fast") and hasattr(mx.fast, "metal_kernel")
+        except Exception:
+            return False
 
     # -- bit packing ---------------------------------------------------------
 
