@@ -74,6 +74,14 @@ def _make_synthetic_baseline(
         compression_time_ms=0.0,
         decompression_time_ms=0.0,
         generated_text="The capital of France is Paris.",
+        run_type="real_model",
+        source_type="installed_wheel",
+        requested_backend="metal",
+        executed_backend="metal",
+        metal_executed=True,
+        fallback_used=False,
+        measured_memory=True,
+        estimated_memory=False,
     )
 
 
@@ -113,6 +121,14 @@ def _make_synthetic_a1_high_quality(baseline: CandidateResult) -> CandidateResul
         compression_time_ms=2.5,
         decompression_time_ms=5.0,
         generated_text="The capital of France is Paris.",
+        run_type="real_model",
+        source_type="installed_wheel",
+        requested_backend="metal",
+        executed_backend="metal",
+        metal_executed=True,
+        fallback_used=False,
+        measured_memory=True,
+        estimated_memory=False,
     )
 
 

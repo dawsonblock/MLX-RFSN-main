@@ -162,6 +162,21 @@ class Judge:
         missing_required: list[str] = []
         improvement_notes: list[str] = []
 
+        # ---- Phase 1 governance checks (before any quality gates) ----
+        gov = self._check_governance(candidate)
+        if gov:
+            return Verdict(
+                label=VerdictLabel.KEEP_EXPERIMENTAL,
+                candidate_name=candidate.candidate_name,
+                model_id=candidate.model_id,
+                prompt_id=candidate.prompt_id,
+                quality_failures=[],
+                missing_required=[],
+                improvement_met=False,
+                improvement_notes=[],
+                reason=f"governance block: {gov}",
+            )
+
         # 1. Check for missing required metrics
         for fname in _REQUIRED_QUALITY_FIELDS + _REQUIRED_PERF_FIELDS:
             val = getattr(candidate, fname, None)
@@ -245,6 +260,18 @@ class Judge:
             improvement_notes=improvement_notes,
             reason="all quality gates and at least one improvement gate passed",
         )
+
+    def _check_governance(self, candidate: CandidateResult) -> str:
+        """Return a failure reason string, or empty string if clean."""
+        if candidate.run_type == "synthetic":
+            return "synthetic runs are ineligible for promotion"
+        if candidate.fallback_used:
+            return "fallback execution is ineligible for promotion"
+        if candidate.estimated_memory and not candidate.measured_memory:
+            return "estimated memory without measurement is ineligible"
+        if candidate.source_type != "installed_wheel":
+            return "installed-wheel execution required for promotion"
+        return ""
 
     def evaluate_batch(
         self,

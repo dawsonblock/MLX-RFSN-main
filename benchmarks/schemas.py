@@ -132,6 +132,23 @@ class CandidateResult:
     baseline_text: str = ""
 
     # ------------------------------------------------------------------
+    # Provenance (Phase 1 governance — prevents synthetic/fallback promotion)
+    # ------------------------------------------------------------------
+    run_type: str = "unknown"                       # "synthetic" | "real_model" | "smoke"
+    source_type: str = "unknown"                    # "checkout" | "installed_wheel"
+    requested_backend: str = "unknown"            # e.g. "metal", "reference"
+    executed_backend: str = "unknown"               # e.g. "metal", "reference", "fallback"
+    metal_executed: bool = False
+    fallback_used: bool = False
+    commit_hash: str = ""
+    corpus_hash: str = ""
+    token_sequence_hash: str = ""
+    mlx_version: str = ""
+    device: str = ""
+    measured_memory: bool = False                   # True if memory was actually measured
+    estimated_memory: bool = False                  # True if memory was estimated (not measured)
+
+    # ------------------------------------------------------------------
     # Errors / notes
     # ------------------------------------------------------------------
     error: str = ""
