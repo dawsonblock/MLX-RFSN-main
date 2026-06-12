@@ -31,7 +31,8 @@ def test_session_isolation() -> None:
         values = mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32)
         session_a.get_layer_cache(0).append(keys, values)
 
-    assert session_a.total_memory_bytes() > 0
+    if HAS_MLX:
+        assert session_a.total_memory_bytes() > 0
     assert session_b.total_memory_bytes() == 0
 
 
