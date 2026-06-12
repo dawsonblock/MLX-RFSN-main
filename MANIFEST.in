@@ -5,3 +5,5 @@ prune .pytest_cache
 prune .mypy_cache
 prune external
 recursive-include artifacts/proof/main12 *.json *.md
+recursive-include rfsn_v10 *.metal *.npz *.json *.yaml *.yml
+recursive-include rfsn_v11 *.metal *.npz *.json *.yaml *.yml

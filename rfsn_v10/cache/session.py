@@ -13,6 +13,7 @@ from typing import Any
 
 from .cartesian_codec import CartesianCodec
 from .incremental_layer_cache import QuantizedLayerCache
+from .memory import MemoryReport, measure_process_rss
 
 
 class GenerationCacheSession:
@@ -101,6 +102,50 @@ class GenerationCacheSession:
 
     def total_memory_bytes(self) -> int:
         return sum(lc.total_memory_bytes() for lc in self._layer_caches.values())
+
+    def memory_report(self) -> MemoryReport:
+        """Return a detailed memory report for this session."""
+        report = MemoryReport(
+            key_bits=self.key_codec.bits,
+            value_bits=self.value_codec.bits,
+            group_size=self.key_codec.group_size,
+            num_layers=self.num_layers,
+            process_rss_bytes=measure_process_rss(),
+        )
+
+        for lc in self._layer_caches.values():
+            stats = lc.stats()
+            report.total_tokens += stats.tokens_encoded + stats.staged_tokens
+
+            # Payload: sealed blocks
+            for kb in lc.iter_key_blocks():
+                report.packed_key_codes_bytes += int(kb.packed_codes.size) * 4
+                report.key_scales_bytes += int(kb.scales.size) * 4
+                report.block_metadata_bytes += 32  # approximate per-block header
+
+            for vb in lc.iter_value_blocks():
+                report.packed_value_codes_bytes += int(vb.packed_codes.size) * 4
+                report.value_scales_bytes += int(vb.scales.size) * 4
+                report.block_metadata_bytes += 32
+
+            # Staging
+            sk, sv, sn = lc.get_staging()
+            if sk is not None:
+                report.staging_keys_bytes += int(sk.size) * 4
+            if sv is not None:
+                report.staging_values_bytes += int(sv.size) * 4
+
+            # Dense residual
+            dk, dv = lc.get_dense_residual()
+            if dk is not None:
+                report.dense_residual_keys_bytes += int(dk.size) * 2  # FP16
+            if dv is not None:
+                report.dense_residual_values_bytes += int(dv.size) * 2
+
+        # Dense shadow from counters
+        report.dense_shadow_bytes = self._counters.get("dense_shadow_bytes", 0)
+
+        return report
 
     # ------------------------------------------------------------------
     # Lifecycle

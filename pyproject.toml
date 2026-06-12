@@ -116,6 +116,10 @@ rfsn-benchmark = "rfsn_v10.cli:main"
 include = ["rfsn_v10*", "rfsn_v11*", "agent_core*", "tools*", "benchmarks*", "memory*"]
 exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 
+[tool.setuptools.package-data]
+"rfsn_v10" = ["*.metal", "*.npz", "*.json", "*.yaml", "*.yml"]
+"rfsn_v11" = ["*.metal", "*.npz", "*.json", "*.yaml", "*.yml"]
+
 [tool.setuptools.exclude-package-data]
 "*" = ["*.pyc", "__pycache__/*", "*.so", "*.dylib"]
 

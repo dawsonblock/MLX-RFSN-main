@@ -1,0 +1,193 @@
+"""Generator wrapper that exposes the RFSNGenerator interface over RfsnMLXModelAdapter.
+
+This allows the server to use the new adapter without changing its call sites.
+"""
+from __future__ import annotations
+
+import time
+from typing import Any, Iterator
+
+from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnMLXModelAdapter
+
+
+try:
+    from mlx_lm.utils import stream_generate
+    MLX_LM_AVAILABLE = True
+except ImportError:
+    MLX_LM_AVAILABLE = False
+
+
+class RfsnMLXGenerator:
+    """Drop-in replacement for RFSNGenerator using the new adapter.
+
+    Provides:
+      - chat(prompt, ...) -> GenerationResult-like object
+      - generate(prompt, ...) -> Iterator[str] (token strings)
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        tokenizer: Any,
+        num_layers: int | None = None,
+        key_bits: int = 8,
+        value_bits: int = 5,
+        group_size: int = 64,
+        staging_capacity: int = 64,
+        dense_residual_window: int = 0,
+    ) -> None:
+        self.adapter = RfsnMLXModelAdapter(
+            model=model,
+            tokenizer=tokenizer,
+            num_layers=num_layers,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            group_size=group_size,
+            staging_capacity=staging_capacity,
+            dense_residual_window=dense_residual_window,
+        )
+        self.tokenizer = tokenizer
+
+    def chat(
+        self,
+        message: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
+        **kwargs: Any,
+    ) -> Any:
+        """Generate a chat response."""
+        t_start = time.monotonic()
+
+        # Build prompt
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            messages = [{"role": "user", "content": message}]
+            try:
+                prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                prompt = message
+        else:
+            prompt = message
+
+        text = self.adapter.generate(
+            prompt,
+            max_tokens=max_new_tokens,
+            verbose=False,
+            temp=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+
+        elapsed_ms = (time.monotonic() - t_start) * 1000.0
+
+        # Create a result object matching GenerationResult interface
+        tokens = []
+        try:
+            tokens = self.tokenizer.encode(text)
+        except Exception:
+            pass
+
+        tps = len(tokens) / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
+
+        return _SimpleResult(
+            text=text,
+            tokens=tokens,
+            generation_time_ms=elapsed_ms,
+            tokens_per_second=tps,
+        )
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
+        stop_sequences: list[str] | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
+        """Generate text, yielding token strings."""
+        if not MLX_LM_AVAILABLE:
+            raise RuntimeError("mlx-lm not installed")
+
+        # Use the adapter's generate_step for streaming
+        import mlx.core as mx
+        from mlx_lm.utils import make_sampler, make_logits_processors
+
+        prompt_ids = mx.array(self.tokenizer.encode(prompt))
+        sampler = make_sampler(temperature, top_p, 0.0, 1)
+        logits_processors = make_logits_processors(
+            None, repetition_penalty, 20
+        )
+
+        # Build caches via adapter
+        from rfsn_v10.cache.session import GenerationCacheSession
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+
+        k_codec = CartesianCodec(bits=self.adapter.key_codec.bits, group_size=self.adapter.key_codec.group_size)
+        v_codec = CartesianCodec(bits=self.adapter.value_codec.bits, group_size=self.adapter.value_codec.group_size)
+
+        session = GenerationCacheSession(
+            model_id="server",
+            num_layers=self.adapter.num_layers,
+            key_codec=k_codec,
+            value_codec=v_codec,
+            staging_capacity=self.adapter.staging_capacity,
+            dense_residual_window=self.adapter.dense_residual_window,
+        )
+
+        # Build cache list
+        from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache
+        cache_list = [
+            RfsnQuantizedKVCache(
+                layer_cache=session.get_layer_cache(i),
+                session=session,
+            )
+            for i in range(self.adapter.num_layers)
+        ]
+
+        # Use mlx_lm generate_step
+        from mlx_lm.utils import generate_step
+        for token, _ in generate_step(
+            prompt_ids,
+            self.adapter.model,
+            max_tokens=max_new_tokens,
+            prompt_cache=cache_list,
+            sampler=sampler,
+            logits_processors=logits_processors,
+        ):
+            token_text = self.tokenizer.decode([token.item()])
+
+            # Check stop sequences
+            if stop_sequences:
+                for seq in stop_sequences:
+                    if seq in token_text:
+                        token_text = token_text.split(seq)[0]
+                        if token_text:
+                            yield token_text
+                        return
+
+            yield token_text
+
+
+class _SimpleResult:
+    """Lightweight result object matching GenerationResult interface."""
+
+    def __init__(
+        self,
+        text: str,
+        tokens: list[int],
+        generation_time_ms: float,
+        tokens_per_second: float,
+    ) -> None:
+        self.text = text
+        self.tokens = tokens
+        self.generation_time_ms = generation_time_ms
+        self.tokens_per_second = tokens_per_second
+        self.decode_token_count = len(tokens)
+        self.finish_reason = "stop"
+        self.stopped_on = None
+        self.telemetry = []

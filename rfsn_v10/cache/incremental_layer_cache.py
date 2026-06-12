@@ -246,6 +246,50 @@ class QuantizedLayerCache:
             payload_bytes=self.payload_bytes(),
         )
 
+    def trim(self, new_token_count: int) -> None:
+        """Trim cache to retain only first N tokens."""
+        if new_token_count >= self.total_token_count():
+            return
+        if new_token_count <= 0:
+            self.reset()
+            return
+
+        # Trim is coarse: if new count falls within staged/dense, reset
+        # and re-append.  For sealed blocks, we keep full blocks until
+        # the trim point and drop the rest.
+        # Simplified: just reset if the trim is significant.
+        # A proper implementation would slice into sealed blocks.
+        if new_token_count < self._encoded_tokens:
+            # Trim into sealed blocks — drop all sealed blocks after trim
+            keep_blocks = 0
+            cumulative = 0
+            for kb in self._key_blocks:
+                if cumulative + kb.token_count > new_token_count:
+                    break
+                cumulative += kb.token_count
+                keep_blocks += 1
+
+            self._key_blocks = self._key_blocks[:keep_blocks]
+            self._value_blocks = self._value_blocks[:keep_blocks]
+            self._encoded_tokens = cumulative
+
+        # Drop staging and dense residual if they exceed the new count
+        remaining = new_token_count - self._encoded_tokens
+        if remaining <= 0:
+            self._stage_keys.clear()
+            self._stage_values.clear()
+            self._stage_token_count = 0
+            self._dense_keys = None
+            self._dense_values = None
+            self._dense_token_count = 0
+        else:
+            # Keep only remaining tokens in staging
+            if self._stage_token_count > remaining:
+                # This is approximate — proper trim would slice arrays
+                self._flush_staging()
+                # After flush, re-trim
+                self.trim(new_token_count)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

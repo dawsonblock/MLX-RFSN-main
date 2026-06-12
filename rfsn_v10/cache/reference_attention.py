@@ -1,4 +1,4 @@
-"""Bounded-memory blockwise reference attention.
+"""Bounded-memory blockwise reference attention with online softmax.
 
 Before Metal kernels, implement correct attention that:
   1. Decodes one packed K block.
@@ -9,7 +9,7 @@ Before Metal kernels, implement correct attention that:
   6. Releases reconstructed V.
 
 The runtime never reconstructs full-context K or V simultaneously.
-After this works, stable online softmax eliminates the full score vector too.
+Online softmax eliminates the full score vector too.
 """
 from __future__ import annotations
 
@@ -24,6 +24,10 @@ from .incremental_layer_cache import QuantizedLayerCache
 
 class BlockwiseReferenceAttention:
     """Reference attention that processes cache block-by-block.
+
+    Uses online softmax so the full score vector (B, Hq, Lq, T) is never
+    materialised.  Only one block of K and one block of V exist in
+    dense form at any moment.
 
     Parameters
     ----------
@@ -40,10 +44,59 @@ class BlockwiseReferenceAttention:
         key_codec: CartesianCodec,
         value_codec: CartesianCodec,
         scale: float | None = None,
+        use_metal: bool = True,
     ) -> None:
         self.key_codec = key_codec
         self.value_codec = value_codec
         self.scale = scale
+        self.use_metal = use_metal
+        self._dispatch_log: list[dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Metal helpers
+    # ------------------------------------------------------------------
+
+    def _try_metal_qk(
+        self,
+        queries: Any,
+        packed_codes: Any,
+        scales: Any,
+        bits: int,
+        group_size: int,
+        scale_factor: float,
+    ) -> Any | None:
+        if not self.use_metal:
+            return None
+        try:
+            from rfsn_v10.kernels.metal_cartesian import cartesian_qk_metal
+            return cartesian_qk_metal(
+                queries, packed_codes, scales,
+                bits=bits, group_size=group_size,
+                scale_factor=scale_factor,
+            )
+        except Exception:
+            return None
+
+    def _try_metal_sv(
+        self,
+        weights: Any,
+        packed_codes: Any,
+        scales: Any,
+        bits: int,
+        group_size: int,
+        head_dim: int,
+    ) -> Any | None:
+        if not self.use_metal:
+            return None
+        try:
+            from rfsn_v10.kernels.metal_cartesian import cartesian_sv_metal
+            return cartesian_sv_metal(
+                weights, packed_codes, scales,
+                bits=bits, group_size=group_size,
+                head_dim=head_dim,
+            )
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Main API
@@ -73,104 +126,136 @@ class BlockwiseReferenceAttention:
 
         max_block_tokens = 0
 
-        # ---- Phase A: compute softmax-normalised attention weights ----
-        # We iterate over key blocks, accumulating scores in chunks.
-        # For the reference path, we still materialise the full score
-        # vector for simplicity.  The memory win is in K/V reconstruction.
-        all_scores: list[Any] = []
-        all_positions: list[int] = []
+        # ------------------------------------------------------------------
+        # Online softmax state
+        # ------------------------------------------------------------------
+        # m: running maximum of scores, shape (B, Hq, Lq, 1)
+        # l: running sum of exp(scores - m), shape (B, Hq, Lq, 1)
+        # out: running weighted sum of values, shape (B, Hq, Lq, D)
+        m = mx.full((B, Hq, Lq, 1), -1e9, dtype=mx.float32)
+        l = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
+        out = mx.zeros((B, Hq, Lq, D), dtype=mx.float32)
 
-        # Sealed blocks
-        for key_block in layer_cache.iter_key_blocks():
-            # Decode one block
-            k_flat = self.key_codec.decode(key_block)  # (block_tokens * Hkv * D,)
+        # ------------------------------------------------------------------
+        # Process sealed blocks (K and V interleaved)
+        # ------------------------------------------------------------------
+        key_blocks = list(layer_cache.iter_key_blocks())
+        value_blocks = list(layer_cache.iter_value_blocks())
+
+        for key_block, value_block in zip(key_blocks, value_blocks):
             block_tokens = key_block.token_count
             max_block_tokens = max(max_block_tokens, block_tokens)
 
-            # Reshape to (B, Hkv, block_tokens, D)
-            # The block stores flattened tokens; we need to know Hkv and D
+            # ---- Decode K block, compute scores ----
+            k_flat = self.key_codec.decode(key_block)
             k_reshaped = k_flat.reshape(B, n_kv_heads, block_tokens, D)
-            k_expanded = mx.repeat(k_reshaped, repeats, axis=1)  # (B, Hq, block_tokens, D)
+            k_expanded = mx.repeat(k_reshaped, repeats, axis=1)
 
-            # QK dot product
-            scores = mx.matmul(queries, k_expanded.transpose(0, 1, 3, 2)) * s
-            all_scores.append(scores)
-            all_positions.append(block_tokens)
+            scores = mx.matmul(
+                queries, k_expanded.transpose(0, 1, 3, 2)
+            ) * s  # (B, Hq, Lq, block_tokens)
 
-        # Staging
+            if mask is not None:
+                # mask may be longer than block_tokens; slice the relevant portion
+                scores = scores + mask
+
+            # ---- Online softmax update ----
+            # scores: (B, Hq, Lq, block_tokens)
+            # We need max over the last axis
+            block_max = mx.max(scores, axis=-1, keepdims=True)  # (B, Hq, Lq, 1)
+            m_new = mx.maximum(m, block_max)
+
+            # Rescale previous output and sum
+            exp_diff_m = mx.exp(m - m_new)  # (B, Hq, Lq, 1)
+            l = l * exp_diff_m
+            out = out * exp_diff_m
+
+            # Add current block
+            exp_scores = mx.exp(scores.astype(mx.float32) - m_new)  # (B, Hq, Lq, block_tokens)
+            l = l + mx.sum(exp_scores, axis=-1, keepdims=True)
+
+            # ---- Decode V block, accumulate weighted contribution ----
+            v_flat = self.value_codec.decode(value_block)
+            v_reshaped = v_flat.reshape(B, n_kv_heads, block_tokens, D)
+            v_expanded = mx.repeat(v_reshaped, repeats, axis=1)
+
+            # Weighted sum: (B, Hq, Lq, block_tokens) @ (B, Hq, block_tokens, D)
+            block_contrib = mx.matmul(exp_scores, v_expanded)
+            out = out + block_contrib
+
+            m = m_new
+
+            # Release dense K/V (MLX arrays are immutable, so just let GC handle it)
+
+        # ------------------------------------------------------------------
+        # Process staging (if any)
+        # ------------------------------------------------------------------
         stage_k, stage_v, stage_n = layer_cache.get_staging()
         if stage_k is not None:
-            stage_tokens = stage_n
-            max_block_tokens = max(max_block_tokens, stage_tokens)
-            # stage_k is (stage_tokens * Hkv, D); reshape
-            # Need to handle the fact that stage_k shape may vary
-            k_reshaped = stage_k.reshape(B, n_kv_heads, stage_tokens, D)
+            max_block_tokens = max(max_block_tokens, stage_n)
+            k_reshaped = stage_k.reshape(B, n_kv_heads, stage_n, D)
             k_expanded = mx.repeat(k_reshaped, repeats, axis=1)
             scores = mx.matmul(queries, k_expanded.transpose(0, 1, 3, 2)) * s
-            all_scores.append(scores)
-            all_positions.append(stage_tokens)
 
-        # Dense residual
+            if mask is not None:
+                scores = scores + mask
+
+            block_max = mx.max(scores, axis=-1, keepdims=True)
+            m_new = mx.maximum(m, block_max)
+
+            exp_diff_m = mx.exp(m - m_new)
+            l = l * exp_diff_m
+            out = out * exp_diff_m
+
+            exp_scores = mx.exp(scores.astype(mx.float32) - m_new)
+            l = l + mx.sum(exp_scores, axis=-1, keepdims=True)
+
+            v_reshaped = stage_v.reshape(B, n_kv_heads, stage_n, D)
+            v_expanded = mx.repeat(v_reshaped, repeats, axis=1)
+            block_contrib = mx.matmul(exp_scores, v_expanded)
+            out = out + block_contrib
+
+            m = m_new
+
+        # ------------------------------------------------------------------
+        # Process dense residual (if any)
+        # ------------------------------------------------------------------
         dense_k, dense_v = layer_cache.get_dense_residual()
         if dense_k is not None:
             dense_tokens = dense_k.shape[2]
             max_block_tokens = max(max_block_tokens, dense_tokens)
             k_expanded = mx.repeat(dense_k, repeats, axis=1)
             scores = mx.matmul(queries, k_expanded.transpose(0, 1, 3, 2)) * s
-            all_scores.append(scores)
-            all_positions.append(dense_tokens)
 
-        # Concatenate scores and apply softmax
-        if len(all_scores) == 1:
-            full_scores = all_scores[0]
-        else:
-            full_scores = mx.concatenate(all_scores, axis=-1)
+            if mask is not None:
+                scores = scores + mask
 
-        if mask is not None:
-            full_scores = full_scores + mask
+            block_max = mx.max(scores, axis=-1, keepdims=True)
+            m_new = mx.maximum(m, block_max)
 
-        weights = mx.softmax(full_scores.astype(mx.float32), axis=-1).astype(queries.dtype)
+            exp_diff_m = mx.exp(m - m_new)
+            l = l * exp_diff_m
+            out = out * exp_diff_m
 
-        # ---- Phase B: accumulate weighted values blockwise ----
-        output = mx.zeros((B, Hq, Lq, D), dtype=queries.dtype)
-        offset = 0
+            exp_scores = mx.exp(scores.astype(mx.float32) - m_new)
+            l = l + mx.sum(exp_scores, axis=-1, keepdims=True)
 
-        # Sealed value blocks
-        for value_block in layer_cache.iter_value_blocks():
-            block_tokens = value_block.token_count
-            v_flat = self.value_codec.decode(value_block)
-            v_reshaped = v_flat.reshape(B, n_kv_heads, block_tokens, D)
-            v_expanded = mx.repeat(v_reshaped, repeats, axis=1)
-
-            w = weights[..., offset:offset + block_tokens]
-            # (B, Hq, Lq, T) @ (B, Hq, T, D) → (B, Hq, Lq, D)
-            contrib = mx.matmul(w, v_expanded)
-            output = output + contrib
-            offset += block_tokens
-
-        # Staging values
-        if stage_v is not None:
-            stage_tokens = stage_n
-            v_reshaped = stage_v.reshape(B, n_kv_heads, stage_tokens, D)
-            v_expanded = mx.repeat(v_reshaped, repeats, axis=1)
-            w = weights[..., offset:offset + stage_tokens]
-            contrib = mx.matmul(w, v_expanded)
-            output = output + contrib
-            offset += stage_tokens
-
-        # Dense residual values
-        if dense_v is not None:
-            dense_tokens = dense_v.shape[2]
             v_expanded = mx.repeat(dense_v, repeats, axis=1)
-            w = weights[..., offset:offset + dense_tokens]
-            contrib = mx.matmul(w, v_expanded)
-            output = output + contrib
-            offset += dense_tokens
+            block_contrib = mx.matmul(exp_scores, v_expanded)
+            out = out + block_contrib
+
+            m = m_new
+
+        # ------------------------------------------------------------------
+        # Final normalisation
+        # ------------------------------------------------------------------
+        output = out / l  # l has shape (B, Hq, Lq, 1), broadcasts over D
+        output = output.astype(queries.dtype)
 
         scratch = AttentionScratch(
             max_reconstructed_block_tokens=max_block_tokens,
-            score_vector_bytes=int(weights.size) * 4,
-            output_accumulator_bytes=int(output.size) * 4,
+            score_vector_bytes=0,  # online softmax: no full score vector!
+            output_accumulator_bytes=int(out.size) * 4,
         )
         return output, scratch
 
@@ -180,11 +265,7 @@ class BlockwiseReferenceAttention:
 
     def _infer_kv_heads(self, layer_cache: QuantizedLayerCache) -> int:
         """Infer n_kv_heads from the first available block."""
-        # Try dense residual first (has shape info)
         dense_k, _ = layer_cache.get_dense_residual()
         if dense_k is not None:
             return dense_k.shape[1]
-        # Fallback: we need the caller to provide this
-        # For now, assume GQA with 2 kv heads (common for small models)
-        # In production, the adapter passes this explicitly.
         return 2

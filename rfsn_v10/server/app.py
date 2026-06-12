@@ -107,7 +107,7 @@ class ServerState:
             )
         return model_id
 
-    def load_generator(self) -> RFSNGenerator:
+    def load_generator(self) -> Any:
         if self.generator is not None:
             return self.generator
 
@@ -123,12 +123,27 @@ class ServerState:
         self.model, self.tokenizer = load_model_auto(
             model_id, backend=backend,
         )
-        self.generator = RFSNGenerator(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            enable_sparse_decode=self.sparse_decode_enabled,
-            enable_quantized_kv=self.kv_compression_enabled,
-        )
+
+        if self.kv_compression_enabled:
+            # Use new incremental quantized cache adapter
+            from rfsn_v10.integrations.mlx_lm_adapter.generator import RfsnMLXGenerator
+            self.generator = RfsnMLXGenerator(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                num_layers=len(getattr(self.model, "layers", [])),
+                key_bits=8,
+                value_bits=5,
+                group_size=64,
+                staging_capacity=64,
+                dense_residual_window=0,
+            )
+        else:
+            self.generator = RFSNGenerator(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                enable_sparse_decode=self.sparse_decode_enabled,
+                enable_quantized_kv=False,
+            )
         self.model_id_loaded = model_id
         self.metrics["model_loaded"] = True
         self.metrics["kv_compression"] = self.kv_compression_enabled
@@ -564,11 +579,29 @@ def create_app(config: RFSNConfig | None = None) -> FastAPI:
         elapsed_ms = (time.monotonic() - t_start) * 1000
         s.metrics["last_latency_ms"] = round(elapsed_ms, 1)
         s.metrics["last_error"] = None
-        tokens = len(result.text.split())
-        if elapsed_ms > 0:
+
+        # Token-based TPS (not word-based)
+        decode_tokens = result.decode_token_count if hasattr(result, "decode_token_count") else 0
+        if decode_tokens == 0:
+            # Fallback: count tokens via tokenizer
+            try:
+                decode_tokens = len(s.tokenizer.encode(result.text))
+            except Exception:
+                decode_tokens = 0
+        if elapsed_ms > 0 and decode_tokens > 0:
             s.metrics["last_decode_tps"] = round(
-                tokens / (elapsed_ms / 1000), 1,
+                decode_tokens / (elapsed_ms / 1000), 1,
             )
+
+        # Determine correct finish reason
+        finish_reason = "stop"
+        if hasattr(result, "finish_reason") and result.finish_reason:
+            finish_reason = result.finish_reason
+        elif decode_tokens >= cfg.max_new_tokens:
+            finish_reason = "length"
+        elif hasattr(result, "stopped_on") and result.stopped_on:
+            finish_reason = "stop"
+
         return ChatCompletionResponse(
             id=f"rfsn-{int(time.time() * 1000)}",
             created=int(time.time()),
@@ -583,7 +616,7 @@ def create_app(config: RFSNConfig | None = None) -> FastAPI:
                     message=ChatMessage(
                         role="assistant", content=result.text,
                     ),
-                    finish_reason="stop",
+                    finish_reason=finish_reason,
                 )
             ],
         )
@@ -623,7 +656,9 @@ async def _sse_stream(
     stop_event = threading.Event()
 
     def _worker() -> None:
+        finish_reason = "stop"
         try:
+            tokens_generated = 0
             for idx, token in enumerate(
                 generator.generate(
                     prompt,
@@ -636,6 +671,36 @@ async def _sse_stream(
             ):
                 if stop_event.is_set():
                     return
+                tokens_generated += 1
+                # Check if token contains a stop sequence
+                if cfg.stop_sequences:
+                    for seq in cfg.stop_sequences:
+                        if seq in token:
+                            token = token.split(seq)[0]
+                            finish_reason = "stop"
+                            stop_event.set()
+                            break
+                    if stop_event.is_set():
+                        if token:
+                            payload = {
+                                "id": f"{id_prefix}-{idx}",
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": state.model_id_loaded or "rfsn-v10",
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": token},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                f"data: {json.dumps(payload)}\n\n",
+                            )
+                        break
+
                 payload = {
                     "id": f"{id_prefix}-{idx}",
                     "object": "chat.completion.chunk",
@@ -653,9 +718,31 @@ async def _sse_stream(
                     queue.put_nowait,
                     f"data: {json.dumps(payload)}\n\n",
                 )
+
+            # Determine finish reason
+            if tokens_generated >= cfg.max_new_tokens:
+                finish_reason = "length"
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
+            # Send final chunk with finish_reason
+            final_payload = {
+                "id": f"{id_prefix}-final",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": state.model_id_loaded or "rfsn-v10",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }
+                ],
+            }
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                f"data: {json.dumps(final_payload)}\n\n",
+            )
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     Thread(target=_worker, daemon=True).start()

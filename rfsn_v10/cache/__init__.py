@@ -20,6 +20,7 @@ from .incremental_layer_cache import QuantizedLayerCache
 from .session import GenerationCacheSession
 
 # Phase 5 — Attention
+from .memory import MemoryReport, measure_process_rss, measure_metal_peak_memory
 from .reference_attention import BlockwiseReferenceAttention
 
 __all__ = [
@@ -27,5 +28,8 @@ __all__ = [
     "PackedBlock",
     "QuantizedLayerCache",
     "GenerationCacheSession",
+    "MemoryReport",
+    "measure_process_rss",
+    "measure_metal_peak_memory",
     "BlockwiseReferenceAttention",
 ]
