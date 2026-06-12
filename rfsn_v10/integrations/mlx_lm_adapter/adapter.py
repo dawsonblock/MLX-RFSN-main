@@ -19,7 +19,6 @@ Proof counters (tracked per session):
 """
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from rfsn_v10.cache.cartesian_codec import CartesianCodec
@@ -122,10 +121,10 @@ class RfsnQuantizedKVCache:
         """Trim the last n tokens from the cache."""
         n = min(self.offset, n)
         new_total = self.offset - n
-        # Our layer cache doesn't support per-token trim yet;
-        # for now we reset if trim removes everything.
         if new_total <= 0:
             self.layer_cache.reset()
+        else:
+            self.layer_cache.trim(new_total)
         self.offset = new_total
         return n
 

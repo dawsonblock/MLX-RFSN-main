@@ -115,7 +115,11 @@ class GenerationCacheSession:
 
         for lc in self._layer_caches.values():
             stats = lc.stats()
-            report.total_tokens += stats.tokens_encoded + stats.staged_tokens
+            report.total_tokens += (
+                stats.tokens_encoded
+                + stats.staged_tokens
+                + stats.dense_residual_tokens
+            )
 
             # Payload: sealed blocks
             for kb in lc.iter_key_blocks():

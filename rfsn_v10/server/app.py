@@ -47,7 +47,7 @@ import time
 import threading
 from dataclasses import dataclass, field
 from threading import Thread
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse, HTMLResponse
@@ -599,8 +599,6 @@ def create_app(config: RFSNConfig | None = None) -> FastAPI:
             finish_reason = result.finish_reason
         elif decode_tokens >= cfg.max_new_tokens:
             finish_reason = "length"
-        elif hasattr(result, "stopped_on") and result.stopped_on:
-            finish_reason = "stop"
 
         return ChatCompletionResponse(
             id=f"rfsn-{int(time.time() * 1000)}",
@@ -779,7 +777,7 @@ async def _sse_stream(
                     {
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop",
+                        "finish_reason": "length",
                     },
                 ],
                 "error": "Generation timed out",

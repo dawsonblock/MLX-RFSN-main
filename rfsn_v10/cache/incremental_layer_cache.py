@@ -87,7 +87,7 @@ class QuantizedLayerCache:
         keys, values
             Shape ``(batch, n_kv_heads, new_tokens, head_dim)``.
         """
-        B, Hkv, new_T, D = keys.shape
+        B, _, new_T, D = keys.shape
         assert B == 1, "Batch size must be 1"
 
         # Flatten to (new_tokens * Hkv, D) for per-head-vector quantization
@@ -283,12 +283,23 @@ class QuantizedLayerCache:
             self._dense_values = None
             self._dense_token_count = 0
         else:
-            # Keep only remaining tokens in staging
+            # remaining > 0: may keep some staging and/or dense residual
             if self._stage_token_count > remaining:
-                # This is approximate — proper trim would slice arrays
+                # Flush staging to sealed so we can cleanly re-trim
                 self._flush_staging()
-                # After flush, re-trim
                 self.trim(new_token_count)
+                return
+
+            # Drop or trim dense residual if the trim point falls inside it
+            keep_dense = remaining - self._stage_token_count
+            if keep_dense <= 0:
+                self._dense_keys = None
+                self._dense_values = None
+                self._dense_token_count = 0
+            elif keep_dense < self._dense_token_count:
+                self._dense_keys = self._dense_keys[:, :, :keep_dense, :]
+                self._dense_values = self._dense_values[:, :, :keep_dense, :]
+                self._dense_token_count = keep_dense
 
     # ------------------------------------------------------------------
     # Lifecycle

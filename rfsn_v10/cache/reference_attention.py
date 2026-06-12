@@ -44,59 +44,10 @@ class BlockwiseReferenceAttention:
         key_codec: CartesianCodec,
         value_codec: CartesianCodec,
         scale: float | None = None,
-        use_metal: bool = True,
     ) -> None:
         self.key_codec = key_codec
         self.value_codec = value_codec
         self.scale = scale
-        self.use_metal = use_metal
-        self._dispatch_log: list[dict[str, Any]] = []
-
-    # ------------------------------------------------------------------
-    # Metal helpers
-    # ------------------------------------------------------------------
-
-    def _try_metal_qk(
-        self,
-        queries: Any,
-        packed_codes: Any,
-        scales: Any,
-        bits: int,
-        group_size: int,
-        scale_factor: float,
-    ) -> Any | None:
-        if not self.use_metal:
-            return None
-        try:
-            from rfsn_v10.kernels.metal_cartesian import cartesian_qk_metal
-            return cartesian_qk_metal(
-                queries, packed_codes, scales,
-                bits=bits, group_size=group_size,
-                scale_factor=scale_factor,
-            )
-        except Exception:
-            return None
-
-    def _try_metal_sv(
-        self,
-        weights: Any,
-        packed_codes: Any,
-        scales: Any,
-        bits: int,
-        group_size: int,
-        head_dim: int,
-    ) -> Any | None:
-        if not self.use_metal:
-            return None
-        try:
-            from rfsn_v10.kernels.metal_cartesian import cartesian_sv_metal
-            return cartesian_sv_metal(
-                weights, packed_codes, scales,
-                bits=bits, group_size=group_size,
-                head_dim=head_dim,
-            )
-        except Exception:
-            return None
 
     # ------------------------------------------------------------------
     # Main API
@@ -125,15 +76,16 @@ class BlockwiseReferenceAttention:
         repeats = Hq // n_kv_heads
 
         max_block_tokens = 0
+        position_offset = 0
 
         # ------------------------------------------------------------------
         # Online softmax state
         # ------------------------------------------------------------------
         # m: running maximum of scores, shape (B, Hq, Lq, 1)
-        # l: running sum of exp(scores - m), shape (B, Hq, Lq, 1)
+        # sum_exp: running sum of exp(scores - m), shape (B, Hq, Lq, 1)
         # out: running weighted sum of values, shape (B, Hq, Lq, D)
         m = mx.full((B, Hq, Lq, 1), -1e9, dtype=mx.float32)
-        l = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
+        sum_exp = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
         out = mx.zeros((B, Hq, Lq, D), dtype=mx.float32)
 
         # ------------------------------------------------------------------
@@ -156,36 +108,32 @@ class BlockwiseReferenceAttention:
             ) * s  # (B, Hq, Lq, block_tokens)
 
             if mask is not None:
-                # mask may be longer than block_tokens; slice the relevant portion
-                scores = scores + mask
+                scores = (
+                    scores
+                    + mask[..., position_offset:position_offset + block_tokens]
+                )
 
             # ---- Online softmax update ----
-            # scores: (B, Hq, Lq, block_tokens)
-            # We need max over the last axis
-            block_max = mx.max(scores, axis=-1, keepdims=True)  # (B, Hq, Lq, 1)
+            block_max = mx.max(scores, axis=-1, keepdims=True)
             m_new = mx.maximum(m, block_max)
 
-            # Rescale previous output and sum
-            exp_diff_m = mx.exp(m - m_new)  # (B, Hq, Lq, 1)
-            l = l * exp_diff_m
+            exp_diff_m = mx.exp(m - m_new)
+            sum_exp = sum_exp * exp_diff_m
             out = out * exp_diff_m
 
-            # Add current block
-            exp_scores = mx.exp(scores.astype(mx.float32) - m_new)  # (B, Hq, Lq, block_tokens)
-            l = l + mx.sum(exp_scores, axis=-1, keepdims=True)
+            exp_scores = mx.exp(scores.astype(mx.float32) - m_new)
+            sum_exp = sum_exp + mx.sum(exp_scores, axis=-1, keepdims=True)
 
             # ---- Decode V block, accumulate weighted contribution ----
             v_flat = self.value_codec.decode(value_block)
             v_reshaped = v_flat.reshape(B, n_kv_heads, block_tokens, D)
             v_expanded = mx.repeat(v_reshaped, repeats, axis=1)
 
-            # Weighted sum: (B, Hq, Lq, block_tokens) @ (B, Hq, block_tokens, D)
             block_contrib = mx.matmul(exp_scores, v_expanded)
             out = out + block_contrib
 
             m = m_new
-
-            # Release dense K/V (MLX arrays are immutable, so just let GC handle it)
+            position_offset += block_tokens
 
         # ------------------------------------------------------------------
         # Process staging (if any)
@@ -198,17 +146,20 @@ class BlockwiseReferenceAttention:
             scores = mx.matmul(queries, k_expanded.transpose(0, 1, 3, 2)) * s
 
             if mask is not None:
-                scores = scores + mask
+                scores = (
+                    scores
+                    + mask[..., position_offset:position_offset + stage_n]
+                )
 
             block_max = mx.max(scores, axis=-1, keepdims=True)
             m_new = mx.maximum(m, block_max)
 
             exp_diff_m = mx.exp(m - m_new)
-            l = l * exp_diff_m
+            sum_exp = sum_exp * exp_diff_m
             out = out * exp_diff_m
 
             exp_scores = mx.exp(scores.astype(mx.float32) - m_new)
-            l = l + mx.sum(exp_scores, axis=-1, keepdims=True)
+            sum_exp = sum_exp + mx.sum(exp_scores, axis=-1, keepdims=True)
 
             v_reshaped = stage_v.reshape(B, n_kv_heads, stage_n, D)
             v_expanded = mx.repeat(v_reshaped, repeats, axis=1)
@@ -216,6 +167,7 @@ class BlockwiseReferenceAttention:
             out = out + block_contrib
 
             m = m_new
+            position_offset += stage_n
 
         # ------------------------------------------------------------------
         # Process dense residual (if any)
@@ -228,28 +180,32 @@ class BlockwiseReferenceAttention:
             scores = mx.matmul(queries, k_expanded.transpose(0, 1, 3, 2)) * s
 
             if mask is not None:
-                scores = scores + mask
+                scores = (
+                    scores
+                    + mask[..., position_offset:position_offset + dense_tokens]
+                )
 
             block_max = mx.max(scores, axis=-1, keepdims=True)
             m_new = mx.maximum(m, block_max)
 
             exp_diff_m = mx.exp(m - m_new)
-            l = l * exp_diff_m
+            sum_exp = sum_exp * exp_diff_m
             out = out * exp_diff_m
 
             exp_scores = mx.exp(scores.astype(mx.float32) - m_new)
-            l = l + mx.sum(exp_scores, axis=-1, keepdims=True)
+            sum_exp = sum_exp + mx.sum(exp_scores, axis=-1, keepdims=True)
 
             v_expanded = mx.repeat(dense_v, repeats, axis=1)
             block_contrib = mx.matmul(exp_scores, v_expanded)
             out = out + block_contrib
 
             m = m_new
+            position_offset += dense_tokens
 
         # ------------------------------------------------------------------
         # Final normalisation
         # ------------------------------------------------------------------
-        output = out / l  # l has shape (B, Hq, Lq, 1), broadcasts over D
+        output = out / sum_exp  # sum_exp has shape (B, Hq, Lq, 1)
         output = output.astype(queries.dtype)
 
         scratch = AttentionScratch(

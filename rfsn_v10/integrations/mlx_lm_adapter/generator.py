@@ -11,7 +11,7 @@ from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnMLXModelAdapter
 
 
 try:
-    from mlx_lm.utils import stream_generate
+    import mlx_lm
     MLX_LM_AVAILABLE = True
 except ImportError:
     MLX_LM_AVAILABLE = False
@@ -55,6 +55,7 @@ class RfsnMLXGenerator:
         temperature: float = 0.7,
         top_p: float = 0.9,
         repetition_penalty: float = 1.0,
+        stop_sequences: list[str] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Generate a chat response."""
@@ -80,6 +81,13 @@ class RfsnMLXGenerator:
             top_p=top_p,
             repetition_penalty=repetition_penalty,
         )
+
+        # Apply stop sequences
+        if stop_sequences:
+            for seq in stop_sequences:
+                if seq in text:
+                    text = text.split(seq)[0]
+                    break
 
         elapsed_ms = (time.monotonic() - t_start) * 1000.0
 

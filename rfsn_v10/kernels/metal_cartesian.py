@@ -6,7 +6,9 @@ is unavailable or compilation fails.
 """
 from __future__ import annotations
 
+import functools
 import importlib.resources
+import os
 from typing import Any
 
 from rfsn_v10.compat import mx
@@ -18,12 +20,20 @@ from ._common import KernelRouteError
 # Kernel source loading
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=2)
 def _load_metal_source(filename: str) -> str:
     """Load a .metal shader file from the package."""
     pkg = "rfsn_v10.kernels.metal"
-    files = importlib.resources.files(pkg)
-    path = files / filename
-    return path.read_text()
+    try:
+        files = importlib.resources.files(pkg)
+        path = files / filename
+        return path.read_text()
+    except Exception:
+        # Fallback for editable installs where package data may not be visible
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        filepath = os.path.join(module_dir, "metal", filename)
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read()
 
 
 # ---------------------------------------------------------------------------
