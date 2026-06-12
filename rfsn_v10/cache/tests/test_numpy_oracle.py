@@ -236,3 +236,52 @@ def test_mlx_and_oracle_reconstruction_match() -> None:
 
     assert tuple(mlx_dense_k.shape) == tuple(np_dense_k.shape)
     assert int(mlx_dense_k.shape[2]) == np_cache.total_token_count()
+
+
+def test_fixed_size_block_packing() -> None:
+    """All sealed blocks must be exactly staging_capacity tokens."""
+    from rfsn_v10.cache.numpy_oracle import NumpyLayerCache
+
+    cache = NumpyLayerCache(staging_capacity=32)
+    keys = np.random.randn(1, 2, 100, 64).astype(np.float32)
+    cache.append(keys, keys)
+
+    for block in cache._key_blocks:
+        assert block.shape[2] == 32, f"Block size {block.shape[2]} != 32"
+    assert cache._stage_token_count == 4
+
+
+def test_numpy_attention_shape_and_finite() -> None:
+    """numpy_attention must return the correct shape and finite values."""
+    from rfsn_v10.cache.numpy_oracle import numpy_attention
+
+    B, Hq, Hkv, Lq, T, D = 1, 4, 2, 1, 64, 64
+    queries = np.random.randn(B, Hq, Lq, D).astype(np.float32)
+    keys = np.random.randn(B, Hkv, T, D).astype(np.float32)
+    values = np.random.randn(B, Hkv, T, D).astype(np.float32)
+
+    output = numpy_attention(queries, keys, values)
+    assert output.shape == (B, Hq, Lq, D)
+    assert np.all(np.isfinite(output))
+
+
+def test_numpy_attention_matches_simple_computation() -> None:
+    """numpy_attention must match a simple manual attention computation."""
+    from rfsn_v10.cache.numpy_oracle import numpy_attention
+
+    B, Hq, Hkv, Lq, T, D = 1, 2, 2, 1, 8, 4
+    queries = np.random.randn(B, Hq, Lq, D).astype(np.float32)
+    keys = np.random.randn(B, Hkv, T, D).astype(np.float32)
+    values = np.random.randn(B, Hkv, T, D).astype(np.float32)
+    scale = D ** -0.5
+
+    output = numpy_attention(queries, keys, values, scale=scale)
+
+    # Manual computation
+    scores = np.einsum("bhqd,bhtd->bhqt", queries, keys) * scale
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores - max_scores)
+    weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+    expected = np.einsum("bhqt,bhtd->bhqd", weights, values)
+
+    np.testing.assert_allclose(output, expected, atol=1e-5)

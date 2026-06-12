@@ -267,3 +267,53 @@ class NumpyLayerCache:
         full_k = np.concatenate(key_parts, axis=2)
         full_v = np.concatenate(value_parts, axis=2)
         return full_k, full_v
+
+
+# ------------------------------------------------------------------
+# Reference attention (NumPy)
+# ------------------------------------------------------------------
+
+def numpy_attention(
+    queries: np.ndarray,
+    keys: np.ndarray,
+    values: np.ndarray,
+    scale: float | None = None,
+) -> np.ndarray:
+    """Compute dense attention using NumPy (reference oracle).
+
+    Parameters
+    ----------
+    queries
+        Shape ``(B, Hq, Lq, D)``.
+    keys, values
+        Shape ``(B, Hkv, T, D)``.
+    scale
+        Attention scale; defaults to ``D ** -0.5``.
+
+    Returns
+    -------
+    output
+        Shape ``(B, Hq, Lq, D)``.
+    """
+    if scale is None:
+        scale = queries.shape[-1] ** -0.5
+
+    # GQA: repeat K/V heads to match query heads
+    n_kv_heads = keys.shape[1]
+    repeats = queries.shape[1] // n_kv_heads
+    if repeats > 1:
+        keys = np.repeat(keys, repeats, axis=1)
+        values = np.repeat(values, repeats, axis=1)
+
+    # Q @ K.T  → (B, Hq, Lq, T)
+    scores = np.einsum("bhqd,bhtd->bhqt", queries, keys) * scale
+
+    # Softmax
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores - max_scores)
+    sum_exp = np.sum(exp_scores, axis=-1, keepdims=True)
+    weights = exp_scores / sum_exp
+
+    # weights @ V  → (B, Hq, Lq, D)
+    output = np.einsum("bhqt,bhtd->bhqd", weights, values)
+    return output.astype(queries.dtype)
