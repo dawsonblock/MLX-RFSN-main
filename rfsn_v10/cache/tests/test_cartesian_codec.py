@@ -169,3 +169,39 @@ def test_wht_sign_roundtrip() -> None:
     decoded_reshaped = decoded.reshape(x.shape)
     max_err = mx.max(mx.abs(x - decoded_reshaped)).item()
     assert max_err < 0.5, f"WHT+sign roundtrip max_err={max_err}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_decode_trims_group_padding() -> None:
+    """V2 decode must trim padding elements so size matches num_elements."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+
+    codec = CartesianCodec(bits=8, group_size=64)
+    # 65 elements forces 63 pad elements to reach 128 (next multiple of 64)
+    x = mx.random.normal(shape=(65,)).astype(mx.float32)
+
+    block = codec.encode(x)
+    assert block.num_elements == 65
+    assert block.n_values == 128  # padded to group_size
+
+    decoded = codec.decode(block)
+    assert int(decoded.size) == 65, f"Expected 65, got {decoded.size}"
+    assert mx.max(mx.abs(decoded - x)).item() < 0.5
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_decode_restores_original_dtype() -> None:
+    """V2 decode must restore the original dtype from PackedBlock metadata."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+
+    codec = CartesianCodec(bits=8, group_size=64)
+    x = mx.random.normal(shape=(128, 64)).astype(mx.float16)
+
+    block = codec.encode(x)
+    assert block.original_dtype == "float16"
+
+    decoded = codec.decode(block)
+    assert decoded.dtype == mx.float16, f"Expected float16, got {decoded.dtype}"
+    decoded_reshaped = decoded.reshape(x.shape)
+    max_err = mx.max(mx.abs(x.astype(mx.float32) - decoded_reshaped.astype(mx.float32))).item()
+    assert max_err < 0.5, f"float16 roundtrip max_err={max_err}"

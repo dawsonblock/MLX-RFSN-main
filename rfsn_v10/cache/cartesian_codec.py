@@ -70,6 +70,7 @@ class CartesianCodec:
             Immutable sealed block with exact payload_bytes().
         """
         original_shape = tuple(x.shape)
+        original_dtype_str = _mlx_dtype_name(x.dtype)
         flat = x.astype(mx.float32).reshape(-1)
         original_size = int(flat.size)
 
@@ -110,6 +111,7 @@ class CartesianCodec:
             n_values=n_values,
             format_version=2,
             num_elements=original_size,
+            original_dtype=original_dtype_str,
             wht_applied=self.use_wht,
             sign_seed=self.sign_seed if self.sign_seed != 0 else 0,
         )
@@ -121,8 +123,7 @@ class CartesianCodec:
     def decode(self, block: PackedBlock) -> Any:
         """Reconstruct the original tensor from a PackedBlock.
 
-        Returns the padded flat array; caller must slice to original_size
-        if needed.
+        Trims group padding and restores the original dtype from V2 metadata.
         """
         if block.bits != self.bits:
             raise ValueError(f"Block bits={block.bits}, codec bits={self.bits}")
@@ -148,7 +149,18 @@ class CartesianCodec:
         if block.wht_applied:
             restored = CartesianCodec.apply_wht(restored)
 
-        return restored.reshape(-1)
+        # Flatten and trim group padding
+        flat_restored = restored.reshape(-1)
+        if block.num_elements > 0 and block.num_elements < int(flat_restored.size):
+            flat_restored = flat_restored[:block.num_elements]
+
+        # Restore original dtype if V2 metadata is present
+        if block.original_dtype:
+            target_dtype = _str_to_mlx_dtype(block.original_dtype)
+            if target_dtype is not None:
+                flat_restored = flat_restored.astype(target_dtype)
+
+        return flat_restored
 
     # ------------------------------------------------------------------
     # Analytical size (no materialisation)
@@ -229,3 +241,43 @@ def _reference_hash_signs(x: Any, seed: int) -> Any:
     key = mx.random.key(seed)
     signs = mx.where(mx.random.normal(shape=x.shape, key=key) > 0, 1.0, -1.0)
     return x * signs
+
+
+# ------------------------------------------------------------------
+# Dtype helpers
+# ------------------------------------------------------------------
+
+_DTYPE_NAME_MAP: dict[Any, str] = {}
+_STR_DTYPE_MAP: dict[str, Any] = {}
+
+
+def _build_dtype_maps() -> None:
+    """Build bidirectional dtype name maps (called once at import)."""
+    global _DTYPE_NAME_MAP, _STR_DTYPE_MAP
+    pairs = [
+        (getattr(mx, "float16", None), "float16"),
+        (getattr(mx, "float32", None), "float32"),
+        (getattr(mx, "bfloat16", None), "bfloat16"),
+        (getattr(mx, "int8", None), "int8"),
+        (getattr(mx, "int16", None), "int16"),
+        (getattr(mx, "int32", None), "int32"),
+        (getattr(mx, "uint8", None), "uint8"),
+        (getattr(mx, "uint32", None), "uint32"),
+        (getattr(mx, "bool_", None), "bool"),
+    ]
+    _DTYPE_NAME_MAP = {dt: name for dt, name in pairs if dt is not None}
+    _STR_DTYPE_MAP = {name: dt for dt, name in pairs if dt is not None}
+
+
+def _mlx_dtype_name(dtype: Any) -> str:
+    """Return a stable string name for an MLX dtype object."""
+    if not _DTYPE_NAME_MAP:
+        _build_dtype_maps()
+    return _DTYPE_NAME_MAP.get(dtype, "float32")
+
+
+def _str_to_mlx_dtype(name: str) -> Any | None:
+    """Return the MLX dtype object for a string name, or None."""
+    if not _STR_DTYPE_MAP:
+        _build_dtype_maps()
+    return _STR_DTYPE_MAP.get(name)
