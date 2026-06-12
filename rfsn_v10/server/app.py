@@ -582,6 +582,7 @@ def create_app(config: RFSNConfig | None = None) -> FastAPI:
                         temperature=cfg.temperature,
                         top_p=cfg.top_p,
                         repetition_penalty=cfg.repetition_penalty,
+                        stop_sequences=cfg.stop_sequences,
                     ),
                     timeout=timeout_s,
                 )

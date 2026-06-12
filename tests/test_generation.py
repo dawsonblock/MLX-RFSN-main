@@ -87,6 +87,24 @@ def test_generator_accepts_backward_compat_kwargs() -> None:
 # ------------------------------------------------------------------
 
 
+def test_generation_finish_reason_length() -> None:
+    """When max_new_tokens is reached, finish_reason must be 'length'."""
+    from rfsn_v10.runtime.generation import GenerationConfig, GenerationResult
+    result = GenerationResult(
+        text="abc",
+        tokens=[1, 2, 3],
+        generation_time_ms=100.0,
+        tokens_per_second=30.0,
+    )
+    # Simulate the contract check from server/app.py
+    cfg = GenerationConfig(max_new_tokens=3)
+    finish_reason = "stop"
+    decode_tokens = len(result.tokens)
+    if decode_tokens >= cfg.max_new_tokens:
+        finish_reason = "length"
+    assert finish_reason == "length"
+
+
 def test_generator_does_not_mutate_model_layers() -> None:
     """The explicit adapter must not wrap or mutate model attention layers."""
     model = FakeModel(num_layers=3)

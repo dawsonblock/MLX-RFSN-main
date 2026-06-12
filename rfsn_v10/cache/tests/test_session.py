@@ -48,6 +48,36 @@ def test_session_counters() -> None:
     assert session.get_counter("nonexistent") == 0
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_session_position_ownership() -> None:
+    """Each session must own independent, monotonically increasing positions."""
+    from rfsn_v10.cache.session import GenerationCacheSession
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+
+    session_a = GenerationCacheSession("test", 2, k_codec, v_codec)
+    session_b = GenerationCacheSession("test", 2, k_codec, v_codec)
+
+    # Append 80 tokens to A → one 64-token block (pos 0) + 16 staged
+    keys = mx.random.normal(shape=(1, 2, 80, 64)).astype(mx.float32)
+    values = mx.random.normal(shape=(1, 2, 80, 64)).astype(mx.float32)
+    session_a.get_layer_cache(0).append(keys, values)
+
+    # A owns logical_start 0
+    a_starts = [b.logical_start for b in session_a.get_layer_cache(0).iter_key_blocks()]
+    assert a_starts == [0], f"Expected [0], got {a_starts}"
+
+    # B must have no blocks yet
+    b_starts = [b.logical_start for b in session_b.get_layer_cache(0).iter_key_blocks()]
+    assert b_starts == []
+
+    # A's total must be exactly 80; B's must be 0
+    assert session_a.get_layer_cache(0).total_token_count() == 80
+    assert session_b.get_layer_cache(0).total_token_count() == 0
+
+
 def test_session_context_manager() -> None:
     k_codec = CartesianCodec(bits=8, group_size=64)
     v_codec = CartesianCodec(bits=5, group_size=64)

@@ -15,6 +15,9 @@ from pathlib import Path
 
 import pytest
 
+alembic = pytest.importorskip("alembic", reason="alembic not installed")
+sqlalchemy = pytest.importorskip("sqlalchemy", reason="sqlalchemy not installed")
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
