@@ -13,8 +13,11 @@
 - Benchmark tests: `pytest benchmarks/tests/ -q`
 - Alembic migrations (skips gracefully if deps missing): `pytest tests/test_alembic_migrations.py -q`
 - Identity tests: `pytest rfsn_v10/cache/tests/test_identity.py -q`
-- Full test suite (CI gate): `pytest tests/test_generation.py rfsn_v10/cache/tests/ rfsn_v10/integrations/mlx_lm_adapter/tests/ rfsn_v10/integrations/mlx_lm_model_support/tests/ rfsn_v10/kernels/tests/ benchmarks/tests/ -q`
+- Full test suite (CI gate): `pytest tests/test_generation.py rfsn_v10/cache/tests/ rfsn_v10/integrations/mlx_lm_adapter/tests/ rfsn_v10/integrations/mlx_lm_model_support/tests/ rfsn_v10/kernels/tests/ benchmarks/tests/ tests/server/ -q`
 - Coverage gate (scoped): `pytest tests/test_generation.py rfsn_v10/cache/tests/ rfsn_v10/integrations/mlx_lm_adapter/tests/ --cov=rfsn_v10.cache --cov=rfsn_v10.integrations.mlx_lm_adapter --cov=rfsn_v10.runtime.generation --cov-report=term-missing --cov-fail-under=60 -q`
+- Slow real-model tests: `pytest rfsn_v10/cache/tests/test_real_model_promotion.py -v --slow -k "packed_reference or multi_turn or long_context"`
+- Polar fused end-to-end: `pytest rfsn_v11/polar_fused/tests/test_end_to_end.py -v --slow -k "quantized"`
+- Server integration: `pytest tests/server/test_chat_completions.py -v -k "concurrent"`
 
 ## Key Architecture
 - Dense/chunked prefill → encode each K/V block once → discard complete dense history → direct packed QK → online softmax → direct packed SV → bounded staging or dense tail only.
@@ -50,6 +53,12 @@
 - Package-wide coverage gate was impossible (27% actual vs 60% target) because large untouched modules (kv_manager, clickhouse_client, server, etc.) were included.
 - Scoped gate covers `rfsn_v10.cache`, `rfsn_v10.integrations.mlx_lm_adapter`, `rfsn_v10.runtime.generation` and passes at ~69%.
 
+## New Tests (Gap Closure)
+1. `test_multi_turn_chat_packed_reference` — Two-turn generation with persistent packed cache; proves cache accumulates across turns with zero requantization.
+2. `test_long_context_packed_reference` — Prefill ~1200 tokens via packed-reference path; proves no requantization at long context.
+3. `test_polar_with_quantized_model_generates` — PolarModelRunner with `mlx-community/Qwen2.5-0.5B-Instruct-4bit`; closes gap where Polar only tested with full-precision model.
+4. `test_concurrent_streaming_requests` — 3 concurrent streaming requests against FastAPI app; verifies no interference between streams.
+
 ## Known Limitations
-- `rfsn_v11` polar_fused path is fixed but not yet exercised in CI promotion tests.
 - Metal kernels are validated for shape correctness; full numerical match against dense baseline is exercised via CPU reference tests.
+- Concurrent streaming test uses a fake generator; real load testing under MLX-metal contention requires separate benchmarking.

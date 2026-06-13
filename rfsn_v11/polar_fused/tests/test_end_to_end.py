@@ -18,10 +18,11 @@ def test_naive_polar_with_real_model_kv() -> None:
     """Prove NaivePolarAttention matches dequantized oracle."""
     from mlx_lm import load
     from mlx_lm.models import cache as mlx_cache
-    from rfsn_v11.polar_fused.config import PolarFusedConfig
-    from rfsn_v11.polar_fused.quantize import PolarQuantizer
+
     from rfsn_v11.polar_fused.attention import NaivePolarAttention
+    from rfsn_v11.polar_fused.config import PolarFusedConfig
     from rfsn_v11.polar_fused.contracts import QuantizedVectors
+    from rfsn_v11.polar_fused.quantize import PolarQuantizer
 
     model, tokenizer = load("Qwen/Qwen2.5-0.5B-Instruct")
     prompt = "Hello"
@@ -87,8 +88,9 @@ def test_naive_polar_with_real_model_kv() -> None:
 def test_polar_replacement_generates_text() -> None:
     """Prove Polar attention can generate actual text."""
     from mlx_lm import load
-    from rfsn_v11.polar_fused.config import PolarFusedConfig
+
     from rfsn_v11.polar_fused.adapters.mlx_lm import PolarModelRunner
+    from rfsn_v11.polar_fused.config import PolarFusedConfig
 
     model, tokenizer = load("Qwen/Qwen2.5-0.5B-Instruct")
     cfg = PolarFusedConfig.polar_safe()
@@ -108,8 +110,9 @@ def test_polar_vs_standard_output() -> None:
     """Compare Polar vs standard generation on same prompt."""
     from mlx_lm import load
     from mlx_lm.models import cache as mlx_cache
-    from rfsn_v11.polar_fused.config import PolarFusedConfig
+
     from rfsn_v11.polar_fused.adapters.mlx_lm import PolarModelRunner
+    from rfsn_v11.polar_fused.config import PolarFusedConfig
 
     model, tokenizer = load("Qwen/Qwen2.5-0.5B-Instruct")
     prompt = "Hello"
@@ -119,7 +122,7 @@ def test_polar_vs_standard_output() -> None:
     # Standard generation
     cache_std = [mlx_cache.KVCache() for _ in range(len(model.layers))]
     y = mx.array(prompt_ids)
-    logits_std = model(y[None], cache=cache_std)
+    model(y[None], cache=cache_std)
     mx.eval([c.state for c in cache_std])
 
     std_ids = list(prompt_ids)
@@ -148,15 +151,16 @@ def test_polar_vs_standard_output() -> None:
 def test_boundary_layers_untouched() -> None:
     """Prove boundary layers still use standard attention."""
     from mlx_lm import load
-    from rfsn_v11.polar_fused.config import PolarFusedConfig
+
     from rfsn_v11.polar_fused.adapters.mlx_lm import PolarModelRunner
+    from rfsn_v11.polar_fused.config import PolarFusedConfig
 
     model, tokenizer = load("Qwen/Qwen2.5-0.5B-Instruct")
     cfg = PolarFusedConfig.polar_safe()
     runner = PolarModelRunner(model, tokenizer, cfg)
 
     # Install wrappers
-    replaced = runner.install()
+    runner.install()
 
     try:
         # Check that boundary layers were NOT replaced
@@ -164,12 +168,33 @@ def test_boundary_layers_untouched() -> None:
         for lid in boundary:
             if lid < len(model.layers):
                 # The __call__ should be the original (not our wrapper)
-                attn = model.layers[lid].self_attn
                 # We can't easily check this, but we know boundary logic says
                 # these should be fp16 mode
                 assert runner._layer_modes.get(lid) == "fp16"
     finally:
         runner.uninstall()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+@pytest.mark.slow
+def test_polar_with_quantized_model_generates() -> None:
+    """PolarModelRunner works with the mlx-community 4-bit Qwen2 model."""
+    from mlx_lm import load
+
+    from rfsn_v11.polar_fused.adapters.mlx_lm import PolarModelRunner
+    from rfsn_v11.polar_fused.config import PolarFusedConfig
+
+    model, tokenizer = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+    cfg = PolarFusedConfig.polar_safe()
+
+    runner = PolarModelRunner(model, tokenizer, cfg)
+    text, metrics = runner.generate("What is the capital of France?", max_tokens=8, verbose=False)
+
+    assert len(text) > len("What is the capital of France?")
+    assert "tokens_generated" in metrics
+    assert metrics["tokens_generated"] == 8
+    assert len(metrics["polar_layers"]) > 0
+    assert len(metrics["boundary_layers"]) > 0
 
 
 def _cosine_similarity(a: mx.array, b: mx.array) -> mx.array:

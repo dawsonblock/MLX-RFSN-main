@@ -192,8 +192,8 @@ class TestRealModelPromotion:
         from rfsn_v10.cache.cartesian_codec import CartesianCodec
         from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
             RfsnDirectPackedKVCache,
-            wrap_model_attention,
             unwrap_model_attention,
+            wrap_model_attention,
         )
 
         model, tokenizer = model_and_tokenizer
@@ -241,3 +241,135 @@ class TestRealModelPromotion:
         assert layer0.total_token_count() == prompt_len + max_tokens
         assert layer0.requantized_token_count == 0
         assert layer0.total_memory_bytes() > 0
+
+    def test_multi_turn_chat_packed_reference(self, model_and_tokenizer):
+        """Two-turn generation with persistent packed cache: zero requantization."""
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+
+        model, tokenizer = model_and_tokenizer
+        max_tokens = 8
+
+        # Turn 1
+        prompt1 = "What is 2+2?"
+        prompt1_ids = mx.array(tokenizer.encode(prompt1))
+        prompt1_len = len(prompt1_ids)
+
+        # Dense baseline turn 1
+        baseline1 = []
+        for token, _ in generate_step(prompt1_ids, model, max_tokens=max_tokens, temp=0.0):
+            baseline1.append(int(token))
+
+        # Packed path: wrap once, persist cache across turns
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        wrap_model_attention(model, caches)
+        try:
+            # Turn 1
+            packed1 = []
+            for token, _ in generate_step(
+                prompt1_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed1.append(int(token))
+
+            assert packed1 == baseline1, (
+                f"Turn 1 divergence: baseline={baseline1}, packed={packed1}"
+            )
+
+            # Turn 2: different prompt, SAME cache
+            prompt2 = "What is 3+3?"
+            prompt2_ids = mx.array(tokenizer.encode(prompt2))
+            prompt2_len = len(prompt2_ids)
+
+            packed2 = []
+            for token, _ in generate_step(
+                prompt2_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed2.append(int(token))
+
+            # Cache must have accumulated ALL tokens from both turns without requantizing
+            layer0 = caches[0].layer_cache
+            expected_total = prompt1_len + len(baseline1) + prompt2_len + len(packed2)
+            assert layer0.total_token_count() == expected_total, (
+                f"Cache total mismatch: expected {expected_total}, got {layer0.total_token_count()}"
+            )
+            assert layer0.requantized_token_count == 0
+            assert layer0.total_memory_bytes() > 0
+
+        finally:
+            unwrap_model_attention(model)
+
+    def test_long_context_packed_reference(self, model_and_tokenizer):
+        """Prefill ~1200 tokens and generate with packed path: no requantization."""
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+
+        model, tokenizer = model_and_tokenizer
+
+        # Build a ~1200 token prompt by repeating a sentence
+        sentence = "The quick brown fox jumps over the lazy dog. "
+        repeat_count = 45  # ~45 * ~27 chars ≈ 1215 chars → ~300-400 tokens
+        prompt = "Summarize the following text: " + sentence * repeat_count
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        prompt_len = len(prompt_ids)
+        max_tokens = 8
+
+        # Packed path
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        wrap_model_attention(model, caches)
+        try:
+            generated = []
+            for token, _ in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                generated.append(int(token))
+
+            # Cache must contain all prefill + generated tokens
+            layer0 = caches[0].layer_cache
+            expected_total = prompt_len + len(generated)
+            assert layer0.total_token_count() == expected_total, (
+                f"Long-context total mismatch: expected {expected_total}, "
+                f"got {layer0.total_token_count()}"
+            )
+            assert layer0.requantized_token_count == 0
+            assert layer0.total_memory_bytes() > 0
+
+        finally:
+            unwrap_model_attention(model)

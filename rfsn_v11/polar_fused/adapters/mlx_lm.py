@@ -16,7 +16,6 @@ from typing import Any
 from rfsn_v11.polar_fused.attention_backend import PolarFusedAttentionBackend
 from rfsn_v11.polar_fused.config import PolarFusedConfig
 from rfsn_v11.polar_fused.incremental_cache import IncrementalPolarCache
-from rfsn_v11.polar_fused.quality_gates import PolarQualityGates
 from rfsn_v11.polar_fused.quantize import PolarQuantizer
 
 try:
@@ -249,7 +248,7 @@ class PolarModelRunner:
             while y.size > 512:
                 self.model(y[:512][None], cache=cache_list)
                 y = y[512:]
-            logits = self.model(y[None], cache=cache_list)
+            self.model(y[None], cache=cache_list)
             mx.eval([c.state for c in cache_list])
             prefill_time = time.monotonic() - t0
 
@@ -270,8 +269,8 @@ class PolarModelRunner:
 
             # Gather cache metadata from wrappers
             cache_meta = {}
-            for wrapper in self._wrappers:
-                cache_meta[wrapper.layer_id] = wrapper._inc_cache.metadata()
+            for layer_id, wrapper in self._wrappers:
+                cache_meta[layer_id] = wrapper._inc_cache.metadata()
 
             metrics = {
                 "prefill_time_ms": prefill_time * 1000.0,

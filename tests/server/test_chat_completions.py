@@ -7,6 +7,7 @@ packed_reference config propagation.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -44,8 +45,7 @@ class FakeGenerator:
 
     def generate(self, prompt: str, **gen_kwargs: Any):
         self.generate_call_count += 1
-        for t in self.tokens:
-            yield t
+        yield from self.tokens
 
 
 class FakeTokenizer:
@@ -277,3 +277,55 @@ class TestChatCompletions:
         )
         assert response.status_code == 200
         # The test passes if the server didn't crash while using packed_reference=True.
+
+    @pytest.mark.anyio
+    async def test_concurrent_streaming_requests(self):
+        """3 concurrent streaming requests all complete without interference."""
+        import asyncio
+
+        import httpx
+        from httpx import ASGITransport
+
+        gen = FakeGenerator(tokens=["A", "B", "C"])
+        app, _ = _app_with_fake_generator(
+            fake_generator=gen,
+            **{"server.require_api_key": False},
+        )
+
+        async def _request(idx: int):
+            async with httpx.AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": f"Request {idx}"}],
+                        "max_tokens": 10,
+                        "stream": True,
+                    },
+                )
+                assert response.status_code == 200
+                events = []
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        payload = line[len("data: "):]
+                        if payload not in ("[DONE]", ""):
+                            events.append(json.loads(payload))
+                return events
+
+        results = await asyncio.gather(*(_request(i) for i in range(3)))
+
+        # All 3 requests must have produced token events
+        for i, events in enumerate(results):
+            token_text = "".join(
+                e["choices"][0]["delta"].get("content", "")
+                for e in events
+                if e["choices"][0].get("finish_reason") is None
+            )
+            assert token_text == "ABC", f"Request {i} produced wrong text: {token_text!r}"
+
+        # Generator should have been called 3 times (once per request)
+        # Streaming path uses generate(), not chat()
+        assert gen.generate_call_count == 3
