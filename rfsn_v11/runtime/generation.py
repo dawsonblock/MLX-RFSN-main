@@ -305,7 +305,7 @@ class RFSNGenerator:
                 self._kv_manager = RFSNTurboQuantKVManager(
                     k_bits=8,
                     v_bits=5,
-                    group_size=32,
+                    group_size=64,
                 )
             else:
                 _logger.warning(

@@ -69,7 +69,7 @@ def load_mlx_model(
     Args:
         model_id: HuggingFace model ID or local path.
         quant_config: Optional quantization config string
-            (e.g. ``"k8_v5_gs32"``).  Not used by ``mlx-lm`` directly;
+            (e.g. ``"k8_v5_gs64"``).  Not used by ``mlx-lm`` directly;
             attached to ``model._rfsn_quant_config`` for downstream use.
         lazy: Whether to load model weights lazily (default ``True``).
         **kwargs: Passed to ``mlx_lm.load``.

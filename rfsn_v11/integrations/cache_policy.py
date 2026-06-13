@@ -17,7 +17,7 @@ Example:
         CachePolicy, create_cache_policy,
     )
 
-    policy = create_cache_policy("rfsn_v10_k8_v5_gs32")
+    policy = create_cache_policy("rfsn_v10_k8_v5_gs64")
     # Future: model.generate(prompt, cache_policy=policy)
 """
 from __future__ import annotations

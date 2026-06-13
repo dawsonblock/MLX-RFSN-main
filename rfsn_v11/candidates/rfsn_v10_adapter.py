@@ -1,12 +1,11 @@
-"""Candidate: RFSN v10 stable baseline (k8_v5_gs32 and k8_v5_gs64).
+"""Candidate: RFSN v10 stable baseline (k8_v5_gs64).
 
 This wraps the validated rfsn_v10 quantization path so the shootout can
 compare it against newer candidates on equal footing.
 
 Config name mapping
 -------------------
-k8_v5_gs32  →  default_bits=8, group_size=32   (recommended)
-k8_v5_gs64  →  default_bits=8, group_size=64   (also validated)
+k8_v5_gs64  →  default_bits=8, group_size=64   (canonical)
 """
 from __future__ import annotations
 
@@ -31,7 +30,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
 
     candidate_status = CandidateStatus.BASELINE
 
-    def __init__(self, config_name: str = "k8_v5_gs32") -> None:
+    def __init__(self, config_name: str = "k8_v5_gs64") -> None:
         if config_name not in _PRESET_MAP:
             raise ValueError(
                 f"Unknown rfsn_v10 preset {config_name!r}. "
