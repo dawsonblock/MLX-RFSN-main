@@ -193,36 +193,15 @@ class QuantizedLayerCache:
         for i in range(n_full_blocks):
             start = i * block_size
             end = start + block_size
-            keys_slice = keys_full[:, :, start:end, :].reshape(-1, D)
-            values_slice = values_full[:, :, start:end, :].reshape(-1, D)
-
-            key_block_raw = self.key_codec.encode(keys_slice)
-            value_block_raw = self.value_codec.encode(values_slice)
-
-            # Reshape flat scales to BHTG layout
-            groups_per_head = D // key_block_raw.group_size
-            key_scales_bhtg = key_block_raw.scales.reshape(B, Hkv, block_size, groups_per_head)
-            value_scales_bhtg = value_block_raw.scales.reshape(B, Hkv, block_size, groups_per_head)
+            keys_slice = keys_full[:, :, start:end, :]
+            values_slice = values_full[:, :, start:end, :]
 
             logical_start = base_offset + start
-            assert logical_start == base_offset + i * block_size
-            key_block = dataclasses.replace(
-                key_block_raw,
-                scales=key_scales_bhtg,
-                token_count=block_size,
-                batch_size=B,
-                n_kv_heads=Hkv,
-                head_dim=D,
-                logical_start=logical_start,
+            key_block = self.key_codec.encode_bhtd(
+                keys_slice, logical_start=logical_start
             )
-            value_block = dataclasses.replace(
-                value_block_raw,
-                scales=value_scales_bhtg,
-                token_count=block_size,
-                batch_size=B,
-                n_kv_heads=Hkv,
-                head_dim=D,
-                logical_start=logical_start,
+            value_block = self.value_codec.encode_bhtd(
+                values_slice, logical_start=logical_start
             )
 
             self._key_blocks.append(key_block)
@@ -478,11 +457,9 @@ class QuantizedLayerCache:
 
         token_offset = 0
         for kb, vb in zip(self._key_blocks, self._value_blocks):
-            k_flat = self.key_codec.decode(kb)
-            v_flat = self.value_codec.decode(vb)
+            k_block = self.key_codec.decode_bhtd(kb)
+            v_block = self.value_codec.decode_bhtd(vb)
             block_T = kb.token_count
-            k_block = k_flat.reshape(B, -1, block_T, D)
-            v_block = v_flat.reshape(B, -1, block_T, D)
             _process_block(k_block, v_block, block_T, token_offset)
             token_offset += block_T
 

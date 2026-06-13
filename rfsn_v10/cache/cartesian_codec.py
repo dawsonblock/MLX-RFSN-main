@@ -57,8 +57,182 @@ class CartesianCodec:
         self.qmax = (1 << (bits - 1)) - 1
 
     # ------------------------------------------------------------------
+    # Vector-aligned helpers
+    # ------------------------------------------------------------------
+
+    def _vector_aligned_pack(self, codes_bhtd: Any, bits: int) -> Any:
+        """Pack integer codes with per-vector alignment.
+
+        Parameters
+        ----------
+        codes_bhtd
+            uint32 array of shape (B, H, T, D) where each element is a code.
+        bits
+            Bit width per code.
+
+        Returns
+        -------
+        packed
+            uint32 array of shape (B, H, T, words_per_vector).
+        """
+        B, H, T, D = codes_bhtd.shape
+        codes_per_word = 32 // bits
+        words_per_vector = math.ceil(D / codes_per_word)
+        padded_D = words_per_vector * codes_per_word
+
+        if padded_D > D:
+            pad_shape = list(codes_bhtd.shape)
+            pad_shape[-1] = padded_D - D
+            codes_bhtd = mx.concatenate(
+                [codes_bhtd, mx.zeros(pad_shape, dtype=mx.uint32)],
+                axis=-1,
+            )
+
+        grouped = codes_bhtd.reshape(B, H, T, words_per_vector, codes_per_word)
+        shifts = mx.arange(codes_per_word, dtype=mx.uint32) * bits
+        packed = mx.sum(
+            grouped.astype(mx.uint32) << shifts.reshape(1, 1, 1, 1, -1),
+            axis=-1,
+        )
+        return packed
+
+    def _vector_aligned_unpack(
+        self, packed: Any, bits: int, head_dim: int
+    ) -> Any:
+        """Unpack vector-aligned uint32 words back to individual codes.
+
+        Parameters
+        ----------
+        packed
+            uint32 array of shape (B, H, T, words_per_vector).
+        bits
+            Bit width per code.
+        head_dim
+            Original head dimension (codes beyond this are padding).
+
+        Returns
+        -------
+        codes
+            uint32 array of shape (B, H, T, head_dim).
+        """
+        B, H, T, words_per_vector = packed.shape
+        codes_per_word = 32 // bits
+        padded_D = words_per_vector * codes_per_word
+
+        packed_view = packed.reshape(B, H, T, words_per_vector, 1).astype(mx.uint32)
+        shifts = (mx.arange(codes_per_word, dtype=mx.uint32) * bits).reshape(1, 1, 1, 1, -1)
+        mask = mx.array((1 << bits) - 1, dtype=mx.uint32)
+        codes = (packed_view >> shifts) & mask
+        codes = codes.reshape(B, H, T, padded_D)
+        if padded_D > head_dim:
+            codes = codes[..., :head_dim]
+        return codes
+
+    # ------------------------------------------------------------------
     # Encode
     # ------------------------------------------------------------------
+
+    def encode_bhtd(
+        self,
+        x: Any,
+        *,
+        logical_start: int = 0,
+        layer_id: int = 0,
+        stream_id: str = "",
+    ) -> "PackedBlock":
+        """Quantize and pack a BHTD tensor with vector-aligned codes.
+
+        Parameters
+        ----------
+        x
+            Array of shape (B, H, T, D).
+        logical_start
+            Global token offset of the first token in this block.
+        layer_id
+            Layer index for deterministic signs.
+        stream_id
+            "K" or "V" for stream-specific sign derivation.
+
+        Returns
+        -------
+        PackedBlock
+            Immutable sealed block with BHTG scales and BHTW packed codes.
+        """
+        if x.ndim != 4:
+            raise ValueError("expected BHTD input")
+        B, H, T, D = x.shape
+        original_dtype_str = _mlx_dtype_name(x.dtype)
+        original_value_count = int(B * H * T * D)
+
+        # Pad feature axis to multiple of group_size
+        pad = (self.group_size - (D % self.group_size)) % self.group_size
+        if pad:
+            pad_shape = [B, H, T, pad]
+            x_padded = mx.concatenate(
+                [x.astype(mx.float32), mx.zeros(pad_shape, dtype=mx.float32)],
+                axis=-1,
+            )
+        else:
+            x_padded = x.astype(mx.float32)
+
+        padded_D = D + pad
+        groups_per_vector = padded_D // self.group_size
+
+        # Reshape to (B, H, T, groups_per_vector, group_size)
+        grouped = x_padded.reshape(B, H, T, groups_per_vector, self.group_size)
+
+        # Optional WHT + deterministic signs
+        if self.use_wht:
+            grouped = CartesianCodec.apply_wht(grouped)
+        if self.sign_seed != 0:
+            grouped = CartesianCodec.apply_hash_signs(grouped, self.sign_seed)
+
+        # Per-vector scales: max over group_size axis
+        max_abs = mx.maximum(
+            mx.max(mx.abs(grouped), axis=-1),
+            mx.array(self.eps, dtype=mx.float32),
+        )
+        scale_bhtg = max_abs / float(self.qmax)
+
+        # Quantize
+        q_signed = mx.round(grouped / scale_bhtg[..., None])
+        q_signed = mx.clip(q_signed, -self.qmax, self.qmax)
+        codes_bhtd = (q_signed + self.qmax).astype(mx.uint32).reshape(B, H, T, padded_D)
+
+        # Vector-aligned packing
+        if self.bits <= 8:
+            packed = self._vector_aligned_pack(codes_bhtd, self.bits)
+            codes_per_word = 32 // self.bits
+            words_per_vector = math.ceil(padded_D / codes_per_word)
+            padded_value_count = int(B * H * T * padded_D)
+        else:
+            packed = codes_bhtd
+            codes_per_word = 1
+            words_per_vector = padded_D
+            padded_value_count = original_value_count
+
+        from .contracts import PackedBlock
+
+        block = PackedBlock(
+            packed_codes=packed,
+            scales=scale_bhtg,
+            token_count=T,
+            bits=self.bits,
+            group_size=self.group_size,
+            n_values=padded_value_count,
+            batch_size=B,
+            n_kv_heads=H,
+            head_dim=D,
+            logical_start=logical_start,
+            num_elements=original_value_count,
+            original_dtype=original_dtype_str,
+            wht_applied=self.use_wht,
+            sign_seed=self.sign_seed if self.sign_seed != 0 else 0,
+            vector_alignment=64,
+            format_version=4,
+        )
+        block.validate()
+        return block
 
     def encode(self, x: Any) -> PackedBlock:
         """Quantize and pack a tensor.
@@ -131,11 +305,19 @@ class CartesianCodec:
         """Reconstruct the original tensor from a PackedBlock.
 
         Trims group padding and restores the original dtype from V2/V3 metadata.
+        For V4 blocks with BHTD shapes, delegates to decode_bhtd.
         """
-        if block.format_version not in (1, 2, 3):
-            raise ValueError(f"Unsupported PackedBlock version: {block.format_version}")
         if block.bits != self.bits:
             raise ValueError(f"Block bits={block.bits}, codec bits={self.bits}")
+
+        # V4 blocks with BHTG scales are handled by decode_bhtd
+        if block.format_version == 4 or (
+            block.scales is not None and block.scales.ndim >= 3
+        ):
+            return self.decode_bhtd(block)
+
+        if block.format_version not in (1, 2, 3):
+            raise ValueError(f"Unsupported PackedBlock version: {block.format_version}")
 
         # Unpack codes
         if block.bits <= 8:
@@ -167,6 +349,78 @@ class CartesianCodec:
 
         # Restore original dtype only for V2+ blocks (V1 default is unreliable)
         if block.format_version >= 2 and block.original_dtype:
+            target_dtype = _str_to_mlx_dtype(block.original_dtype)
+            if target_dtype is not None:
+                flat_restored = flat_restored.astype(target_dtype)
+
+        return flat_restored
+
+    def decode_bhtd(self, block: "PackedBlock") -> Any:
+        """Reconstruct a BHTD tensor from a vector-aligned PackedBlock.
+
+        Expects packed_codes of shape (B,H,T,W) and scales of shape (B,H,T,G).
+        Returns array of shape (B,H,T,D).
+        """
+        if block.format_version not in (3, 4):
+            raise ValueError(f"Unsupported PackedBlock version: {block.format_version}")
+        if block.bits != self.bits:
+            raise ValueError(f"Block bits={block.bits}, codec bits={self.bits}")
+
+        # Unpack codes
+        if block.bits <= 8:
+            codes_bhtd = self._vector_aligned_unpack(
+                block.packed_codes, block.bits, block.head_dim
+            )
+        else:
+            codes_bhtd = block.packed_codes
+
+        B, H, T, D = codes_bhtd.shape
+        padded_D = D
+        pad = (self.group_size - (padded_D % self.group_size)) % self.group_size
+        if pad:
+            codes_bhtd = mx.concatenate(
+                [codes_bhtd, mx.zeros((B, H, T, pad), dtype=mx.uint32)],
+                axis=-1,
+            )
+            padded_D = padded_D + pad
+
+        groups_per_vector = padded_D // self.group_size
+        grouped = codes_bhtd.reshape(B, H, T, groups_per_vector, self.group_size)
+        qmax = (1 << (block.bits - 1)) - 1
+        q_signed = grouped.astype(mx.float32) - float(qmax)
+
+        # Scales are BHTG
+        scales_bhtg = block.scales
+        if scales_bhtg.ndim == 1:
+            # Legacy flat scales — reshape to BHTG
+            expected = B * H * T * groups_per_vector
+            if int(scales_bhtg.size) != expected:
+                raise ValueError(
+                    f"Flat scales size {scales_bhtg.size} != expected {expected}"
+                )
+            scales_bhtg = scales_bhtg.reshape(B, H, T, groups_per_vector)
+
+        restored = q_signed * scales_bhtg[..., None]
+
+        # Inverse hash signs and WHT
+        if block.sign_seed != 0:
+            restored = CartesianCodec.apply_hash_signs(restored, block.sign_seed)
+        if block.wht_applied:
+            restored = CartesianCodec.apply_wht(restored)
+
+        # Flatten feature axis and trim group padding
+        flat_restored = restored.reshape(B, H, T, padded_D)
+        if block.num_elements > 0:
+            expected_elements = B * H * T * block.head_dim
+            if block.num_elements == expected_elements:
+                flat_restored = flat_restored[..., : block.head_dim]
+            elif block.num_elements < int(flat_restored.size):
+                # Flat fallback for older blocks
+                flat_restored = flat_restored.reshape(-1)[: block.num_elements]
+                flat_restored = flat_restored.reshape(B, H, T, block.head_dim)
+
+        # Restore original dtype
+        if block.original_dtype:
             target_dtype = _str_to_mlx_dtype(block.original_dtype)
             if target_dtype is not None:
                 flat_restored = flat_restored.astype(target_dtype)
