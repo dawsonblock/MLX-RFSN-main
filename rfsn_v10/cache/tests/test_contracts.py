@@ -222,3 +222,164 @@ class TestAttentionScratch:
         assert scratch.max_reconstructed_block_tokens == 0
         assert scratch.score_vector_bytes == 0
         assert scratch.output_accumulator_bytes == 0
+
+
+class TestPackedBlockV4:
+    def test_minimal_valid_block(self) -> None:
+        import numpy as np
+        from rfsn_v10.cache.contracts import (
+            PackedBlockV4,
+            PackingLayout,
+            Preconditioner,
+            ScaleLayout,
+            TensorLayout,
+        )
+
+        block = PackedBlockV4(
+            packed_codes=np.zeros((1, 2, 64, 11), dtype=np.uint32),
+            scales=np.zeros((1, 2, 64, 1), dtype=np.float32),
+            format_version=4,
+            tensor_layout=TensorLayout.BHTD,
+            packing_layout=PackingLayout.VECTOR_ALIGNED_UINT32_V4,
+            scale_layout=ScaleLayout.BHTG_V4,
+            preconditioner=Preconditioner.WHT64_HASH_SIGN_V1,
+            batch_size=1,
+            n_kv_heads=2,
+            token_count=64,
+            head_dim=64,
+            logical_start=0,
+            logical_end=64,
+            bits=8,
+            group_size=64,
+            groups_per_vector=1,
+            codes_per_word=6,
+            words_per_vector=11,
+            original_value_count=1 * 2 * 64 * 64,
+            padded_value_count=1 * 2 * 64 * 66,
+            original_dtype="float16",
+            sign_seed=42,
+            sign_algorithm="splitmix64-v1",
+            layer_id=0,
+            stream_id="K",
+        )
+        block.validate()
+
+    def test_rejects_non_v4_format(self) -> None:
+        import numpy as np
+        from rfsn_v10.cache.contracts import (
+            PackedBlockV4,
+            PackingLayout,
+            Preconditioner,
+            ScaleLayout,
+            TensorLayout,
+        )
+
+        block = PackedBlockV4(
+            packed_codes=np.zeros((1, 1, 1, 1), dtype=np.uint32),
+            scales=np.zeros((1, 1, 1, 1), dtype=np.float32),
+            format_version=3,
+            tensor_layout=TensorLayout.BHTD,
+            packing_layout=PackingLayout.GLOBAL_FLAT_V3,
+            scale_layout=ScaleLayout.FLAT_GROUPS_V3,
+            preconditioner=Preconditioner.NONE,
+            batch_size=1,
+            n_kv_heads=1,
+            token_count=1,
+            head_dim=64,
+            logical_start=0,
+            logical_end=1,
+            bits=8,
+            group_size=64,
+            groups_per_vector=1,
+            codes_per_word=6,
+            words_per_vector=11,
+            original_value_count=64,
+            padded_value_count=64,
+            original_dtype="float16",
+            sign_seed=0,
+            sign_algorithm="",
+            layer_id=0,
+            stream_id="",
+        )
+        with pytest.raises(ValueError, match="unsupported PackedBlock format"):
+            block.validate()
+
+    def test_rejects_logical_range_mismatch(self) -> None:
+        import numpy as np
+        from rfsn_v10.cache.contracts import (
+            PackedBlockV4,
+            PackingLayout,
+            Preconditioner,
+            ScaleLayout,
+            TensorLayout,
+        )
+
+        block = PackedBlockV4(
+            packed_codes=np.zeros((1, 1, 64, 11), dtype=np.uint32),
+            scales=np.zeros((1, 1, 64, 1), dtype=np.float32),
+            format_version=4,
+            tensor_layout=TensorLayout.BHTD,
+            packing_layout=PackingLayout.VECTOR_ALIGNED_UINT32_V4,
+            scale_layout=ScaleLayout.BHTG_V4,
+            preconditioner=Preconditioner.WHT64_HASH_SIGN_V1,
+            batch_size=1,
+            n_kv_heads=1,
+            token_count=64,
+            head_dim=64,
+            logical_start=0,
+            logical_end=65,  # mismatch
+            bits=8,
+            group_size=64,
+            groups_per_vector=1,
+            codes_per_word=6,
+            words_per_vector=11,
+            original_value_count=1 * 1 * 64 * 64,
+            padded_value_count=1 * 1 * 64 * 66,
+            original_dtype="float16",
+            sign_seed=42,
+            sign_algorithm="splitmix64-v1",
+            layer_id=0,
+            stream_id="K",
+        )
+        with pytest.raises(ValueError, match="logical range"):
+            block.validate()
+
+    def test_rejects_shape_mismatch(self) -> None:
+        import numpy as np
+        from rfsn_v10.cache.contracts import (
+            PackedBlockV4,
+            PackingLayout,
+            Preconditioner,
+            ScaleLayout,
+            TensorLayout,
+        )
+
+        block = PackedBlockV4(
+            packed_codes=np.zeros((1, 1, 64, 10), dtype=np.uint32),  # wrong words
+            scales=np.zeros((1, 1, 64, 1), dtype=np.float32),
+            format_version=4,
+            tensor_layout=TensorLayout.BHTD,
+            packing_layout=PackingLayout.VECTOR_ALIGNED_UINT32_V4,
+            scale_layout=ScaleLayout.BHTG_V4,
+            preconditioner=Preconditioner.WHT64_HASH_SIGN_V1,
+            batch_size=1,
+            n_kv_heads=1,
+            token_count=64,
+            head_dim=64,
+            logical_start=0,
+            logical_end=64,
+            bits=8,
+            group_size=64,
+            groups_per_vector=1,
+            codes_per_word=6,
+            words_per_vector=11,
+            original_value_count=1 * 1 * 64 * 64,
+            padded_value_count=1 * 1 * 64 * 66,
+            original_dtype="float16",
+            sign_seed=42,
+            sign_algorithm="splitmix64-v1",
+            layer_id=0,
+            stream_id="K",
+        )
+        with pytest.raises(ValueError, match="packed_codes shape mismatch"):
+            block.validate()

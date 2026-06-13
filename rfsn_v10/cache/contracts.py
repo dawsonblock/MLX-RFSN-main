@@ -4,7 +4,9 @@ All public structures are immutable dataclasses.  No anonymous tuples.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 try:
@@ -13,6 +15,25 @@ try:
 except ImportError:  # pragma: no cover
     mx = None  # type: ignore[assignment]
     HAS_MLX = False
+
+
+class TensorLayout(StrEnum):
+    BHTD = "BHTD"
+
+
+class PackingLayout(StrEnum):
+    GLOBAL_FLAT_V3 = "GLOBAL_FLAT_V3"
+    VECTOR_ALIGNED_UINT32_V4 = "VECTOR_ALIGNED_UINT32_V4"
+
+
+class ScaleLayout(StrEnum):
+    FLAT_GROUPS_V3 = "FLAT_GROUPS_V3"
+    BHTG_V4 = "BHTG_V4"
+
+
+class Preconditioner(StrEnum):
+    NONE = "NONE"
+    WHT64_HASH_SIGN_V1 = "WHT64_HASH_SIGN_V1"
 
 
 @dataclass(frozen=True)
@@ -88,7 +109,98 @@ class PackedBlock:
                 )
 
 
-def validate_block_positions(blocks: list[PackedBlock]) -> None:
+@dataclass(frozen=True, slots=True)
+class PackedBlockV4:
+    """Self-describing immutable sealed block (format version 4).
+
+    V4 guarantees that metadata matches physical buffers exactly.
+    A V4 block can be decoded without external shape guessing or
+    mutable codec state.
+    """
+    packed_codes: Any
+    scales: Any
+
+    format_version: int
+    tensor_layout: TensorLayout
+    packing_layout: PackingLayout
+    scale_layout: ScaleLayout
+    preconditioner: Preconditioner
+
+    batch_size: int
+    n_kv_heads: int
+    token_count: int
+    head_dim: int
+
+    logical_start: int
+    logical_end: int
+
+    bits: int
+    group_size: int
+    groups_per_vector: int
+    codes_per_word: int
+    words_per_vector: int
+
+    original_value_count: int
+    padded_value_count: int
+    original_dtype: str
+
+    sign_seed: int
+    sign_algorithm: str
+    layer_id: int
+    stream_id: str
+
+    codec_signature: str = ""
+
+    def payload_bytes(self) -> int:
+        if HAS_MLX and self.packed_codes is not None:
+            code_bytes = int(self.packed_codes.size) * 4
+            scale_bytes = int(self.scales.size) * 4
+            return code_bytes + scale_bytes
+        return 0
+
+    def validate(self) -> None:
+        if self.format_version != 4:
+            raise ValueError("unsupported PackedBlock format")
+        if self.logical_start < 0:
+            raise ValueError("logical_start must be nonnegative")
+        if self.logical_end - self.logical_start != self.token_count:
+            raise ValueError("logical range does not match token count")
+        expected_values = (
+            self.batch_size
+            * self.n_kv_heads
+            * self.token_count
+            * self.head_dim
+        )
+        if self.original_value_count != expected_values:
+            raise ValueError("original value count does not match geometry")
+        if self.padded_value_count < self.original_value_count:
+            raise ValueError("padded value count is too small")
+        if self.head_dim % self.group_size != 0:
+            raise ValueError("head_dim must be divisible by group_size")
+        if self.groups_per_vector != self.head_dim // self.group_size:
+            raise ValueError("groups_per_vector mismatch")
+        expected_words = math.ceil(self.head_dim / self.codes_per_word)
+        if self.words_per_vector != expected_words:
+            raise ValueError("words_per_vector mismatch")
+        expected_code_shape = (
+            self.batch_size,
+            self.n_kv_heads,
+            self.token_count,
+            self.words_per_vector,
+        )
+        if tuple(self.packed_codes.shape) != expected_code_shape:
+            raise ValueError("packed_codes shape mismatch")
+        expected_scale_shape = (
+            self.batch_size,
+            self.n_kv_heads,
+            self.token_count,
+            self.groups_per_vector,
+        )
+        if tuple(self.scales.shape) != expected_scale_shape:
+            raise ValueError("scales shape mismatch")
+
+
+def validate_block_positions(blocks: list) -> None:
     """Validate that blocks are ordered and non-overlapping."""
     for i in range(1, len(blocks)):
         prev = blocks[i - 1]
