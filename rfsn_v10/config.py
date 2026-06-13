@@ -193,6 +193,10 @@ class RuntimeConfig(BaseModel):
         description="Enable v10 KV compression (RFSN_ENABLE_KV_COMPRESSION). "
         "Deprecated alias: RFSN_ENABLE_QUANTIZED_KV.",
     )
+    packed_reference: bool = Field(
+        default=False,
+        description="Use direct packed-reference attention (no dense reconstruction).",
+    )
 
 
 def _resolve_kv_compression_env() -> bool:

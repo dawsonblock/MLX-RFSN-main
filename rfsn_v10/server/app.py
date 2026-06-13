@@ -153,6 +153,7 @@ class ServerState:
                     group_size=64,
                     staging_capacity=64,
                     dense_residual_window=0,
+                    packed_reference=self.cfg.runtime.packed_reference,
                 )
 
         if not self.kv_compression_enabled:
