@@ -40,14 +40,25 @@ def _numpy_wht64(x: np.ndarray) -> np.ndarray:
     return h / math.sqrt(n)
 
 
-def _numpy_hash_signs(x: np.ndarray, seed: int = 42) -> np.ndarray:
+def _numpy_hash_signs(
+    x: np.ndarray, seed: int = 42, layer_id: int = 0, stream_id: str = ""
+) -> np.ndarray:
     """Pure-NumPy reference hash signs (Murmur32-avalanche-v1).
 
     Matches ``_reference_hash_signs`` exactly.
     """
     flat = x.reshape(-1)
     n = flat.size
-    seed_val = seed & 0xFFFFFFFF
+
+    # Mix layer_id and stream_id into the seed (same algorithm as MLX)
+    stream_hash = 0
+    for ch in stream_id:
+        stream_hash = (stream_hash * 31 + ord(ch)) & 0xFFFFFFFF
+    mixed = np.uint32(seed)
+    mixed = np.uint32(mixed ^ np.uint32(layer_id * 0x9E3779B9))
+    mixed = np.uint32(mixed ^ np.uint32(stream_hash))
+    seed_val = int(mixed) & 0xFFFFFFFF
+
     indices = np.arange(n, dtype=np.uint32)
     state = (indices ^ seed_val) & 0xFFFFFFFF
     state = (state + 0x9E3779B9) & 0xFFFFFFFF
@@ -201,7 +212,9 @@ class NumpyCartesianCodec:
             grouped = _numpy_wht64(grouped)
             preconditioner = Preconditioner.WHT64_HASH_SIGN_V1
         if self.sign_seed != 0:
-            grouped = _numpy_hash_signs(grouped, self.sign_seed)
+            grouped = _numpy_hash_signs(
+                grouped, self.sign_seed, layer_id=layer_id, stream_id=stream_id
+            )
 
         # Per-vector scales: max over group_size axis
         max_abs = np.maximum(
@@ -308,7 +321,12 @@ class NumpyCartesianCodec:
         restored = q_signed * scales_bhtg[..., None]
 
         if block.sign_seed != 0:
-            restored = _numpy_hash_signs(restored, block.sign_seed)
+            restored = _numpy_hash_signs(
+                restored,
+                block.sign_seed,
+                layer_id=getattr(block, "layer_id", 0),
+                stream_id=getattr(block, "stream_id", ""),
+            )
         if block.preconditioner == Preconditioner.WHT64_HASH_SIGN_V1:
             restored = _numpy_wht64(restored)
 

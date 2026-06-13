@@ -206,7 +206,9 @@ class CartesianCodec:
             grouped = CartesianCodec.apply_wht(grouped)
             preconditioner = Preconditioner.WHT64_HASH_SIGN_V1
         if self.sign_seed != 0:
-            grouped = CartesianCodec.apply_hash_signs(grouped, self.sign_seed)
+            grouped = CartesianCodec.apply_hash_signs(
+                grouped, self.sign_seed, layer_id=layer_id, stream_id=stream_id
+            )
 
         # Per-vector scales: max over group_size axis
         max_abs = mx.maximum(
@@ -433,7 +435,12 @@ class CartesianCodec:
 
         # Inverse hash signs and WHT
         if block.sign_seed != 0:
-            restored = CartesianCodec.apply_hash_signs(restored, block.sign_seed)
+            restored = CartesianCodec.apply_hash_signs(
+                restored,
+                block.sign_seed,
+                layer_id=getattr(block, "layer_id", 0),
+                stream_id=getattr(block, "stream_id", ""),
+            )
         if block.wht_applied:
             restored = CartesianCodec.apply_wht(restored)
 
@@ -493,13 +500,15 @@ class CartesianCodec:
         return _reference_wht64(x)
 
     @staticmethod
-    def apply_hash_signs(x: Any, seed: int = 42) -> Any:
+    def apply_hash_signs(
+        x: Any, seed: int = 42, layer_id: int = 0, stream_id: str = ""
+    ) -> Any:
         """Apply deterministic hash-based sign randomisation.
 
         Uses the pure-MLX reference implementation.  The Metal kernel path is
         currently disabled pending correctness validation.
         """
-        return _reference_hash_signs(x, seed)
+        return _reference_hash_signs(x, seed, layer_id=layer_id, stream_id=stream_id)
 
 
 def _reference_wht64(x: Any) -> Any:
@@ -526,15 +535,27 @@ def _reference_wht64(x: Any) -> Any:
     return h / math.sqrt(n)
 
 
-def _reference_hash_signs(x: Any, seed: int) -> Any:
+def _reference_hash_signs(
+    x: Any, seed: int, layer_id: int = 0, stream_id: str = ""
+) -> Any:
     """Pure-MLX reference hash signs (SplitMix64-v1).
 
-    Deterministic: same (shape, seed) always produces the same signs.
-    Uses an integer hash so that NumPy and MLX produce identical signs.
+    Deterministic: same (shape, seed, layer_id, stream_id) always produces
+    the same signs.  Uses an integer hash so that NumPy and MLX produce
+    identical signs.
     """
     flat = x.reshape(-1)
     n = int(flat.size)
-    seed_val = mx.array(np.uint32(seed))
+
+    # Mix layer_id and stream_id into the seed so that different layers
+    # and K/V streams get independent sign patterns.
+    stream_hash = 0
+    for ch in stream_id:
+        stream_hash = (stream_hash * 31 + ord(ch)) & 0xFFFFFFFF
+    mixed = np.uint32(seed)
+    mixed = np.uint32(mixed ^ np.uint32(layer_id * 0x9E3779B9))
+    mixed = np.uint32(mixed ^ np.uint32(stream_hash))
+    seed_val = mx.array(mixed)
 
     # Build signs using the same integer hash as the NumPy backend
     indices = mx.arange(n, dtype=mx.uint32)

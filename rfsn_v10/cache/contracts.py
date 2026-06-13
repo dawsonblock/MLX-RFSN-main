@@ -64,11 +64,15 @@ class PackedBlock:
     vector_alignment: int = 64  # NEW in V3
 
     def payload_bytes(self) -> int:
-        if HAS_MLX and self.packed_codes is not None:
+        if self.packed_codes is not None and hasattr(self.packed_codes, "size"):
             code_bytes = int(self.packed_codes.size) * 4
+        else:
+            code_bytes = 0
+        if self.scales is not None and hasattr(self.scales, "size"):
             scale_bytes = int(self.scales.size) * 4
-            return code_bytes + scale_bytes
-        return 0
+        else:
+            scale_bytes = 0
+        return code_bytes + scale_bytes
 
     def validate(self) -> None:
         """Fail-fast validation. Call immediately after construction."""
@@ -175,9 +179,13 @@ class PackedBlockV4:
                     f"packed_codes must have a 'size' attribute, got {type(self.packed_codes)}"
                 )
             code_bytes = int(self.packed_codes.size) * 4
+        else:
+            code_bytes = 0
+        if self.scales is not None and hasattr(self.scales, "size"):
             scale_bytes = int(self.scales.size) * 4
-            return code_bytes + scale_bytes
-        return 0
+        else:
+            scale_bytes = 0
+        return code_bytes + scale_bytes
 
     def validate(self) -> None:
         if self.format_version != 4:
