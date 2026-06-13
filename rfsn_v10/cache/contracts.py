@@ -151,6 +151,23 @@ class PackedBlockV4:
 
     codec_signature: str = ""
 
+    # Legacy aliases for backward compatibility with V3 decoders
+    @property
+    def n_values(self) -> int:
+        return self.padded_value_count
+
+    @property
+    def num_elements(self) -> int:
+        return self.original_value_count
+
+    @property
+    def wht_applied(self) -> bool:
+        return self.preconditioner == Preconditioner.WHT64_HASH_SIGN_V1
+
+    @property
+    def vector_alignment(self) -> int:
+        return 64
+
     def payload_bytes(self) -> int:
         if HAS_MLX and self.packed_codes is not None:
             code_bytes = int(self.packed_codes.size) * 4
@@ -230,3 +247,29 @@ class AttentionScratch:
     max_reconstructed_block_tokens: int = 0
     score_vector_bytes: int = 0
     output_accumulator_bytes: int = 0
+
+
+@dataclass(slots=True)
+class RuntimeCounters:
+    """Typed runtime counters that reconcile with physical cache state.
+
+    These counters describe actual operations, not estimates.
+    """
+    tokens_received: int = 0
+    tokens_staged: int = 0
+    tokens_packed: int = 0
+    tokens_dense_tail: int = 0
+    tokens_reencoded_intentionally: int = 0
+
+    blocks_created: int = 0
+    blocks_read_reference: int = 0
+    blocks_read_metal: int = 0
+
+    reference_dense_calls: int = 0
+    packed_reference_calls: int = 0
+    packed_metal_calls: int = 0
+    fallback_calls: int = 0
+
+    current_scratch_bytes: int = 0
+    peak_scratch_bytes: int = 0
+    cumulative_scratch_traffic_bytes: int = 0

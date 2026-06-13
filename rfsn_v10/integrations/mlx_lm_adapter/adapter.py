@@ -32,12 +32,13 @@ except ImportError:
     mx = None  # type: ignore[assignment]
 
 
-class RfsnQuantizedKVCache:
-    """Cache adapter implementing the MLX-LM KVCache interface.
+class RfsnDenseReconstructionReferenceCache:
+    """Reference cache adapter that reconstructs dense K/V on every call.
 
-    Stores data permanently in ``QuantizedLayerCache``.
-    ``update_and_fetch`` reconstructs dense K/V on-the-fly for the model's
-    standard attention (fallback path).  No dense history is retained.
+    This is the **reference-only** fallback path.  It decompresses the
+    full historical K/V cache into dense FP16 on every attention step so
+    that the model's unmodified attention can run.  It must not be promoted
+    as a speed or memory improvement.
     """
 
     def __init__(
@@ -197,12 +198,16 @@ class RfsnQuantizedKVCache:
         return self.layer_cache.blockwise_attention(queries, scale, mask)
 
 
-class RfsnMLXModelAdapter:
-    """Adapter that runs MLX-LM models with rfsn_v10 quantized caches.
+class RfsnMLXReferenceAdapter:
+    """Reference adapter that runs MLX-LM models with dense-reconstruction fallback.
+
+    This is a **reference-only** path: every decode step reconstructs the
+    full dense K/V history.  It is useful for correctness validation but
+    must never be promoted as a production speed or memory win.
 
     Usage::
 
-        adapter = RfsnMLXModelAdapter(model, tokenizer, num_layers=24)
+        adapter = RfsnMLXReferenceAdapter(model, tokenizer, num_layers=24)
         text = adapter.generate("Hello", max_tokens=32)
         print(adapter.counters())
     """
@@ -377,3 +382,8 @@ class RfsnMLXModelAdapter:
             return self._last_memory_report
         from rfsn_v10.cache.memory import MemoryReport
         return MemoryReport().to_dict()
+
+
+# Backward compatibility aliases (deprecated)
+RfsnMLXModelAdapter = RfsnMLXReferenceAdapter
+RfsnQuantizedKVCache = RfsnDenseReconstructionReferenceCache

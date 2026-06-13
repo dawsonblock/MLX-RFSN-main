@@ -14,10 +14,19 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
+
 from rfsn_v10.bitpack import BitPackedQuantizer
 from rfsn_v10.compat import mx
 
-from .contracts import PackedBlock
+from .contracts import (
+    PackedBlock,
+    PackedBlockV4,
+    PackingLayout,
+    Preconditioner,
+    ScaleLayout,
+    TensorLayout,
+)
 
 
 class CartesianCodec:
@@ -48,6 +57,10 @@ class CartesianCodec:
         if group_size % 64 != 0:
             raise ValueError(
                 f"group_size must be a multiple of 64 for vector alignment; got {group_size}"
+            )
+        if use_wht and group_size != 64:
+            raise ValueError(
+                f"canonical WHT path requires group_size=64; got {group_size}"
             )
         self.bits = bits
         self.group_size = group_size
@@ -139,7 +152,7 @@ class CartesianCodec:
         logical_start: int = 0,
         layer_id: int = 0,
         stream_id: str = "",
-    ) -> "PackedBlock":
+    ) -> "PackedBlockV4":
         """Quantize and pack a BHTD tensor with vector-aligned codes.
 
         Parameters
@@ -155,7 +168,7 @@ class CartesianCodec:
 
         Returns
         -------
-        PackedBlock
+        PackedBlockV4
             Immutable sealed block with BHTG scales and BHTW packed codes.
         """
         if x.ndim != 4:
@@ -182,8 +195,10 @@ class CartesianCodec:
         grouped = x_padded.reshape(B, H, T, groups_per_vector, self.group_size)
 
         # Optional WHT + deterministic signs
+        preconditioner = Preconditioner.NONE
         if self.use_wht:
             grouped = CartesianCodec.apply_wht(grouped)
+            preconditioner = Preconditioner.WHT64_HASH_SIGN_V1
         if self.sign_seed != 0:
             grouped = CartesianCodec.apply_hash_signs(grouped, self.sign_seed)
 
@@ -211,25 +226,32 @@ class CartesianCodec:
             words_per_vector = padded_D
             padded_value_count = original_value_count
 
-        from .contracts import PackedBlock
-
-        block = PackedBlock(
+        block = PackedBlockV4(
             packed_codes=packed,
             scales=scale_bhtg,
-            token_count=T,
-            bits=self.bits,
-            group_size=self.group_size,
-            n_values=padded_value_count,
+            format_version=4,
+            tensor_layout=TensorLayout.BHTD,
+            packing_layout=PackingLayout.VECTOR_ALIGNED_UINT32_V4,
+            scale_layout=ScaleLayout.BHTG_V4,
+            preconditioner=preconditioner,
             batch_size=B,
             n_kv_heads=H,
+            token_count=T,
             head_dim=D,
             logical_start=logical_start,
-            num_elements=original_value_count,
+            logical_end=logical_start + T,
+            bits=self.bits,
+            group_size=self.group_size,
+            groups_per_vector=groups_per_vector,
+            codes_per_word=codes_per_word,
+            words_per_vector=words_per_vector,
+            original_value_count=original_value_count,
+            padded_value_count=padded_value_count,
             original_dtype=original_dtype_str,
-            wht_applied=self.use_wht,
             sign_seed=self.sign_seed if self.sign_seed != 0 else 0,
-            vector_alignment=64,
-            format_version=4,
+            sign_algorithm="splitmix64-v1",
+            layer_id=layer_id,
+            stream_id=stream_id,
         )
         block.validate()
         return block
@@ -498,14 +520,26 @@ def _reference_wht64(x: Any) -> Any:
 
 
 def _reference_hash_signs(x: Any, seed: int) -> Any:
-    """Pure-MLX reference hash signs.
+    """Pure-MLX reference hash signs (SplitMix64-v1).
 
     Deterministic: same (shape, seed) always produces the same signs.
-    Uses a PRNG key derived from ``seed``; does not mutate global state.
+    Uses an integer hash so that NumPy and MLX produce identical signs.
     """
-    key = mx.random.key(seed)
-    signs = mx.where(mx.random.normal(shape=x.shape, key=key) > 0, 1.0, -1.0)
-    return x * signs
+    flat = x.reshape(-1)
+    n = int(flat.size)
+    seed_val = mx.array(np.uint32(seed))
+
+    # Build signs using the same integer hash as the NumPy backend
+    indices = mx.arange(n, dtype=mx.uint32)
+    state = mx.bitwise_xor(indices, seed_val)
+    state = (state + mx.array(np.uint32(0x9E3779B9))) & mx.array(np.uint32(0xFFFFFFFF))
+    state = mx.bitwise_xor(state, state >> 16)
+    state = (state * mx.array(np.uint32(0x85EBCA6B))) & mx.array(np.uint32(0xFFFFFFFF))
+    state = mx.bitwise_xor(state, state >> 13)
+    state = (state * mx.array(np.uint32(0xC2B2AE35))) & mx.array(np.uint32(0xFFFFFFFF))
+    state = mx.bitwise_xor(state, state >> 16)
+    signs = mx.where((state & 1) == 1, mx.array(-1.0, dtype=x.dtype), mx.array(1.0, dtype=x.dtype))
+    return (flat * signs).reshape(x.shape)
 
 
 # ------------------------------------------------------------------

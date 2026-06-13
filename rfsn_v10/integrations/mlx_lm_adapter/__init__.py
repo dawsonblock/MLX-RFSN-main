@@ -15,13 +15,28 @@ Proof counters are tracked in the session and can be inspected after generation.
 """
 from __future__ import annotations
 
-from .adapter import RfsnMLXModelAdapter, RfsnQuantizedKVCache
-from .compatibility import MIN_MLX_LM_VERSION, check_mlx_lm_version
+from .adapter import (
+    RfsnDenseReconstructionReferenceCache,
+    RfsnMLXReferenceAdapter,
+    RfsnMLXModelAdapter,
+    RfsnQuantizedKVCache,
+)
+from .compatibility import (
+    PINNED_MLX_LM_VERSION,
+    PINNED_MLX_VERSION,
+    check_mlx_lm_version,
+    require_pinned_versions,
+)
 
 __all__ = [
+    "RfsnMLXReferenceAdapter",
+    "RfsnDenseReconstructionReferenceCache",
+    # Deprecated aliases
     "RfsnMLXModelAdapter",
     "RfsnQuantizedKVCache",
     "check_mlx_lm_version",
-    "MIN_MLX_LM_VERSION",
+    "require_pinned_versions",
+    "PINNED_MLX_VERSION",
+    "PINNED_MLX_LM_VERSION",
 ]
 

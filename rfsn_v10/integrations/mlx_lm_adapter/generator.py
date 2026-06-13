@@ -1,4 +1,4 @@
-"""Generator wrapper that exposes the RFSNGenerator interface over RfsnMLXModelAdapter.
+"""Generator wrapper that exposes the RFSNGenerator interface over RfsnMLXReferenceAdapter.
 
 This allows the server to use the new adapter without changing its call sites.
 """
@@ -6,9 +6,15 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
-from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnMLXModelAdapter
+from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnMLXReferenceAdapter
+from rfsn_v10.integrations.mlx_lm_adapter.tokenization import (
+    apply_chat_template_safe,
+    count_generation_tokens,
+    count_prompt_tokens,
+)
 
 try:
     import mlx_lm  # noqa: F401
@@ -17,8 +23,16 @@ except ImportError:
     MLX_LM_AVAILABLE = False
 
 
+@dataclass(frozen=True, slots=True)
+class AdapterAvailability:
+    requested: bool
+    dependency_available: bool
+    active: bool
+    reason: str
+
+
 class RfsnMLXGenerator:
-    """Drop-in replacement for RFSNGenerator using the new adapter.
+    """Drop-in replacement for RFSNGenerator using the reference adapter.
 
     Provides:
       - chat(prompt, ...) -> GenerationResult-like object
@@ -36,17 +50,33 @@ class RfsnMLXGenerator:
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
     ) -> None:
-        self.adapter = RfsnMLXModelAdapter(
-            model=model,
-            tokenizer=tokenizer,
-            num_layers=num_layers,
-            key_bits=key_bits,
-            value_bits=value_bits,
-            group_size=group_size,
-            staging_capacity=staging_capacity,
-            dense_residual_window=dense_residual_window,
-        )
         self.tokenizer = tokenizer
+        self.adapter: RfsnMLXReferenceAdapter | None = None
+
+        if not MLX_LM_AVAILABLE:
+            self.adapter_availability = AdapterAvailability(
+                requested=True,
+                dependency_available=False,
+                active=False,
+                reason="MLX-LM is unavailable on this platform",
+            )
+        else:
+            self.adapter = RfsnMLXReferenceAdapter(
+                model=model,
+                tokenizer=tokenizer,
+                num_layers=num_layers,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                group_size=group_size,
+                staging_capacity=staging_capacity,
+                dense_residual_window=dense_residual_window,
+            )
+            self.adapter_availability = AdapterAvailability(
+                requested=True,
+                dependency_available=True,
+                active=True,
+                reason="reference adapter active",
+            )
 
     def chat(
         self,
@@ -59,19 +89,19 @@ class RfsnMLXGenerator:
         **kwargs: Any,
     ) -> Any:
         """Generate a chat response."""
+        if self.adapter is None:
+            raise RuntimeError(
+                f"Adapter unavailable: {self.adapter_availability.reason}"
+            )
+
         t_start = time.monotonic()
 
-        # Build prompt
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            messages = [{"role": "user", "content": message}]
-            try:
-                prompt = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            except Exception:
-                prompt = message
-        else:
-            prompt = message
+        # Build prompt using hermetic template helper
+        messages = [{"role": "user", "content": message}]
+        prompt = apply_chat_template_safe(self.tokenizer, messages)
+
+        # Count prompt tokens accurately
+        prompt_tokens = count_prompt_tokens(self.tokenizer, prompt)
 
         text = self.adapter.generate(
             prompt,
@@ -92,19 +122,24 @@ class RfsnMLXGenerator:
         elapsed_ms = (time.monotonic() - t_start) * 1000.0
 
         # Create a result object matching GenerationResult interface
+        # Count generation tokens by decoding the text (most reliable cross-tokenizer)
         tokens = []
         try:
-            tokens = self.tokenizer.encode(text)
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
         except Exception:
             pass
 
-        tps = len(tokens) / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
+        # Decode TPS uses actual generation tokens, not prompt+decode
+        decode_tokens = count_generation_tokens(self.tokenizer, tokens)
+        tps = decode_tokens / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
 
         return _SimpleResult(
             text=text,
             tokens=tokens,
             generation_time_ms=elapsed_ms,
             tokens_per_second=tps,
+            prompt_token_count=prompt_tokens,
+            decode_token_count=decode_tokens,
         )
 
     def generate(
@@ -190,12 +225,15 @@ class _SimpleResult:
         tokens: list[int],
         generation_time_ms: float,
         tokens_per_second: float,
+        prompt_token_count: int = 0,
+        decode_token_count: int = 0,
     ) -> None:
         self.text = text
         self.tokens = tokens
         self.generation_time_ms = generation_time_ms
         self.tokens_per_second = tokens_per_second
-        self.decode_token_count = len(tokens)
+        self.prompt_token_count = prompt_token_count
+        self.decode_token_count = decode_token_count
         self.finish_reason = "stop"
         self.stopped_on = None
         self.telemetry = []

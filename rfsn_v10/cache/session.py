@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 from .cartesian_codec import CartesianCodec
+from .contracts import RuntimeCounters
 from .incremental_layer_cache import QuantizedLayerCache
 from .memory import MemoryReport, measure_process_rss
 
@@ -61,6 +62,9 @@ class GenerationCacheSession:
             "dense_shadow_bytes": 0,
             "requantized_tokens": 0,
         }
+
+        # Typed runtime counters (Phase 10)
+        self.runtime_counters = RuntimeCounters()
 
     # ------------------------------------------------------------------
     # Access

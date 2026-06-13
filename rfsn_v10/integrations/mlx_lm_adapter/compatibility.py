@@ -1,44 +1,59 @@
 """MLX-LM version compatibility checks.
 
-The adapter is pinned to a specific MLX-LM version range.
-Major version changes may break the cache interface.
+The adapter is pinned to exact MLX and MLX-LM versions.
+No version range is used — any mismatch is a hard error.
 """
 from __future__ import annotations
 
-MIN_MLX_LM_VERSION = "0.19.0"
-MAX_MLX_LM_VERSION = "0.22.0"
+PINNED_MLX_VERSION = "0.21.1"
+PINNED_MLX_LM_VERSION = "0.20.6"
+
+
+def _get_installed_version(module_name: str) -> str | None:
+    try:
+        mod = __import__(module_name)
+        return str(getattr(mod, "__version__", None) or getattr(mod, "core", None).__version__)
+    except Exception:
+        return None
 
 
 def check_mlx_lm_version() -> tuple[bool, str]:
-    """Check if the installed mlx-lm version is compatible.
+    """Check if the installed mlx and mlx-lm versions match the pinned pair.
 
     Returns
     -------
     ok, msg
-        ``ok`` is True if compatible, False otherwise.
+        ``ok`` is True if both versions match exactly, False otherwise.
         ``msg`` is a human-readable reason if not compatible.
     """
-    try:
-        import mlx_lm
-    except ImportError:
+    mlx_version = _get_installed_version("mlx")
+    mlx_lm_version = _get_installed_version("mlx_lm")
+
+    if mlx_version is None:
+        return False, "mlx is not installed"
+    if mlx_lm_version is None:
         return False, "mlx-lm is not installed"
-    try:
-        from packaging import version
-    except ImportError:
-        return False, "packaging is required for version checks"
 
-    installed = version.parse(mlx_lm.__version__)
-    minimum = version.parse(MIN_MLX_LM_VERSION)
-    maximum = version.parse(MAX_MLX_LM_VERSION)
-
-    if installed < minimum:
+    if mlx_version != PINNED_MLX_VERSION:
         return (
             False,
-            f"mlx-lm {installed} < minimum {MIN_MLX_LM_VERSION}"
+            f"mlx {mlx_version} != pinned {PINNED_MLX_VERSION}"
         )
-    if installed >= maximum:
+    if mlx_lm_version != PINNED_MLX_LM_VERSION:
         return (
             False,
-            f"mlx-lm {installed} >= maximum {MAX_MLX_LM_VERSION}"
+            f"mlx-lm {mlx_lm_version} != pinned {PINNED_MLX_LM_VERSION}"
         )
-    return True, f"mlx-lm {installed} is compatible"
+
+    return True, f"mlx {mlx_version} + mlx-lm {mlx_lm_version} pinned pair verified"
+
+
+def require_pinned_versions() -> None:
+    """Raise RuntimeError if the installed versions do not match exactly."""
+    ok, msg = check_mlx_lm_version()
+    if not ok:
+        raise RuntimeError(
+            f"Unsupported MLX/MLX-LM version: {msg}. "
+            f"This release requires mlx=={PINNED_MLX_VERSION} and "
+            f"mlx-lm=={PINNED_MLX_LM_VERSION}."
+        )

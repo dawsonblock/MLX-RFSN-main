@@ -449,3 +449,54 @@ def require_experimental(feature: str, config: RFSNConfig | None = None) -> None
         "production or quality-critical generation.",
         stacklevel=3,
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical KV configuration (promotion-eligible format)
+# ---------------------------------------------------------------------------
+
+class CanonicalKVConfig(BaseModel):
+    """Canonical KV configuration for promotion-eligible runs.
+
+    Only one candidate format is promotion-eligible:
+      * K8 grouped symmetric keys
+      * V5 grouped symmetric values
+      * group_size = 64
+      * block_size = 64 tokens
+      * WHT-64 preconditioner + deterministic integer-hash signs
+      * Vector-aligned uint32 packing (V4)
+      * BHTG scales
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    key_bits: int = Field(default=8)
+    value_bits: int = Field(default=5)
+
+    group_size: int = Field(default=64)
+    block_size: int = Field(default=64)
+
+    use_wht: bool = Field(default=True)
+    sign_seed: int = Field(default=42)
+    sign_algorithm: str = Field(default="splitmix64-v1")
+
+    dense_residual_window: int = Field(default=0)
+
+    format_version: int = Field(default=4)
+    tensor_layout: str = Field(default="BHTD")
+    packing_layout: str = Field(default="VECTOR_ALIGNED_UINT32")
+    scale_layout: str = Field(default="BHTG")
+
+    sparse_decode: bool = Field(default=False)
+    qjl_enabled: bool = Field(default=False)
+    polar_enabled: bool = Field(default=False)
+
+
+CANONICAL_KV_CONFIG = CanonicalKVConfig()
+
+
+def require_canonical_candidate(config: CanonicalKVConfig) -> None:
+    if config != CANONICAL_KV_CONFIG:
+        raise ValueError(
+            "Only the canonical K8/V5/WHT-64 configuration is promotion eligible"
+        )
