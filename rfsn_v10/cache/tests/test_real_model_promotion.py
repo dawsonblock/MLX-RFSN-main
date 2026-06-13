@@ -183,3 +183,61 @@ class TestRealModelPromotion:
         tokens1 = report1.get("total_tokens", 0)
         tokens2 = report2.get("total_tokens", 0)
         assert abs(tokens1 - tokens2) <= 2, "Token counts diverged between identical runs"
+
+    def test_packed_reference_matches_dense_baseline(self, model_and_tokenizer):
+        """One full Qwen2 step with packed wrapper: zero dense reconstruction, matching tokens."""
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            wrap_model_attention,
+            unwrap_model_attention,
+        )
+
+        model, tokenizer = model_and_tokenizer
+        prompt = "What is the capital of France?"
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        prompt_len = len(prompt_ids)
+        max_tokens = 16
+
+        # Dense baseline (no wrapper, no custom cache)
+        baseline_tokens = []
+        for token, _ in generate_step(prompt_ids, model, max_tokens=max_tokens, temp=0.0):
+            baseline_tokens.append(int(token))
+
+        # Packed-reference path
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        wrap_model_attention(model, caches)
+        try:
+            packed_tokens = []
+            for token, _ in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed_tokens.append(int(token))
+        finally:
+            unwrap_model_attention(model)
+
+        # Tokens must match exactly
+        assert packed_tokens == baseline_tokens, (
+            f"Packed-reference divergence: baseline={baseline_tokens}, packed={packed_tokens}"
+        )
+
+        # Cache lifecycle proof: every token encoded once, never requantized
+        layer0 = caches[0].layer_cache
+        assert layer0.total_token_count() == prompt_len + max_tokens
+        assert layer0.requantized_token_count == 0
+        assert layer0.total_memory_bytes() > 0
