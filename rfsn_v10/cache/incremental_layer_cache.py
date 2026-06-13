@@ -27,7 +27,7 @@ from typing import Any
 from rfsn_v10.compat import mx
 
 from .cartesian_codec import CartesianCodec
-from .contracts import CacheStats, PackedBlock
+from .contracts import CacheStats, PackedBlock, validate_block_positions
 
 
 class QuantizedLayerCache:
@@ -51,11 +51,13 @@ class QuantizedLayerCache:
         value_codec: CartesianCodec,
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
+        layer_id: int = 0,
     ) -> None:
         self.key_codec = key_codec
         self.value_codec = value_codec
         self.staging_capacity = staging_capacity
         self.dense_residual_window = dense_residual_window
+        self.layer_id = layer_id
 
         # Immutable sealed blocks
         self._key_blocks: list[PackedBlock] = []
@@ -198,16 +200,28 @@ class QuantizedLayerCache:
 
             logical_start = base_offset + start
             key_block = self.key_codec.encode_bhtd(
-                keys_slice, logical_start=logical_start
+                keys_slice,
+                logical_start=logical_start,
+                layer_id=self.layer_id,
+                stream_id="K",
             )
             value_block = self.value_codec.encode_bhtd(
-                values_slice, logical_start=logical_start
+                values_slice,
+                logical_start=logical_start,
+                layer_id=self.layer_id,
+                stream_id="V",
             )
 
             self._key_blocks.append(key_block)
             self._value_blocks.append(value_block)
 
         self._encoded_tokens += n_full_blocks * block_size
+
+        # Validate sealed block positions after flush
+        if self._key_blocks:
+            validate_block_positions(self._key_blocks)
+        if self._value_blocks:
+            validate_block_positions(self._value_blocks)
 
         # Keep remainder in staging
         if remainder > 0:

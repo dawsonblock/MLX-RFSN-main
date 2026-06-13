@@ -112,7 +112,8 @@ class RfsnDenseReconstructionReferenceCache:
         # No-op — our cache does not support state injection.
         if self.strict and v:
             raise NotImplementedError(
-                "RfsnQuantizedKVCache does not support state injection in strict mode"
+                "RfsnDenseReconstructionReferenceCache does not support "
+                "state injection in strict mode"
             )
 
     def is_trimmable(self) -> bool:

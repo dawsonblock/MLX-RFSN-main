@@ -48,6 +48,7 @@ class GenerationCacheSession:
                 value_codec=value_codec,
                 staging_capacity=staging_capacity,
                 dense_residual_window=dense_residual_window,
+                layer_id=i,
             )
             for i in range(num_layers)
         }
@@ -84,6 +85,19 @@ class GenerationCacheSession:
 
     def increment(self, counter: str, delta: int = 1) -> None:
         self._counters[counter] = self._counters.get(counter, 0) + delta
+        # Sync typed runtime counters where field names map directly
+        if counter == "new_tokens_received":
+            self.runtime_counters.tokens_received += delta
+        elif counter == "new_tokens_encoded":
+            self.runtime_counters.tokens_staged += delta
+        elif counter == "packed_blocks_created":
+            self.runtime_counters.blocks_created += delta
+        elif counter == "sealed_blocks_read":
+            self.runtime_counters.blocks_read_reference += delta
+        elif counter == "fallback_attention_calls":
+            self.runtime_counters.fallback_calls += delta
+        elif counter == "dense_shadow_bytes":
+            self.runtime_counters.cumulative_scratch_traffic_bytes += delta
 
     def get_counter(self, counter: str) -> int:
         return self._counters.get(counter, 0)

@@ -12,7 +12,13 @@ PINNED_MLX_LM_VERSION = "0.20.6"
 def _get_installed_version(module_name: str) -> str | None:
     try:
         mod = __import__(module_name)
-        return str(getattr(mod, "__version__", None) or getattr(mod, "core", None).__version__)
+        version = getattr(mod, "__version__", None)
+        if version is not None:
+            return str(version)
+        core = getattr(mod, "core", None)
+        if core is not None:
+            return str(getattr(core, "__version__", None))
+        return None
     except Exception:
         return None
 
@@ -45,7 +51,9 @@ def check_mlx_lm_version() -> tuple[bool, str]:
             f"mlx-lm {mlx_lm_version} != pinned {PINNED_MLX_LM_VERSION}"
         )
 
-    return True, f"mlx {mlx_version} + mlx-lm {mlx_lm_version} pinned pair verified"
+    return True, (
+        f"mlx {mlx_version} + mlx-lm {mlx_lm_version} pinned pair verified"
+    )
 
 
 def require_pinned_versions() -> None:
