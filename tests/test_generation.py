@@ -7,6 +7,8 @@ The global SDPA monkeypatch layer has been removed.
 
 from __future__ import annotations
 
+import pytest
+
 from rfsn_v10.runtime.generation import RFSNGenerator
 
 
@@ -116,3 +118,82 @@ def test_generator_does_not_mutate_model_layers() -> None:
     # No monkeypatch artifacts
     for layer in model.model.layers:
         assert not hasattr(layer.self_attn, "_rfsn_original_call")
+
+
+# ------------------------------------------------------------------
+# _build_chat_prompt
+# ------------------------------------------------------------------
+
+
+class FakeTokenizerWithTemplate(FakeTokenizer):
+    """Tokenizer that supports apply_chat_template."""
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        parts = []
+        for m in messages:
+            parts.append(f"<{m['role']}>{m['content']}</{m['role']}>")
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        return "\n".join(parts)
+
+
+def test_build_chat_prompt_with_template() -> None:
+    tok = FakeTokenizerWithTemplate()
+    gen = RFSNGenerator(model=FakeModel(), tokenizer=tok, enable_quantized_kv=False)
+    prompt = gen._build_chat_prompt("Hello", system_prompt="Be helpful")
+    assert "<system>Be helpful</system>" in prompt
+    assert "<user>Hello</user>" in prompt
+    assert "<assistant>" in prompt
+
+
+def test_build_chat_prompt_fallback() -> None:
+    tok = FakeTokenizer()
+    gen = RFSNGenerator(model=FakeModel(), tokenizer=tok, enable_quantized_kv=False)
+    prompt = gen._build_chat_prompt("Hello", system_prompt="Be helpful")
+    assert "Be helpful" in prompt
+    assert "Hello" in prompt
+
+
+# ------------------------------------------------------------------
+# _make_gen_config
+# ------------------------------------------------------------------
+
+
+def test_gen_config_defaults() -> None:
+    gen = RFSNGenerator(
+        model=FakeModel(), tokenizer=FakeTokenizer(), enable_quantized_kv=False
+    )
+    cfg = gen._make_gen_config()
+    assert cfg.max_new_tokens == 256
+    assert cfg.temperature == 0.7
+    assert cfg.top_p == 0.9
+    assert cfg.repetition_penalty == 1.0
+    assert cfg.stream is True
+
+
+def test_gen_config_overrides() -> None:
+    gen = RFSNGenerator(
+        model=FakeModel(), tokenizer=FakeTokenizer(), enable_quantized_kv=False
+    )
+    cfg = gen._make_gen_config(max_new_tokens=10, temperature=0.5, stream=False)
+    assert cfg.max_new_tokens == 10
+    assert cfg.temperature == 0.5
+    assert cfg.stream is False
+
+
+# ------------------------------------------------------------------
+# MLX-dependent tests
+# ------------------------------------------------------------------
+
+
+@pytest.mark.mlx
+def test_generator_mlx_path_imports() -> None:
+    """When MLX is present, the adapter path is attempted."""
+    pytest.importorskip("mlx.core")
+    gen = RFSNGenerator(
+        model=FakeModel(),
+        tokenizer=FakeTokenizer(),
+        enable_quantized_kv=True,
+    )
+    # With MLX present, _adapter should be non-None.
+    assert gen._adapter is not None

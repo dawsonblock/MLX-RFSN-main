@@ -52,6 +52,9 @@ jobs:
       - name: Collection check — all tests discoverable without PYTHONPATH hack
         run: pytest --collect-only -q
 
+      - name: Coverage gate — core packages >= 60%
+        run: pytest tests/test_generation.py rfsn_v10/cache/tests/ --cov=rfsn_v10 --cov-report=term-missing --cov-fail-under=60 -q
+
       - name: Cache oracle tests (NumPy, no MLX required)
         run: pytest rfsn_v10/cache/tests/test_numpy_oracle.py rfsn_v10/cache/tests/test_session.py -q
 

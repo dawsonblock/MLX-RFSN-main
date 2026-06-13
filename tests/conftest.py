@@ -10,12 +10,6 @@ import pytest
 
 from rfsn_v10.clickhouse_client import ClickHouseClient
 
-# Add repo root to sys.path so `benchmarks` package is importable from test modules.
-_repo_root = str(Path(__file__).resolve().parents[1])
-if _repo_root not in sys.path:
-    sys.path.insert(0, _repo_root)
-
-
 @pytest.fixture(autouse=True)
 def isolate_clickhouse_flush_path(tmp_path, monkeypatch):
     """Redirect the ClickHouseClient flush file to a per-test temp path.
