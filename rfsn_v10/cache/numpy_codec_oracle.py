@@ -41,7 +41,7 @@ def _numpy_wht64(x: np.ndarray) -> np.ndarray:
 
 
 def _numpy_hash_signs(x: np.ndarray, seed: int = 42) -> np.ndarray:
-    """Pure-NumPy reference hash signs (SplitMix64-v1).
+    """Pure-NumPy reference hash signs (Murmur32-avalanche-v1).
 
     Matches ``_reference_hash_signs`` exactly.
     """

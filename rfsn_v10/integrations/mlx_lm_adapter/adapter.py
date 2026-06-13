@@ -308,7 +308,6 @@ class RfsnMLXReferenceAdapter:
                     )
                     // self.num_layers,
                 }
-            return text  # type: ignore[unreachable]
 
         session = self._new_session()
         try:
@@ -390,7 +389,6 @@ class RfsnMLXReferenceAdapter:
                     )
                     // self.num_layers,
                 }
-            return
 
         session = self._new_session()
         try:

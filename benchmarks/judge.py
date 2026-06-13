@@ -336,9 +336,9 @@ class Judge:
             return f"unknown run_type '{candidate.run_type}' is ineligible"
         if candidate.fallback_used:
             return "fallback execution is ineligible for promotion"
-        if candidate.estimated_memory and not candidate.measured_memory:
+        if candidate.estimated_memory and candidate.measured_memory is None:
             return "estimated memory without measurement is ineligible"
-        if not candidate.measured_memory:
+        if candidate.measured_memory is None:
             return "unmeasured memory is ineligible for promotion"
         if candidate.source_type != "installed_wheel":
             return "installed-wheel execution required for promotion"

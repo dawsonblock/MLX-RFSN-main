@@ -189,6 +189,12 @@ class _PackedAttentionWrapper:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._original, name)
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.__slots__:
+            super().__setattr__(name, value)
+        else:
+            setattr(self._original, name, value)
+
     def __repr__(self) -> str:
         return f"<_PackedAttentionWrapper wrapping {self._original!r}>"
 

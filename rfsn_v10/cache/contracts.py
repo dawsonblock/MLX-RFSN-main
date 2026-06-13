@@ -170,8 +170,12 @@ class PackedBlockV4:
 
     def payload_bytes(self) -> int:
         if self.packed_codes is not None:
-            code_bytes = int(getattr(self.packed_codes, "size", 0)) * 4
-            scale_bytes = int(getattr(self.scales, "size", 0)) * 4
+            if not hasattr(self.packed_codes, "size"):
+                raise TypeError(
+                    f"packed_codes must have a 'size' attribute, got {type(self.packed_codes)}"
+                )
+            code_bytes = int(self.packed_codes.size) * 4
+            scale_bytes = int(self.scales.size) * 4
             return code_bytes + scale_bytes
         return 0
 

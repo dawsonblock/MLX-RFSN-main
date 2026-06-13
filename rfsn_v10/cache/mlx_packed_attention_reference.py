@@ -114,6 +114,8 @@ def attend(
                 causal_mask[None, None, :, :], (B, Hq, Lq, region_tokens)
             )
             scores = mx.where(causal_mask, scores, mx.array(-mx.inf, dtype=scores.dtype))
+        elif isinstance(mask, str):
+            raise ValueError(f"unrecognized mask string: {mask!r}")
 
         # Online softmax
         block_max = mx.max(scores, axis=-1, keepdims=True)

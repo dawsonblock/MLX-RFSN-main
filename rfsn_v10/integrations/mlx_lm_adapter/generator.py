@@ -155,60 +155,17 @@ class RfsnMLXGenerator:
         **kwargs: Any,
     ) -> Iterator[str]:
         """Generate text, yielding token strings."""
-        if not MLX_LM_AVAILABLE:
-            raise RuntimeError("mlx-lm not installed")
-
-        # Use the adapter's generate_step for streaming
-        import mlx.core as mx
-        try:
-            from mlx_lm.sample_utils import make_logits_processors, make_sampler
-        except ImportError:
-            from mlx_lm.utils import make_logits_processors, make_sampler
-
-        prompt_ids = mx.array(self.tokenizer.encode(prompt))
-        sampler = make_sampler(temperature, top_p, 0.0, 1)
-        logits_processors = make_logits_processors(
-            None, repetition_penalty, 20
-        )
-
-        # Build caches via adapter
-        from rfsn_v10.cache.cartesian_codec import CartesianCodec
-        from rfsn_v10.cache.session import GenerationCacheSession
-
-        k_codec = CartesianCodec(bits=self.adapter.key_codec.bits, group_size=self.adapter.key_codec.group_size)
-        v_codec = CartesianCodec(bits=self.adapter.value_codec.bits, group_size=self.adapter.value_codec.group_size)
-
-        session = GenerationCacheSession(
-            model_id="server",
-            num_layers=self.adapter.num_layers,
-            key_codec=k_codec,
-            value_codec=v_codec,
-            staging_capacity=self.adapter.staging_capacity,
-            dense_residual_window=self.adapter.dense_residual_window,
-        )
-
-        # Build cache list
-        from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache
-        cache_list = [
-            RfsnQuantizedKVCache(
-                layer_cache=session.get_layer_cache(i),
-                session=session,
+        if self.adapter is None:
+            raise RuntimeError(
+                f"Adapter unavailable: {self.adapter_availability.reason}"
             )
-            for i in range(self.adapter.num_layers)
-        ]
 
-        # Use mlx_lm generate_step
-        try:
-            from mlx_lm import generate_step
-        except ImportError:
-            from mlx_lm.utils import generate_step
-        for token, _ in generate_step(
-            prompt_ids,
-            self.adapter.model,
+        for token, _ in self.adapter.generate_step(
+            prompt,
             max_tokens=max_new_tokens,
-            prompt_cache=cache_list,
-            sampler=sampler,
-            logits_processors=logits_processors,
+            temp=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
         ):
             token_text = self.tokenizer.decode([token.item()])
 

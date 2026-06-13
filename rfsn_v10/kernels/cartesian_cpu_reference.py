@@ -83,14 +83,11 @@ def _extract_code(
       words_per_vec = ceil(D / codes_per_word)
     """
     codes_per_word = 32 // bits
-    words_per_vec = math.ceil(D / codes_per_word)
     mask = (1 << bits) - 1
 
     word_idx = d // codes_per_word
     bit_offset = (d % codes_per_word) * bits
 
-    kv_offset = (b * Hkv + hkv) * Lkv + k_pos
-    packed_idx = kv_offset * words_per_vec + word_idx
     word = int(packed_codes[b, hkv, k_pos, word_idx])
     code = int((word >> bit_offset) & mask)
     return code
