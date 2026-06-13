@@ -21,15 +21,27 @@ import numpy as np
 
 
 def _token_hash_signs(
-    token_flat_start: int, length: int, seed: int
+    token_flat_start: int,
+    length: int,
+    seed: int,
+    layer_id: int = 0,
+    stream_id: str = "",
 ) -> np.ndarray:
     """Generate hash signs for a single token at a specific global flat offset.
 
-    Matches the sign pattern that ``_numpy_hash_signs`` would produce when
-    applied to the full block tensor.
+    Matches the sign pattern that ``_numpy_hash_signs`` produces after
+    mixing layer_id and stream_id into the seed.
     """
+    # Mix layer_id and stream_id into the seed (same algorithm as codec)
+    stream_hash = 0
+    for ch in stream_id:
+        stream_hash = (stream_hash * 31 + ord(ch)) & 0xFFFFFFFF
+    mixed = np.uint32(seed)
+    mixed = np.uint32(mixed ^ np.uint32((layer_id * 0x9E3779B9) & 0xFFFFFFFF))
+    mixed = np.uint32(mixed ^ np.uint32(stream_hash & 0xFFFFFFFF))
+    seed_val = int(mixed) & 0xFFFFFFFF
+
     indices = np.arange(token_flat_start, token_flat_start + length, dtype=np.uint32)
-    seed_val = seed & 0xFFFFFFFF
     state = (indices ^ seed_val) & 0xFFFFFFFF
     state = (state + 0x9E3779B9) & 0xFFFFFFFF
     state = state ^ (state >> 16)
@@ -46,6 +58,8 @@ def _inverse_wht_signs_token(
     use_wht: bool,
     sign_seed: int,
     token_flat_start: int,
+    layer_id: int = 0,
+    stream_id: str = "",
 ) -> np.ndarray:
     """Apply inverse WHT and/or hash signs to a single token's grouped values.
 
@@ -56,7 +70,9 @@ def _inverse_wht_signs_token(
     out = x.astype(np.float32)
     if sign_seed != 0:
         flat = out.reshape(-1)
-        signs = _token_hash_signs(token_flat_start, flat.size, sign_seed)
+        signs = _token_hash_signs(
+            token_flat_start, flat.size, sign_seed, layer_id=layer_id, stream_id=stream_id
+        )
         out = (flat * signs).reshape(out.shape)
     if use_wht:
         from rfsn_v10.cache.numpy_codec_oracle import _numpy_wht64
@@ -108,6 +124,8 @@ def cartesian_qk_cpu_reference(
     scale_factor: float,
     use_wht: bool = False,
     sign_seed: int = 0,
+    layer_id: int = 0,
+    stream_id: str = "",
 ) -> np.ndarray:
     """Compute QK scores on CPU using exact Metal indexing.
 
@@ -132,6 +150,10 @@ def cartesian_qk_cpu_reference(
         Whether the packed codes were WHT-transformed.
     sign_seed
         Seed for deterministic hash signs (0 disables).
+    layer_id
+        Layer index for sign derivation (must match encode).
+    stream_id
+        Stream identifier for sign derivation (must match encode).
 
     Returns
     -------
@@ -166,7 +188,8 @@ def cartesian_qk_cpu_reference(
                     ) * (n_groups * group_size)
                     k_grouped = k_vals.reshape(n_groups, group_size)
                     k_grouped = _inverse_wht_signs_token(
-                        k_grouped, use_wht, sign_seed, token_flat_start
+                        k_grouped, use_wht, sign_seed, token_flat_start,
+                        layer_id=layer_id, stream_id=stream_id,
                     )
                     k_vals = k_grouped.reshape(D)
 
@@ -188,6 +211,8 @@ def cartesian_sv_cpu_reference(
     head_dim: int,
     use_wht: bool = False,
     sign_seed: int = 0,
+    layer_id: int = 0,
+    stream_id: str = "",
 ) -> np.ndarray:
     """Compute weighted value sum on CPU using exact Metal indexing.
 
@@ -213,6 +238,10 @@ def cartesian_sv_cpu_reference(
         Whether the packed codes were WHT-transformed.
     sign_seed
         Seed for deterministic hash signs (0 disables).
+    layer_id
+        Layer index for sign derivation (must match encode).
+    stream_id
+        Stream identifier for sign derivation (must match encode).
 
     Returns
     -------
@@ -252,7 +281,8 @@ def cartesian_sv_cpu_reference(
                         ) * (n_groups * group_size)
                         v_grouped = v_vals.reshape(n_groups, group_size)
                         v_grouped = _inverse_wht_signs_token(
-                            v_grouped, use_wht, sign_seed, token_flat_start
+                            v_grouped, use_wht, sign_seed, token_flat_start,
+                            layer_id=layer_id, stream_id=stream_id,
                         )
                         v_vals = v_grouped.reshape(D)
 

@@ -526,14 +526,24 @@ def create_app(config: RFSNConfig | None = None) -> FastAPI:
                 status_code=503, detail=str(exc),
             ) from exc
 
-        # Build prompt
+        # Build prompt (guard against tokenizers without apply_chat_template)
         messages = [
             {"role": m.role, "content": m.content}
             for m in chat_request.messages
         ]
-        prompt: str = s.tokenizer.apply_chat_template(  # type: ignore[union-attr]
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+        if hasattr(s.tokenizer, "apply_chat_template"):
+            prompt = str(
+                s.tokenizer.apply_chat_template(  # type: ignore[union-attr]
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            )
+        else:
+            # Fallback for tokenizers without chat template
+            parts = []
+            for m in messages:
+                parts.append(f"{m['role']}: {m['content']}")
+            parts.append("assistant:")
+            prompt = "\n".join(parts)
 
         # Limit checks
         if len(prompt) > max_prompt:
@@ -675,6 +685,7 @@ async def _sse_stream(
 
     def _worker() -> None:
         finish_reason = "stop"
+        accumulated_text = ""
         try:
             tokens_generated = 0
             for idx, token in enumerate(
@@ -690,16 +701,27 @@ async def _sse_stream(
                 if stop_event.is_set():
                     return
                 tokens_generated += 1
-                # Check if token contains a stop sequence
+
+                # Accumulate text and check stop sequences on the full buffer
+                # so that multi-token stop sequences are caught correctly.
+                accumulated_text += token
+                truncated_token = token
                 if cfg.stop_sequences:
                     for seq in cfg.stop_sequences:
-                        if seq in token:
-                            token = token.split(seq)[0]
+                        pos = accumulated_text.find(seq)
+                        if pos != -1:
+                            # Determine how much of the current token to keep
+                            text_before = accumulated_text[:pos]
+                            already_yielded_len = len(accumulated_text) - len(token)
+                            if already_yielded_len < len(text_before):
+                                truncated_token = text_before[already_yielded_len:]
+                            else:
+                                truncated_token = ""
                             finish_reason = "stop"
                             stop_event.set()
                             break
                     if stop_event.is_set():
-                        if token:
+                        if truncated_token:
                             payload = {
                                 "id": f"{id_prefix}-{idx}",
                                 "object": "chat.completion.chunk",
@@ -708,7 +730,7 @@ async def _sse_stream(
                                 "choices": [
                                     {
                                         "index": 0,
-                                        "delta": {"content": token},
+                                        "delta": {"content": truncated_token},
                                         "finish_reason": None,
                                     }
                                 ],

@@ -84,6 +84,8 @@ def test_cpu_qk_matches_original_domain() -> None:
         scale_factor=scale_factor,
         use_wht=True,
         sign_seed=42,
+        layer_id=0,
+        stream_id="K",
     )
 
     np.testing.assert_allclose(cpu_scores, dense_scores, atol=0.03, rtol=0.05)
@@ -123,6 +125,8 @@ def test_cpu_sv_matches_original_domain() -> None:
         head_dim=D,
         use_wht=True,
         sign_seed=42,
+        layer_id=0,
+        stream_id="V",
     )
 
     np.testing.assert_allclose(cpu_out, dense_out, atol=0.05, rtol=0.01)
