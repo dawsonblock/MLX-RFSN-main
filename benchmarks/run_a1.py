@@ -75,7 +75,7 @@ def _make_smoke_a1_result(
         preconditioner="wht",
         quantizer="grouped_sym",
         key_bits=8.0,
-        value_bits=4.0,
+        value_bits=5.0,
         group_size=64,
         run_type="smoke",
         logit_cosine=float(rng.uniform(0.997, 0.9999)),
@@ -102,6 +102,17 @@ def _make_smoke_a1_result(
         decompression_time_ms=float(rng.uniform(2.0, 8.0)),
         generated_text=f"[smoke] A1 generated text for {baseline.prompt_id!r}.",
         notes="synthetic smoke data — A1 quality-safe",
+        source_type="installed_wheel",
+        commit_hash="smoke",
+        corpus_hash="smoke",
+        token_sequence_hash="smoke",
+        measured_memory=True,
+        proof_counters={
+            "requantized_tokens": 0,
+            "fallback_attention_calls": 0,
+            "dense_shadow_bytes": 0,
+            "unknown_layer_events": 0,
+        },
     )
 
 
@@ -167,7 +178,7 @@ def main() -> int:
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     generator = ReportGenerator(out_dir=results_dir, report_dir=reports_dir)
-    judge = Judge()
+    judge = Judge(strict=True)
     rng = np.random.default_rng(args.seed)
     prompts = PROMPT_SUITE_QUICK if args.quick else PROMPT_SUITE
 
