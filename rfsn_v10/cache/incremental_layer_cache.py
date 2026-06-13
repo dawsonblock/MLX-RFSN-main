@@ -90,8 +90,19 @@ class QuantizedLayerCache:
         keys, values
             Shape ``(batch, n_kv_heads, new_tokens, head_dim)``.
         """
+        if keys.shape != values.shape:
+            raise ValueError(
+                f"keys shape {keys.shape} != values shape {values.shape}"
+            )
+        if len(keys.shape) != 4:
+            raise ValueError(
+                f"Expected rank-4 tensors (B, Hkv, T, D), got rank {len(keys.shape)}"
+            )
         B, Hkv, new_T, D = keys.shape
-        assert B == 1, "Batch size must be 1"
+        if new_T <= 0:
+            raise ValueError(f"new_T must be positive, got {new_T}")
+        if B != 1:
+            raise ValueError(f"Batch size must be 1, got {B}")
 
         if self._geometry is None:
             self._geometry = (B, Hkv, D)

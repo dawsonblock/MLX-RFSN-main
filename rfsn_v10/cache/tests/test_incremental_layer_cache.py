@@ -199,6 +199,57 @@ def test_geometry_frozen_after_first_append() -> None:
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_append_shape_mismatch_raises() -> None:
+    """Mismatched keys/values shapes must raise ValueError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    with pytest.raises(ValueError, match="shape"):
+        cache.append(
+            mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32),
+            mx.random.normal(shape=(1, 2, 10, 32)).astype(mx.float32),
+        )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_append_rank_not_4_raises() -> None:
+    """Rank != 4 must raise ValueError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    with pytest.raises(ValueError, match="rank"):
+        cache.append(
+            mx.random.normal(shape=(1, 2, 10)).astype(mx.float32),
+            mx.random.normal(shape=(1, 2, 10)).astype(mx.float32),
+        )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_append_zero_tokens_raises() -> None:
+    """Zero new tokens must raise ValueError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    with pytest.raises(ValueError, match="new_T"):
+        cache.append(
+            mx.zeros((1, 2, 0, 64), dtype=mx.float32),
+            mx.zeros((1, 2, 0, 64), dtype=mx.float32),
+        )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_block_positions_are_monotonic_and_contiguous() -> None:
     """After multiple flushes, block positions must be contiguous."""
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
