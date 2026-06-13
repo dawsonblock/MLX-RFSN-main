@@ -5,7 +5,7 @@ a loaded model and tokenizer with:
 
 - Prefill (dense causal attention for the initial prompt)
 - Decode loop (streaming token generation)
-- Explicit per-layer quantized KV cache via ``RfsnMLXModelAdapter``
+- Explicit per-layer quantized KV cache via ``RfsnMLXReferenceAdapter``
 - Temperature / top-p / repetition-penalty sampling
 - Telemetry / proof counters per generation
 
@@ -133,8 +133,8 @@ class RFSNGenerator:
 
         self._adapter = None
         if MLX_LM_AVAILABLE and enable_quantized_kv:
-            from ..integrations.mlx_lm_adapter.adapter import RfsnMLXModelAdapter
-            self._adapter = RfsnMLXModelAdapter(
+            from ..integrations.mlx_lm_adapter.adapter import RfsnMLXReferenceAdapter
+            self._adapter = RfsnMLXReferenceAdapter(
                 model=model,
                 tokenizer=tokenizer,
                 key_bits=key_bits,

@@ -28,14 +28,26 @@ except ImportError:
 
 
 class PolarAttentionWrapper:
-    """Instance-level wrapper that replaces a layer's attention with Polar.
+    """Real attention module wrapper that replaces a layer's attention with Polar.
 
     Uses IncrementalPolarCache to avoid re-quantizing the full cache on every
     decode step.  Only newly appended tokens are quantized.
 
-    This is **not** global monkey-patching.  It replaces ``__call__`` on a
-    single attention instance inside a single model object.
+    This replaces ``layer.self_attn`` with the wrapper instance, which is
+    functionally correct because Python resolves ``__call__`` on the class.
+    All attribute accesses are transparently delegated to the original module.
     """
+
+    __slots__ = (
+        "original",
+        "layer_id",
+        "head_dim",
+        "key_q",
+        "value_q",
+        "scale",
+        "_inc_cache",
+        "_prev_token_count",
+    )
 
     def __init__(
         self,
@@ -65,8 +77,14 @@ class PolarAttentionWrapper:
         # Track how many tokens we've processed so we only append new ones
         self._prev_token_count = 0
 
-        # Save original __call__ for restoration
-        self._original_call = original_attn.__call__
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.original, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.__slots__:
+            super().__setattr__(name, value)
+        else:
+            setattr(self.original, name, value)
 
     def __call__(self, x: Any, mask: Any | None = None, cache: Any | None = None) -> Any:
         """Polar attention forward with incremental quantized cache."""
@@ -114,11 +132,6 @@ class PolarAttentionWrapper:
         # Output projection (same as original)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.original.o_proj(output)
-
-    def restore(self) -> None:
-        """Restore the original attention __call__."""
-        self.original.__call__ = self._original_call  # type: ignore[method-assign]
-
 
 class PolarModelRunner:
     """Runs an MLX model with Polar attention replacing standard attention.
@@ -192,17 +205,21 @@ class PolarModelRunner:
                 self._value_q,
                 self._actual_head_dim,
             )
-            # Instance-level replacement (binds to this specific object)
-            layer.self_attn.__call__ = wrapper.__call__  # type: ignore[method-assign]
-            self._wrappers.append(wrapper)
+            # Replace the module instance with the wrapper.
+            # Python resolves __call__ on the class, so this works correctly.
+            layer.self_attn = wrapper  # type: ignore[assignment]
+            self._wrappers.append((layer_id, wrapper))
             replaced.append(layer_id)
 
         return replaced
 
     def uninstall(self) -> None:
         """Restore all original attention methods."""
-        for wrapper in self._wrappers:
-            wrapper.restore()
+        for layer_id, wrapper in self._wrappers:
+            if layer_id < len(self.model.layers):
+                layer = self.model.layers[layer_id]
+                if layer.self_attn is wrapper:
+                    layer.self_attn = wrapper.original
         self._wrappers.clear()
 
     def generate(

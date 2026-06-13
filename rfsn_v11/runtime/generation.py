@@ -171,6 +171,36 @@ class _RFSNSDPAPatcher:
         return False
 
 
+class _LayerIdWrapper:
+    """Wrapper that injects layer_id into thread-local before each forward."""
+
+    __slots__ = ("_original", "_layer_id")
+
+    def __init__(self, original: Any, layer_id: str) -> None:
+        self._original = original
+        self._layer_id = layer_id
+
+    def __call__(self, x: Any, mask: Any | None = None, cache: Any | None = None) -> Any:
+        old = getattr(_rfsn_thread_local, "layer_id", None)
+        _rfsn_thread_local.layer_id = self._layer_id
+        try:
+            return self._original(x, mask, cache)
+        finally:
+            _rfsn_thread_local.layer_id = old
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self.__slots__:
+            super().__setattr__(name, value)
+        else:
+            setattr(self._original, name, value)
+
+
+_original_attns: dict[int, Any] = {}
+
+
 def _wrap_layers_for_rfsn(model: Any) -> None:
     """Wrap model attention layers to set layer_id before each forward."""
     inner = model
@@ -182,23 +212,11 @@ def _wrap_layers_for_rfsn(model: Any) -> None:
         if not hasattr(layer, "self_attn"):
             continue
         attn = layer.self_attn
-        if hasattr(attn, "_rfsn_original_call"):
+        key = id(layer)
+        if key in _original_attns:
             continue
-        original = attn.__call__
-        attn._rfsn_original_call = original
-
-        def _make_wrapper(orig, lid):
-            def wrapper(x, mask=None, cache=None):
-                old = getattr(_rfsn_thread_local, "layer_id", None)
-                _rfsn_thread_local.layer_id = lid
-                try:
-                    return orig(x, mask, cache)
-                finally:
-                    _rfsn_thread_local.layer_id = old
-
-            return wrapper
-
-        attn.__call__ = _make_wrapper(original, f"layer_{idx}")
+        _original_attns[key] = attn
+        layer.self_attn = _LayerIdWrapper(attn, f"layer_{idx}")
 
 
 def _unwrap_layers_for_rfsn(model: Any) -> None:
@@ -211,10 +229,9 @@ def _unwrap_layers_for_rfsn(model: Any) -> None:
     for layer in inner.layers:
         if not hasattr(layer, "self_attn"):
             continue
-        attn = layer.self_attn
-        if hasattr(attn, "_rfsn_original_call"):
-            attn.__call__ = attn._rfsn_original_call
-            delattr(attn, "_rfsn_original_call")
+        key = id(layer)
+        if key in _original_attns:
+            layer.self_attn = _original_attns.pop(key)
 
 
 # ---------------------------------------------------------------------------
