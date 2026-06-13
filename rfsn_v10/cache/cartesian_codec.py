@@ -150,7 +150,9 @@ class CartesianCodec:
         qmax = (1 << (block.bits - 1)) - 1
         grouped = flat.reshape(-1, block.group_size)
         q_signed = grouped - float(qmax)
-        restored = q_signed * block.scales[:, None]
+        # Scales may be BHTG (B,H,T,G) or flat (n_groups,); flatten for broadcast
+        scales_flat = block.scales.reshape(-1)
+        restored = q_signed * scales_flat[:, None]
 
         # Inverse hash signs and WHT (both are self-inverse when normalized)
         if block.sign_seed != 0:

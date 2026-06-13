@@ -164,10 +164,16 @@ class QuantizedLayerCache:
             key_block_raw = self.key_codec.encode(keys_slice)
             value_block_raw = self.value_codec.encode(values_slice)
 
+            # Reshape flat scales to BHTG layout
+            groups_per_head = D // key_block_raw.group_size
+            key_scales_bhtg = key_block_raw.scales.reshape(B, Hkv, block_size, groups_per_head)
+            value_scales_bhtg = value_block_raw.scales.reshape(B, Hkv, block_size, groups_per_head)
+
             logical_start = base_offset + start
             assert logical_start == base_offset + i * block_size
             key_block = dataclasses.replace(
                 key_block_raw,
+                scales=key_scales_bhtg,
                 token_count=block_size,
                 batch_size=B,
                 n_kv_heads=Hkv,
@@ -176,6 +182,7 @@ class QuantizedLayerCache:
             )
             value_block = dataclasses.replace(
                 value_block_raw,
+                scales=value_scales_bhtg,
                 token_count=block_size,
                 batch_size=B,
                 n_kv_heads=Hkv,
