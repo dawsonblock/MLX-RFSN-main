@@ -248,6 +248,8 @@ class RfsnMLXReferenceAdapter:
         # Session (created per generation, not persisted)
         self._session: GenerationCacheSession | None = None
         self._cache_list: list[Any] = []
+        self._last_counters: dict[str, int] = {}
+        self._last_memory_report: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Generation
@@ -275,8 +277,8 @@ class RfsnMLXReferenceAdapter:
         if self.use_direct_packed:
             from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
                 RfsnDirectPackedKVCache,
-                unwrap_model_attention,
-                wrap_model_attention,
+                install_packed_attention,
+                is_model_wrapped,
             )
             caches = [
                 RfsnDirectPackedKVCache(
@@ -288,26 +290,24 @@ class RfsnMLXReferenceAdapter:
                 )
                 for i in range(self.num_layers)
             ]
-            wrap_model_attention(self.model, caches)
-            try:
-                text = generate(
-                    self.model,
-                    self.tokenizer,
-                    prompt,
-                    verbose=verbose,
-                    prompt_cache=caches,
-                    max_tokens=max_tokens,
-                    **generate_kwargs,
+            if not is_model_wrapped(self.model):
+                install_packed_attention(self.model, caches)
+            text = generate(
+                self.model,
+                self.tokenizer,
+                prompt,
+                verbose=verbose,
+                prompt_cache=caches,
+                max_tokens=max_tokens,
+                **generate_kwargs,
+            )
+            self._last_counters = {
+                "direct_packed_tokens": sum(
+                    c.layer_cache.total_token_count() for c in caches
                 )
-                return text
-            finally:
-                unwrap_model_attention(self.model)
-                self._last_counters = {
-                    "direct_packed_tokens": sum(
-                        c.layer_cache.total_token_count() for c in caches
-                    )
-                    // self.num_layers,
-                }
+                // self.num_layers,
+            }
+            return text
 
         session = self._new_session()
         try:
@@ -333,8 +333,9 @@ class RfsnMLXReferenceAdapter:
             )
             return text
         finally:
-            # Capture report before destroy
+            # Capture report and counters before destroy
             self._last_memory_report = session.memory_report().to_dict()
+            self._last_counters = session.counters()
             session.destroy()
 
     def generate_step(
@@ -355,8 +356,8 @@ class RfsnMLXReferenceAdapter:
         if self.use_direct_packed:
             from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
                 RfsnDirectPackedKVCache,
-                unwrap_model_attention,
-                wrap_model_attention,
+                is_model_wrapped,
+                install_packed_attention,
             )
             caches = [
                 RfsnDirectPackedKVCache(
@@ -368,12 +369,13 @@ class RfsnMLXReferenceAdapter:
                 )
                 for i in range(self.num_layers)
             ]
-            wrap_model_attention(self.model, caches)
+            if not is_model_wrapped(self.model):
+                install_packed_attention(self.model, caches)
+            prompt_ids = (
+                prompt if isinstance(prompt, mx.array)
+                else mx.array(self.tokenizer.encode(prompt))
+            )
             try:
-                prompt_ids = (
-                    prompt if isinstance(prompt, mx.array)
-                    else mx.array(self.tokenizer.encode(prompt))
-                )
                 yield from generate_step(
                     prompt_ids,
                     self.model,
@@ -382,13 +384,13 @@ class RfsnMLXReferenceAdapter:
                     **generate_kwargs,
                 )
             finally:
-                unwrap_model_attention(self.model)
                 self._last_counters = {
                     "direct_packed_tokens": sum(
                         c.layer_cache.total_token_count() for c in caches
                     )
                     // self.num_layers,
                 }
+            return
 
         session = self._new_session()
         try:

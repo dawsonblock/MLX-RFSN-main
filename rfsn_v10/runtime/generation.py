@@ -148,6 +148,7 @@ class RFSNGenerator:
             )
 
         self._telemetry_log: list[dict] = []
+        self._last_counters: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -334,8 +335,8 @@ class RFSNGenerator:
                 # Direct packed-attention path — intercept attention modules.
                 from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
                     RfsnDirectPackedKVCache,
-                    unwrap_model_attention,
-                    wrap_model_attention,
+                    install_packed_attention,
+                    is_model_wrapped,
                 )
 
                 caches = [
@@ -348,18 +349,18 @@ class RFSNGenerator:
                     )
                     for i in range(self._adapter.num_layers)
                 ]
-                wrap_model_attention(self.model, caches)
+                if not is_model_wrapped(self.model):
+                    install_packed_attention(self.model, caches)
+                gen_iter = _mlx_stream_generate(
+                    self.model,
+                    self.tokenizer,
+                    prompt=prompt,
+                    prompt_cache=caches,
+                    **gen_kwargs,
+                )
                 try:
-                    gen_iter = _mlx_stream_generate(
-                        self.model,
-                        self.tokenizer,
-                        prompt=prompt,
-                        prompt_cache=caches,
-                        **gen_kwargs,
-                    )
                     yield from gen_iter
                 finally:
-                    unwrap_model_attention(self.model)
                     self._last_counters = {
                         "direct_packed_tokens": sum(
                             c.layer_cache.total_token_count() for c in caches

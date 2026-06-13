@@ -4,16 +4,16 @@ Usage::
 
     from rfsn_v10.integrations.mlx_lm_model_support import (
         RfsnDirectPackedKVCache,
-        wrap_model_attention,
+        install_packed_attention,
     )
 
     caches = [
         RfsnDirectPackedKVCache(layer_id=i, key_codec=k_codec, value_codec=v_codec)
         for i in range(arch.num_layers)
     ]
-    wrap_model_attention(model, caches)
+    install_packed_attention(model, caches)
     # ... run generation with caches as prompt_cache ...
-    unwrap_model_attention(model)
+    # Wrappers stay installed; per-request caches select the backend.
 
 The wrapper:
 1. Calls original Q/K/V projections.
@@ -54,6 +54,7 @@ class RfsnDirectPackedKVCache:
             value_codec=value_codec,
             staging_capacity=staging_capacity,
             dense_residual_window=dense_residual_window,
+            layer_id=layer_id,
         )
         self.offset: int = 0
 
@@ -70,7 +71,14 @@ class RfsnDirectPackedKVCache:
 
     @property
     def state(self) -> tuple[Any, ...]:
-        """Lightweight state for ``mx.eval``."""
+        """Eval-able state for ``mx.eval`` during chunked prefill.
+
+        Returns the current staging tensors so that ``mx.eval`` forces
+        computation without materialising dense history.
+        """
+        stage_k, stage_v, stage_n = self.layer_cache.get_staging()
+        if stage_n > 0 and stage_k is not None and stage_v is not None:
+            return (stage_k, stage_v)
         return ()
 
     @state.setter
@@ -103,9 +111,6 @@ class RfsnDirectPackedKVCache:
 # Attention wrapper
 # ------------------------------------------------------------------
 
-_original_attns: dict[int, Any] = {}  # id(layer) -> original attention module
-
-
 class _PackedAttentionWrapper:
     """Wrapper that intercepts attention calls and routes through packed reference.
 
@@ -118,26 +123,10 @@ class _PackedAttentionWrapper:
     transparently delegated to the original attention module.
     """
 
-    __slots__ = (
-        "_original",
-        "_layer_cache",
-        "_key_codec",
-        "_value_codec",
-        "_scale",
-    )
+    __slots__ = ("_original", "_scale")
 
-    def __init__(
-        self,
-        original: Any,
-        layer_cache: QuantizedLayerCache,
-        key_codec: CartesianCodec,
-        value_codec: CartesianCodec,
-        scale: float,
-    ) -> None:
+    def __init__(self, original: Any, scale: float) -> None:
         self._original = original
-        self._layer_cache = layer_cache
-        self._key_codec = key_codec
-        self._value_codec = value_codec
         self._scale = scale
 
     def __call__(
@@ -146,10 +135,12 @@ class _PackedAttentionWrapper:
         mask: Any | None = None,
         cache: Any | None = None,
     ) -> Any:
-        # If no cache is provided, fall back to the original attention.
-        # This handles the very first prefill call when MLX-LM has not yet
-        # initialised the per-layer cache objects.
-        if cache is None:
+        # If no cache is provided, or the cache is not our packed cache,
+        # fall back to the original attention.  This handles:
+        #   - The very first prefill call when MLX-LM has not yet
+        #     initialised the per-layer cache objects.
+        #   - Any caller that passes a non-packed cache.
+        if not isinstance(cache, RfsnDirectPackedKVCache):
             return self._original(x, mask=mask, cache=cache)
 
         B, L, D = x.shape
@@ -172,12 +163,13 @@ class _PackedAttentionWrapper:
         cache.update_and_fetch(keys, values)
 
         # Direct packed attention over the full quantized cache
+        layer_cache = cache.layer_cache
         output, _ = attend(
             queries,
-            self._layer_cache,
+            layer_cache,
             scale=self._scale,
             mask=mask,
-            query_start_pos=self._layer_cache.total_token_count() - L,
+            query_start_pos=layer_cache.total_token_count() - L,
             causal=True,
         )
 
@@ -198,11 +190,16 @@ class _PackedAttentionWrapper:
         return f"<_PackedAttentionWrapper wrapping {self._original!r}>"
 
 
-def wrap_model_attention(
+def install_packed_attention(
     model: Any,
     caches: list[RfsnDirectPackedKVCache],
 ) -> None:
-    """Replace every attention module in *model* with the packed attention path.
+    """Install packed attention wrappers permanently on *model*.
+
+    Each layer's ``self_attn`` is replaced with a ``_PackedAttentionWrapper``
+    that delegates to the original module.  Wrappers are installed once at
+    model-load time and stay in place; per-request ``prompt_cache`` objects
+    select the packed path when provided.
 
     Parameters
     ----------
@@ -222,31 +219,33 @@ def wrap_model_attention(
         if attn is None:
             raise ValueError(f"Layer {i} has no self_attn attribute")
 
-        cache_wrapper = caches[i]
-        key_codec = cache_wrapper.layer_cache.key_codec
-        value_codec = cache_wrapper.layer_cache.value_codec
-        scale = key_codec.group_size ** -0.5  # fallback; real scale from args
+        # Don't double-wrap
+        if isinstance(attn, _PackedAttentionWrapper):
+            continue
 
-        # Try to get actual scale from the attention module
-        scale = getattr(attn, "scale", scale)
+        # Attention scale — always present on MLX-LM attention modules.
+        scale = getattr(attn, "scale", 1.0)
 
-        # Save original by layer identity so we can restore even if the
-        # attribute is reassigned between wrap and unwrap.
-        _original_attns[id(layer)] = attn
-
-        wrapper = _PackedAttentionWrapper(
-            attn,
-            cache_wrapper.layer_cache,
-            key_codec,
-            value_codec,
-            scale,
-        )
+        wrapper = _PackedAttentionWrapper(attn, scale)
         layer.self_attn = wrapper
 
 
-def unwrap_model_attention(model: Any) -> None:
-    """Restore the original attention modules."""
+def uninstall_packed_attention(model: Any) -> None:
+    """Remove packed attention wrappers and restore original modules."""
     for layer in getattr(model, "layers", []):
-        key = id(layer)
-        if key in _original_attns:
-            layer.self_attn = _original_attns.pop(key)
+        attn = getattr(layer, "self_attn", None)
+        if isinstance(attn, _PackedAttentionWrapper):
+            layer.self_attn = attn._original
+
+
+def is_model_wrapped(model: Any) -> bool:
+    """Return ``True`` if any layer has a packed attention wrapper."""
+    for layer in getattr(model, "layers", []):
+        if isinstance(getattr(layer, "self_attn", None), _PackedAttentionWrapper):
+            return True
+    return False
+
+
+# Backward compatibility aliases (deprecated)
+wrap_model_attention = install_packed_attention
+unwrap_model_attention = uninstall_packed_attention

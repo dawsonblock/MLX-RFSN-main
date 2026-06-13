@@ -13,8 +13,11 @@ from .model_support import (
 )
 from .attention_wrapper import (
     RfsnDirectPackedKVCache,
-    wrap_model_attention,
+    install_packed_attention,
+    is_model_wrapped,
+    uninstall_packed_attention,
     unwrap_model_attention,
+    wrap_model_attention,
 )
 
 __all__ = [
@@ -22,6 +25,9 @@ __all__ = [
     "inspect_model_architecture",
     "is_supported_architecture",
     "RfsnDirectPackedKVCache",
+    "install_packed_attention",
+    "is_model_wrapped",
+    "uninstall_packed_attention",
     "wrap_model_attention",
     "unwrap_model_attention",
 ]

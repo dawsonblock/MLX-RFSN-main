@@ -11,6 +11,8 @@ import importlib.resources
 import os
 from typing import Any
 
+import numpy as np
+
 from rfsn_v10.compat import mx
 
 from ._common import KernelRouteError
@@ -46,6 +48,10 @@ def cartesian_qk_metal(
     bits: int,
     group_size: int,
     scale_factor: float,
+    use_wht: bool = False,
+    sign_seed: int = 0,
+    layer_id: int = 0,
+    stream_id: str = "",
 ) -> Any:
     """Compute QK scores via Metal kernel.
 
@@ -57,7 +63,29 @@ def cartesian_qk_metal(
     ``scales`` must have shape ``(B, Hkv, Lkv, n_groups)`` — one scale
     group per KV token.  The caller is responsible for concatenating
     per-block scales into this flat layout.
+
+    When *use_wht* or *sign_seed* is set, the kernel falls back to the
+    CPU reference path because the Metal shader does not yet implement
+    inverse WHT / hash-sign transforms.
     """
+    if use_wht or sign_seed != 0:
+        # Metal shader does not yet implement inverse WHT / hash signs.
+        from rfsn_v10.kernels.cartesian_cpu_reference import cartesian_qk_cpu_reference
+        return mx.array(
+            cartesian_qk_cpu_reference(
+                np.array(queries),
+                np.array(packed_codes),
+                np.array(scales),
+                bits=bits,
+                group_size=group_size,
+                scale_factor=scale_factor,
+                use_wht=use_wht,
+                sign_seed=sign_seed,
+                layer_id=layer_id,
+                stream_id=stream_id,
+            )
+        )
+
     if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
         raise KernelRouteError("metal_kernel_api_unavailable")
 
@@ -118,13 +146,38 @@ def cartesian_sv_metal(
     bits: int,
     group_size: int,
     head_dim: int,
+    use_wht: bool = False,
+    sign_seed: int = 0,
+    layer_id: int = 0,
+    stream_id: str = "",
 ) -> Any:
     """Compute weighted value sum via Metal kernel.
 
     ``scales`` must have shape ``(B, Hkv, Lkv, n_groups)`` — one scale
     group per KV token.  The caller is responsible for concatenating
     per-block scales into this flat layout.
+
+    When *use_wht* or *sign_seed* is set, the kernel falls back to the
+    CPU reference path because the Metal shader does not yet implement
+    inverse WHT / hash-sign transforms.
     """
+    if use_wht or sign_seed != 0:
+        from rfsn_v10.kernels.cartesian_cpu_reference import cartesian_sv_cpu_reference
+        return mx.array(
+            cartesian_sv_cpu_reference(
+                np.array(weights),
+                np.array(packed_codes),
+                np.array(scales),
+                bits=bits,
+                group_size=group_size,
+                head_dim=head_dim,
+                use_wht=use_wht,
+                sign_seed=sign_seed,
+                layer_id=layer_id,
+                stream_id=stream_id,
+            )
+        )
+
     if not hasattr(mx, "fast") or not hasattr(mx.fast, "metal_kernel"):
         raise KernelRouteError("metal_kernel_api_unavailable")
 

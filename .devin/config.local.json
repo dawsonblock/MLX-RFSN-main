@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Exec(find)",
-      "Exec(python3)"
+      "Exec(python3)",
+      "Exec(python)",
+      "Exec(pytest)",
+      "Exec(sed)"
     ]
   }
 }
