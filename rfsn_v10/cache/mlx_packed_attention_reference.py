@@ -83,7 +83,9 @@ def attend(
     position_offset = 0
 
     # Online softmax state
-    running_max = mx.full((B, Hq, Lq, 1), -mx.inf, dtype=mx.float32)
+    # Initialise to -1e9 (finite) so that exp(running_max - new_max) never
+    # hits the NaN-producing -inf - (-inf) case, even for fully-masked blocks.
+    running_max = mx.full((B, Hq, Lq, 1), -1e9, dtype=mx.float32)
     running_sum = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
     out = mx.zeros((B, Hq, Lq, D), dtype=mx.float32)
 
@@ -117,10 +119,10 @@ def attend(
         elif isinstance(mask, str):
             raise ValueError(f"unrecognized mask string: {mask!r}")
 
-        # Online softmax
+        # Online softmax with direct exp(scores - new_max) to avoid NaN
+        # when block_max is -inf (fully-masked block).
         block_max = mx.max(scores, axis=-1, keepdims=True)
         new_max = mx.maximum(running_max, block_max)
-
         old_scale = mx.exp(running_max - new_max)
 
         running_sum = running_sum * old_scale

@@ -454,19 +454,22 @@ class QuantizedLayerCache:
                 block_mask = mx.broadcast_to(block_mask[None, None, :, :], (B, Hq, Lq, block_t))
 
             scores = mx.matmul(queries.astype(mx.float32), k_block.swapaxes(2, 3)) * scale
-            scores = mx.where(block_mask, scores, mx.array(-1e9, dtype=scores.dtype))
+            # Use -inf for masked positions so they contribute 0 to softmax
+            scores = mx.where(block_mask, scores, mx.array(-mx.inf, dtype=scores.dtype))
 
             block_max = mx.max(scores, axis=-1, keepdims=True)
-            block_exp = mx.exp(scores - block_max)
-            block_sum = mx.sum(block_exp, axis=-1, keepdims=True)
-
-            # Update running statistics
             new_max = mx.maximum(running_max, block_max)
             old_scale = mx.exp(running_max - new_max)
-            block_scale = mx.exp(block_max - new_max)
 
-            running_sum = running_sum * old_scale + block_sum * block_scale
-            output = output * old_scale + mx.matmul(block_exp, v_block.astype(mx.float32)) * block_scale
+            running_sum = running_sum * old_scale
+            output = output * old_scale
+
+            # Compute block contributions relative to the new global max.
+            # new_max is always finite (running_max is initialised to -1e9),
+            # so exp(scores - new_max) is safe even for fully-masked rows.
+            block_exp = mx.exp(scores.astype(mx.float32) - new_max)
+            running_sum = running_sum + mx.sum(block_exp, axis=-1, keepdims=True)
+            output = output + mx.matmul(block_exp, v_block.astype(mx.float32))
             running_max = new_max
 
         token_offset = 0
@@ -490,8 +493,8 @@ class QuantizedLayerCache:
             dense_T = self._dense_token_count
             _process_block(dense_k, dense_v, dense_T, token_offset)
 
-        # Normalise by the final softmax denominator
-        output = output / running_sum
+        # Guard against fully-masked rows where running_sum == 0
+        output = mx.where(running_sum == 0, mx.zeros_like(output), output / running_sum)
         return output.astype(queries.dtype)
 
     # ------------------------------------------------------------------
