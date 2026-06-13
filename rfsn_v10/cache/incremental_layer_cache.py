@@ -78,9 +78,16 @@ class QuantizedLayerCache:
         self._encoded_tokens: int = 0
         self._requantized_tokens: int = 0
 
+        # Lifecycle
+        self._destroyed: bool = False
+
     # ------------------------------------------------------------------
     # Append
     # ------------------------------------------------------------------
+
+    def _check_destroyed(self) -> None:
+        if getattr(self, "_destroyed", False):
+            raise RuntimeError("cache has been destroyed")
 
     def append(self, keys: Any, values: Any) -> None:
         """Append new K/V tokens.
@@ -90,21 +97,49 @@ class QuantizedLayerCache:
         keys, values
             Shape ``(batch, n_kv_heads, new_tokens, head_dim)``.
         """
-        if keys.shape != values.shape:
-            raise ValueError(
-                f"keys shape {keys.shape} != values shape {values.shape}"
-            )
-        if len(keys.shape) != 4:
-            raise ValueError(
-                f"Expected rank-4 tensors (B, Hkv, T, D), got rank {len(keys.shape)}"
-            )
-        B, Hkv, new_T, D = keys.shape
+        self._check_destroyed()
+        if getattr(keys, "ndim", None) != 4:
+            raise ValueError("keys must have shape (B,H,T,D)")
+        if getattr(values, "ndim", None) != 4:
+            raise ValueError("values must have shape (B,H,T,D)")
+        if tuple(keys.shape) != tuple(values.shape):
+            raise ValueError("keys and values must have identical shapes")
+
+        B, Hkv, new_T, D = map(int, keys.shape)
         if new_T <= 0:
-            raise ValueError(f"new_T must be positive, got {new_T}")
+            raise ValueError("new token count must be positive")
         if B != 1:
-            raise ValueError(f"Batch size must be 1, got {B}")
+            raise ValueError("batch size 1 is required")
+        if Hkv <= 0:
+            raise ValueError("n_kv_heads must be positive")
+        if D <= 0:
+            raise ValueError("head_dim must be positive")
+
+        # dtype validation
+        key_dtype = str(keys.dtype).split(".")[-1]
+        value_dtype = str(values.dtype).split(".")[-1]
+        _SUPPORTED_DTYPES = {"float16", "bfloat16", "float32"}
+        if key_dtype not in _SUPPORTED_DTYPES:
+            raise TypeError(f"unsupported key dtype: {key_dtype}")
+        if value_dtype not in _SUPPORTED_DTYPES:
+            raise TypeError(f"unsupported value dtype: {value_dtype}")
+
+        # finite-value validation
+        if not bool(mx.all(mx.isfinite(keys)).item()):
+            raise ValueError("keys contain NaN or Inf")
+        if not bool(mx.all(mx.isfinite(values)).item()):
+            raise ValueError("values contain NaN or Inf")
 
         if self._geometry is None:
+            # Codec geometry compatibility
+            if D % self.key_codec.group_size != 0:
+                raise ValueError(
+                    f"head_dim {D} incompatible with key group_size {self.key_codec.group_size}"
+                )
+            if D % self.value_codec.group_size != 0:
+                raise ValueError(
+                    f"head_dim {D} incompatible with value group_size {self.value_codec.group_size}"
+                )
             self._geometry = (B, Hkv, D)
         else:
             expected_B, expected_Hkv, expected_D = self._geometry
@@ -247,14 +282,17 @@ class QuantizedLayerCache:
 
     def iter_key_blocks(self):
         """Yield each sealed key block for blockwise attention."""
+        self._check_destroyed()
         yield from self._key_blocks
 
     def iter_value_blocks(self):
         """Yield each sealed value block for blockwise attention."""
+        self._check_destroyed()
         yield from self._value_blocks
 
     def get_dense_residual(self) -> tuple[Any | None, Any | None]:
         """Return the dense FP16 residual window, or (None, None)."""
+        self._check_destroyed()
         return self._dense_keys, self._dense_values
 
     def get_staging(self) -> tuple[Any | None, Any | None, int]:
@@ -262,6 +300,7 @@ class QuantizedLayerCache:
 
         Returns full-shaped tensors ``(B, Hkv, staged_T, D)`` or ``(None, None, 0)``.
         """
+        self._check_destroyed()
         if self._stage_token_count == 0:
             return None, None, 0
         keys = mx.concatenate(self._stage_keys, axis=2) if len(self._stage_keys) > 1 else self._stage_keys[0]
@@ -274,10 +313,12 @@ class QuantizedLayerCache:
 
     @property
     def encoded_token_count(self) -> int:
+        self._check_destroyed()
         return self._encoded_tokens
 
     @property
     def requantized_token_count(self) -> int:
+        self._check_destroyed()
         return self._requantized_tokens
 
     def total_token_count(self) -> int:
@@ -285,6 +326,7 @@ class QuantizedLayerCache:
 
         These three regions are mutually exclusive.
         """
+        self._check_destroyed()
         total = self._encoded_tokens + self._stage_token_count
         if self.dense_residual_window > 0 and self._dense_keys is not None:
             total += self._dense_token_count
@@ -296,6 +338,7 @@ class QuantizedLayerCache:
 
     def payload_bytes(self) -> int:
         """Exact bytes from all sealed blocks (valid payload only)."""
+        self._check_destroyed()
         total = 0
         for kb, vb in zip(self._key_blocks, self._value_blocks):
             total += kb.payload_bytes()
@@ -304,12 +347,14 @@ class QuantizedLayerCache:
 
     def dense_residual_bytes(self) -> int:
         """Bytes in the dense FP16 residual window."""
+        self._check_destroyed()
         if self._dense_keys is None:
             return 0
         return int(self._dense_keys.size) * 2 + int(self._dense_values.size) * 2
 
     def staging_bytes(self) -> int:
         """Bytes in staging buffers."""
+        self._check_destroyed()
         total = 0
         for k in self._stage_keys:
             total += int(k.size) * 4  # float32
@@ -319,9 +364,11 @@ class QuantizedLayerCache:
 
     def total_memory_bytes(self) -> int:
         """All accounted bytes: payload + dense + staging."""
+        self._check_destroyed()
         return self.payload_bytes() + self.dense_residual_bytes() + self.staging_bytes()
 
     def stats(self) -> CacheStats:
+        self._check_destroyed()
         return CacheStats(
             tokens_encoded=self._encoded_tokens,
             tokens_requantized=self._requantized_tokens,
@@ -338,6 +385,7 @@ class QuantizedLayerCache:
             NotImplementedError: Always, to prevent data loss from the
                 known-buggy trim implementation.
         """
+        self._check_destroyed()
         raise NotImplementedError(
             "trim() is disabled in this release. Use reset() and re-prefill."
         )
@@ -370,6 +418,7 @@ class QuantizedLayerCache:
         output
             Shape ``(B, Hq, Lq, D)``.
         """
+        self._check_destroyed()
         B, Hq, Lq, D = queries.shape
         assert B == 1, "Batch size must be 1"
 
@@ -459,7 +508,10 @@ class QuantizedLayerCache:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Destroy all state.  Called on session teardown."""
+        """Clear all cache state but preserve codec references.
+
+        The cache can be reused after reset with the same codecs.
+        """
         self._key_blocks.clear()
         self._value_blocks.clear()
         self._stage_keys.clear()
@@ -470,3 +522,12 @@ class QuantizedLayerCache:
         self._dense_token_count = 0
         self._encoded_tokens = 0
         self._requantized_tokens = 0
+        self._geometry = None
+
+    def destroy(self) -> None:
+        """Permanently destroy the cache and prevent reuse.
+
+        After destroy(), every public method raises RuntimeError.
+        """
+        self.reset()
+        self._destroyed = True

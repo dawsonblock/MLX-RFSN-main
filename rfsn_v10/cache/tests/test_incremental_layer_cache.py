@@ -225,7 +225,7 @@ def test_append_rank_not_4_raises() -> None:
     v_codec = CartesianCodec(bits=5, group_size=64)
     cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
 
-    with pytest.raises(ValueError, match="rank"):
+    with pytest.raises(ValueError, match="keys must have shape"):
         cache.append(
             mx.random.normal(shape=(1, 2, 10)).astype(mx.float32),
             mx.random.normal(shape=(1, 2, 10)).astype(mx.float32),
@@ -242,7 +242,7 @@ def test_append_zero_tokens_raises() -> None:
     v_codec = CartesianCodec(bits=5, group_size=64)
     cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
 
-    with pytest.raises(ValueError, match="new_T"):
+    with pytest.raises(ValueError, match="new token count must be positive"):
         cache.append(
             mx.zeros((1, 2, 0, 64), dtype=mx.float32),
             mx.zeros((1, 2, 0, 64), dtype=mx.float32),
@@ -270,3 +270,117 @@ def test_block_positions_are_monotonic_and_contiguous() -> None:
     validate_block_positions(key_blocks)
     logical_starts = [b.logical_start for b in key_blocks]
     assert logical_starts == [0, 32, 64], f"Unexpected positions: {logical_starts}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_destroy_prevents_reuse() -> None:
+    """destroy() must make all public methods raise RuntimeError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    keys = mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32)
+    values = mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32)
+    cache.append(keys, values)
+
+    cache.destroy()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        cache.append(keys, values)
+    with pytest.raises(RuntimeError, match="destroyed"):
+        cache.total_token_count()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        cache.payload_bytes()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        cache.stats()
+    with pytest.raises(RuntimeError, match="destroyed"):
+        cache.trim(5)
+    with pytest.raises(RuntimeError, match="destroyed"):
+        list(cache.iter_key_blocks())
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_reset_clears_geometry() -> None:
+    """reset() must allow reuse with different geometry."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    cache.append(
+        mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32),
+        mx.random.normal(shape=(1, 2, 10, 64)).astype(mx.float32),
+    )
+    cache.reset()
+    # Should not raise geometry mismatch
+    cache.append(
+        mx.random.normal(shape=(1, 4, 10, 64)).astype(mx.float32),
+        mx.random.normal(shape=(1, 4, 10, 64)).astype(mx.float32),
+    )
+    assert cache.total_token_count() == 10
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_append_unsupported_dtype_raises() -> None:
+    """Unsupported dtypes must raise TypeError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    with pytest.raises(TypeError, match="unsupported key dtype"):
+        cache.append(
+            mx.zeros((1, 2, 10, 64), dtype=mx.int32),
+            mx.zeros((1, 2, 10, 64), dtype=mx.float32),
+        )
+    with pytest.raises(TypeError, match="unsupported value dtype"):
+        cache.append(
+            mx.zeros((1, 2, 10, 64), dtype=mx.float32),
+            mx.zeros((1, 2, 10, 64), dtype=mx.int32),
+        )
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_append_nan_inf_raises() -> None:
+    """NaN or Inf values must raise ValueError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    bad_keys = mx.zeros((1, 2, 10, 64), dtype=mx.float32)
+    bad_keys[0, 0, 0, 0] = float("nan")
+
+    with pytest.raises(ValueError, match="NaN"):
+        cache.append(bad_keys, mx.zeros((1, 2, 10, 64), dtype=mx.float32))
+
+    bad_values = mx.zeros((1, 2, 10, 64), dtype=mx.float32)
+    bad_values[0, 0, 0, 0] = float("inf")
+
+    with pytest.raises(ValueError, match="Inf"):
+        cache.append(mx.zeros((1, 2, 10, 64), dtype=mx.float32), bad_values)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_append_incompatible_head_dim_raises() -> None:
+    """head_dim not divisible by group_size must raise ValueError."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+    cache = QuantizedLayerCache(k_codec, v_codec, staging_capacity=64)
+
+    with pytest.raises(ValueError, match="incompatible"):
+        cache.append(
+            mx.zeros((1, 2, 10, 32), dtype=mx.float32),
+            mx.zeros((1, 2, 10, 32), dtype=mx.float32),
+        )
