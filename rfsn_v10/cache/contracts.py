@@ -65,6 +65,17 @@ class PackedBlock:
             raise ValueError(f"Invalid logical_start: {self.logical_start}")
         if self.vector_alignment <= 0:
             raise ValueError(f"Invalid vector_alignment: {self.vector_alignment}")
+        # Geometry self-consistency: if geometry is set, scales must match BHTG
+        if self.n_kv_heads > 0 and self.head_dim > 0 and self.token_count > 0:
+            groups_per_head = self.head_dim // self.group_size
+            expected_scale_elements = self.batch_size * self.n_kv_heads * self.token_count * groups_per_head
+            if self.scales is not None and int(self.scales.size) != expected_scale_elements:
+                raise ValueError(
+                    f"scales size ({int(self.scales.size)}) != expected BHTG "
+                    f"({expected_scale_elements}) for "
+                    f"batch={self.batch_size}, heads={self.n_kv_heads}, "
+                    f"tokens={self.token_count}, groups_per_head={groups_per_head}"
+                )
         # Payload sanity: n_values should be close to num_elements when no WHT
         if self.num_elements > 0 and self.n_values > 0:
             padded = self.num_elements + (
