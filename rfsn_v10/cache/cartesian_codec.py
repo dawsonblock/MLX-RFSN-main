@@ -158,7 +158,7 @@ class CartesianCodec:
         logical_start: int = 0,
         layer_id: int = 0,
         stream_id: str = "",
-    ) -> "PackedBlockV4":
+    ) -> PackedBlockV4:
         """Quantize and pack a BHTD tensor with vector-aligned codes.
 
         Parameters
@@ -386,7 +386,7 @@ class CartesianCodec:
 
         return flat_restored
 
-    def decode_bhtd(self, block: "PackedBlock") -> Any:
+    def decode_bhtd(self, block: PackedBlock) -> Any:
         """Reconstruct a BHTD tensor from a vector-aligned PackedBlock.
 
         Expects packed_codes of shape (B,H,T,W) and scales of shape (B,H,T,G).

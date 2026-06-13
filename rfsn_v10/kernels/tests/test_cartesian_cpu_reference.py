@@ -16,7 +16,7 @@ except ImportError:
     HAS_MLX = False
 
 
-def _make_bhtg_scales_from_block(block, Hkv: int, Lkv: int, D: int) -> np.ndarray:
+def _make_bhtg_scales_from_block(block, Hkv: int, Lkv: int, D: int) -> np.ndarray:  # noqa: N803
     """Convert a single PackedBlockV4 scales to BHTG shape."""
     scales = np.array(block.scales)
     # For a single block, scales is (B, Hkv, T, groups_per_vector)
@@ -31,6 +31,7 @@ def _dequantize_raw(block, bits: int, group_size: int) -> np.ndarray:
     matching what the Metal kernels operate on.
     """
     import math
+
     from rfsn_v10.cache.numpy_codec_oracle import _vector_aligned_unpack_numpy
 
     packed = block.packed_codes

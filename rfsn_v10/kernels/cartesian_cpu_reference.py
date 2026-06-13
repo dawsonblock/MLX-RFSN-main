@@ -15,7 +15,6 @@ that the result matches canonical attention mathematics.
 from __future__ import annotations
 
 import math
-from typing import Any
 
 import numpy as np
 
@@ -80,16 +79,16 @@ def _inverse_wht_signs_token(
     return out
 
 
-def _extract_code(
+def _extract_code(  # noqa: N803
     packed_codes: np.ndarray,
     b: int,
     hkv: int,
     k_pos: int,
     d: int,
     bits: int,
-    D: int,
-    Hkv: int,
-    Lkv: int,
+    D: int,  # noqa: N803
+    Hkv: int,  # noqa: N803
+    Lkv: int,  # noqa: N803
 ) -> int:
     """Extract one quantized code from packed_codes (exact Metal indexing).
 

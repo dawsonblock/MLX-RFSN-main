@@ -275,8 +275,8 @@ class RfsnMLXReferenceAdapter:
         if self.use_direct_packed:
             from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
                 RfsnDirectPackedKVCache,
-                wrap_model_attention,
                 unwrap_model_attention,
+                wrap_model_attention,
             )
             caches = [
                 RfsnDirectPackedKVCache(
@@ -355,8 +355,8 @@ class RfsnMLXReferenceAdapter:
         if self.use_direct_packed:
             from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
                 RfsnDirectPackedKVCache,
-                wrap_model_attention,
                 unwrap_model_attention,
+                wrap_model_attention,
             )
             caches = [
                 RfsnDirectPackedKVCache(

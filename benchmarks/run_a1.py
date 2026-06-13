@@ -34,25 +34,27 @@ Exit codes
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from benchmarks.baseline_mlx import PROMPT_SUITE, PROMPT_SUITE_QUICK, MODELS_QUICK, MODELS_FULL
-from benchmarks.baseline_mlx import run_single as run_baseline, _make_smoke_result
+from benchmarks.baseline_mlx import (
+    MODELS_FULL,
+    MODELS_QUICK,
+    PROMPT_SUITE,
+    PROMPT_SUITE_QUICK,
+    _make_smoke_result,
+)
+from benchmarks.baseline_mlx import run_single as run_baseline
 from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_Grouped
 from benchmarks.candidates.base_candidate import BenchmarkCandidate
 from benchmarks.judge import Judge, VerdictLabel
 from benchmarks.report_generator import ReportGenerator
 from benchmarks.schemas import CandidateResult
-
 
 # ---------------------------------------------------------------------------
 # Smoke A1 result
@@ -263,7 +265,7 @@ def main() -> int:
             print(f"  [{prompt_id}]")
 
             # --- Baseline ---
-            print(f"    baseline ...", end=" ", flush=True)
+            print("    baseline ...", end=" ", flush=True)
             t0 = time.perf_counter()
             baseline = run_baseline(
                 model, tokenizer, model_id, prompt_id, prompt,
@@ -277,7 +279,7 @@ def main() -> int:
             )
 
             # --- A1 ---
-            print(f"    A1 ...", end=" ", flush=True)
+            print("    A1 ...", end=" ", flush=True)
             t0 = time.perf_counter()
             a1 = a1_candidate.run_on_model(
                 model, tokenizer, model_id, prompt_id, prompt,

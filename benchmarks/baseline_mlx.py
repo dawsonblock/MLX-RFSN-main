@@ -35,9 +35,6 @@ kv_cache_memory_mb   estimated FP16 KV size: 2 * layers * heads * head_dim * seq
 from __future__ import annotations
 
 import argparse
-import json
-import math
-import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -49,8 +46,8 @@ import numpy as np
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
 from benchmarks.schemas import CandidateResult
+from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixed prompt set
@@ -355,16 +352,16 @@ def _build_markdown_report(
     smoke: bool,
 ) -> str:
     lines = [
-        f"# RFSN Dense MLX Baseline Report",
-        f"",
+        "# RFSN Dense MLX Baseline Report",
+        "",
         f"**Model:** `{model_id}`  ",
         f"**Generated:** {timestamp}  ",
         f"**Mode:** {'smoke (synthetic)' if smoke else 'real model'}  ",
-        f"",
-        f"## Per-Prompt Results",
-        f"",
-        f"| prompt_id | context_len | output_tokens | prefill_tps | decode_tps | TTFT_ms | total_ms | peak_mb | kv_mb |",
-        f"|---|---|---|---|---|---|---|---|---|",
+        "",
+        "## Per-Prompt Results",
+        "",
+        "| prompt_id | context_len | output_tokens | prefill_tps | decode_tps | TTFT_ms | total_ms | peak_mb | kv_mb |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         def _f(v: float | None, fmt: str = ".1f") -> str:
@@ -467,7 +464,7 @@ def main() -> None:
                 )
 
                 if args.check_determinism:
-                    print(f"    checking determinism ...", end=" ", flush=True)
+                    print("    checking determinism ...", end=" ", flush=True)
                     r2 = run_single(
                         model, tokenizer, model_id, prompt_id, prompt,
                         output_tokens=args.output_tokens, seed=args.seed,

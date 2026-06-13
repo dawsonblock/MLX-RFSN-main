@@ -29,7 +29,6 @@ from typing import Any
 from rfsn_v10.cache.cartesian_codec import CartesianCodec
 from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
-from rfsn_v10.compat import mx
 
 
 class RfsnDirectPackedKVCache:

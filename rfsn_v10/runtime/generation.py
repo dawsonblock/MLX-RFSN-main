@@ -70,6 +70,8 @@ class GenerationResult:
     generation_time_ms: float
     tokens_per_second: float
     telemetry: list[dict] = field(default_factory=list)
+    decode_token_count: int = 0
+    finish_reason: str = ""
 
 
 class RFSNGenerator:
@@ -332,8 +334,8 @@ class RFSNGenerator:
                 # Direct packed-attention path — intercept attention modules.
                 from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
                     RfsnDirectPackedKVCache,
-                    wrap_model_attention,
                     unwrap_model_attention,
+                    wrap_model_attention,
                 )
 
                 caches = [

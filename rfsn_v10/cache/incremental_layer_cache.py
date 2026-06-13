@@ -189,7 +189,6 @@ class QuantizedLayerCache:
         n_full_blocks = stage_T // block_size
         remainder = stage_T % block_size
 
-        import dataclasses
 
         base_offset = self._encoded_tokens
         for i in range(n_full_blocks):

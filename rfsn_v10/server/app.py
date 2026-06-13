@@ -531,13 +531,13 @@ def create_app(config: RFSNConfig | None = None) -> FastAPI:
             {"role": m.role, "content": m.content}
             for m in chat_request.messages
         ]
-        if hasattr(s.tokenizer, "apply_chat_template"):
+        try:
             prompt = str(
                 s.tokenizer.apply_chat_template(  # type: ignore[union-attr]
                     messages, tokenize=False, add_generation_prompt=True,
                 )
             )
-        else:
+        except (AttributeError, TypeError, ValueError):
             # Fallback for tokenizers without chat template
             parts = []
             for m in messages:

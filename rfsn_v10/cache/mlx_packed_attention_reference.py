@@ -12,7 +12,6 @@ from typing import Any
 
 from rfsn_v10.compat import mx
 
-from .cartesian_codec import CartesianCodec
 from .contracts import AttentionScratch
 from .incremental_layer_cache import QuantizedLayerCache
 
