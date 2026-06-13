@@ -15,7 +15,6 @@ from rfsn_v10.compat import mx
 
 from ._common import KernelRouteError
 
-
 # ---------------------------------------------------------------------------
 # Kernel source loading
 # ---------------------------------------------------------------------------
@@ -32,7 +31,7 @@ def _load_metal_source(filename: str) -> str:
         # Fallback for editable installs where package data may not be visible
         module_dir = os.path.dirname(os.path.abspath(__file__))
         filepath = os.path.join(module_dir, "metal", filename)
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, encoding="utf-8") as f:
             return f.read()
 
 

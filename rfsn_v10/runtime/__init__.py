@@ -10,7 +10,6 @@ The stable runtime lives in :mod:`rfsn_v10.runtime.engine`.
 
 from __future__ import annotations
 
-from .engine import RFSNRuntime, TelemetryEvent
 from .adaptive_controller import AdaptiveQuantController
 from .audit import (
     AuditEvent,
@@ -19,6 +18,7 @@ from .audit import (
     check_drift,
     log_audit_event,
 )
+from .engine import RFSNRuntime, TelemetryEvent
 from .scoring_modes import (
     score_attention_fp16,
     score_attention_packed_block,

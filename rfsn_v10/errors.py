@@ -11,7 +11,7 @@ import enum
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 
 class ErrorCode(enum.Enum):
@@ -75,9 +75,9 @@ class RFSNError:
     code: ErrorCode
     message: str
     severity: ErrorSeverity = ErrorSeverity.ERROR
-    timestamp: Optional[datetime] = field(default=None)
-    context: Optional[dict[str, Any]] = field(default=None)
-    stack_trace: Optional[str] = None
+    timestamp: datetime | None = field(default=None)
+    context: dict[str, Any] | None = field(default=None)
+    stack_trace: str | None = None
     recoverable: bool = True
 
     def __post_init__(self):

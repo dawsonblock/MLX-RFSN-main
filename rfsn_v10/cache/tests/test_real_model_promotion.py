@@ -18,10 +18,10 @@ import time
 
 import pytest
 
-from rfsn_v10.cache.tests.test_corpus import get_corpus_prompts, get_corpus_hash
+from rfsn_v10.cache.tests.test_corpus import get_corpus_hash
 
 try:
-    import mlx.core as mx
+    import mlx.core as mx  # noqa: F401
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
@@ -152,7 +152,6 @@ class TestRealModelPromotion:
 
         # dense_shadow_bytes is the temporary reconstruction during attention,
         # not the cache itself. The cache should only have quantized payload.
-        total_accounted = report.get("total_accounted_bytes", 0)
         payload = report.get("payload_bytes", 0)
         staging = report.get("staging_bytes", 0)
         dense_residual = report.get("dense_residual_bytes", 0)

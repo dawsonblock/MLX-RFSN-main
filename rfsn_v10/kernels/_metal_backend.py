@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 
 from ..compat import MLX_AVAILABLE, ensure_mlx_available, mx
-
 from ._common import KernelRouteError
 
 

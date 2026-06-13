@@ -104,7 +104,7 @@ class TestLoggingConfigValidation:
     def test_invalid_format_raises(self):
         """Invalid format should raise ValidationError (if strict)."""
         # Currently only json and text are supported
-        config = RFSNConfig(logging={"format": "xml"})
+        _ = RFSNConfig(logging={"format": "xml"})
         # Should accept any string unless we add validator
 
 

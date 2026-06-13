@@ -16,7 +16,6 @@ validate the compression/decompression pipeline in isolation.
 """
 from __future__ import annotations
 
-import math
 import tempfile
 
 import numpy as np
@@ -24,9 +23,8 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 from rfsn_v10.attention_reference import causal_attention_dense
-
+from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 
 # ---------------------------------------------------------------------------
 # Quality thresholds for stable configs

@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from rfsn_v10.config import RFSNConfig
-from rfsn_v10.server.app import create_app, ServerState
+from rfsn_v10.server.app import ServerState, create_app
 
 
 def _state_with(**overrides) -> ServerState:

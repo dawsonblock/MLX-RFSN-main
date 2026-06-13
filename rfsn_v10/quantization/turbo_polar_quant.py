@@ -10,7 +10,6 @@ import math
 from dataclasses import dataclass
 
 from rfsn_v10.compat import mx
-
 from rfsn_v10.quantization.grouped_cartesian import GroupedCartesianQuantizer
 from rfsn_v10.quantization.polar_quant import PolarQuantizer
 

@@ -124,8 +124,8 @@ class ClickHouseClient:
         self._max_retries = 5
         self._flush_interval = 1.0
         # Use user-specific temp path to avoid conflicts in multi-user systems
-        import tempfile
         import getpass
+        import tempfile
 
         tmpdir = tempfile.gettempdir()
         user = getpass.getuser()

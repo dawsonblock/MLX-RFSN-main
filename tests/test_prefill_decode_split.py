@@ -19,9 +19,8 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 from rfsn_v10.attention_reference import causal_attention_dense
-
+from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 
 # ---------------------------------------------------------------------------
 # Quality thresholds

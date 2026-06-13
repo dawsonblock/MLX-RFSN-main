@@ -20,11 +20,11 @@ process-global SDPA mutation and is safe for concurrent serving.
 from __future__ import annotations
 
 import time
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Iterator
+from typing import Any
 
 from ..config import RFSNConfig, load_config
-
 
 try:
     from ..compat import mx

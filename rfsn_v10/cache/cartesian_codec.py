@@ -73,7 +73,7 @@ class CartesianCodec:
         PackedBlock
             Immutable sealed block with exact payload_bytes().
         """
-        original_shape = tuple(x.shape)
+        _ = tuple(x.shape)  # shape captured in num_elements below
         original_dtype_str = _mlx_dtype_name(x.dtype)
         flat = x.astype(mx.float32).reshape(-1)
         original_size = int(flat.size)
@@ -82,7 +82,7 @@ class CartesianCodec:
         pad = (self.group_size - (original_size % self.group_size)) % self.group_size
         if pad:
             flat = mx.concatenate([flat, mx.zeros((pad,), dtype=mx.float32)])
-        padded_size = int(flat.size)
+        _ = int(flat.size)  # padded size for debugging if needed
 
         # Grouped quantization
         grouped = flat.reshape(-1, self.group_size)

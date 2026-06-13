@@ -16,7 +16,7 @@ except ImportError:
     HAS_MLX = False
 
 
-def _make_identity_tensor(B: int, Hkv: int, T: int, D: int, layer_id: int = 0) -> np.ndarray:
+def _make_identity_tensor(B: int, Hkv: int, T: int, D: int, layer_id: int = 0) -> np.ndarray:  # noqa: N803
     """Create a tensor where each head/token has a unique broadcast value."""
     base = layer_id * 1000
     vals = []
@@ -306,6 +306,39 @@ def test_numpy_attention_matches_manual_computation() -> None:
     k_exp = np.repeat(keys, Hq // Hkv, axis=1)
     v_exp = np.repeat(values, Hq // Hkv, axis=1)
     scores = np.matmul(queries, k_exp.transpose(0, 1, 3, 2)) * (D ** -0.5)
+    max_scores = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores.astype(np.float32) - max_scores)
+    weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+    expected = np.matmul(weights, v_exp)
+    np.testing.assert_allclose(out, expected, atol=1e-4)
+
+
+def test_numpy_attention_multi_block_matches_dense() -> None:
+    """numpy_attention across multiple blocks must match dense reference."""
+    from rfsn_v10.cache.numpy_oracle import NumpyLayerCache
+
+    cache = NumpyLayerCache(staging_capacity=32)
+    B, Hq, Hkv, D = 1, 8, 2, 64
+    scale = D ** -0.5
+
+    all_keys = []
+    all_values = []
+    for _ in range(3):
+        keys = np.random.randn(B, Hkv, 20, D).astype(np.float32)
+        values = np.random.randn(B, Hkv, 20, D).astype(np.float32)
+        cache.append(keys, values)
+        all_keys.append(keys)
+        all_values.append(values)
+
+    queries = np.random.randn(B, Hq, 1, D).astype(np.float32)
+    out = cache.numpy_attention(queries, scale=scale)
+
+    # Dense reference
+    full_k = np.concatenate(all_keys, axis=2)
+    full_v = np.concatenate(all_values, axis=2)
+    k_exp = np.repeat(full_k, Hq // Hkv, axis=1)
+    v_exp = np.repeat(full_v, Hq // Hkv, axis=1)
+    scores = np.matmul(queries, k_exp.transpose(0, 1, 3, 2)) * scale
     max_scores = np.max(scores, axis=-1, keepdims=True)
     exp_scores = np.exp(scores.astype(np.float32) - max_scores)
     weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)

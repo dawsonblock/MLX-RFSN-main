@@ -13,9 +13,9 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+from rfsn_v10 import RFSNRuntime
 from rfsn_v10.attention import AdaptiveBlockSparseAttention
 from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
-from rfsn_v10 import RFSNRuntime
 
 
 def cosine_similarity(a: mx.array, b: mx.array) -> float:

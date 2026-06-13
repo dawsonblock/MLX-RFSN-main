@@ -10,7 +10,6 @@ from pathlib import Path
 
 from rfsn_v11.candidates.logit_capture import compute_token_sequence_hash
 
-
 ARTIFACT_DIRS = [
     Path("artifacts/bench/shootout/quick"),
     Path("artifacts/bench/shootout/full_logit"),

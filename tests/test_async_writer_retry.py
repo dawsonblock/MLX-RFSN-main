@@ -7,12 +7,9 @@ Tests verify:
 """
 from __future__ import annotations
 
-import queue
 import threading
 import time
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from rfsn_v10.async_writer import AsyncWriter, TelemetryBatch
 from rfsn_v10.clickhouse_client import ClickHouseClient

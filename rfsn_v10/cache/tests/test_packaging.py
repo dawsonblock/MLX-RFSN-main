@@ -24,10 +24,10 @@ import pytest
 def test_package_can_import() -> None:
     """Verify the rfsn_v10.cache package is importable."""
     from rfsn_v10.cache import (
+        BlockwiseReferenceAttention,
         CartesianCodec,
         GenerationCacheSession,
         MemoryReport,
-        BlockwiseReferenceAttention,
     )
     assert CartesianCodec is not None
     assert GenerationCacheSession is not None

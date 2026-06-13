@@ -120,14 +120,17 @@ class RfsnQuantizedKVCache:
         return False
 
     def trim(self, n: int) -> int:
-        """Trim the last n tokens from the cache."""
+        """Trim the last n tokens from the cache.
+
+        Partial trim is not yet supported; any trim resets the entire cache.
+        The caller must re-prefill after trimming.
+        """
         n = min(self.offset, n)
-        new_total = self.offset - n
-        if new_total <= 0:
+        if n > 0:
+            # Safe fallback: reset everything since QuantizedLayerCache.trim()
+            # is disabled (raises NotImplementedError).
             self.layer_cache.reset()
-        else:
-            self.layer_cache.trim(new_total)
-        self.offset = new_total
+            self.offset = 0
         return n
 
     # ------------------------------------------------------------------

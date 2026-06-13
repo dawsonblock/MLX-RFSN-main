@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+
 import pytest
 
 try:
@@ -230,7 +231,6 @@ def test_decode_restores_dtype_and_trims_padding() -> None:
 def test_decode_v1_block_no_dtype_restore() -> None:
     """V1 blocks must not have dtype restored (num_elements==0, version==1)."""
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
-    from rfsn_v10.cache.contracts import PackedBlock
 
     codec = CartesianCodec(bits=8, group_size=64)
     x = mx.random.normal(shape=(128, 64)).astype(mx.float32)
@@ -253,8 +253,9 @@ def test_decode_v1_block_no_dtype_restore() -> None:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_v3_block_validate_rejects_negative_token_count() -> None:
-    from rfsn_v10.cache.contracts import PackedBlock
     import mlx.core as mx
+
+    from rfsn_v10.cache.contracts import PackedBlock
 
     block = PackedBlock(
         packed_codes=mx.array([0], dtype=mx.uint32),
@@ -271,8 +272,9 @@ def test_v3_block_validate_rejects_negative_token_count() -> None:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_v3_block_validate_rejects_mismatched_n_values() -> None:
-    from rfsn_v10.cache.contracts import PackedBlock
     import mlx.core as mx
+
+    from rfsn_v10.cache.contracts import PackedBlock
 
     block = PackedBlock(
         packed_codes=mx.array([0] * 32, dtype=mx.uint32),

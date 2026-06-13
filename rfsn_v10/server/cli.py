@@ -133,8 +133,8 @@ def health_check(argv: list[str] | None = None) -> None:
 
     This is the ``rfsn-health`` entry point.
     """
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     parser = argparse.ArgumentParser(
         prog="rfsn-health",

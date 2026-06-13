@@ -9,6 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from rfsn_v11.candidates.artifact_utils import (
     _build_honest_markdown_table,
 )

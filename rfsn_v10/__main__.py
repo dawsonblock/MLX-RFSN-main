@@ -29,8 +29,8 @@ def _cmd_healthcheck() -> int:
                   Exit 2.
     - unhealthy : selected backend unavailable or config invalid.  Exit 1.
     """
-    from rfsn_v10.health import HealthStatus, get_health_checker
     from rfsn_v10.compat import MLX_AVAILABLE
+    from rfsn_v10.health import HealthStatus, get_health_checker
 
     backend = os.environ.get("RFSN_BACKEND", "mlx").lower()
 

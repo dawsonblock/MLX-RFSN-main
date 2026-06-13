@@ -45,22 +45,22 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 import threading
+import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from threading import Thread
-from typing import Any, AsyncIterator
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.responses import StreamingResponse, HTMLResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .._version import __version__
 from ..config import RFSNConfig
 from ..model_loader import load_model_auto
 from ..runtime.generation import GenerationConfig, RFSNGenerator
-
 
 # ---------------------------------------------------------------------------
 # ServerState: all mutable per-app state in one object

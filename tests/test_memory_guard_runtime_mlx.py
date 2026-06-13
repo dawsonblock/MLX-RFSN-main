@@ -7,9 +7,9 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+from rfsn_v10 import RFSNRuntime
 from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 from rfsn_v10.memory_guard import MemoryGuard
-from rfsn_v10 import RFSNRuntime
 
 
 def test_soft_pressure_calls_eviction_callback_with_target_bytes() -> None:

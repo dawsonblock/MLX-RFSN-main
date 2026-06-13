@@ -15,12 +15,12 @@ import json
 import os
 import time
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from rfsn_v10.clickhouse_client import ClickHouseClient
 from rfsn_v10.async_writer import AsyncWriter
+from rfsn_v10.clickhouse_client import ClickHouseClient
 
 
 @pytest.fixture
@@ -172,7 +172,7 @@ class TestTelemetryEndToEnd:
                 success = True
             except RuntimeError:
                 attempt += 1
-                backoff = min(2 ** attempt, 30)
+                _ = min(2 ** attempt, 30)  # backoff
                 time.sleep(0.01)  # Fast for test
 
         assert success

@@ -14,9 +14,8 @@ All measurements use actual array sizes, not estimates.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
-
 
 try:
     import mlx.core as mx
@@ -146,6 +145,7 @@ def measure_process_rss() -> int:
     """Return current process RSS in bytes."""
     try:
         import os
+
         import psutil
         proc = psutil.Process(os.getpid())
         return proc.memory_info().rss

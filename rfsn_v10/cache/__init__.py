@@ -16,12 +16,12 @@ from .cartesian_codec import CartesianCodec, PackedBlock
 # Phase 3 — Layer cache
 from .incremental_layer_cache import QuantizedLayerCache
 
+# Phase 5 — Attention
+from .memory import MemoryReport, measure_metal_peak_memory, measure_process_rss
+from .reference_attention import BlockwiseReferenceAttention
+
 # Phase 4 — Sessions
 from .session import GenerationCacheSession
-
-# Phase 5 — Attention
-from .memory import MemoryReport, measure_process_rss, measure_metal_peak_memory
-from .reference_attention import BlockwiseReferenceAttention
 
 __all__ = [
     "CartesianCodec",

@@ -229,13 +229,11 @@ class QuantizedLayerCache:
 
     def iter_key_blocks(self):
         """Yield each sealed key block for blockwise attention."""
-        for block in self._key_blocks:
-            yield block
+        yield from self._key_blocks
 
     def iter_value_blocks(self):
         """Yield each sealed value block for blockwise attention."""
-        for block in self._value_blocks:
-            yield block
+        yield from self._value_blocks
 
     def get_dense_residual(self) -> tuple[Any | None, Any | None]:
         """Return the dense FP16 residual window, or (None, None)."""
@@ -378,7 +376,7 @@ class QuantizedLayerCache:
         running_max = mx.full((B, Hq, Lq, 1), -1e9, dtype=mx.float32)
         running_sum = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
 
-        def _process_block(k_block: Any, v_block: Any, block_T: int, token_offset: int) -> None:
+        def _process_block(k_block: Any, v_block: Any, block_t: int, token_offset: int) -> None:
             nonlocal output, running_max, running_sum
             if k_block.shape[1] != Hq:
                 repeats = Hq // k_block.shape[1]
@@ -386,14 +384,14 @@ class QuantizedLayerCache:
                 v_block = mx.repeat(v_block, repeats, axis=1)
 
             if mask is not None:
-                block_mask = mask[..., token_offset:token_offset + block_T]
+                block_mask = mask[..., token_offset:token_offset + block_t]
             else:
                 # Causal mask: query at global position q can attend to kv at position kv if q >= kv
                 # Query positions: query_start_pos .. query_start_pos + Lq - 1
                 q_positions = mx.arange(query_start_pos, query_start_pos + Lq)[:, None]
-                kv_positions = mx.arange(token_offset, token_offset + block_T)[None, :]
+                kv_positions = mx.arange(token_offset, token_offset + block_t)[None, :]
                 block_mask = (q_positions >= kv_positions).astype(queries.dtype)
-                block_mask = mx.broadcast_to(block_mask[None, None, :, :], (B, Hq, Lq, block_T))
+                block_mask = mx.broadcast_to(block_mask[None, None, :, :], (B, Hq, Lq, block_t))
 
             scores = mx.matmul(queries.astype(mx.float32), k_block.swapaxes(2, 3)) * scale
             scores = mx.where(block_mask, scores, mx.array(-1e9, dtype=scores.dtype))

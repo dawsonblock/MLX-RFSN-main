@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from rfsn_v10.compat import mx
 import numpy as np
 
 from rfsn_v10.bitpack import BitPackedQuantizer
+from rfsn_v10.compat import mx
 
 
 def _dedupe_and_validate(

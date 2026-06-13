@@ -18,8 +18,8 @@ import pytest
 pytestmark = [pytest.mark.mlx, pytest.mark.experimental]
 mx = pytest.importorskip("mlx.core", reason="MLX not available")
 
-from rfsn_v11.quant.polar.encoder import PolarQuantEncoder
 from rfsn_v11.kernels.turbo_polar.metal import online_attention_dense_v
+from rfsn_v11.quant.polar.encoder import PolarQuantEncoder
 
 
 def _synthetic_kv(

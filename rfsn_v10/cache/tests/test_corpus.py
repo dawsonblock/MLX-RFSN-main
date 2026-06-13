@@ -12,7 +12,6 @@ Covers:
 """
 from __future__ import annotations
 
-
 CORPUS: dict[str, str] = {
     "chat_short": "What is the capital of France?",
     "chat_medium": (

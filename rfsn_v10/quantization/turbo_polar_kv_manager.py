@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from rfsn_v10.compat import mx
-
 from rfsn_v10.quantization.turbo_polar_quant import TurboPolarQuantizer
 
 

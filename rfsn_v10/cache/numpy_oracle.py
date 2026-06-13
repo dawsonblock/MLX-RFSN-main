@@ -10,8 +10,6 @@ Use this to:
 """
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 
 
@@ -127,12 +125,10 @@ class NumpyLayerCache:
     # ------------------------------------------------------------------
 
     def iter_key_blocks(self):
-        for block in self._key_blocks:
-            yield block
+        yield from self._key_blocks
 
     def iter_value_blocks(self):
-        for block in self._value_blocks:
-            yield block
+        yield from self._value_blocks
 
     def get_dense_residual(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         return self._dense_keys, self._dense_values
@@ -302,7 +298,7 @@ class NumpyLayerCache:
         sum_exp = np.zeros((B, Hq, Lq, 1), dtype=np.float32)
         out = np.zeros((B, Hq, Lq, D), dtype=np.float32)
 
-        def _process(k_block: np.ndarray, v_block: np.ndarray, block_T: int) -> None:
+        def _process(k_block: np.ndarray, v_block: np.ndarray, block_t: int) -> None:
             nonlocal m, sum_exp, out
             k_expanded = np.repeat(k_block, repeats, axis=1)
             v_expanded = np.repeat(v_block, repeats, axis=1)

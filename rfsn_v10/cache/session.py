@@ -161,7 +161,7 @@ class GenerationCacheSession:
             lc.reset()
         self._layer_caches.clear()
 
-    def __enter__(self) -> "GenerationCacheSession":
+    def __enter__(self) -> GenerationCacheSession:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:

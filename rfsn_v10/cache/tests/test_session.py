@@ -52,8 +52,8 @@ def test_session_counters() -> None:
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_session_position_ownership() -> None:
     """Each session must own independent, monotonically increasing positions."""
-    from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.session import GenerationCacheSession
 
     k_codec = CartesianCodec(bits=8, group_size=64)
     v_codec = CartesianCodec(bits=5, group_size=64)

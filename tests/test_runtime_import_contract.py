@@ -54,8 +54,9 @@ def test_quantization_subpackage_importable():
 
 def test_runtime_subpackage_importable():
     """rfsn_v10.runtime must be importable as a package (not a module)."""
-    import rfsn_v10.runtime  # noqa: F401
     import importlib
+
+    import rfsn_v10.runtime  # noqa: F401
     spec = importlib.util.find_spec("rfsn_v10.runtime")
     assert spec is not None, "rfsn_v10.runtime not found"
     # The spec origin should point to runtime/__init__.py, not runtime.py

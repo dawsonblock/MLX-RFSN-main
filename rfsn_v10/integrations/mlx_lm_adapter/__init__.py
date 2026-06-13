@@ -16,7 +16,7 @@ Proof counters are tracked in the session and can be inspected after generation.
 from __future__ import annotations
 
 from .adapter import RfsnMLXModelAdapter, RfsnQuantizedKVCache
-from .compatibility import check_mlx_lm_version, MIN_MLX_LM_VERSION
+from .compatibility import MIN_MLX_LM_VERSION, check_mlx_lm_version
 
 __all__ = [
     "RfsnMLXModelAdapter",

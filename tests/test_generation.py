@@ -115,6 +115,7 @@ def test_generator_does_not_mutate_model_layers() -> None:
         tokenizer=FakeTokenizer(),
         enable_quantized_kv=True,
     )
+    _ = gen  # construction is the test
     # No monkeypatch artifacts
     for layer in model.model.layers:
         assert not hasattr(layer.self_attn, "_rfsn_original_call")

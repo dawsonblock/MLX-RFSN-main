@@ -16,7 +16,7 @@ except ImportError:
     HAS_MLX = False
 
 
-def _make_identity_tensor(B: int, Hkv: int, T: int, D: int, layer_id: int = 0) -> "mx.array":
+def _make_identity_tensor(B: int, Hkv: int, T: int, D: int, layer_id: int = 0) -> mx.array:  # noqa: N803
     """Create a tensor where each head/token has a unique, broadcast value.
 
     Every element for a given (head, token) has the same value:
@@ -134,6 +134,7 @@ def test_multiple_appends_and_flush_preserves_identity() -> None:
     full_v = mx.concatenate(value_parts, axis=2)
 
     assert full_k.shape == (B, Hkv, 50, D)
+    assert full_v.shape == (B, Hkv, 50, D)
 
     # Verify ordering: head-major within the concatenated batch
     expected = mx.concatenate(all_keys, axis=2)

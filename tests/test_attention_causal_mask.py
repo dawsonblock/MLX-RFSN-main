@@ -19,8 +19,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from rfsn_v10.attention_reference import causal_attention_dense, _causal_attention_numpy
-
+from rfsn_v10.attention_reference import _causal_attention_numpy, causal_attention_dense
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,9 +59,6 @@ def test_prefill_cannot_attend_future_tokens():
     out = causal_attention_dense(q, k, v, backend="mlx")
     mx.eval(out)
     out_np = _to_np(out)  # [B, H, T_q, D]
-
-    scale = 1.0 / math.sqrt(D)
-    scores = np.einsum("bhqd,bhkd->bhqk", q_np, k_np) * scale  # [B, H, T_q, T_k]
 
     # For each query i, future keys j > i should have near-zero weight
     for i in range(T_q):

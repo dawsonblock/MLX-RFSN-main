@@ -15,7 +15,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock, get_ident
-from typing import Any
+
+# Experimental quantization backends — loaded lazily to avoid importing MLX
+# at package level on systems that do not have MLX installed.
+# TYPE_CHECKING guard keeps mypy/pyright happy without forcing a real import.
+from typing import TYPE_CHECKING, Any
 
 from .bitpack import BitPackedQuantizer
 from .compat import mx
@@ -28,11 +32,6 @@ from .kernels import (
     packed_dequant_wht_sign_metal,
     wht64_metal,
 )
-
-# Experimental quantization backends — loaded lazily to avoid importing MLX
-# at package level on systems that do not have MLX installed.
-# TYPE_CHECKING guard keeps mypy/pyright happy without forcing a real import.
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .quantization.hybrid_polar_cartesian import HybridPolarCartesianQuantizer

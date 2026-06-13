@@ -15,9 +15,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from rfsn_v10.compat import mx
-
 from rfsn_v10.bitpack import BitPackedQuantizer
+from rfsn_v10.compat import mx
 
 from .polar_quant import PackedCodeBuffer
 

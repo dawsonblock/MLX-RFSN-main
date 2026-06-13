@@ -5,13 +5,13 @@ This allows the server to use the new adapter without changing its call sites.
 from __future__ import annotations
 
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnMLXModelAdapter
 
-
 try:
-    import mlx_lm
+    import mlx_lm  # noqa: F401
     MLX_LM_AVAILABLE = True
 except ImportError:
     MLX_LM_AVAILABLE = False
@@ -123,7 +123,7 @@ class RfsnMLXGenerator:
 
         # Use the adapter's generate_step for streaming
         import mlx.core as mx
-        from mlx_lm.utils import make_sampler, make_logits_processors
+        from mlx_lm.utils import make_logits_processors, make_sampler
 
         prompt_ids = mx.array(self.tokenizer.encode(prompt))
         sampler = make_sampler(temperature, top_p, 0.0, 1)
@@ -132,8 +132,8 @@ class RfsnMLXGenerator:
         )
 
         # Build caches via adapter
-        from rfsn_v10.cache.session import GenerationCacheSession
         from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.cache.session import GenerationCacheSession
 
         k_codec = CartesianCodec(bits=self.adapter.key_codec.bits, group_size=self.adapter.key_codec.group_size)
         v_codec = CartesianCodec(bits=self.adapter.value_codec.bits, group_size=self.adapter.value_codec.group_size)

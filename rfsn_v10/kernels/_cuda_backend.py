@@ -13,8 +13,8 @@ class CudaBackend:
     @classmethod
     def available(cls) -> bool:
         try:
-            import triton  # noqa: F401
             import torch  # noqa: F401
+            import triton  # noqa: F401
             return True
         except ImportError:
             return False

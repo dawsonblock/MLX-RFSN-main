@@ -61,12 +61,12 @@ def test_candidate_result_gate_status_values():
     """Allowed gate_status values are enforced."""
     from rfsn_v11.candidates.base import CandidateResult
     from rfsn_v11.candidates.quality_gates import (
-        GATE_STATUS_PASS,
+        GATE_STATUS_ERROR,
         GATE_STATUS_FAIL,
+        GATE_STATUS_PASS,
         GATE_STATUS_PENDING_LOGIT_GATE,
         GATE_STATUS_PENDING_MEMORY_METRICS,
         GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
-        GATE_STATUS_ERROR,
     )
 
     for status in [
@@ -84,7 +84,6 @@ def test_candidate_result_gate_status_values():
 @pytest.mark.unit
 def test_candidate_result_promotion_eligibility_rule():
     """Promotion eligible only when logit and memory gates pass with full metrics."""
-    from rfsn_v11.candidates.base import CandidateResult
     from rfsn_v11.candidates.quality_gates import compute_promotion_eligibility
 
     # Not eligible without logit gate

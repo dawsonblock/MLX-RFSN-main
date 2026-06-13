@@ -202,8 +202,8 @@ def test_geometry_frozen_after_first_append() -> None:
 def test_block_positions_are_monotonic_and_contiguous() -> None:
     """After multiple flushes, block positions must be contiguous."""
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
-    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
     from rfsn_v10.cache.contracts import validate_block_positions
+    from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 
     k_codec = CartesianCodec(bits=8, group_size=64)
     v_codec = CartesianCodec(bits=5, group_size=64)

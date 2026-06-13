@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
-from pathlib import Path
 
 import pytest
 
 from rfsn_v10.clickhouse_client import ClickHouseClient
+
 
 @pytest.fixture(autouse=True)
 def isolate_clickhouse_flush_path(tmp_path, monkeypatch):
