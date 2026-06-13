@@ -71,14 +71,6 @@ CONTROL_POLICIES: dict[str, dict[str, Any]] = {
 }
 
 BASELINE_POLICIES: dict[str, dict[str, Any]] = {
-    "rfsn_v10_k8_v5_gs32": {
-        "candidate_name": "rfsn_v10_k8_v5_gs32",
-        "supports_real_generation": True,
-        "supports_prompt_cache": True,
-        "supports_streaming": True,
-        "supports_state_restore": False,
-        "config": {"default_bits": 8, "group_size": 32},
-    },
     "rfsn_v10_k8_v5_gs64": {
         "candidate_name": "rfsn_v10_k8_v5_gs64",
         "supports_real_generation": True,
@@ -89,11 +81,23 @@ BASELINE_POLICIES: dict[str, dict[str, Any]] = {
     },
 }
 
+LEGACY_POLICIES: dict[str, dict[str, Any]] = {
+    "legacy_k8_v5_gs32": {
+        "candidate_name": "legacy_k8_v5_gs32",
+        "supports_real_generation": True,
+        "supports_prompt_cache": True,
+        "supports_streaming": True,
+        "supports_state_restore": False,
+        "config": {"default_bits": 8, "group_size": 32},
+    },
+}
+
 PROMOTED_POLICIES: dict[str, dict[str, Any]] = {}
 
 _KNOWN_POLICIES: dict[str, dict[str, Any]] = {
     **CONTROL_POLICIES,
     **BASELINE_POLICIES,
+    **LEGACY_POLICIES,
     **PROMOTED_POLICIES,
 }
 

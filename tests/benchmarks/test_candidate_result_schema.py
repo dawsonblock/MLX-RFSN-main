@@ -38,7 +38,7 @@ def test_candidate_result_with_metrics():
     from rfsn_v11.candidates.base import CandidateResult
 
     r = CandidateResult(
-        name="rfsn_v10_k8_v5_gs32",
+        name="rfsn_v10_k8_v5_gs64",
         model_id="qwen2",
         prompt="hello",
         gate_status="PASS",

@@ -425,8 +425,8 @@ def _run_once(
             except Exception:
                 candidate_logprobs = None
         elif candidate.name in (
-            "rfsn_v10_k8_v5_gs32",
             "rfsn_v10_k8_v5_gs64",
+            "legacy_k8_v5_gs32",
             "turbo_polar_k4_qjl64",
         ):
             # RFSN v10 with enable_sparse_decode=True activates the SDPA

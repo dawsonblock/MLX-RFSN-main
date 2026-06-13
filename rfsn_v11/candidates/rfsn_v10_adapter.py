@@ -20,8 +20,11 @@ from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 # Map the human-readable preset names to actual QuantizationConfig kwargs.
 # rfsn_v10.config.RFSNConfig has no from_preset() — we build it directly.
 _PRESET_MAP: dict[str, dict[str, Any]] = {
-    "k8_v5_gs32": {"default_bits": 8, "group_size": 32},
     "k8_v5_gs64": {"default_bits": 8, "group_size": 64},
+}
+
+_LEGACY_PRESETS: dict[str, dict[str, Any]] = {
+    "legacy_k8_v5_gs32": {"default_bits": 8, "group_size": 32},
 }
 
 
@@ -31,10 +34,12 @@ class RFSNV10Candidate(KVCompressionCandidate):
     candidate_status = CandidateStatus.BASELINE
 
     def __init__(self, config_name: str = "k8_v5_gs64") -> None:
-        if config_name not in _PRESET_MAP:
+        all_presets = {**_PRESET_MAP, **_LEGACY_PRESETS}
+        if config_name not in all_presets:
             raise ValueError(
                 f"Unknown rfsn_v10 preset {config_name!r}. "
-                f"Valid: {list(_PRESET_MAP)}"
+                f"Valid canonical: {list(_PRESET_MAP)}; "
+                f"legacy: {list(_LEGACY_PRESETS)}"
             )
         self.config_name = config_name
         self.name = f"rfsn_v10_{config_name}"
@@ -69,7 +74,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
             from rfsn_v10.cache.session import GenerationCacheSession
             from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache
 
-            quant_kwargs = _PRESET_MAP[self.config_name]
+            quant_kwargs = {**_PRESET_MAP, **_LEGACY_PRESETS}[self.config_name]
             bits = quant_kwargs["default_bits"]
             group_size = quant_kwargs["group_size"]
 
@@ -177,7 +182,7 @@ class RFSNV10Candidate(KVCompressionCandidate):
             from rfsn_v10.config import QuantizationConfig, RFSNConfig
             from rfsn_v10.runtime.generation import RFSNGenerator
 
-            quant_kwargs = _PRESET_MAP[self.config_name]
+            quant_kwargs = {**_PRESET_MAP, **_LEGACY_PRESETS}[self.config_name]
             cfg = RFSNConfig(
                 quantization=QuantizationConfig(**quant_kwargs),
             )

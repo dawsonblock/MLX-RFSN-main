@@ -10,6 +10,7 @@ import pytest
 from rfsn_v11.integrations.cache_policy import (
     BASELINE_POLICIES,
     CONTROL_POLICIES,
+    LEGACY_POLICIES,
     PROMOTED_POLICIES,
     create_cache_policy,
     is_promoted_policy,
@@ -23,8 +24,8 @@ def test_control_policies_exist() -> None:
 
 
 def test_baseline_policies_contain_rfsn_v10() -> None:
-    assert "rfsn_v10_k8_v5_gs32" in BASELINE_POLICIES
     assert "rfsn_v10_k8_v5_gs64" in BASELINE_POLICIES
+    assert "legacy_k8_v5_gs32" in LEGACY_POLICIES
 
 
 def test_promoted_policies_empty_after_demotion() -> None:
@@ -48,8 +49,14 @@ def test_create_known_control_policy() -> None:
 
 
 def test_create_known_baseline_policy() -> None:
-    policy = create_cache_policy("rfsn_v10_k8_v5_gs32")
-    assert policy.name == "rfsn_v10_k8_v5_gs32"
+    policy = create_cache_policy("rfsn_v10_k8_v5_gs64")
+    assert policy.name == "rfsn_v10_k8_v5_gs64"
+    assert policy.supports_real_generation is True
+
+
+def test_create_legacy_policy() -> None:
+    policy = create_cache_policy("legacy_k8_v5_gs32")
+    assert policy.name == "legacy_k8_v5_gs32"
     assert policy.supports_real_generation is True
 
 
@@ -69,7 +76,7 @@ def test_create_unknown_policy_with_allow_experimental() -> None:
 
 
 def test_is_promoted_policy_false_for_rfsn_v10_after_demotion() -> None:
-    assert is_promoted_policy("rfsn_v10_k8_v5_gs32") is False
+    assert is_promoted_policy("legacy_k8_v5_gs32") is False
     assert is_promoted_policy("rfsn_v10_k8_v5_gs64") is False
 
 
@@ -86,5 +93,5 @@ def test_list_policies_includes_control_and_promoted() -> None:
     policies = list_policies()
     assert "mlx_lm_fp16" in policies
     assert "mlx_lm_quantized_kv" in policies
-    assert "rfsn_v10_k8_v5_gs32" in policies
+    assert "legacy_k8_v5_gs32" in policies
     assert "rfsn_v10_k8_v5_gs64" in policies
