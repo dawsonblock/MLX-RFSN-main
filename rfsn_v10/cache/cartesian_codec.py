@@ -553,8 +553,8 @@ def _reference_hash_signs(
     for ch in stream_id:
         stream_hash = (stream_hash * 31 + ord(ch)) & 0xFFFFFFFF
     mixed = np.uint32(seed)
-    mixed = np.uint32(mixed ^ np.uint32(layer_id * 0x9E3779B9))
-    mixed = np.uint32(mixed ^ np.uint32(stream_hash))
+    mixed = np.uint32(mixed ^ np.uint32((layer_id * 0x9E3779B9) & 0xFFFFFFFF))
+    mixed = np.uint32(mixed ^ np.uint32(stream_hash & 0xFFFFFFFF))
     seed_val = mx.array(mixed)
 
     # Build signs using the same integer hash as the NumPy backend
