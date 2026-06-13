@@ -236,7 +236,7 @@ class TestPackedBlockV4:
         )
 
         block = PackedBlockV4(
-            packed_codes=np.zeros((1, 2, 64, 11), dtype=np.uint32),
+            packed_codes=np.zeros((1, 2, 64, 16), dtype=np.uint32),
             scales=np.zeros((1, 2, 64, 1), dtype=np.float32),
             format_version=4,
             tensor_layout=TensorLayout.BHTD,
@@ -252,15 +252,16 @@ class TestPackedBlockV4:
             bits=8,
             group_size=64,
             groups_per_vector=1,
-            codes_per_word=6,
-            words_per_vector=11,
+            codes_per_word=4,
+            words_per_vector=16,
             original_value_count=1 * 2 * 64 * 64,
-            padded_value_count=1 * 2 * 64 * 66,
+            padded_value_count=1 * 2 * 64 * 64,
             original_dtype="float16",
             sign_seed=42,
-            sign_algorithm="splitmix64-v1",
+            sign_algorithm="murmur32-avalanche-v1",
             layer_id=0,
             stream_id="K",
+            codec_signature="rfsn-v4-8-64-wht",
         )
         block.validate()
 
@@ -300,6 +301,7 @@ class TestPackedBlockV4:
             sign_algorithm="",
             layer_id=0,
             stream_id="",
+            codec_signature="",
         )
         with pytest.raises(ValueError, match="unsupported PackedBlock format"):
             block.validate()
@@ -315,7 +317,7 @@ class TestPackedBlockV4:
         )
 
         block = PackedBlockV4(
-            packed_codes=np.zeros((1, 1, 64, 11), dtype=np.uint32),
+            packed_codes=np.zeros((1, 1, 64, 16), dtype=np.uint32),
             scales=np.zeros((1, 1, 64, 1), dtype=np.float32),
             format_version=4,
             tensor_layout=TensorLayout.BHTD,
@@ -331,15 +333,16 @@ class TestPackedBlockV4:
             bits=8,
             group_size=64,
             groups_per_vector=1,
-            codes_per_word=6,
-            words_per_vector=11,
+            codes_per_word=4,
+            words_per_vector=16,
             original_value_count=1 * 1 * 64 * 64,
-            padded_value_count=1 * 1 * 64 * 66,
+            padded_value_count=1 * 1 * 64 * 64,
             original_dtype="float16",
             sign_seed=42,
-            sign_algorithm="splitmix64-v1",
+            sign_algorithm="murmur32-avalanche-v1",
             layer_id=0,
             stream_id="K",
+            codec_signature="rfsn-v4-8-64-wht",
         )
         with pytest.raises(ValueError, match="logical range"):
             block.validate()
@@ -371,15 +374,16 @@ class TestPackedBlockV4:
             bits=8,
             group_size=64,
             groups_per_vector=1,
-            codes_per_word=6,
-            words_per_vector=11,
+            codes_per_word=4,
+            words_per_vector=16,
             original_value_count=1 * 1 * 64 * 64,
-            padded_value_count=1 * 1 * 64 * 66,
+            padded_value_count=1 * 1 * 64 * 64,
             original_dtype="float16",
             sign_seed=42,
-            sign_algorithm="splitmix64-v1",
+            sign_algorithm="murmur32-avalanche-v1",
             layer_id=0,
             stream_id="K",
+            codec_signature="rfsn-v4-8-64-wht",
         )
         with pytest.raises(ValueError, match="packed_codes shape mismatch"):
             block.validate()

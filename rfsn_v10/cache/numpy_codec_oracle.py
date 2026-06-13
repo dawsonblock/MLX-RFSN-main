@@ -154,6 +154,12 @@ class NumpyCartesianCodec:
         self.sign_seed = sign_seed
         self.qmax = (1 << (bits - 1)) - 1
 
+    @property
+    def codec_signature(self) -> str:
+        """Canonical signature for decoder compatibility verification."""
+        wht_flag = "wht" if self.use_wht else "raw"
+        return f"rfsn-v4-{self.bits}-{self.group_size}-{wht_flag}"
+
     def encode_bhtd(
         self,
         x: np.ndarray,
@@ -214,7 +220,7 @@ class NumpyCartesianCodec:
             packed = _vector_aligned_pack_numpy(codes_bhtd, self.bits)
             codes_per_word = 32 // self.bits
             words_per_vector = math.ceil(padded_D / codes_per_word)
-            padded_value_count = int(B * H * T * padded_D)
+            padded_value_count = int(B * H * T * words_per_vector * codes_per_word)
         else:
             packed = codes_bhtd
             codes_per_word = 1
@@ -244,9 +250,10 @@ class NumpyCartesianCodec:
             padded_value_count=padded_value_count,
             original_dtype=original_dtype_str,
             sign_seed=self.sign_seed if self.sign_seed != 0 else 0,
-            sign_algorithm="splitmix64-v1",
+            sign_algorithm="murmur32-avalanche-v1",
             layer_id=layer_id,
             stream_id=stream_id,
+            codec_signature=self.codec_signature,
         )
         block.validate()
         return block

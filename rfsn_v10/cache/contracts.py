@@ -169,9 +169,9 @@ class PackedBlockV4:
         return 64
 
     def payload_bytes(self) -> int:
-        if HAS_MLX and self.packed_codes is not None:
-            code_bytes = int(self.packed_codes.size) * 4
-            scale_bytes = int(self.scales.size) * 4
+        if self.packed_codes is not None:
+            code_bytes = int(getattr(self.packed_codes, "size", 0)) * 4
+            scale_bytes = int(getattr(self.scales, "size", 0)) * 4
             return code_bytes + scale_bytes
         return 0
 
@@ -192,6 +192,18 @@ class PackedBlockV4:
             raise ValueError("original value count does not match geometry")
         if self.padded_value_count < self.original_value_count:
             raise ValueError("padded value count is too small")
+        expected_physical_slots = (
+            self.batch_size
+            * self.n_kv_heads
+            * self.token_count
+            * self.words_per_vector
+            * self.codes_per_word
+        )
+        if self.padded_value_count != expected_physical_slots:
+            raise ValueError(
+                f"padded_value_count ({self.padded_value_count}) != expected physical slots "
+                f"({expected_physical_slots})"
+            )
         if self.head_dim % self.group_size != 0:
             raise ValueError("head_dim must be divisible by group_size")
         if self.groups_per_vector != self.head_dim // self.group_size:
@@ -199,6 +211,14 @@ class PackedBlockV4:
         expected_words = math.ceil(self.head_dim / self.codes_per_word)
         if self.words_per_vector != expected_words:
             raise ValueError("words_per_vector mismatch")
+        if self.bits not in (2, 3, 4, 5, 6, 7, 8, 16):
+            raise ValueError(f"unsupported bits: {self.bits}")
+        if self.bits <= 8 and self.codes_per_word != 32 // self.bits:
+            raise ValueError(
+                f"codes_per_word ({self.codes_per_word}) != 32 // bits ({32 // self.bits})"
+            )
+        if not self.codec_signature:
+            raise ValueError("codec_signature must be non-empty")
         expected_code_shape = (
             self.batch_size,
             self.n_kv_heads,

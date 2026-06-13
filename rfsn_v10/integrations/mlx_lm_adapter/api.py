@@ -42,35 +42,50 @@ def import_mlx_lm_utils() -> Any:
 
 
 def import_mlx_lm_generate() -> Any:
-    """Import ``mlx_lm.utils.generate`` after version validation."""
+    """Import ``generate`` after version validation."""
     _ensure_versions()
-    from mlx_lm.utils import generate
+    try:
+        from mlx_lm import generate
+    except ImportError:
+        from mlx_lm.utils import generate
     return generate
 
 
 def import_mlx_lm_generate_step() -> Any:
-    """Import ``mlx_lm.utils.generate_step`` after version validation."""
+    """Import ``generate_step`` after version validation."""
     _ensure_versions()
-    from mlx_lm.utils import generate_step
+    try:
+        from mlx_lm import generate_step
+    except ImportError:
+        from mlx_lm.utils import generate_step
     return generate_step
 
 
 def import_mlx_lm_stream_generate() -> Any:
-    """Import ``mlx_lm.utils.stream_generate`` after version validation."""
+    """Import ``stream_generate`` after version validation."""
     _ensure_versions()
-    from mlx_lm.utils import stream_generate
+    try:
+        from mlx_lm import stream_generate
+    except ImportError:
+        from mlx_lm.utils import stream_generate
     return stream_generate
 
 
 def import_mlx_lm_make_sampler() -> Any:
-    """Import ``mlx_lm.utils.make_sampler`` after version validation."""
+    """Import ``make_sampler`` after version validation."""
     _ensure_versions()
-    from mlx_lm.utils import make_sampler
+    try:
+        from mlx_lm.sample_utils import make_sampler
+    except ImportError:
+        from mlx_lm.utils import make_sampler
     return make_sampler
 
 
 def import_mlx_lm_make_logits_processors() -> Any:
-    """Import ``mlx_lm.utils.make_logits_processors`` after version validation."""
+    """Import ``make_logits_processors`` after version validation."""
     _ensure_versions()
-    from mlx_lm.utils import make_logits_processors
+    try:
+        from mlx_lm.sample_utils import make_logits_processors
+    except ImportError:
+        from mlx_lm.utils import make_logits_processors
     return make_logits_processors

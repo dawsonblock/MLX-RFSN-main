@@ -48,8 +48,8 @@ def _dequantize_raw(block, bits: int, group_size: int) -> np.ndarray:
     return raw.reshape(B, H, T, D)
 
 
-def test_cpu_qk_matches_raw_dequantized() -> None:
-    """CPU QK over packed codes must match QK over raw (non-inverse-transformed) K."""
+def test_cpu_qk_matches_original_domain() -> None:
+    """CPU QK over packed codes must match QK over original (pre-transform) K."""
     from rfsn_v10.cache.numpy_codec_oracle import NumpyCartesianCodec
     from rfsn_v10.kernels.cartesian_cpu_reference import cartesian_qk_cpu_reference
 
@@ -65,17 +65,16 @@ def test_cpu_qk_matches_raw_dequantized() -> None:
     k_codec = NumpyCartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
     k_block = k_codec.encode_bhtd(k, logical_start=0, layer_id=0, stream_id="K")
 
-    # Raw dequantized K (still in WHT+sign domain)
-    k_raw = _dequantize_raw(k_block, bits=8, group_size=64)
+    # Dense attention over the ORIGINAL K
     repeats = Hq // Hkv
-    k_exp = np.repeat(k_raw, repeats, axis=1)
+    k_exp = np.repeat(k, repeats, axis=1)
     scale_factor = D ** -0.5
     dense_scores = np.matmul(
         q.astype(np.float32),
         k_exp.astype(np.float32).transpose(0, 1, 3, 2),
     ) * scale_factor
 
-    # CPU reference QK over packed codes
+    # CPU reference QK over packed codes (inverse-transforms internally)
     cpu_scores = cartesian_qk_cpu_reference(
         q,
         np.array(k_block.packed_codes),
@@ -83,13 +82,15 @@ def test_cpu_qk_matches_raw_dequantized() -> None:
         bits=8,
         group_size=64,
         scale_factor=scale_factor,
+        use_wht=True,
+        sign_seed=42,
     )
 
-    np.testing.assert_allclose(cpu_scores, dense_scores, atol=0.01, rtol=0.01)
+    np.testing.assert_allclose(cpu_scores, dense_scores, atol=0.03, rtol=0.05)
 
 
-def test_cpu_sv_matches_raw_dequantized() -> None:
-    """CPU SV over packed codes must match weighted raw (non-inverse-transformed) V."""
+def test_cpu_sv_matches_original_domain() -> None:
+    """CPU SV over packed codes must match weighted sum over original (pre-transform) V."""
     from rfsn_v10.cache.numpy_codec_oracle import NumpyCartesianCodec
     from rfsn_v10.kernels.cartesian_cpu_reference import cartesian_sv_cpu_reference
 
@@ -107,13 +108,12 @@ def test_cpu_sv_matches_raw_dequantized() -> None:
     v_codec = NumpyCartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
     v_block = v_codec.encode_bhtd(v, logical_start=0, layer_id=0, stream_id="V")
 
-    # Raw dequantized V (still in WHT+sign domain)
-    v_raw = _dequantize_raw(v_block, bits=5, group_size=64)
+    # Dense attention over the ORIGINAL V
     repeats = Hq // Hkv
-    v_exp = np.repeat(v_raw, repeats, axis=1)
+    v_exp = np.repeat(v, repeats, axis=1)
     dense_out = np.matmul(weights.astype(np.float32), v_exp.astype(np.float32))
 
-    # CPU reference SV
+    # CPU reference SV (inverse-transforms internally)
     cpu_out = cartesian_sv_cpu_reference(
         weights,
         np.array(v_block.packed_codes),
@@ -121,6 +121,8 @@ def test_cpu_sv_matches_raw_dequantized() -> None:
         bits=5,
         group_size=64,
         head_dim=D,
+        use_wht=True,
+        sign_seed=42,
     )
 
     np.testing.assert_allclose(cpu_out, dense_out, atol=0.05, rtol=0.01)

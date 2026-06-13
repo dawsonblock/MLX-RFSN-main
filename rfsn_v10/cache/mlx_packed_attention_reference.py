@@ -83,7 +83,7 @@ def attend(
     position_offset = 0
 
     # Online softmax state
-    running_max = mx.full((B, Hq, Lq, 1), -1e9, dtype=mx.float32)
+    running_max = mx.full((B, Hq, Lq, 1), -mx.inf, dtype=mx.float32)
     running_sum = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
     out = mx.zeros((B, Hq, Lq, D), dtype=mx.float32)
 
@@ -103,9 +103,9 @@ def attend(
         ) * s
 
         # Mask
-        if mask is not None:
+        if mask is not None and not isinstance(mask, str):
             scores = scores + mask[..., position_offset:position_offset + region_tokens]
-        elif causal:
+        elif causal or (isinstance(mask, str) and mask.lower() == "causal"):
             # Causal mask: query at global position q can attend to kv at position kv if q >= kv
             q_positions = mx.arange(query_start_pos, query_start_pos + Lq)[:, None]
             kv_positions = mx.arange(position_offset, position_offset + region_tokens)[None, :]
@@ -113,7 +113,7 @@ def attend(
             causal_mask = mx.broadcast_to(
                 causal_mask[None, None, :, :], (B, Hq, Lq, region_tokens)
             )
-            scores = mx.where(causal_mask, scores, mx.array(-1e9, dtype=scores.dtype))
+            scores = mx.where(causal_mask, scores, mx.array(-mx.inf, dtype=scores.dtype))
 
         # Online softmax
         block_max = mx.max(scores, axis=-1, keepdims=True)
@@ -147,7 +147,8 @@ def attend(
     if dense_k is not None:
         _process_region(dense_k, dense_v, dense_k.shape[2])
 
-    output = out / running_sum
+    # Guard against fully-masked rows where running_sum == 0
+    output = mx.where(running_sum == 0, mx.zeros_like(out), out / running_sum)
     output = output.astype(queries.dtype)
 
     scratch = AttentionScratch(

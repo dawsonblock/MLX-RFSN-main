@@ -104,61 +104,93 @@ class RfsnDirectPackedKVCache:
 # Attention wrapper
 # ------------------------------------------------------------------
 
-_original_callers: dict[int, Any] = {}
+_original_attns: dict[int, Any] = {}  # id(layer) -> original attention module
 
 
-def _make_packed_attention_call(
-    original_call: Any,
-    layer_cache: QuantizedLayerCache,
-    key_codec: CartesianCodec,
-    value_codec: CartesianCodec,
-    scale: float,
-) -> Any:
-    """Build a replacement ``__call__`` for an MLX-LM Attention module."""
+class _PackedAttentionWrapper:
+    """Wrapper that intercepts attention calls and routes through packed reference.
 
-    def _packed_attn_call(
-        self: Any,
+    Python resolves ``__call__`` on the *class*, not the instance.  Therefore
+    monkeypatching ``attn.__call__`` does **not** affect ``attn(...)``.  This
+    wrapper class solves the problem by installing a wrapper *instance* whose
+    class defines ``__call__``.
+
+    All attribute accesses (``q_proj``, ``k_proj``, ``rope``, etc.) are
+    transparently delegated to the original attention module.
+    """
+
+    __slots__ = (
+        "_original",
+        "_layer_cache",
+        "_key_codec",
+        "_value_codec",
+        "_scale",
+    )
+
+    def __init__(
+        self,
+        original: Any,
+        layer_cache: QuantizedLayerCache,
+        key_codec: CartesianCodec,
+        value_codec: CartesianCodec,
+        scale: float,
+    ) -> None:
+        self._original = original
+        self._layer_cache = layer_cache
+        self._key_codec = key_codec
+        self._value_codec = value_codec
+        self._scale = scale
+
+    def __call__(
+        self,
         x: Any,  # (B, L, D)
         mask: Any | None = None,
         cache: Any | None = None,
     ) -> Any:
+        # If no cache is provided, fall back to the original attention.
+        # This handles the very first prefill call when MLX-LM has not yet
+        # initialised the per-layer cache objects.
+        if cache is None:
+            return self._original(x, mask=mask, cache=cache)
+
         B, L, D = x.shape
+        attn = self._original
 
         # Original projections
-        queries = self.q_proj(x)
-        keys = self.k_proj(x)
-        values = self.v_proj(x)
+        queries = attn.q_proj(x)
+        keys = attn.k_proj(x)
+        values = attn.v_proj(x)
 
         # Reshape to BHTD
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, attn.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         # RoPE at original offset
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            # Append to our quantized cache (cache is RfsnDirectPackedKVCache)
-            cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+        queries = attn.rope(queries, offset=cache.offset)
+        keys = attn.rope(keys, offset=cache.offset)
+        # Append to our quantized cache (cache is RfsnDirectPackedKVCache)
+        cache.update_and_fetch(keys, values)
 
         # Direct packed attention over the full quantized cache
         output, _ = attend(
             queries,
-            layer_cache,
-            scale=scale,
+            self._layer_cache,
+            scale=self._scale,
             mask=mask,
-            query_start_pos=layer_cache.total_token_count() - L,
+            query_start_pos=self._layer_cache.total_token_count() - L,
             causal=True,
         )
 
         # Reshape back and output projection
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return attn.o_proj(output)
 
-    return _packed_attn_call
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._original, name)
+
+    def __repr__(self) -> str:
+        return f"<_PackedAttentionWrapper wrapping {self._original!r}>"
 
 
 def wrap_model_attention(
@@ -193,28 +225,23 @@ def wrap_model_attention(
         # Try to get actual scale from the attention module
         scale = getattr(attn, "scale", scale)
 
-        original = attn.__call__
-        _original_callers[id(attn)] = original
+        # Save original by layer identity so we can restore even if the
+        # attribute is reassigned between wrap and unwrap.
+        _original_attns[id(layer)] = attn
 
-        wrapped = _make_packed_attention_call(
-            original,
+        wrapper = _PackedAttentionWrapper(
+            attn,
             cache_wrapper.layer_cache,
             key_codec,
             value_codec,
             scale,
         )
-        # Bind the wrapper to the module instance
-        import types
-        attn.__call__ = types.MethodType(wrapped, attn)
+        layer.self_attn = wrapper
 
 
 def unwrap_model_attention(model: Any) -> None:
     """Restore the original attention modules."""
     for layer in getattr(model, "layers", []):
-        attn = getattr(layer, "self_attn", None)
-        if attn is None:
-            continue
-        key = id(attn)
-        if key in _original_callers:
-            original = _original_callers.pop(key)
-            attn.__call__ = original
+        key = id(layer)
+        if key in _original_attns:
+            layer.self_attn = _original_attns.pop(key)

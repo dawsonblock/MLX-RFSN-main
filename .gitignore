@@ -16,3 +16,4 @@ artifacts/local/
 .kilo/
 .tmp/
 *.zip
+_wheel_test/

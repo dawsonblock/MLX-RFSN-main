@@ -82,6 +82,9 @@ def _make_synthetic_baseline(
         fallback_used=False,
         measured_memory=True,
         estimated_memory=False,
+        commit_hash="abc123",
+        corpus_hash="def456",
+        token_sequence_hash="ghi789",
     )
 
 
@@ -96,7 +99,7 @@ def _make_synthetic_a1_high_quality(baseline: CandidateResult) -> CandidateResul
         preconditioner="wht",
         quantizer="grouped_sym",
         key_bits=8.0,
-        value_bits=4.0,
+        value_bits=5.0,
         group_size=64,
         logit_cosine=0.9975,
         top1_match_rate=0.98,
@@ -129,6 +132,9 @@ def _make_synthetic_a1_high_quality(baseline: CandidateResult) -> CandidateResul
         fallback_used=False,
         measured_memory=True,
         estimated_memory=False,
+        commit_hash="abc123",
+        corpus_hash="def456",
+        token_sequence_hash="ghi789",
     )
 
 

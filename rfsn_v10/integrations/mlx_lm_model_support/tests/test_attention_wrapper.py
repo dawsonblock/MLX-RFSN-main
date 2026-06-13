@@ -75,10 +75,11 @@ def test_direct_packed_cache_state_injection_raises() -> None:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_wrap_and_unwrap_model_attention() -> None:
-    """Wrap and unwrap must restore the original __call__."""
+    """Wrap must intercept normal ``attn(...)`` calls; unwrap must restore original."""
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
     from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
         RfsnDirectPackedKVCache,
+        _PackedAttentionWrapper,
         wrap_model_attention,
         unwrap_model_attention,
     )
@@ -86,9 +87,28 @@ def test_wrap_and_unwrap_model_attention() -> None:
     k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
     v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
 
-    # Create a minimal fake model
+    class FakeLinear:
+        def __call__(self, x):
+            return x
+
+    class FakeRope:
+        def __call__(self, x, offset=0):
+            return x
+
     class FakeAttn:
+        def __init__(self):
+            self.n_heads = 2
+            self.n_kv_heads = 2
+            self.scale = 0.125
+            self.q_proj = FakeLinear()
+            self.k_proj = FakeLinear()
+            self.v_proj = FakeLinear()
+            self.o_proj = FakeLinear()
+            self.rope = FakeRope()
+            self.call_count = 0
+
         def __call__(self, x, mask=None, cache=None):
+            self.call_count += 1
             return x
 
     class FakeLayer:
@@ -105,14 +125,38 @@ def test_wrap_and_unwrap_model_attention() -> None:
         for i in range(2)
     ]
 
-    original_func = model.layers[0].self_attn.__call__.__func__ if hasattr(model.layers[0].self_attn.__call__, '__func__') else model.layers[0].self_attn.__call__
+    original_attn = model.layers[0].self_attn
+    original_call_count = original_attn.call_count
+
     wrap_model_attention(model, caches)
-    wrapped_func = model.layers[0].self_attn.__call__.__func__ if hasattr(model.layers[0].self_attn.__call__, '__func__') else model.layers[0].self_attn.__call__
-    assert wrapped_func is not original_func
+
+    # Wrap replaces the instance with a _PackedAttentionWrapper
+    assert isinstance(model.layers[0].self_attn, _PackedAttentionWrapper)
+    assert model.layers[0].self_attn._original is original_attn
+
+    # Calling with normal ``attn(...)`` syntax must route through the wrapper,
+    # NOT through the original FakeAttn.__call__.
+    x = mx.random.normal(shape=(1, 2, 128)).astype(mx.float32)
+    result = model.layers[0].self_attn(x, mask=None, cache=caches[0])
+
+    # Original FakeAttn.__call__ should never have been invoked.
+    assert original_attn.call_count == original_call_count
+
+    # The cache should have received the 2 tokens from the call.
+    assert caches[0].offset == 2
+    assert caches[0].layer_cache.total_token_count() == 2
+
+    # Result should be an MLX array (not the unmodified x)
+    assert hasattr(result, "shape")
 
     unwrap_model_attention(model)
-    restored_func = model.layers[0].self_attn.__call__.__func__ if hasattr(model.layers[0].self_attn.__call__, '__func__') else model.layers[0].self_attn.__call__
-    assert restored_func is original_func
+
+    # After unwrap, the original attention is restored.
+    assert model.layers[0].self_attn is original_attn
+
+    # Calling the restored original should now increment call_count.
+    model.layers[0].self_attn(x, mask=None, cache=caches[0])
+    assert original_attn.call_count == original_call_count + 1
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")

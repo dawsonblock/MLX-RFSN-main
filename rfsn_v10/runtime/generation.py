@@ -102,6 +102,7 @@ class RFSNGenerator:
         group_size: int = 64,
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
+        packed_reference: bool = False,
         # Deprecated no-ops (kept for backward compatibility)
         enable_sparse_decode: bool = False,
         audit_mode: bool = False,
@@ -119,11 +120,16 @@ class RFSNGenerator:
             group_size: Group size for symmetric quantization.
             staging_capacity: Tokens accumulated before encoding a sealed block.
             dense_residual_window: Keep last N tokens in dense FP16 (0 disables).
+            packed_reference: If True, use the direct packed-attention wrapper
+                instead of dense-reconstruction fallback.  This bypasses the
+                model's native attention and runs blockwise quantized attention
+                directly.  Only effective when ``enable_quantized_kv=True``.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or load_config()
         self.enable_quantized_kv = enable_quantized_kv
+        self.packed_reference = packed_reference
 
         self._adapter = None
         if MLX_LM_AVAILABLE and enable_quantized_kv:
@@ -136,6 +142,7 @@ class RFSNGenerator:
                 group_size=group_size,
                 staging_capacity=staging_capacity,
                 dense_residual_window=dense_residual_window,
+                use_direct_packed=packed_reference,
             )
 
         self._telemetry_log: list[dict] = []
@@ -321,7 +328,45 @@ class RFSNGenerator:
         )
 
         if self._adapter is not None and self.enable_quantized_kv:
-            # Explicit per-layer cache path — no monkeypatching.
+            if self.packed_reference:
+                # Direct packed-attention path — intercept attention modules.
+                from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+                    RfsnDirectPackedKVCache,
+                    wrap_model_attention,
+                    unwrap_model_attention,
+                )
+
+                caches = [
+                    RfsnDirectPackedKVCache(
+                        layer_id=i,
+                        key_codec=self._adapter.key_codec,
+                        value_codec=self._adapter.value_codec,
+                        staging_capacity=self._adapter.staging_capacity,
+                        dense_residual_window=self._adapter.dense_residual_window,
+                    )
+                    for i in range(self._adapter.num_layers)
+                ]
+                wrap_model_attention(self.model, caches)
+                try:
+                    gen_iter = _mlx_stream_generate(
+                        self.model,
+                        self.tokenizer,
+                        prompt=prompt,
+                        prompt_cache=caches,
+                        **gen_kwargs,
+                    )
+                    yield from gen_iter
+                finally:
+                    unwrap_model_attention(self.model)
+                    self._last_counters = {
+                        "direct_packed_tokens": sum(
+                            c.layer_cache.total_token_count() for c in caches
+                        )
+                        // self._adapter.num_layers,
+                    }
+                return
+
+            # Explicit per-layer cache path — dense reconstruction fallback.
             from ..integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache
 
             session = self._adapter._new_session()

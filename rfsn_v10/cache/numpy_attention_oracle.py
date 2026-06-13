@@ -32,6 +32,7 @@ def numpy_packed_attention(
     *,
     scale: float,
     query_start_pos: int = 0,
+    causal: bool = False,
     additive_mask: np.ndarray | None = None,
     stage_k: np.ndarray | None = None,
     stage_v: np.ndarray | None = None,
@@ -52,6 +53,8 @@ def numpy_packed_attention(
         Attention scale (typically ``head_dim ** -0.5``).
     query_start_pos
         Global sequence position of the first query token.
+    causal
+        If True, apply a causal mask when *additive_mask* is None.
     additive_mask
         Optional additive mask of shape ``(Lq, total_kv_tokens)``.
     stage_k, stage_v
@@ -82,7 +85,7 @@ def numpy_packed_attention(
     repeats = Hq // Hkv
 
     # Online softmax state
-    running_max = np.full((B, Hq, Lq, 1), -1e9, dtype=np.float32)
+    running_max = np.full((B, Hq, Lq, 1), -np.inf, dtype=np.float32)
     running_sum = np.zeros((B, Hq, Lq, 1), dtype=np.float32)
     out = np.zeros((B, Hq, Lq, D), dtype=np.float32)
 
@@ -107,6 +110,14 @@ def numpy_packed_attention(
         if additive_mask is not None:
             mask_slice = additive_mask[..., token_offset:token_offset + block_T]
             scores = scores + mask_slice
+        elif causal:
+            q_positions = np.arange(query_start_pos, query_start_pos + Lq)[:, None]
+            kv_positions = np.arange(token_offset, token_offset + block_T)[None, :]
+            causal_mask = q_positions >= kv_positions
+            causal_mask = np.broadcast_to(
+                causal_mask[None, None, :, :], (B, Hq, Lq, block_T)
+            )
+            scores = np.where(causal_mask, scores, -np.inf)
 
         # Online softmax update for this block
         block_max = np.max(scores, axis=-1, keepdims=True)
@@ -138,8 +149,8 @@ def numpy_packed_attention(
     if dense_k is not None:
         _process_block(dense_k, dense_v)
 
-    # Normalize
-    output = out / running_sum
+    # Normalize — guard against fully-masked rows where running_sum == 0
+    output = np.where(running_sum == 0, 0.0, out / running_sum)
     return output.astype(queries.dtype)
 
 

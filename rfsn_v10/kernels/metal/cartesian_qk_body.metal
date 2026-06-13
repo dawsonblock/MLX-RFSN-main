@@ -1,0 +1,54 @@
+    int bits = bits_buf[0];
+    int group_size = group_buf[0];
+    float scale_factor = scale_buf[0];
+    int B = b_buf[0];
+    int Hq = hq_buf[0];
+    int Hkv = hkv_buf[0];
+    int Lq = lq_buf[0];
+    int Lkv = lkv_buf[0];
+    int D = d_buf[0];
+
+    int b = thread_position_in_grid.z;
+    int hq = thread_position_in_grid.y;
+    int k_pos = thread_position_in_grid.x;
+
+    if (b >= B || hq >= Hq || k_pos >= Lkv) return;
+
+    int hkv = hq * Hkv / Hq;
+
+    int kv_offset = ((b * Hkv + hkv) * Lkv + k_pos);
+
+    int codes_per_word = 32 / bits;
+    int words_per_vec = (D + codes_per_word - 1) / codes_per_word;
+    int mask = (1 << bits) - 1;
+    int qmax = (1 << (bits - 1)) - 1;
+    int n_groups = (D + group_size - 1) / group_size;
+
+    // Precompute scale offset for this (b, hkv, k_pos) — per-token scales
+    int scale_base = ((b * Hkv + hkv) * Lkv + k_pos) * n_groups;
+
+    for (int q_pos = 0; q_pos < Lq; ++q_pos) {
+        int q_offset = ((b * Hq + hq) * Lq + q_pos) * D;
+
+        float score = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            int word_idx = d / codes_per_word;
+            int bit_offset = (d % codes_per_word) * bits;
+
+            int packed_idx = kv_offset * words_per_vec + word_idx;
+            uint32_t word = packed_codes[packed_idx];
+            int code = int((word >> bit_offset) & mask);
+
+            int group_idx = d / group_size;
+            float scale = scales[scale_base + group_idx];
+            float k_val = (float(code) - float(qmax)) * scale;
+
+            float q_val = queries[q_offset + d];
+            score += q_val * k_val;
+        }
+
+        score *= scale_factor;
+
+        int out_idx = ((b * Hq + hq) * Lq + q_pos) * Lkv + k_pos;
+        scores[out_idx] = score;
+    }

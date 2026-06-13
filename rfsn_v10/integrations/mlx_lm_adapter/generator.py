@@ -49,6 +49,7 @@ class RfsnMLXGenerator:
         group_size: int = 64,
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
+        packed_reference: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.adapter: RfsnMLXReferenceAdapter | None = None
@@ -70,6 +71,7 @@ class RfsnMLXGenerator:
                 group_size=group_size,
                 staging_capacity=staging_capacity,
                 dense_residual_window=dense_residual_window,
+                use_direct_packed=packed_reference,
             )
             self.adapter_availability = AdapterAvailability(
                 requested=True,
@@ -158,7 +160,10 @@ class RfsnMLXGenerator:
 
         # Use the adapter's generate_step for streaming
         import mlx.core as mx
-        from mlx_lm.utils import make_logits_processors, make_sampler
+        try:
+            from mlx_lm.sample_utils import make_logits_processors, make_sampler
+        except ImportError:
+            from mlx_lm.utils import make_logits_processors, make_sampler
 
         prompt_ids = mx.array(self.tokenizer.encode(prompt))
         sampler = make_sampler(temperature, top_p, 0.0, 1)
@@ -193,7 +198,10 @@ class RfsnMLXGenerator:
         ]
 
         # Use mlx_lm generate_step
-        from mlx_lm.utils import generate_step
+        try:
+            from mlx_lm import generate_step
+        except ImportError:
+            from mlx_lm.utils import generate_step
         for token, _ in generate_step(
             prompt_ids,
             self.adapter.model,

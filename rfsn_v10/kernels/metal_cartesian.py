@@ -64,7 +64,7 @@ def cartesian_qk_metal(
     B, Hq, Lq, D = queries.shape
     _, Hkv, Lkv, _ = packed_codes.shape
 
-    source = _load_metal_source("cartesian_qk.metal")
+    source = _load_metal_source("cartesian_qk_body.metal")
 
     kernel = mx.fast.metal_kernel(
         name="cartesian_qk",
@@ -132,7 +132,7 @@ def cartesian_sv_metal(
     _, Hkv, _, _ = packed_codes.shape
     D = head_dim
 
-    source = _load_metal_source("cartesian_sv.metal")
+    source = _load_metal_source("cartesian_sv_body.metal")
 
     kernel = mx.fast.metal_kernel(
         name="cartesian_sv",

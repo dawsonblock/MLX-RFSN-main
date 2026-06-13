@@ -185,11 +185,11 @@ class Judge:
         improvement_notes: list[str] = []
 
         # ---- Phase 1 governance checks (before any quality gates) ----
+        # Governance is fail-closed: violations always produce REJECT.
         gov = self._check_governance(candidate)
         if gov:
-            label = VerdictLabel.REJECT if self.strict else VerdictLabel.KEEP_EXPERIMENTAL
             return Verdict(
-                label=label,
+                label=VerdictLabel.REJECT,
                 candidate_name=candidate.candidate_name,
                 model_id=candidate.model_id,
                 prompt_id=candidate.prompt_id,
@@ -325,15 +325,51 @@ class Judge:
         )
 
     def _check_governance(self, candidate: CandidateResult) -> str:
-        """Return a failure reason string, or empty string if clean."""
+        """Return a failure reason string, or empty string if clean.
+
+        Governance is **always** enforced (fail-closed).  Violations produce
+        ``REJECT`` regardless of *strict* mode.
+        """
         if candidate.run_type == "synthetic":
             return "synthetic runs are ineligible for promotion"
+        if candidate.run_type not in ("real_model", "smoke"):
+            return f"unknown run_type '{candidate.run_type}' is ineligible"
         if candidate.fallback_used:
             return "fallback execution is ineligible for promotion"
         if candidate.estimated_memory and not candidate.measured_memory:
             return "estimated memory without measurement is ineligible"
+        if not candidate.measured_memory:
+            return "unmeasured memory is ineligible for promotion"
         if candidate.source_type != "installed_wheel":
             return "installed-wheel execution required for promotion"
+        if (
+            candidate.requested_backend != "unknown"
+            and candidate.executed_backend != "unknown"
+            and candidate.requested_backend != candidate.executed_backend
+        ):
+            return (
+                f"backend mismatch: requested '{candidate.requested_backend}' "
+                f"but executed '{candidate.executed_backend}'"
+            )
+        if candidate.executed_backend == "reference":
+            return "dense-reference backend is ineligible for promotion"
+
+        # Canonical format enforcement (K8/V5/gs64)
+        if candidate.key_bits is not None and candidate.key_bits != 8:
+            return f"noncanonical key_bits={candidate.key_bits} (required 8)"
+        if candidate.value_bits is not None and candidate.value_bits != 5:
+            return f"noncanonical value_bits={candidate.value_bits} (required 5)"
+        if candidate.group_size is not None and candidate.group_size != 64:
+            return f"noncanonical group_size={candidate.group_size} (required 64)"
+
+        # Evidence hash completeness
+        if not candidate.commit_hash:
+            return "empty commit_hash is ineligible"
+        if not candidate.corpus_hash:
+            return "empty corpus_hash is ineligible"
+        if not candidate.token_sequence_hash:
+            return "empty token_sequence_hash is ineligible"
+
         return ""
 
     def _check_proof_counters(self, candidate: CandidateResult) -> list[str]:

@@ -224,6 +224,7 @@ class RfsnMLXReferenceAdapter:
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
         strict: bool = False,
+        use_direct_packed: bool = False,
     ) -> None:
         if not HAS_MLX:
             raise RuntimeError("MLX is not installed")
@@ -231,6 +232,7 @@ class RfsnMLXReferenceAdapter:
         self.model = model
         self.tokenizer = tokenizer
         self.strict = strict
+        self.use_direct_packed = use_direct_packed
 
         if num_layers is None:
             num_layers = len(getattr(model, "layers", []))
@@ -245,7 +247,7 @@ class RfsnMLXReferenceAdapter:
 
         # Session (created per generation, not persisted)
         self._session: GenerationCacheSession | None = None
-        self._cache_list: list[RfsnQuantizedKVCache] = []
+        self._cache_list: list[Any] = []
 
     # ------------------------------------------------------------------
     # Generation
@@ -265,7 +267,48 @@ class RfsnMLXReferenceAdapter:
         if not HAS_MLX:
             raise RuntimeError("MLX is not installed")
 
-        from mlx_lm.utils import generate
+        try:
+            from mlx_lm import generate
+        except ImportError:
+            from mlx_lm.utils import generate
+
+        if self.use_direct_packed:
+            from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+                RfsnDirectPackedKVCache,
+                wrap_model_attention,
+                unwrap_model_attention,
+            )
+            caches = [
+                RfsnDirectPackedKVCache(
+                    layer_id=i,
+                    key_codec=self.key_codec,
+                    value_codec=self.value_codec,
+                    staging_capacity=self.staging_capacity,
+                    dense_residual_window=self.dense_residual_window,
+                )
+                for i in range(self.num_layers)
+            ]
+            wrap_model_attention(self.model, caches)
+            try:
+                text = generate(
+                    self.model,
+                    self.tokenizer,
+                    prompt,
+                    verbose=verbose,
+                    prompt_cache=caches,
+                    max_tokens=max_tokens,
+                    **generate_kwargs,
+                )
+                return text
+            finally:
+                unwrap_model_attention(self.model)
+                self._last_counters = {
+                    "direct_packed_tokens": sum(
+                        c.layer_cache.total_token_count() for c in caches
+                    )
+                    // self.num_layers,
+                }
+            return text  # type: ignore[unreachable]
 
         session = self._new_session()
         try:
@@ -305,7 +348,49 @@ class RfsnMLXReferenceAdapter:
         if not HAS_MLX:
             raise RuntimeError("MLX is not installed")
 
-        from mlx_lm.utils import generate_step
+        try:
+            from mlx_lm import generate_step
+        except ImportError:
+            from mlx_lm.utils import generate_step
+
+        if self.use_direct_packed:
+            from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+                RfsnDirectPackedKVCache,
+                wrap_model_attention,
+                unwrap_model_attention,
+            )
+            caches = [
+                RfsnDirectPackedKVCache(
+                    layer_id=i,
+                    key_codec=self.key_codec,
+                    value_codec=self.value_codec,
+                    staging_capacity=self.staging_capacity,
+                    dense_residual_window=self.dense_residual_window,
+                )
+                for i in range(self.num_layers)
+            ]
+            wrap_model_attention(self.model, caches)
+            try:
+                prompt_ids = (
+                    prompt if isinstance(prompt, mx.array)
+                    else mx.array(self.tokenizer.encode(prompt))
+                )
+                yield from generate_step(
+                    prompt_ids,
+                    self.model,
+                    max_tokens=max_tokens,
+                    prompt_cache=caches,
+                    **generate_kwargs,
+                )
+            finally:
+                unwrap_model_attention(self.model)
+                self._last_counters = {
+                    "direct_packed_tokens": sum(
+                        c.layer_cache.total_token_count() for c in caches
+                    )
+                    // self.num_layers,
+                }
+            return
 
         session = self._new_session()
         try:
