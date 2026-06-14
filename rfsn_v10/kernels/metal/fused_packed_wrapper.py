@@ -1,9 +1,31 @@
-"""Metal kernel wrapper for fused packed attention.
+"""Metal kernel scaffold for fused packed attention.
 
-Phase 8.28: Build fused Metal runtime (one layer-level dispatch)
-Phase 8.29: Compare Metal kernel against direct-packed MLX reference
+P0 #7: This is a scaffold, not a functional implementation.
 
-This module provides a Python interface to the Metal fused packed attention kernel.
+The Metal kernel is not yet implemented. This wrapper provides:
+- A Python interface structure for future Metal implementation
+- CPU fallback for testing
+- Comparison infrastructure for future validation
+
+TODO sections remain in the Metal source file:
+- Cartesian decoding is not implemented
+- Online softmax is not implemented
+- Packed traversal is not implemented
+- Output values are written as zeros
+
+The proper progression is:
+1. Implement packed descriptor parsing
+2. Decode K in Metal
+3. Decode V in Metal
+4. Compute QK
+5. Apply scale and mask
+6. Maintain online-softmax state
+7. Accumulate weighted V
+8. Handle staging and dense residual
+9. Write final output
+10. Compare against the MLX packed reference
+
+A Metal test must execute and pass on Apple hardware. A skipped test is not evidence.
 """
 from __future__ import annotations
 
@@ -51,7 +73,7 @@ class FusedPackedAttentionMetal:
         """Load the Metal kernel from .metal file."""
         # TODO: Implement actual Metal kernel loading
         # This would:
-        # 1. Load fused_packed_attention.metal
+        # 1. Load fused_packed_attention_scaffold.metal
         # 2. Compile the kernel
         # 3. Create compute pipeline
         self._kernel_loaded = False

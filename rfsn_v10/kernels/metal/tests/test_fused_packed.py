@@ -1,7 +1,13 @@
-"""Tests for fused Metal packed attention kernel.
+"""Tests for fused Metal packed attention kernel scaffold.
 
-Phase 8.28: Build fused Metal runtime (one layer-level dispatch)
-Phase 8.29: Compare Metal kernel against direct-packed MLX reference
+P0 #7: This is a scaffold, not a functional implementation.
+
+The Metal kernel is not yet implemented. These tests verify:
+- Wrapper initialization
+- CPU fallback behavior
+- Comparison infrastructure (using CPU fallback)
+
+Real Metal execution tests are skipped until the kernel is implemented.
 """
 from __future__ import annotations
 
@@ -72,15 +78,18 @@ def test_fused_packed_comparison():
     assert metrics["passed"] is True
 
 
-@pytest.mark.skip(reason="Requires actual Metal kernel implementation")
+@pytest.mark.skip(reason="P0 #7: Metal kernel is a scaffold, not implemented")
 def test_fused_packed_metal_execution():
     """Test actual Metal kernel execution.
     
-    This test is skipped until the Metal kernel is fully implemented.
-    When implemented, it should:
+    P0 #7: This test is skipped because the Metal kernel is a scaffold.
+    
+    When the kernel is actually implemented, this test should:
     1. Load the Metal kernel
     2. Execute on GPU
     3. Compare against CPU reference
     4. Verify numerical accuracy
+    
+    A skipped test is not evidence of a working implementation.
     """
     pass
