@@ -38,7 +38,7 @@ Ratio    : 1.875 / 4           = 0.46875 → 53.125% reduction (passes 30% gate)
 
 For D=128: 240 bytes vs 512 FP16 bytes → compression_factor ≈ 2.13×
 
-Candidate name: A1_wht_grouped_k8v5_gs64
+Candidate name: A1_wht_grouped_k8v4_gs64
 """
 from __future__ import annotations
 
