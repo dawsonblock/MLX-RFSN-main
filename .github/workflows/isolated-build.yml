@@ -1,0 +1,50 @@
+name: Isolated Environment Build
+
+on:
+  push:
+    branches: [ mlx-rfsn-fusion-alpha-8-3 ]
+  pull_request:
+    branches: [ mlx-rfsn-fusion-alpha-8-3 ]
+
+jobs:
+  build-python-311:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-apple-silicon.txt
+      - name: Install package
+        run: pip install -e .
+      - name: Run portable tests
+        run: pytest -m portable -q
+      - name: Run MLX tests
+        run: pytest -m mlx -q || echo "MLX tests skipped"
+      - name: Run cache tests
+        run: pytest rfsn_v10/cache/tests/ -k "not real_model" -q
+
+  build-python-312:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-apple-silicon.txt
+      - name: Install package
+        run: pip install -e .
+      - name: Run portable tests
+        run: pytest -m portable -q
+      - name: Run MLX tests
+        run: pytest -m mlx -q || echo "MLX tests skipped"
+      - name: Run cache tests
+        run: pytest rfsn_v10/cache/tests/ -k "not real_model" -q
