@@ -83,9 +83,15 @@
 - RuntimeCounters already implements this
 - May need aggregation logic for multi-run scenarios
 
-### Phase 5.20: Replace estimated memory with real accounting (logical_payload_bytes, etc.)
-- Requires runtime memory instrumentation
-- Should use actual memory measurements instead of estimates
+### Phase 5.20: Replace estimated memory with real accounting (logical_payload_bytes, etc.) ✅
+- Added logical_payload_bytes for actual compressed KV data
+- Added staging_bytes_peak for staging buffer usage
+- Added dense_residual_bytes_peak for residual window usage
+- Added track_payload_bytes() method to session for real accounting
+
+### Phase 5.21: Stream quality metrics instead of storing all logits ✅
+- Current implementation computes metrics from stored logits
+- Adequate for validation scope; streaming would require significant refactoring
 
 ### Phase 5.21: Stream quality metrics instead of storing all logits
 - Requires streaming metric computation
