@@ -34,6 +34,7 @@ class CandidateResult:
     # Memory
     actual_kv_memory_mb: float | None = None
     working_set_memory_mb: float | None = None
+    measurement_kind: str = "ESTIMATED"  # P0 #8: Distinguish ESTIMATED vs RUNTIME_COUNTERS
 
     # Compression
     size_ratio: float | None = None  # compressed / baseline

@@ -257,7 +257,9 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             gen_tokens = max(len(tokens), 1)
             tps = gen_tokens / (total_ms / 1000)
 
-            actual_kv_memory_mb = estimate_kv_memory_mb(
+            # P0 #8: Remove actual_ label from estimated memory
+            # This is an analytical estimate, not a runtime measurement
+            estimated_kv_memory_mb = estimate_kv_memory_mb(
                 model, tokenizer, prompt, gen_tokens,
                 bits=self.key_bits,  # Use key_bits for estimate
             )
@@ -311,13 +313,14 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=result_text,
-                actual_kv_memory_mb=actual_kv_memory_mb,
+                actual_kv_memory_mb=estimated_kv_memory_mb,  # P0 #8: Keep field name for compatibility, but value is estimated
+                measurement_kind="ESTIMATED",  # P0 #8: Mark as estimated
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 promotion_eligible=False,
                 cache_backend_used="rfsn_v10_direct_packed",
-                notes="Direct packed attention with K8/V8 quantization (strict mode)",
+                notes="Direct packed attention with K8/V8 quantization (strict mode) [memory is estimated, not runtime-measured]",
                 packed_attention_calls=packed_attention_calls,
                 dense_fallback_calls=dense_fallback_calls,
                 packed_bytes_read=packed_bytes_read,
