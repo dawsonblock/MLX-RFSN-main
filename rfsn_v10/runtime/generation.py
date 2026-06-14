@@ -144,6 +144,7 @@ class RFSNGenerator:
                 group_size=group_size,
                 staging_capacity=staging_capacity,
                 dense_residual_window=dense_residual_window,
+                strict=self.config.runtime.strict_packed_mode,
                 use_direct_packed=packed_reference,
             )
 

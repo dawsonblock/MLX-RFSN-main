@@ -286,6 +286,8 @@ class RfsnMLXReferenceAdapter:
                 install_packed_attention,
                 is_model_wrapped,
             )
+            # Create session for direct packed path
+            self._session = self._new_session()
             caches = [
                 RfsnDirectPackedKVCache(
                     layer_id=i,
@@ -294,6 +296,7 @@ class RfsnMLXReferenceAdapter:
                     staging_capacity=self.staging_capacity,
                     dense_residual_window=self.dense_residual_window,
                     strict=self.strict,
+                    session=self._session,
                 )
                 for i in range(self.num_layers)
             ]
@@ -314,8 +317,15 @@ class RfsnMLXReferenceAdapter:
                 )
                 // self.num_layers,
             }
+            # Capture runtime counters from session
+            if self._session:
+                self._last_counters["runtime_counters"] = self._session.runtime_counters
+            # Destroy session
+            if self._session:
+                self._session.destroy()
             return text
 
+        # Dense reconstruction path
         session = self._new_session()
         try:
             # Build cache list for this generation

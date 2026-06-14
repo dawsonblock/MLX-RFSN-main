@@ -52,12 +52,14 @@ class QuantizedLayerCache:
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
         layer_id: int = 0,
+        session: Any = None,
     ) -> None:
         self.key_codec = key_codec
         self.value_codec = value_codec
         self.staging_capacity = staging_capacity
         self.dense_residual_window = dense_residual_window
         self.layer_id = layer_id
+        self.session = session
 
         # Immutable sealed blocks
         self._key_blocks: list[PackedBlock] = []

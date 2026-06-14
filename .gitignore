@@ -17,3 +17,4 @@ artifacts/local/
 .tmp/
 *.zip
 _wheel_test/
+rfsn_v10/_version.py

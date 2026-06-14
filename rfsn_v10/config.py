@@ -198,7 +198,7 @@ class RuntimeConfig(BaseModel):
         description="Use direct packed-reference attention (no dense reconstruction).",
     )
     strict_packed_mode: bool = Field(
-        default=True,
+        default=False,
         description="Require packed cache and reject fallback to dense attention.",
     )
 

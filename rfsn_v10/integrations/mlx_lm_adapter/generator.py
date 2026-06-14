@@ -50,6 +50,7 @@ class RfsnMLXGenerator:
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
         packed_reference: bool = False,
+        strict: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.adapter: RfsnMLXReferenceAdapter | None = None
@@ -71,6 +72,7 @@ class RfsnMLXGenerator:
                 group_size=group_size,
                 staging_capacity=staging_capacity,
                 dense_residual_window=dense_residual_window,
+                strict=strict,
                 use_direct_packed=packed_reference,
             )
             self.adapter_availability = AdapterAvailability(

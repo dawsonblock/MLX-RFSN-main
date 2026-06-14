@@ -49,6 +49,7 @@ class GenerationCacheSession:
                 staging_capacity=staging_capacity,
                 dense_residual_window=dense_residual_window,
                 layer_id=i,
+                session=self,
             )
             for i in range(num_layers)
         }

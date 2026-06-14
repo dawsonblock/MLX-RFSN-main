@@ -171,11 +171,15 @@ def _make_smoke_result(
         attention_time_ms=rng.uniform(0.5, 2.0),
         generated_text=f"[smoke] Generated {output_tokens} tokens for prompt {prompt_id!r}.",
         notes="synthetic smoke data — no real model used",
-        source_type="installed_wheel",
+        source_type="synthetic",
+        run_type="smoke",
+        promotion_eligible=False,
         commit_hash="smoke",
         corpus_hash="smoke",
         token_sequence_hash="smoke",
-        measured_memory=True,
+        measured_memory=False,
+        requested_backend="unknown",
+        executed_backend="unknown",
     )
 
 

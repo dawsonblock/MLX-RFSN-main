@@ -49,6 +49,7 @@ class RfsnDirectPackedKVCache:
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
         strict: bool = False,
+        session: Any = None,
     ) -> None:
         self.layer_id = layer_id
         self.strict = strict
@@ -58,6 +59,7 @@ class RfsnDirectPackedKVCache:
             staging_capacity=staging_capacity,
             dense_residual_window=dense_residual_window,
             layer_id=layer_id,
+            session=session,
         )
         self.offset: int = 0
 
@@ -68,10 +70,6 @@ class RfsnDirectPackedKVCache:
         returned dense history and instead calls ``attend()`` on the
         ``QuantizedLayerCache`` directly.
         """
-        if self.strict and (self.layer_cache.total_token_count() == 0):
-            # Strict mode: require that cache has some content before proceeding
-            # This prevents silent fallback to dense attention
-            pass
         self.layer_cache.append(keys, values)
         self.offset = self.layer_cache.total_token_count()
         return keys, values
@@ -157,7 +155,7 @@ class _PackedAttentionWrapper(nn.Module):
     """
 
     def __init__(
-        self, original: Any, scale: float, strict: bool = False
+        self, original: Any, scale: float, strict: bool = False, layer_id: int | None = None
     ) -> None:
         super().__init__()
         # Copy all dict entries (parameters, submodules, arrays) so that
@@ -178,6 +176,7 @@ class _PackedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_strict", strict)
         object.__setattr__(self, "_fallback_count", 0)
         object.__setattr__(self, "_executed_backend", "unknown")
+        object.__setattr__(self, "_layer_id", layer_id)
 
     def __call__(
         self,
@@ -228,6 +227,10 @@ class _PackedAttentionWrapper(nn.Module):
             causal=True,
         )
 
+        # Increment backend call counter in session
+        if hasattr(layer_cache, "session") and layer_cache.session is not None:
+            layer_cache.session.runtime_counters.packed_reference_calls += 1
+
         # Reshape back and output projection
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -238,6 +241,15 @@ class _PackedAttentionWrapper(nn.Module):
 
     def __repr__(self) -> str:
         return f"<_PackedAttentionWrapper wrapping {self._original!r}>"
+
+    def get_backend_stats(self) -> dict[str, Any]:
+        """Return backend execution statistics."""
+        return {
+            "layer_id": self._layer_id,
+            "executed_backend": self._executed_backend,
+            "fallback_count": self._fallback_count,
+            "strict": self._strict,
+        }
 
 
 def install_packed_attention(
@@ -280,7 +292,7 @@ def install_packed_attention(
         # Attention scale — always present on MLX-LM attention modules.
         scale = getattr(attn, "scale", 1.0)
 
-        wrapper = _PackedAttentionWrapper(attn, scale, strict=strict)
+        wrapper = _PackedAttentionWrapper(attn, scale, strict=strict, layer_id=i)
         layer.self_attn = wrapper
 
 
@@ -290,6 +302,16 @@ def uninstall_packed_attention(model: Any) -> None:
         attn = getattr(layer, "self_attn", None)
         if isinstance(attn, _PackedAttentionWrapper):
             layer.self_attn = attn._original
+
+
+def collect_backend_stats(model: Any) -> list[dict[str, Any]]:
+    """Collect backend execution statistics from all wrapped attention layers."""
+    stats = []
+    for layer in getattr(model, "layers", []):
+        attn = getattr(layer, "self_attn", None)
+        if isinstance(attn, _PackedAttentionWrapper):
+            stats.append(attn.get_backend_stats())
+    return stats
 
 
 def is_model_wrapped(model: Any) -> bool:

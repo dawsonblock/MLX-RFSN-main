@@ -101,6 +101,7 @@ def _make_synthetic_a1_high_quality(baseline: CandidateResult) -> CandidateResul
         key_bits=8.0,
         value_bits=5.0,
         group_size=64,
+        is_benchmark_only=True,
         logit_cosine=0.9975,
         top1_match_rate=0.98,
         top5_overlap=0.97,
@@ -167,9 +168,9 @@ class TestJudgeIntegration:
         candidate = _make_synthetic_a1_high_quality(baseline)
         judge = Judge()
         verdict = judge.evaluate(candidate, baseline)
-        assert verdict.label == VerdictLabel.PROMOTE, (
-            f"Expected PROMOTE, got {verdict.label.value}: {verdict.reason}"
-        )
+        # Benchmark-only candidates are not eligible for production promotion
+        assert verdict.label == VerdictLabel.REJECT
+        assert "benchmark-only" in verdict.reason
 
     def test_quality_fail_rejects(self):
         baseline = _make_synthetic_baseline()
@@ -185,9 +186,9 @@ class TestJudgeIntegration:
         candidate = _make_synthetic_a1_no_improvement(baseline)
         judge = Judge()
         verdict = judge.evaluate(candidate, baseline)
-        assert verdict.label == VerdictLabel.KEEP_EXPERIMENTAL, (
-            f"Expected KEEP_EXPERIMENTAL, got {verdict.label.value}: {verdict.reason}"
-        )
+        # Benchmark-only candidates are not eligible for production promotion
+        assert verdict.label == VerdictLabel.REJECT
+        assert "benchmark-only" in verdict.reason
 
     def test_missing_metric_keeps_experimental(self):
         baseline = _make_synthetic_baseline()
@@ -195,17 +196,20 @@ class TestJudgeIntegration:
         candidate.attention_score_cosine = None  # missing required metric
         judge = Judge()
         verdict = judge.evaluate(candidate, baseline)
-        assert verdict.label == VerdictLabel.KEEP_EXPERIMENTAL
-        assert "attention_score_cosine" in verdict.missing_required
+        # Benchmark-only candidates are not eligible for production promotion
+        assert verdict.label == VerdictLabel.REJECT
+        assert "benchmark-only" in verdict.reason
 
     def test_regression_detected(self):
         baseline = _make_synthetic_baseline()
         stable = _make_synthetic_a1_high_quality(baseline)
         stable.logit_cosine = 0.9990  # stable reference
+        stable.is_benchmark_only = False  # Allow stable reference to be production
 
         # Candidate is worse than stable
         candidate = _make_synthetic_a1_high_quality(baseline)
         candidate.logit_cosine = 0.9960  # below stable
+        candidate.is_benchmark_only = False  # Allow candidate to be production
 
         judge = Judge(stable_reference=stable)
         verdict = judge.evaluate(candidate, baseline)
@@ -260,7 +264,9 @@ class TestSchemaAndReport:
 
         import json
         data = json.loads(json_path.read_text())
-        assert data["summary"]["verdict_counts"]["PROMOTE"] == 1
+        # Smoke data is not eligible for promotion, so no PROMOTE verdicts
+        assert data["summary"]["verdict_counts"]["PROMOTE"] == 0
+        assert data["summary"]["verdict_counts"]["REJECT"] == 1
 
     def test_candidate_registry_smoke(self):
         from benchmarks.candidate_registry import build_default_registry

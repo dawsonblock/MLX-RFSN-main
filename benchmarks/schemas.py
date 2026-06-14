@@ -46,6 +46,7 @@ class CandidateResult:
     residual_length: Optional[int] = None
     snapkv_enabled: bool = False
     paged_cache_enabled: bool = False
+    is_benchmark_only: bool = False  # True for benchmark-only candidates (e.g., A1 with MLX limitations)
 
     # ------------------------------------------------------------------
     # Quality metrics (vs dense baseline logits)
@@ -140,6 +141,7 @@ class CandidateResult:
     executed_backend: str = "unknown"               # e.g. "metal", "reference", "fallback"
     metal_executed: bool = False
     fallback_used: bool = False
+    promotion_eligible: bool = True                 # False for smoke/benchmark-only data
     commit_hash: str = ""
     corpus_hash: str = ""
     token_sequence_hash: str = ""

@@ -367,16 +367,15 @@ class Judge:
             return f"unknown_layer_events={counters['unknown_layer_events']} > 0"
 
         # Canonical format enforcement (K8/V5/gs64 for production)
-        # A1 benchmark is allowed to use V4 due to MLX mx.quantize limitations
+        # Benchmark-only candidates (e.g., A1 with MLX limitations) are exempt
         if candidate.key_bits is not None and candidate.key_bits != 8:
             return f"noncanonical key_bits={candidate.key_bits} (required 8)"
         if candidate.value_bits is not None:
-            # A1 benchmark candidates are allowed to use V4 due to MLX limitations
-            is_a1_candidate = candidate.candidate_name.startswith("A1")
-            if not is_a1_candidate and candidate.value_bits != 5:
-                return f"noncanonical value_bits={candidate.value_bits} (required 5 for production, V4 only allowed for A1)"
-            if is_a1_candidate and candidate.value_bits not in (4, 5):
-                return f"noncanonical value_bits={candidate.value_bits} (A1 requires 4 or 5)"
+            # Benchmark-only candidates are allowed to use V4 due to MLX limitations
+            if not candidate.is_benchmark_only and candidate.value_bits != 5:
+                return f"noncanonical value_bits={candidate.value_bits} (required 5 for production, V4 only allowed for benchmark-only candidates)"
+            if candidate.is_benchmark_only and candidate.value_bits not in (4, 5):
+                return f"noncanonical value_bits={candidate.value_bits} (benchmark-only requires 4 or 5)"
         if candidate.group_size is not None and candidate.group_size != 64:
             return f"noncanonical group_size={candidate.group_size} (required 64)"
 
@@ -398,6 +397,14 @@ class Judge:
                 return "value_bits is required for promotion"
             if candidate.group_size is None:
                 return "group_size is required for promotion"
+
+        # Smoke data is not eligible for production promotion
+        if not candidate.promotion_eligible:
+            return "candidate is not eligible for production promotion"
+
+        # Benchmark-only candidates are not eligible for production promotion
+        if candidate.is_benchmark_only:
+            return "benchmark-only candidates are not eligible for production promotion"
 
         return ""
 
