@@ -168,8 +168,26 @@ class NumpyCartesianCodec:
     @property
     def codec_signature(self) -> str:
         """Canonical signature for decoder compatibility verification."""
-        wht_flag = "wht" if self.use_wht else "raw"
-        return f"rfsn-v4-{self.bits}-{self.group_size}-{wht_flag}"
+        from .contracts import (
+            PackingLayout,
+            Preconditioner,
+            ScaleLayout,
+            TensorLayout,
+        )
+
+        preconditioner = (
+            Preconditioner.WHT64_HASH_SIGN_V1
+            if self.use_wht
+            else Preconditioner.NONE
+        )
+        sign_algorithm = "murmur32-avalanche-v1"
+        return (
+            f"rfsn-v4-{self.bits}-{self.group_size}-"
+            f"{preconditioner.value}-{sign_algorithm}-{self.sign_seed}-"
+            f"{PackingLayout.VECTOR_ALIGNED_UINT32_V4.value}-"
+            f"{ScaleLayout.BHTG_V4.value}-"
+            f"{TensorLayout.BHTD.value}"
+        )
 
     def encode_bhtd(
         self,
@@ -277,6 +295,13 @@ class NumpyCartesianCodec:
             raise ValueError(f"Unsupported PackedBlock version: {block.format_version}")
         if block.bits != self.bits:
             raise ValueError(f"Block bits={block.bits}, codec bits={self.bits}")
+
+        # Strict signature validation
+        if block.codec_signature and block.codec_signature != self.codec_signature:
+            raise ValueError(
+                f"Codec signature mismatch: block has {block.codec_signature}, "
+                f"codec expects {self.codec_signature}"
+            )
 
         # Convert MLX arrays to NumPy if needed
         packed_codes = block.packed_codes

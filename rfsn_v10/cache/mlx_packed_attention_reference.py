@@ -81,15 +81,16 @@ def attend(
     max_block_tokens = 0
     position_offset = 0
 
-    # Online softmax state
-    # Initialise to -1e9 (finite) so that exp(running_max - new_max) never
-    # hits the NaN-producing -inf - (-inf) case, even for fully-masked blocks.
-    running_max = mx.full((B, Hq, Lq, 1), -1e9, dtype=mx.float32)
+    # Online softmax state with explicit valid-mass tracking.
+    # Initialising running_max to -inf and tracking has_mass avoids the
+    # NaN-producing -inf - (-inf) case on fully-masked blocks.
+    running_max = mx.full((B, Hq, Lq, 1), -mx.inf, dtype=mx.float32)
     running_sum = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
     out = mx.zeros((B, Hq, Lq, D), dtype=mx.float32)
+    has_mass = mx.zeros((B, Hq, Lq, 1), dtype=mx.bool_)
 
     def _process_region(k_bhtd: Any, v_bhtd: Any, region_tokens: int) -> None:
-        nonlocal running_max, running_sum, out, position_offset, max_block_tokens
+        nonlocal running_max, running_sum, out, has_mass, position_offset, max_block_tokens
         max_block_tokens = max(max_block_tokens, region_tokens)
 
         # GQA repeat if needed
@@ -118,20 +119,24 @@ def attend(
         elif isinstance(mask, str):
             raise ValueError(f"unrecognized mask string: {mask!r}")
 
-        # Online softmax with direct exp(scores - new_max) to avoid NaN
-        # when block_max is -inf (fully-masked block).
+        # Online softmax — explicit valid-mass tracking for fully-masked blocks.
         block_max = mx.max(scores, axis=-1, keepdims=True)
         new_max = mx.maximum(running_max, block_max)
         old_scale = mx.exp(running_max - new_max)
+        # Guard exp(-inf - (-inf)) => NaN on rows with no valid mass yet.
+        old_scale = mx.where(mx.isfinite(old_scale), old_scale, 1.0)
 
         running_sum = running_sum * old_scale
         out = out * old_scale
 
         block_exp = mx.exp(scores.astype(mx.float32) - new_max)
+        # Zero out exp(NaN) from masked positions when new_max is also -inf.
+        block_exp = mx.where(mx.isfinite(block_exp), block_exp, 0.0)
         running_sum = running_sum + mx.sum(block_exp, axis=-1, keepdims=True)
         out = out + mx.matmul(block_exp, v_bhtd.astype(mx.float32))
 
         running_max = new_max
+        has_mass = mx.logical_or(has_mass, mx.any(mx.isfinite(scores), axis=-1, keepdims=True))
         position_offset += region_tokens
 
     # Sealed blocks (use decode_bhtd directly)
@@ -150,8 +155,8 @@ def attend(
     if dense_k is not None:
         _process_region(dense_k, dense_v, dense_k.shape[2])
 
-    # Guard against fully-masked rows where running_sum == 0
-    output = mx.where(running_sum == 0, mx.zeros_like(out), out / running_sum)
+    # Fully-masked rows return defined zero output.
+    output = mx.where(has_mass, out / running_sum, mx.zeros_like(out))
     output = output.astype(queries.dtype)
 
     scratch = AttentionScratch(

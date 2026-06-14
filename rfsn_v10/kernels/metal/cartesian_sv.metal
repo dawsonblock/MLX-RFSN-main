@@ -1,6 +1,11 @@
 // Cartesian SV kernel for grouped symmetric quantization.
 // One thread computes one output coordinate (b, hq, q_pos, d).
 //
+// FIXME: This kernel computes a weighted sum of V_packed values, where
+// V_packed is in the transform domain (WHT + hash signs).  The accumulated
+// result must be inverse-transformed before writing to output.  See
+// cartesian_sv_body.metal for details.
+//
 // Generated signature:
 //   device const float*    weights       [[buffer(0)]]
 //   device const uint32_t* packed_codes   [[buffer(1)]]

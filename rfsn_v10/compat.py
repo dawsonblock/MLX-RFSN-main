@@ -4,9 +4,11 @@ from __future__ import annotations
 
 try:
     import mlx.core as _mx
+    import mlx.nn as _nn
 
     MLX_AVAILABLE = True
     mx = _mx
+    nn = _nn
 except Exception:
     MLX_AVAILABLE = False
 
@@ -15,6 +17,16 @@ except Exception:
             raise AttributeError(name)
 
     mx = _MissingMLXModule()
+
+    class _MissingNNModule:
+        class Module:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __setattr__(self, name, value):
+                object.__setattr__(self, name, value)
+
+    nn = _MissingNNModule()
 
 
 def ensure_mlx_available() -> None:

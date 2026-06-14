@@ -432,11 +432,12 @@ class QuantizedLayerCache:
         # fuse dequant + matmul inside the shader.
 
         output = mx.zeros((B, Hq, Lq, D), dtype=mx.float32)
-        running_max = mx.full((B, Hq, Lq, 1), -1e9, dtype=mx.float32)
+        running_max = mx.full((B, Hq, Lq, 1), -mx.inf, dtype=mx.float32)
         running_sum = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
+        has_mass = mx.zeros((B, Hq, Lq, 1), dtype=mx.bool_)
 
         def _process_block(k_block: Any, v_block: Any, block_t: int, token_offset: int) -> None:
-            nonlocal output, running_max, running_sum
+            nonlocal output, running_max, running_sum, has_mass
             if k_block.shape[1] != Hq:
                 repeats = Hq // k_block.shape[1]
                 k_block = mx.repeat(k_block, repeats, axis=1)
@@ -459,17 +460,20 @@ class QuantizedLayerCache:
             block_max = mx.max(scores, axis=-1, keepdims=True)
             new_max = mx.maximum(running_max, block_max)
             old_scale = mx.exp(running_max - new_max)
+            # Guard exp(-inf - (-inf)) => NaN on rows with no valid mass yet.
+            old_scale = mx.where(mx.isfinite(old_scale), old_scale, 1.0)
 
             running_sum = running_sum * old_scale
             output = output * old_scale
 
             # Compute block contributions relative to the new global max.
-            # new_max is always finite (running_max is initialised to -1e9),
-            # so exp(scores - new_max) is safe even for fully-masked rows.
             block_exp = mx.exp(scores.astype(mx.float32) - new_max)
+            # Zero out exp(NaN) from masked positions when new_max is also -inf.
+            block_exp = mx.where(mx.isfinite(block_exp), block_exp, 0.0)
             running_sum = running_sum + mx.sum(block_exp, axis=-1, keepdims=True)
             output = output + mx.matmul(block_exp, v_block.astype(mx.float32))
             running_max = new_max
+            has_mass = mx.logical_or(has_mass, mx.any(mx.isfinite(scores), axis=-1, keepdims=True))
 
         token_offset = 0
         for kb, vb in zip(self._key_blocks, self._value_blocks):
@@ -492,8 +496,8 @@ class QuantizedLayerCache:
             dense_T = self._dense_token_count
             _process_block(dense_k, dense_v, dense_T, token_offset)
 
-        # Guard against fully-masked rows where running_sum == 0
-        output = mx.where(running_sum == 0, mx.zeros_like(output), output / running_sum)
+        # Fully-masked rows return defined zero output.
+        output = mx.where(has_mass, output / running_sum, mx.zeros_like(output))
         return output.astype(queries.dtype)
 
     # ------------------------------------------------------------------

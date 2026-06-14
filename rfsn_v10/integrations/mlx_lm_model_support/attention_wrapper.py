@@ -29,6 +29,7 @@ from typing import Any
 from rfsn_v10.cache.cartesian_codec import CartesianCodec
 from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
+from rfsn_v10.compat import nn
 
 
 class RfsnDirectPackedKVCache:
@@ -73,13 +74,42 @@ class RfsnDirectPackedKVCache:
     def state(self) -> tuple[Any, ...]:
         """Eval-able state for ``mx.eval`` during chunked prefill.
 
-        Returns the current staging tensors so that ``mx.eval`` forces
-        computation without materialising dense history.
+        Returns every live tensor (sealed packed codes and scales, staging
+        K/V, and dense residual K/V) so that ``mx.eval`` forces computation
+        without materialising dense history.
         """
+        tensors: list[Any] = []
+
+        # Sealed key blocks
+        for block in self.layer_cache.iter_key_blocks():
+            if block.packed_codes is not None:
+                tensors.append(block.packed_codes)
+            if block.scales is not None:
+                tensors.append(block.scales)
+
+        # Sealed value blocks
+        for block in self.layer_cache.iter_value_blocks():
+            if block.packed_codes is not None:
+                tensors.append(block.packed_codes)
+            if block.scales is not None:
+                tensors.append(block.scales)
+
+        # Staging buffers
         stage_k, stage_v, stage_n = self.layer_cache.get_staging()
-        if stage_n > 0 and stage_k is not None and stage_v is not None:
-            return (stage_k, stage_v)
-        return ()
+        if stage_n > 0:
+            if stage_k is not None:
+                tensors.append(stage_k)
+            if stage_v is not None:
+                tensors.append(stage_v)
+
+        # Dense residual window
+        dense_k, dense_v = self.layer_cache.get_dense_residual()
+        if dense_k is not None:
+            tensors.append(dense_k)
+        if dense_v is not None:
+            tensors.append(dense_v)
+
+        return tuple(tensors)
 
     @state.setter
     def state(self, v: Any) -> None:
@@ -111,23 +141,37 @@ class RfsnDirectPackedKVCache:
 # Attention wrapper
 # ------------------------------------------------------------------
 
-class _PackedAttentionWrapper:
+class _PackedAttentionWrapper(nn.Module):
     """Wrapper that intercepts attention calls and routes through packed reference.
 
-    Python resolves ``__call__`` on the *class*, not the instance.  Therefore
-    monkeypatching ``attn.__call__`` does **not** affect ``attn(...)``.  This
-    wrapper class solves the problem by installing a wrapper *instance* whose
-    class defines ``__call__``.
-
-    All attribute accesses (``q_proj``, ``k_proj``, ``rope``, etc.) are
-    transparently delegated to the original attention module.
+    Subclasses ``mlx.nn.Module`` so that the original attention subtree
+    remains visible in MLX's parameter and module tree.  All dict entries
+    and instance attributes from the original module are copied into the
+    wrapper, preserving exact parameter paths.
     """
 
-    __slots__ = ("_original", "_scale")
+    def __init__(
+        self, original: Any, scale: float, strict: bool = False
+    ) -> None:
+        super().__init__()
+        # Copy all dict entries (parameters, submodules, arrays) so that
+        # parameter paths like ``model.layers[0].self_attn.q_proj.weight``
+        # remain valid after wrapping.
+        for k, v in original.items():
+            self[k] = v
 
-    def __init__(self, original: Any, scale: float) -> None:
-        self._original = original
-        self._scale = scale
+        # Copy instance attributes that MLX stores outside the dict
+        # (ints, floats, callables, etc.).  Skip MLX internal flags.
+        for k, v in original.__dict__.items():
+            if k not in ("_no_grad", "_training"):
+                object.__setattr__(self, k, v)
+
+        # Keep a private reference to the original for uninstall.
+        object.__setattr__(self, "_original", original)
+        object.__setattr__(self, "_scale", scale)
+        object.__setattr__(self, "_strict", strict)
+        object.__setattr__(self, "_fallback_count", 0)
+        object.__setattr__(self, "_executed_backend", "unknown")
 
     def __call__(
         self,
@@ -136,31 +180,36 @@ class _PackedAttentionWrapper:
         cache: Any | None = None,
     ) -> Any:
         # If no cache is provided, or the cache is not our packed cache,
-        # fall back to the original attention.  This handles:
-        #   - The very first prefill call when MLX-LM has not yet
-        #     initialised the per-layer cache objects.
-        #   - Any caller that passes a non-packed cache.
+        # handle according to strictness.
         if not isinstance(cache, RfsnDirectPackedKVCache):
+            if self._strict:
+                raise RuntimeError(
+                    "Strict packed mode: received non-packed cache or no cache; "
+                    "dense fallback is disabled."
+                )
+            object.__setattr__(self, "_fallback_count", self._fallback_count + 1)
+            object.__setattr__(self, "_executed_backend", "dense")
             return self._original(x, mask=mask, cache=cache)
 
         B, L, D = x.shape
-        attn = self._original
 
-        # Original projections
-        queries = attn.q_proj(x)
-        keys = attn.k_proj(x)
-        values = attn.v_proj(x)
+        # Original projections (copied into self, so direct access works)
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
 
         # Reshape to BHTD
-        queries = queries.reshape(B, L, attn.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         # RoPE at original offset
-        queries = attn.rope(queries, offset=cache.offset)
-        keys = attn.rope(keys, offset=cache.offset)
+        queries = self.rope(queries, offset=cache.offset)
+        keys = self.rope(keys, offset=cache.offset)
         # Append to our quantized cache (cache is RfsnDirectPackedKVCache)
         cache.update_and_fetch(keys, values)
+
+        object.__setattr__(self, "_executed_backend", "packed")
 
         # Direct packed attention over the full quantized cache
         layer_cache = cache.layer_cache
@@ -175,16 +224,13 @@ class _PackedAttentionWrapper:
 
         # Reshape back and output projection
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return attn.o_proj(output)
+        return self.o_proj(output)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._original, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name in self.__slots__:
-            super().__setattr__(name, value)
-        else:
-            setattr(self._original, name, value)
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return super().__getattr__(name)
 
     def __repr__(self) -> str:
         return f"<_PackedAttentionWrapper wrapping {self._original!r}>"
@@ -193,6 +239,7 @@ class _PackedAttentionWrapper:
 def install_packed_attention(
     model: Any,
     caches: list[RfsnDirectPackedKVCache],
+    strict: bool = False,
 ) -> None:
     """Install packed attention wrappers permanently on *model*.
 
@@ -207,6 +254,9 @@ def install_packed_attention(
         An MLX-LM model (e.g. Qwen2Model).
     caches
         One ``RfsnDirectPackedKVCache`` per layer, in layer order.
+    strict
+        If ``True``, the wrapper raises instead of silently falling back
+        to dense attention when the cache is missing or of the wrong type.
     """
     layers = getattr(model, "layers", [])
     if len(layers) != len(caches):
@@ -226,7 +276,7 @@ def install_packed_attention(
         # Attention scale — always present on MLX-LM attention modules.
         scale = getattr(attn, "scale", 1.0)
 
-        wrapper = _PackedAttentionWrapper(attn, scale)
+        wrapper = _PackedAttentionWrapper(attn, scale, strict=strict)
         layer.self_attn = wrapper
 
 

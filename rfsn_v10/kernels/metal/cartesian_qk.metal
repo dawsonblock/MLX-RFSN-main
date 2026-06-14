@@ -2,6 +2,11 @@
 // One thread computes scores for one KV token position (b, hq, k_pos)
 // across ALL query positions (q_pos = 0 .. Lq-1).
 //
+// FIXME: This kernel computes dot(Q, K_packed) where K_packed is in the
+// transform domain (WHT + hash signs).  For correctness when use_wht or
+// sign_seed is active, K must be inverse-transformed back to the original
+// domain before the dot product.  See cartesian_qk_body.metal for details.
+//
 // Dispatch grid: (Lkv, Hq, B)
 //
 // Generated signature by mlx.core.fast.metal_kernel:

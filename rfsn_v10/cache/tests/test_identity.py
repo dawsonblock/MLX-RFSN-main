@@ -435,3 +435,45 @@ def test_blockwise_attention_matches_dense() -> None:
 
     max_err = mx.max(mx.abs(out_bw - out_dense)).item()
     assert max_err < 0.01, f"blockwise vs dense max_err={max_err}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_decode_rejects_signature_mismatch() -> None:
+    """decode_bhtd must raise when block codec_signature does not match codec."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.contracts import PackedBlockV4
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+
+    # Build a valid block manually but with a deliberately wrong signature
+    block = PackedBlockV4(
+        packed_codes=mx.zeros((1, 2, 4, 8), dtype=mx.uint32),
+        scales=mx.ones((1, 2, 4, 1), dtype=mx.float32),
+        format_version=4,
+        tensor_layout="BHTD",
+        packing_layout="VECTOR_ALIGNED_UINT32_V4",
+        scale_layout="BHTG_V4",
+        preconditioner="WHT64_HASH_SIGN_V1",
+        batch_size=1,
+        n_kv_heads=2,
+        token_count=4,
+        head_dim=64,
+        logical_start=0,
+        logical_end=4,
+        bits=8,
+        group_size=64,
+        groups_per_vector=1,
+        codes_per_word=4,
+        words_per_vector=8,
+        original_value_count=512,
+        padded_value_count=512,
+        original_dtype="float16",
+        sign_seed=42,
+        sign_algorithm="murmur32-avalanche-v1",
+        layer_id=0,
+        stream_id="K",
+        codec_signature="rfsn-v4-8-64-WRONG",
+    )
+
+    with pytest.raises(ValueError, match="Codec signature mismatch"):
+        k_codec.decode_bhtd(block)

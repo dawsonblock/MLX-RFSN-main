@@ -71,9 +71,24 @@ class CartesianCodec:
 
     @property
     def codec_signature(self) -> str:
-        """Canonical signature for decoder compatibility verification."""
-        wht_flag = "wht" if self.use_wht else "raw"
-        return f"rfsn-v4-{self.bits}-{self.group_size}-{wht_flag}"
+        """Canonical signature for decoder compatibility verification.
+
+        Includes every field that affects the wire format so that decode
+        can reject blocks created with an incompatible configuration.
+        """
+        preconditioner = (
+            Preconditioner.WHT64_HASH_SIGN_V1
+            if self.use_wht
+            else Preconditioner.NONE
+        )
+        sign_algorithm = "murmur32-avalanche-v1"
+        return (
+            f"rfsn-v4-{self.bits}-{self.group_size}-"
+            f"{preconditioner.value}-{sign_algorithm}-{self.sign_seed}-"
+            f"{PackingLayout.VECTOR_ALIGNED_UINT32_V4.value}-"
+            f"{ScaleLayout.BHTG_V4.value}-"
+            f"{TensorLayout.BHTD.value}"
+        )
 
     # ------------------------------------------------------------------
     # Vector-aligned helpers
@@ -396,6 +411,14 @@ class CartesianCodec:
             raise ValueError(f"Unsupported PackedBlock version: {block.format_version}")
         if block.bits != self.bits:
             raise ValueError(f"Block bits={block.bits}, codec bits={self.bits}")
+
+        # Strict signature validation — reject blocks created with an
+        # incompatible codec configuration (different signs, layout, etc.).
+        if block.codec_signature and block.codec_signature != self.codec_signature:
+            raise ValueError(
+                f"Codec signature mismatch: block has {block.codec_signature}, "
+                f"codec expects {self.codec_signature}"
+            )
 
         # Unpack codes
         if block.bits <= 8:

@@ -1,3 +1,22 @@
+    // FIXME: This shader computes dot(Q, K_packed) where K_packed is in the
+    // transform domain (WHT + hash signs).  For correctness when use_wht or
+    // sign_seed is active, K must be inverse-transformed back to the original
+    // domain before the dot product.
+    //
+    // Correct design:
+    //   1. Decode the full K vector (D elements) for this token.
+    //   2. Apply inverse hash signs (per-element sign flips from the codec seed).
+    //   3. Apply inverse WHT per group (length = group_size).
+    //   4. Then compute the dot product with the untransformed Q vector.
+    //
+    // Until this is implemented, the Python dispatch layer falls back to the
+    // CPU reference path whenever use_wht or sign_seed is non-zero.
+    // See: rfsn_v10/kernels/cartesian_cpu_reference.py
+    //
+    // The same issue exists in cartesian_sv_body.metal: the accumulated output
+    // is in the transform domain and must be inverse-transformed once after
+    // the weighted sum.
+
     int bits = bits_buf[0];
     int group_size = group_buf[0];
     float scale_factor = scale_buf[0];

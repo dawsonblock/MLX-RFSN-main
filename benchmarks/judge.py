@@ -336,23 +336,35 @@ class Judge:
             return f"unknown run_type '{candidate.run_type}' is ineligible"
         if candidate.fallback_used:
             return "fallback execution is ineligible for promotion"
-        if candidate.estimated_memory and candidate.measured_memory is None:
-            return "estimated memory without measurement is ineligible"
-        if candidate.measured_memory is None:
-            return "unmeasured memory is ineligible for promotion"
+        if not candidate.measured_memory:
+            return "measured_memory must be True for promotion"
         if candidate.source_type != "installed_wheel":
             return "installed-wheel execution required for promotion"
-        if (
-            candidate.requested_backend != "unknown"
-            and candidate.executed_backend != "unknown"
-            and candidate.requested_backend != candidate.executed_backend
-        ):
+        if not candidate.requested_backend or candidate.requested_backend == "unknown":
+            return "requested_backend must be a known, typed value"
+        if not candidate.executed_backend or candidate.executed_backend == "unknown":
+            return "executed_backend must be a known, typed value"
+        if candidate.requested_backend != candidate.executed_backend:
             return (
                 f"backend mismatch: requested '{candidate.requested_backend}' "
                 f"but executed '{candidate.executed_backend}'"
             )
-        if candidate.executed_backend == "reference":
-            return "dense-reference backend is ineligible for promotion"
+        executed_lower = candidate.executed_backend.lower()
+        if "reference" in executed_lower or "dense" in executed_lower:
+            return "dense-reference backend aliases are ineligible for promotion"
+        if "fallback" in executed_lower:
+            return "fallback backend is ineligible for promotion"
+
+        # Proof counters that must hold in all paths (not just strict mode)
+        counters = candidate.proof_counters or {}
+        if counters.get("requantized_tokens", 0) > 0:
+            return f"requantized_tokens={counters['requantized_tokens']} > 0"
+        if counters.get("fallback_attention_calls", 0) > 0:
+            return f"fallback_attention_calls={counters['fallback_attention_calls']} > 0"
+        if counters.get("dense_shadow_bytes", 0) > 0:
+            return f"dense_shadow_bytes={counters['dense_shadow_bytes']} > 0"
+        if counters.get("unknown_layer_events", 0) > 0:
+            return f"unknown_layer_events={counters['unknown_layer_events']} > 0"
 
         # Canonical format enforcement (K8/V5/gs64)
         if candidate.key_bits is not None and candidate.key_bits != 8:

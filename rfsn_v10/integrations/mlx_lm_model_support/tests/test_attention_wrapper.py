@@ -6,6 +6,7 @@ import pytest
 try:
     import mlx.core as mx
     import mlx.nn as nn
+    import mlx.utils as mx_utils
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
@@ -41,6 +42,48 @@ def test_direct_packed_cache_interface() -> None:
     cache.update_and_fetch(keys, values)
     assert cache.offset == 10
     assert cache.layer_cache.total_token_count() == 10
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_direct_packed_cache_state_returns_all_live_tensors() -> None:
+    """state must expose sealed blocks, staging, and dense residual for mx.eval."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+        RfsnDirectPackedKVCache,
+    )
+
+    k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+    v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+
+    cache = RfsnDirectPackedKVCache(
+        layer_id=0,
+        key_codec=k_codec,
+        value_codec=v_codec,
+        staging_capacity=4,
+        dense_residual_window=4,
+    )
+
+    # First append: goes to staging (4 tokens)
+    k1 = mx.random.normal(shape=(1, 2, 4, 64)).astype(mx.float32)
+    v1 = mx.random.normal(shape=(1, 2, 4, 64)).astype(mx.float32)
+    cache.update_and_fetch(k1, v1)
+
+    # Staging should be present; no sealed blocks yet
+    state1 = cache.state
+    assert len(state1) == 2  # stage_k, stage_v
+    mx.eval(state1)
+
+    # Second append: staging flushes to sealed, new staging, dense residual
+    k2 = mx.random.normal(shape=(1, 2, 8, 64)).astype(mx.float32)
+    v2 = mx.random.normal(shape=(1, 2, 8, 64)).astype(mx.float32)
+    cache.update_and_fetch(k2, v2)
+
+    state2 = cache.state
+    # Expect: 2 sealed blocks (K codes, K scales, V codes, V scales) +
+    #          staging K, staging V +
+    #          dense K, dense V
+    assert len(state2) == 10
+    mx.eval(state2)
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
@@ -80,23 +123,28 @@ def test_wrap_and_unwrap_model_attention() -> None:
     from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
         RfsnDirectPackedKVCache,
         _PackedAttentionWrapper,
-        wrap_model_attention,
-        unwrap_model_attention,
+        install_packed_attention,
+        uninstall_packed_attention,
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
     v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
 
-    class FakeLinear:
+    class FakeLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.zeros((8, 8))
+
         def __call__(self, x):
             return x
 
-    class FakeRope:
+    class FakeRope(nn.Module):
         def __call__(self, x, offset=0):
             return x
 
-    class FakeAttn:
+    class FakeAttn(nn.Module):
         def __init__(self):
+            super().__init__()
             self.n_heads = 2
             self.n_kv_heads = 2
             self.scale = 0.125
@@ -111,12 +159,14 @@ def test_wrap_and_unwrap_model_attention() -> None:
             self.call_count += 1
             return x
 
-    class FakeLayer:
+    class FakeLayer(nn.Module):
         def __init__(self) -> None:
+            super().__init__()
             self.self_attn = FakeAttn()
 
-    class FakeModel:
+    class FakeModel(nn.Module):
         def __init__(self) -> None:
+            super().__init__()
             self.layers = [FakeLayer(), FakeLayer()]
 
     model = FakeModel()
@@ -128,7 +178,7 @@ def test_wrap_and_unwrap_model_attention() -> None:
     original_attn = model.layers[0].self_attn
     original_call_count = original_attn.call_count
 
-    wrap_model_attention(model, caches)
+    install_packed_attention(model, caches)
 
     # Wrap replaces the instance with a _PackedAttentionWrapper
     assert isinstance(model.layers[0].self_attn, _PackedAttentionWrapper)
@@ -149,7 +199,7 @@ def test_wrap_and_unwrap_model_attention() -> None:
     # Result should be an MLX array (not the unmodified x)
     assert hasattr(result, "shape")
 
-    unwrap_model_attention(model)
+    uninstall_packed_attention(model)
 
     # After unwrap, the original attention is restored.
     assert model.layers[0].self_attn is original_attn
@@ -160,11 +210,197 @@ def test_wrap_and_unwrap_model_attention() -> None:
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_strict_mode_raises_on_missing_cache() -> None:
+    """Strict wrapper must raise when cache is missing or wrong type."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+        RfsnDirectPackedKVCache,
+        install_packed_attention,
+        uninstall_packed_attention,
+    )
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+
+    class FakeAttn(nn.Module):
+        def __call__(self, x, mask=None, cache=None):
+            return x
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = FakeAttn()
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [FakeLayer()]
+
+    model = FakeModel()
+    caches = [
+        RfsnDirectPackedKVCache(layer_id=0, key_codec=k_codec, value_codec=v_codec)
+    ]
+
+    install_packed_attention(model, caches, strict=True)
+    x = mx.random.normal(shape=(1, 2, 128)).astype(mx.float32)
+
+    with pytest.raises(RuntimeError, match="Strict packed mode"):
+        model.layers[0].self_attn(x, mask=None, cache=None)
+
+    with pytest.raises(RuntimeError, match="Strict packed mode"):
+        model.layers[0].self_attn(x, mask=None, cache="not_a_packed_cache")
+
+    uninstall_packed_attention(model)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_permissive_fallback_increments_counter() -> None:
+    """Permissive wrapper must count fallback and record backend."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+        RfsnDirectPackedKVCache,
+        install_packed_attention,
+        uninstall_packed_attention,
+    )
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+
+    class FakeLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.zeros((8, 8))
+        def __call__(self, x):
+            return x
+
+    class FakeRope(nn.Module):
+        def __call__(self, x, offset=0):
+            return x
+
+    class FakeAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.n_heads = 2
+            self.n_kv_heads = 2
+            self.scale = 0.125
+            self.q_proj = FakeLinear()
+            self.k_proj = FakeLinear()
+            self.v_proj = FakeLinear()
+            self.o_proj = FakeLinear()
+            self.rope = FakeRope()
+        def __call__(self, x, mask=None, cache=None):
+            return x
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = FakeAttn()
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [FakeLayer()]
+
+    model = FakeModel()
+    caches = [
+        RfsnDirectPackedKVCache(layer_id=0, key_codec=k_codec, value_codec=v_codec)
+    ]
+
+    install_packed_attention(model, caches, strict=False)
+    wrapper = model.layers[0].self_attn
+    x = mx.random.normal(shape=(1, 2, 128)).astype(mx.float32)
+
+    assert wrapper._fallback_count == 0
+    assert wrapper._executed_backend == "unknown"
+
+    model.layers[0].self_attn(x, mask=None, cache=None)
+    assert wrapper._fallback_count == 1
+    assert wrapper._executed_backend == "dense"
+
+    # packed path requires BHTD inputs; x is (B, L, D) = (1, 2, 128)
+    # projections return x which is (1, 2, 128); reshape will fail because
+    # n_heads=2, head_dim would be 64, but 128/2 = 64... wait, x is (1,2,128).
+    # q_proj(x) returns (1,2,128). reshape(1, 2, 2, -1) -> (1, 2, 2, 64).transpose -> (1,2,2,64)
+    # That works. rope returns same shape. Then attend() needs proper shapes.
+    # But the fake cache has empty layer_cache, so attend() will raise.
+    # We just want to verify _executed_backend is set before attend() is called.
+    # Since attend() is called after setting backend, it will be set to "packed"
+    # even if attend() fails. We can catch the error or just not call it.
+    # Actually, for this test, we only need to verify fallback behavior.
+
+    uninstall_packed_attention(model)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_wrap_preserves_parameter_and_state_parity() -> None:
+    """Wrapping must keep the same arrays in model.parameters() and model.state."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+        RfsnDirectPackedKVCache,
+        install_packed_attention,
+        uninstall_packed_attention,
+    )
+
+    k_codec = CartesianCodec(bits=8, group_size=64)
+    v_codec = CartesianCodec(bits=5, group_size=64)
+
+    class FakeAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(16, 16)
+            self.k_proj = nn.Linear(16, 16)
+            self.n_heads = 2
+            self.n_kv_heads = 2
+            self.scale = 0.125
+
+        def __call__(self, x, mask=None, cache=None):
+            return x
+
+    class FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = FakeAttn()
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [FakeLayer()]
+
+    model = FakeModel()
+    caches = [
+        RfsnDirectPackedKVCache(layer_id=0, key_codec=k_codec, value_codec=v_codec)
+    ]
+
+    before_params = model.parameters()
+    before_state_keys = set(model.state.keys())
+
+    install_packed_attention(model, caches)
+
+    after_params = model.parameters()
+    after_state_keys = set(model.state.keys())
+
+    # Parameter tree structure must be identical
+    assert before_state_keys == after_state_keys
+    assert before_params == after_params
+
+    # Every array object must be the same (no copies)
+    before_ids = {id(v) for _, v in mx_utils.tree_flatten(before_params)}
+    after_ids = {id(v) for _, v in mx_utils.tree_flatten(after_params)}
+    assert before_ids == after_ids
+
+    uninstall_packed_attention(model)
+
+    # After uninstall, parity must be restored
+    assert model.parameters() == before_params
+    assert set(model.state.keys()) == before_state_keys
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_wrap_model_mismatched_layer_count_raises() -> None:
     """Mismatch between model layers and caches must raise."""
     from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
         RfsnDirectPackedKVCache,
-        wrap_model_attention,
+        install_packed_attention,
     )
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
 
@@ -182,4 +418,4 @@ def test_wrap_model_mismatched_layer_count_raises() -> None:
     ]
 
     with pytest.raises(ValueError, match="3 layers but 2 caches"):
-        wrap_model_attention(model, caches)
+        install_packed_attention(model, caches)
