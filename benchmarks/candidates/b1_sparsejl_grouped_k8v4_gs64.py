@@ -16,7 +16,7 @@ indices and a random ±1 sign vector, both deterministic from seed.
 This candidate exists for evidence only. Expected outcome:
   KEEP_EXPERIMENTAL or REJECT (WHT is the safer practical default).
 
-Candidate name: B1_sparsejl_grouped_k8v5_gs64
+Candidate name: B1_sparsejl_grouped_k8v4_gs64
 """
 from __future__ import annotations
 
@@ -44,9 +44,9 @@ except ImportError:
 class B1_SparseJL_Grouped(BenchmarkCandidate):
     """B1: Sparse JL preconditioning + grouped symmetric quantization."""
 
-    candidate_name = "B1_sparsejl_grouped_k8v5_gs64"
+    candidate_name = "B1_sparsejl_grouped_k8v4_gs64"
 
-    def __init__(self, key_bits: int = 8, value_bits: int = 5, group_size: int = 64, seed: int = 42) -> None:
+    def __init__(self, key_bits: int = 8, value_bits: int = 4, group_size: int = 64, seed: int = 42) -> None:
         self.key_bits = key_bits
         self.value_bits = value_bits
         self.group_size = group_size

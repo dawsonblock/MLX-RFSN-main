@@ -6,7 +6,7 @@ in FP16 while compressing older history with WHT + grouped symmetric.
 Also supports sweep: R=32, 64, 128, 256.
 Expected safe default: R=128.
 
-Candidate name: R1_wht_grouped_k8v5_residual128
+Candidate name: R1_wht_grouped_k8v4_residual128
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import A1_WHT_Grouped
+from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_Grouped
 from benchmarks.candidates.base_candidate import BenchmarkCandidate
 from benchmarks.schemas import CandidateResult
 
@@ -32,13 +32,13 @@ except ImportError:
 class R1_WHT_Grouped_Residual(BenchmarkCandidate):
     """R1: WHT grouped + FP16 residual window."""
 
-    candidate_name = "R1_wht_grouped_k8v5_residual128"
+    candidate_name = "R1_wht_grouped_k8v4_residual128"
 
     def __init__(
         self,
         residual_length: int = 128,
         key_bits: int = 8,
-        value_bits: int = 5,
+        value_bits: int = 4,
         group_size: int = 64,
     ) -> None:
         self.residual_length = residual_length

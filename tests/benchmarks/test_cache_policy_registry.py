@@ -39,7 +39,7 @@ def test_turboquant_v2_not_in_promoted() -> None:
 
 
 def test_rfsn_v11_not_in_promoted() -> None:
-    assert "rfsn_v11_offline_asymmetric_kv_k8v5_gs64" not in PROMOTED_POLICIES
+    assert "rfsn_v11_offline_asymmetric_kv_k8v4_gs64" not in PROMOTED_POLICIES
 
 
 def test_create_known_control_policy() -> None:

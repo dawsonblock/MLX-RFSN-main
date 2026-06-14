@@ -84,15 +84,18 @@ def numpy_packed_attention(
 
     repeats = Hq // Hkv
 
-    # Online softmax state
+    # Online softmax state with explicit valid-mass tracking.
+    # Initialising running_max to -inf and tracking has_mass avoids the
+    # NaN-producing -inf - (-inf) case on fully-masked blocks.
     running_max = np.full((B, Hq, Lq, 1), -np.inf, dtype=np.float32)
     running_sum = np.zeros((B, Hq, Lq, 1), dtype=np.float32)
     out = np.zeros((B, Hq, Lq, D), dtype=np.float32)
+    has_mass = np.zeros((B, Hq, Lq, 1), dtype=np.bool_)
 
     token_offset = 0
 
     def _process_block(k_block_bhtd: np.ndarray, v_block_bhtd: np.ndarray) -> None:
-        nonlocal running_max, running_sum, out, token_offset
+        nonlocal running_max, running_sum, out, has_mass, token_offset
         block_T = k_block_bhtd.shape[2]
 
         # GQA repeat
@@ -119,20 +122,25 @@ def numpy_packed_attention(
             )
             scores = np.where(causal_mask, scores, -np.inf)
 
-        # Online softmax update for this block
+        # Online softmax update for this block — explicit valid-mass tracking for fully-masked blocks.
         block_max = np.max(scores, axis=-1, keepdims=True)
         new_max = np.maximum(running_max, block_max)
 
         old_scale = np.exp(running_max - new_max)
+        # Guard exp(-inf - (-inf)) => NaN on rows with no valid mass yet.
+        old_scale = np.where(np.isfinite(old_scale), old_scale, 1.0)
 
         running_sum = running_sum * old_scale
         out = out * old_scale
 
         block_exp = np.exp(scores.astype(np.float32) - new_max)
+        # Zero out exp(NaN) from masked positions when new_max is also -inf.
+        block_exp = np.where(np.isfinite(block_exp), block_exp, 0.0)
         running_sum = running_sum + np.sum(block_exp, axis=-1, keepdims=True)
         out = out + np.matmul(block_exp, v_block_bhtd.astype(np.float32))
 
         running_max = new_max
+        has_mass = np.logical_or(has_mass, np.any(np.isfinite(scores), axis=-1, keepdims=True))
         token_offset += block_T
 
     # Process sealed blocks
@@ -149,8 +157,13 @@ def numpy_packed_attention(
     if dense_k is not None:
         _process_block(dense_k, dense_v)
 
-    # Normalize — guard against fully-masked rows where running_sum == 0
-    output = np.where(running_sum == 0, 0.0, out / running_sum)
+    # Fully-masked rows return defined zero output.
+    # Guard against running_sum == 0 due to numerical underflow.
+    output = np.where(
+        has_mass & (running_sum > 0),
+        out / running_sum,
+        np.zeros_like(out)
+    )
     return output.astype(queries.dtype)
 
 

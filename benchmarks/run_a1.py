@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the full A1 benchmark: dense baseline vs A1_wht_grouped_k8v5_gs64.
+"""Run the full A1 benchmark: dense baseline vs A1_wht_grouped_k8v4_gs64.
 
 Steps 11 and 12: Full A1 CLI runner with judge-based PROMOTE/KEEP_EXPERIMENTAL/REJECT verdict.
 
@@ -50,7 +50,7 @@ from benchmarks.baseline_mlx import (
     _make_smoke_result,
 )
 from benchmarks.baseline_mlx import run_single as run_baseline
-from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import A1_WHT_Grouped
+from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_Grouped
 from benchmarks.candidates.base_candidate import BenchmarkCandidate
 from benchmarks.judge import Judge, VerdictLabel
 from benchmarks.report_generator import ReportGenerator
@@ -69,7 +69,7 @@ def _make_smoke_a1_result(
     compressed = kv_dense * 0.44  # ~56% of FP16 → 44% reduction
 
     return CandidateResult(
-        candidate_name="A1_wht_grouped_k8v5_gs64",
+        candidate_name="A1_wht_grouped_k8v4_gs64",
         model_id=baseline.model_id,
         prompt_id=baseline.prompt_id,
         context_length=baseline.context_length,
@@ -77,7 +77,7 @@ def _make_smoke_a1_result(
         preconditioner="wht",
         quantizer="grouped_sym",
         key_bits=8.0,
-        value_bits=5.0,
+        value_bits=4.0,
         group_size=64,
         run_type="smoke",
         logit_cosine=float(rng.uniform(0.997, 0.9999)),

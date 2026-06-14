@@ -184,7 +184,7 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
         RFSNV10Candidate("k8_v5_gs32"),
         RFSNV10Candidate("k8_v5_gs64"),
         RFSNV11Candidate(
-            key_bits=8, value_bits=4, group_size=64,
+            key_bits=8, value_bits=5, group_size=64,
             use_wht=True, dim=128,
         ),
         TurboQuantV2Candidate(bits=4, group_size=64),

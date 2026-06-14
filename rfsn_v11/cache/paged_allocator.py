@@ -20,7 +20,7 @@ class CacheBlock:
     block_id: int
     ref_count: int = 0
     block_hash: bytes = b""
-    compression_signature: str = ""  # e.g. "k8v5_gs64_wht"
+    compression_signature: str = ""  # e.g. "k8v4_gs64_wht"
     last_used: float = field(default_factory=time.time)
     compressed_kv: Any = None  # actual compressed KV data
 

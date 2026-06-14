@@ -21,7 +21,7 @@ KV compression becomes **recommended** (default on) when ALL of the following ho
 | Output drift | Acceptable on human review |
 | Crash count across full matrix | 0 |
 
-**Current status of `rfsn_v10_k8v5_gs64_wht`:** Passes memory gate. Speed and quality gates require full matrix run.
+**Current status of `rfsn_v10_k8v4_gs64_wht`:** Passes memory gate. Speed and quality gates require full matrix run.
 
 ## Sparse Decode Gate
 

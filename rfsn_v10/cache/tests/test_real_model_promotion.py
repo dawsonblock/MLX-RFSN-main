@@ -66,7 +66,7 @@ class TestRealModelPromotion:
         adapter = RfsnMLXModelAdapter(
             model, tokenizer,
             num_layers=len(model.layers),
-            key_bits=8, value_bits=5, group_size=64,
+            key_bits=8, value_bits=4, group_size=64,
             staging_capacity=64, dense_residual_window=0,
         )
 

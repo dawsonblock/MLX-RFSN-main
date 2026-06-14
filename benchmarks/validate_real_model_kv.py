@@ -41,15 +41,15 @@ KL_DIV_THRESHOLD = 0.02
 
 # Mixed-precision config registry: per-layer bit overrides on top of default
 _MIXED_CONFIG_REGISTRY: dict[str, dict[str, Any]] = {
-    "mixed_L0-1k8v5_restk6v4_gs64": {
-        "name": "mixed_L0-1k8v5_restk6v4_gs64",
+    "mixed_L0-1k8v4_restk6v4_gs64": {
+        "name": "mixed_L0-1k8v4_restk6v4_gs64",
         "k_bits": 6,
         "v_bits": 4,
         "group_size": 64,
         "layer_map": {0: (8, 4), 1: (8, 4)},
     },
-    "mixed_L0k8v5_restk6v4_gs64": {
-        "name": "mixed_L0k8v5_restk6v4_gs64",
+    "mixed_L0k8v4_restk6v4_gs64": {
+        "name": "mixed_L0k8v4_restk6v4_gs64",
         "k_bits": 6,
         "v_bits": 4,
         "group_size": 64,
@@ -832,7 +832,7 @@ def _run_long_context_validation(
 
     def _recommended(ctxs: list[dict]) -> str:
         for prefer in (
-            "mixed_L0-1k8v5_restk6v4_gs64",
+            "mixed_L0-1k8v4_restk6v4_gs64",
             "k8_v4_gs64",
             "k8_v4_gs32",
             "k8_v5_gs64",
@@ -1214,7 +1214,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--configs",
-        default="baseline_fp16,mixed_L0-1k8v5_restk6v4_gs64,"
+        default="baseline_fp16,mixed_L0-1k8v4_restk6v4_gs64,"
         "k8_v4_gs64,k8_v5_gs64,k8_v3_gs64,"
         "k6_v6_gs64,k8_v4_gs32,k8_v5_gs32,k4_v4_gs64",
         help="Comma-separated config names to test",

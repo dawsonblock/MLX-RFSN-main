@@ -337,12 +337,12 @@ class A1_WHT_Grouped(BenchmarkCandidate):
     - Pass attention_score_cosine >= 0.995
     """
 
-    candidate_name = "A1_wht_grouped_k8v5_gs64"
+    candidate_name = "A1_wht_grouped_k8v4_gs64"
 
     def __init__(
         self,
         key_bits: int = 8,
-        value_bits: int = 5,
+        value_bits: int = 4,
         group_size: int = 64,
     ) -> None:
         self.key_bits = key_bits
