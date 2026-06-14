@@ -338,6 +338,7 @@ class RFSNGenerator:
                     RfsnDirectPackedKVCache,
                     install_packed_attention,
                     is_model_wrapped,
+                    packed_attention_context,
                 )
 
                 # Create session for direct packed path
@@ -354,31 +355,33 @@ class RFSNGenerator:
                     )
                     for i in range(self._adapter.num_layers)
                 ]
-                if not is_model_wrapped(self.model):
-                    install_packed_attention(self.model, caches, strict=self.config.runtime.strict_packed_mode)
-                gen_iter = _mlx_stream_generate(
-                    self.model,
-                    self.tokenizer,
-                    prompt=prompt,
-                    prompt_cache=caches,
-                    **gen_kwargs,
-                )
-                try:
-                    yield from gen_iter
-                finally:
-                    if caches is not None:
-                        self._last_counters = {
-                            "direct_packed_tokens": sum(
-                                c.layer_cache.total_token_count() for c in caches
-                            )
-                            // self._adapter.num_layers,
-                        }
-                        # Capture runtime counters from session
-                        if session:
-                            self._last_counters["runtime_counters"] = session.runtime_counters
-                        # Cleanup session
-                        if session:
-                            session.destroy()
+                
+                # P0 #3: Use lifecycle management to ensure model is unwrapped
+                strict_mode = self.config.runtime.strict_packed_mode if self.config else True
+                with packed_attention_context(self.model, caches, strict=strict_mode):
+                    gen_iter = _mlx_stream_generate(
+                        self.model,
+                        self.tokenizer,
+                        prompt=prompt,
+                        prompt_cache=caches,
+                        **gen_kwargs,
+                    )
+                    try:
+                        yield from gen_iter
+                    finally:
+                        if caches is not None:
+                            self._last_counters = {
+                                "direct_packed_tokens": sum(
+                                    c.layer_cache.total_token_count() for c in caches
+                                )
+                                // self._adapter.num_layers,
+                            }
+                            # Capture runtime counters from session
+                            if session:
+                                self._last_counters["runtime_counters"] = session.runtime_counters.to_dict()
+                            # Cleanup session
+                            if session:
+                                session.destroy()
                 return
 
             # Explicit per-layer cache path — dense reconstruction fallback.

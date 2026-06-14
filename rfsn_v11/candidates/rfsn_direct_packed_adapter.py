@@ -227,28 +227,20 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             import contextlib
             import io
 
-            from rfsn_v10.config import (
-                QuantizationConfig,
-                RFSNConfig,
-                RuntimeConfig,
-            )
             from rfsn_v10.runtime.generation import RFSNGenerator
 
-            cfg = RFSNConfig(
-                quantization=QuantizationConfig(
-                    default_bits=self.key_bits,
-                    group_size=self.group_size,
-                ),
-                runtime=RuntimeConfig(
-                    strict_packed_mode=True,  # Strict no-fallback
-                ),
-            )
+            # P0 #1: Pass exact key and value bits to generator
+            # The candidate's key_bits and value_bits must be used in generation,
+            # not the generator's defaults (8, 5)
             generator = RFSNGenerator(
                 model,
                 tokenizer,
-                cfg,
+                config=None,  # Don't use RFSNConfig, pass parameters directly
                 enable_quantized_kv=True,
                 packed_reference=True,  # Enable direct packed attention
+                key_bits=self.key_bits,  # Use candidate's key_bits
+                value_bits=self.value_bits,  # Use candidate's value_bits
+                group_size=self.group_size,
                 staging_capacity=self.staging_capacity,
                 dense_residual_window=self.dense_residual_window,
             )
