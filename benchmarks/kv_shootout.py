@@ -219,7 +219,7 @@ def _build_candidates(quick: bool = False, include_legacy: bool = False) -> list
             key_bits=8, value_bits=5, group_size=64,
             use_wht=True, dim=128,
         ),
-        TurboQuantV2Candidate(bits=4, group_size=64),
+        TurboQuantV2Candidate(bits=6, group_size=64),
         PolarReferenceAdapter(bits=4, dim=128),
         TurboPolarAdapter(TurboPolarConfig()),
     ]
@@ -405,6 +405,8 @@ def _run_once(
         elif candidate.name in (
             "turboquant_v2_b4_gs64_rot",
             "turboquant_v2_b4_gs64_norot",
+            "turboquant_v2_b6_gs64_rot",
+            "turboquant_v2_b6_gs64_norot",
         ):
             # TurboQuant V2 builds its own cache and patches SDPA
             tq_candidate = candidate

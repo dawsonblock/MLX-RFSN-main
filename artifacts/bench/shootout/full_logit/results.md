@@ -4,14 +4,14 @@
 
 | Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |
 |-----------|--------|-------------|----------------|------------|-----------------|-----------|
-| mlx_lm_baseline | CONTROL | 45.40 | 1.000 | PASS_NO_PROMOTE | yes | no |
-| mlx_lm_quantized_kv_b8 | CONTROL | 45.27 | 0.500 | FAIL | yes | no |
-| rfsn_v10_k8_v5_gs32 | BASELINE | 5.29 | 0.500 | FAIL | yes | no |
-| rfsn_v10_k8_v5_gs64 | BASELINE | 5.06 | 0.500 | FAIL | yes | no |
-| rfsn_v11_offline_asymmetric_kv_k8v4_gs64 | OFFLINE_ONLY | 32.49 | 0.398 | PENDING_REAL_CACHE_INJECTION | no | no |
-| turboquant_v2_b4_gs64_norot | EXPERIMENTAL | 83.05 | 0.281 | FAIL | yes | no |
-| polar_reference_offline_b4_d128 | REFERENCE_ONLY | 17.70 | 0.139 | FAIL | yes | no |
-| turbo_polar_k4_qjl64 | EXPERIMENTAL | 3.16 | baseline | FAIL | yes | no |
+| mlx_lm_baseline | CONTROL | 17.92 | 1.000 | PASS_NO_PROMOTE | yes | no |
+| mlx_lm_quantized_kv_b8 | CONTROL | 26.98 | 0.500 | FAIL | yes | no |
+| rfsn_v10_k8_v5_gs64 | REFERENCE_ONLY | 16.38 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| rfsn_direct_packed_k8v8_gs64 | EXPERIMENTAL | — | baseline | ERROR | no | no |
+| rfsn_v11_offline_asymmetric_kv_k8v5_gs64 | EXPERIMENTAL | — | baseline | ERROR | no | no |
+| turboquant_v2_b4_gs64_rot | EXPERIMENTAL | 8.68 | 0.311 | FAIL | yes | no |
+| polar_reference_offline_b4_d128 | REFERENCE_ONLY | 5.44 | 0.132 | FAIL | yes | no |
+| turbo_polar_k4_qjl64 | EXPERIMENTAL | 2.92 | baseline | FAIL | yes | no |
 
 | *Summary* | — | — | — | — | — | **No candidate is promotion eligible.** |
 
@@ -22,5 +22,5 @@
 **Schema version:** 2.0  
 
 **Working-set memory measurement mode dependency**: Baseline working-set memory differs between full-logit mode (~975 MB) and memory-report mode (~1422 MB). This is due to different run paths, model warmup states, prompt lengths, and sampling timing. Working-set memory should be treated as measurement-mode dependent, not promotion-critical. Actual KV cache bytes (actual_kv_memory_mb) are the stable compression proof.
-**Token sequence hash:** `c2ff72f2e716ef3e30262cbaf5ec955629fe07b40ea88c6808602cb5b8b06716`  
+**Token sequence hash:** *empty* — promotion blocked until teacher-forced rerun produces a non-empty hash.
 **Current status:** No candidate is promotion eligible. Official promoted candidate: NONE.
