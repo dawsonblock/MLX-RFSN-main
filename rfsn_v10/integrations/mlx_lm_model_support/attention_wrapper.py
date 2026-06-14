@@ -54,14 +54,21 @@ class RfsnDirectPackedKVCache:
     ) -> None:
         self.layer_id = layer_id
         self.strict = strict
-        self.layer_cache = QuantizedLayerCache(
-            key_codec=key_codec,
-            value_codec=value_codec,
-            staging_capacity=staging_capacity,
-            dense_residual_window=dense_residual_window,
-            layer_id=layer_id,
-            session=session,
-        )
+        self.session = session
+        
+        # P0 #4: Make session own the actual layer cache
+        # If session is provided, use its layer cache; otherwise create one
+        if session is not None:
+            self.layer_cache = session.get_layer_cache(layer_id)
+        else:
+            self.layer_cache = QuantizedLayerCache(
+                key_codec=key_codec,
+                value_codec=value_codec,
+                staging_capacity=staging_capacity,
+                dense_residual_window=dense_residual_window,
+                layer_id=layer_id,
+                session=session,
+            )
         self.offset: int = 0
 
     def update_and_fetch(self, keys: Any, values: Any) -> tuple[Any, Any]:
