@@ -140,6 +140,18 @@ def attend(
         position_offset += region_tokens
 
     # Sealed blocks (use decode_bhtd directly)
+    # P0 #5: Instrument runtime counters - track block reads and bytes read
+    if hasattr(layer_cache, "session") and layer_cache.session is not None:
+        layer_cache.session.increment("packed_blocks_read", len(key_blocks))
+        # Track bytes read for keys and values
+        for kb, vb in zip(key_blocks, value_blocks):
+            if kb.packed_codes is not None:
+                layer_cache.session.runtime_counters.packed_bytes_read += int(kb.packed_codes.size) * 4
+            if vb.packed_codes is not None:
+                layer_cache.session.runtime_counters.packed_bytes_read += int(vb.packed_codes.size) * 4
+            # Track decoded block bytes
+            layer_cache.session.runtime_counters.decoded_block_bytes += int(kb.token_count) * D * 4 * 2  # K and V
+    
     for kb, vb in zip(key_blocks, value_blocks):
         k_dense = layer_cache.key_codec.decode_bhtd(kb)
         v_dense = layer_cache.value_codec.decode_bhtd(vb)
@@ -169,4 +181,11 @@ def attend(
         score_vector_bytes=0,
         output_accumulator_bytes=int(out.size) * 4,
     )
+    
+    # P0 #5: Instrument runtime counters - track scratch bytes
+    if hasattr(layer_cache, "session") and layer_cache.session is not None:
+        layer_cache.session.runtime_counters.scratch_bytes_current = scratch.output_accumulator_bytes
+        if scratch.output_accumulator_bytes > layer_cache.session.runtime_counters.scratch_bytes_peak:
+            layer_cache.session.runtime_counters.scratch_bytes_peak = scratch.output_accumulator_bytes
+    
     return output, scratch

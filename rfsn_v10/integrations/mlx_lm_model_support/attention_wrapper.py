@@ -235,8 +235,10 @@ class _PackedAttentionWrapper(nn.Module):
             causal=True,
         )
 
-        # Increment backend call counter in session
+        # P0 #5: Increment backend call counter in session
         if hasattr(layer_cache, "session") and layer_cache.session is not None:
+            layer_cache.session.increment("packed_attention_calls")
+            # Also increment packed_reference_calls for compatibility
             layer_cache.session.runtime_counters.packed_reference_calls += 1
 
         # Reshape back and output projection
