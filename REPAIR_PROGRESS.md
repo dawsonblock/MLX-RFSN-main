@@ -59,17 +59,25 @@
 - Requires test infrastructure for block boundary scenarios
 - Should test staging capacity boundaries and block sealing behavior
 
-### Phase 4.14: Add layer-by-layer divergence tracing for debugging
-- Requires instrumentation for per-layer divergence detection
-- Useful for debugging quality issues
+### Phase 4.14: Add layer-by-layer divergence tracing for debugging ✅
+- Added layer_divergence_count and layers_processed to RuntimeCounters
+- Added track_layer_divergence() method to session for per-layer divergence detection
+- Useful for debugging quality issues across transformer layers
 
-### Phase 4.15: Explicitly test GQA behavior (num_q_heads > num_kv_heads)
-- Requires test models with GQA architecture
-- Tests grouped-query attention correctness
+### Phase 4.15: Explicitly test GQA behavior (num_q_heads > num_kv_heads) ✅
+- Created test_gqa_validation.py with GQA geometry tests
+- Tests cache structure for GQA (8 query heads, 2 KV heads)
+- Tests packed attention compatibility with GQA geometry
+- Integration test skipped until GQA model is available
+- Test results: 2 passed, 1 skipped
 
-### Phase 4.16: Verify RoPE offsets across all generation scenarios
-- Requires testing various context lengths and generation patterns
-- Ensures rotary position encoding correctness
+### Phase 4.16: Verify RoPE offsets across all generation scenarios ✅
+- Created test_rope_validation.py with comprehensive RoPE tests
+- Tests block position monotonicity for correct RoPE application
+- Tests multi-turn continuation with RoPE offset preservation
+- Tests long context positioning (512 tokens, 8 blocks)
+- Tests incremental append positioning (20 appends of 10 tokens)
+- All 4 tests pass
 
 ### Phase 5.17: Create immutable token-fixture manifest (artifacts/fixtures/token_fixtures.jsonl)
 - Requires creating reproducible token fixtures
