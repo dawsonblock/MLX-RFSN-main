@@ -24,35 +24,8 @@ from ..attention_reference import causal_attention_dense
 from ..compat import mx
 from ..kv_manager import RFSNTurboQuantKVManager
 from ..memory_guard import MemoryGuard
-
-
-@dataclass
-class RuntimeCounters:
-    """Honest runtime counters for RFSN v10 KV-cache operations.
-
-    All fields are zero-initialised and incremented during actual execution.
-    """
-
-    prefill_quantize_events: int = 0
-    decode_quantized_fetch_events: int = 0
-    decode_quantized_store_events: int = 0
-    cache_bytes_written_actual: int = 0
-    cache_bytes_read_actual: int = 0
-    patch_enter_count: int = 0
-    patch_exit_count: int = 0
-    layers_wrapped_actual: int = 0
-
-    def as_dict(self) -> dict[str, int | None]:
-        return {
-            "prefill_quantize_events": self.prefill_quantize_events,
-            "decode_quantized_fetch_events": self.decode_quantized_fetch_events,
-            "decode_quantized_store_events": self.decode_quantized_store_events,
-            "cache_bytes_written_actual": self.cache_bytes_written_actual,
-            "cache_bytes_read_actual": self.cache_bytes_read_actual,
-            "patch_enter_count": self.patch_enter_count,
-            "patch_exit_count": self.patch_exit_count,
-            "layers_wrapped_actual": self.layers_wrapped_actual,
-        }
+# P0 #6: Use unified RuntimeCounters from cache.contracts
+from ..cache.contracts import RuntimeCounters
 
 
 @dataclass
@@ -139,8 +112,11 @@ class RFSNRuntime:
         adapter / generator prefill path.  This method lets those paths
         report real prefill counts back into the same counter object so
         the exported trace is fully runtime-instrumented.
+        
+        P0 #6: Map to unified RuntimeCounters schema
         """
-        self.counters.prefill_quantize_events += int(count)
+        # Map old field to new unified schema
+        self.counters.tokens_appended += int(count)
 
     @staticmethod
     def _make_cache_key(
@@ -316,14 +292,15 @@ class RFSNRuntime:
                 allow_store = True
 
                 # Runtime counter: decode step attempted a store
-                self.counters.decode_quantized_store_events += 1
+                # P0 #6: Map to unified RuntimeCounters schema
+                self.counters.packed_attention_calls += 1
                 est_store_bytes = self.kv_manager.estimate_compressed_bytes_for_shape(
                     shape=tuple(keys.shape),
                     k_bits=self.kv_manager.k_bits,
                     v_bits=self.kv_manager.v_bits,
                     group_size=self.kv_manager.group_size,
                 )
-                self.counters.cache_bytes_written_actual += int(est_store_bytes)
+                self.counters.packed_bytes_written += int(est_store_bytes)
 
                 if self.memory_guard is not None:
                     estimated_cache_bytes = self.kv_manager.estimate_compressed_bytes_for_shape(
@@ -353,27 +330,29 @@ class RFSNRuntime:
                         keys, values = kv_result
                         # Count this as a fetch event — the compressed cache was
                         # stored and then immediately read back for attention.
-                        self.counters.decode_quantized_fetch_events += 1
+                        # P0 #6: Map to unified RuntimeCounters schema
+                        self.counters.packed_blocks_read += 1
                         est_fetch_bytes = self.kv_manager.estimate_compressed_bytes_for_shape(
                             shape=tuple(keys.shape),
                             k_bits=self.kv_manager.k_bits,
                             v_bits=self.kv_manager.v_bits,
                             group_size=self.kv_manager.group_size,
                         )
-                        self.counters.cache_bytes_read_actual += int(est_fetch_bytes)
+                        self.counters.packed_bytes_read += int(est_fetch_bytes)
             else:
                 if kv_result is None:
                     raise RuntimeError("KV cache reported hit but retrieve returned None")
                 keys, values = kv_result
                 # Runtime counter: decode step successfully fetched from cache
-                self.counters.decode_quantized_fetch_events += 1
+                # P0 #6: Map to unified RuntimeCounters schema
+                self.counters.packed_blocks_read += 1
                 est_fetch_bytes = self.kv_manager.estimate_compressed_bytes_for_shape(
                     shape=tuple(keys.shape),
                     k_bits=self.kv_manager.k_bits,
                     v_bits=self.kv_manager.v_bits,
                     group_size=self.kv_manager.group_size,
                 )
-                self.counters.cache_bytes_read_actual += int(est_fetch_bytes)
+                self.counters.packed_bytes_read += int(est_fetch_bytes)
         else:
             self.kv_manager.last_reconstruction_kernel = "quantized_disabled"
 
