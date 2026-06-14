@@ -283,25 +283,58 @@ class AttentionScratch:
 
 @dataclass(slots=True)
 class RuntimeCounters:
-    """Typed runtime counters that reconcile with physical cache state.
+    """Unified runtime counters for compressed KV cache execution.
 
     These counters describe actual operations, not estimates.
+    One instance is shared by: Generator, Session, Layer caches, Attention wrappers,
+    Packed attention, and Benchmark reporter.
+
+    Acceptance criteria for valid direct-packed run:
+        packed_blocks_created > 0
+        packed_blocks_read > 0
+        packed_attention_calls > 0
+        packed_bytes_written > 0
+        packed_bytes_read > 0
+        dense_fallback_calls == 0
+        full_history_materialization_calls == 0
     """
-    tokens_received: int = 0
-    tokens_staged: int = 0
-    tokens_packed: int = 0
-    tokens_dense_tail: int = 0
-    tokens_reencoded_intentionally: int = 0
+    # Token flow
+    tokens_appended: int = 0
+    staging_tokens_peak: int = 0
+    dense_residual_tokens_peak: int = 0
 
-    blocks_created: int = 0
-    blocks_read_reference: int = 0
-    blocks_read_metal: int = 0
+    # Block lifecycle
+    packed_blocks_created: int = 0
+    packed_blocks_read: int = 0
 
-    reference_dense_calls: int = 0
-    packed_reference_calls: int = 0
-    packed_metal_calls: int = 0
-    fallback_calls: int = 0
+    # Attention execution
+    packed_attention_calls: int = 0
+    dense_fallback_calls: int = 0
+    full_history_materialization_calls: int = 0
 
-    current_scratch_bytes: int = 0
-    peak_scratch_bytes: int = 0
-    cumulative_scratch_traffic_bytes: int = 0
+    # Byte accounting
+    packed_bytes_written: int = 0
+    packed_bytes_read: int = 0
+    decoded_block_bytes: int = 0
+
+    # Scratch memory
+    scratch_bytes_current: int = 0
+    scratch_bytes_peak: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        """Convert to dictionary for serialization."""
+        return {
+            "tokens_appended": self.tokens_appended,
+            "staging_tokens_peak": self.staging_tokens_peak,
+            "dense_residual_tokens_peak": self.dense_residual_tokens_peak,
+            "packed_blocks_created": self.packed_blocks_created,
+            "packed_blocks_read": self.packed_blocks_read,
+            "packed_attention_calls": self.packed_attention_calls,
+            "dense_fallback_calls": self.dense_fallback_calls,
+            "full_history_materialization_calls": self.full_history_materialization_calls,
+            "packed_bytes_written": self.packed_bytes_written,
+            "packed_bytes_read": self.packed_bytes_read,
+            "decoded_block_bytes": self.decoded_block_bytes,
+            "scratch_bytes_current": self.scratch_bytes_current,
+            "scratch_bytes_peak": self.scratch_bytes_peak,
+        }

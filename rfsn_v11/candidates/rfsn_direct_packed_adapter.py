@@ -1,22 +1,39 @@
-"""Candidate: RFSN direct-packed K8/V8 (conservative quantization).
+"""Candidate: RFSN direct-packed attention (configurable bit-width).
 
 This is a direct-packed attention candidate that uses:
-- K8/V8 quantization (conservative, higher quality than K8/V5)
+- Configurable K/V bit-widths (K16/V16, K8/V16, K16/V8, K8/V8, K8/V6, K8/V5)
 - Direct packed attention without full dense reconstruction
 - Strict no-fallback execution mode
 
-This is the primary correctness validation candidate before pursuing
-lower bit-widths or fused Metal implementations.
+Bit-width isolation ladder for correctness validation:
+- K16/V16: Near-lossless reference (baseline for quality comparison)
+- K8/V16: Conservative value quantization
+- K16/V8: Conservative key quantization
+- K8/V8: Balanced quantization (primary validation target)
+- K8/V6: Aggressive value quantization
+- K8/V5: Maximum compression (original RFSN target)
 """
 from __future__ import annotations
 
 import time
+import traceback
+from dataclasses import dataclass
 from typing import Any
 
 from .base import CandidateResult, KVCompressionCandidate
 from .candidate_status import CandidateStatus
 from .memory_metrics import estimate_kv_memory_mb
 from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
+
+
+@dataclass
+class CandidateExecutionError:
+    """Structured error for candidate execution failures."""
+    candidate: str
+    stage: str
+    exception_type: str
+    exception_message: str
+    traceback_path: str
 
 
 class RFSNDirectPackedCandidate(KVCompressionCandidate):
@@ -35,7 +52,7 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
         value_bits: int = 8,
         group_size: int = 64,
         staging_capacity: int = 64,
-        dense_residual_window: int = 128,
+        dense_residual_window: int = 0,  # Set to 0 for initial validation to force compressed execution
     ) -> None:
         self.key_bits = key_bits
         self.value_bits = value_bits
@@ -73,9 +90,15 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             import mlx.core as mx
             from rfsn_v10.cache.cartesian_codec import CartesianCodec
             from rfsn_v10.cache.session import GenerationCacheSession
-            from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache
-            from rfsn_v10.runtime.generation import RFSNGenerator
-            from rfsn_v10.config import QuantizationConfig, RFSNConfig
+            from rfsn_v10.integrations.mlx_lm_model_support import (
+                RfsnDirectPackedKVCache,
+                packed_attention_context,
+            )
+            from rfsn_v10.config import (
+                QuantizationConfig,
+                RFSNConfig,
+                RuntimeConfig,
+            )
 
             # Configure K8/V8 quantization
             key_codec = CartesianCodec(bits=self.key_bits, group_size=self.group_size)
@@ -86,115 +109,100 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 key_codec=key_codec,
                 value_codec=value_codec,
             )
+            
+            # Create direct-packed caches
             cache_list = [
-                RfsnQuantizedKVCache(
-                    layer_cache=session.get_layer_cache(i),
+                RfsnDirectPackedKVCache(
+                    layer_id=i,
+                    key_codec=key_codec,
+                    value_codec=value_codec,
+                    staging_capacity=self.staging_capacity,
+                    dense_residual_window=self.dense_residual_window,
+                    strict=True,  # Strict mode for validation
                     session=session,
                 )
                 for i in range(len(model.layers))
             ]
 
-            # Configure generator with packed_reference=True
-            cfg = RFSNConfig(
-                quantization=QuantizationConfig(
-                    default_bits=self.key_bits,
-                    group_size=self.group_size,
-                ),
-                runtime=RFSNConfig.RuntimeConfig(
-                    strict_packed_mode=True,  # Strict no-fallback
-                ),
-            )
-            generator = RFSNGenerator(
-                model,
-                tokenizer,
-                cfg,
-                enable_quantized_kv=True,
-                packed_reference=True,  # Enable direct packed attention
-                staging_capacity=self.staging_capacity,
-                dense_residual_window=self.dense_residual_window,
-            )
+            # Use context manager to ensure wrapper cleanup
+            with packed_attention_context(model, cache_list, strict=True):
+                prompt_ids = tokenizer.encode(prompt)
+                target_ids = tokenizer.encode(target_text)
 
-            prompt_ids = tokenizer.encode(prompt)
-            target_ids = tokenizer.encode(target_text)
+                # Same logic as capture_teacher_forced_logprobs
+                if (
+                    len(target_ids) >= len(prompt_ids)
+                    and target_ids[: len(prompt_ids)] == prompt_ids
+                ):
+                    gen_ids = target_ids[len(prompt_ids):]
+                else:
+                    gen_ids = target_ids
 
-            # Same logic as capture_teacher_forced_logprobs
-            if (
-                len(target_ids) >= len(prompt_ids)
-                and target_ids[: len(prompt_ids)] == prompt_ids
-            ):
-                gen_ids = target_ids[len(prompt_ids):]
-            else:
-                gen_ids = target_ids
+                if not gen_ids:
+                    return None
 
-            if not gen_ids:
-                return None
-
-            # Prefill
-            y = mx.array(prompt_ids)
-            while y.size > 512:
-                model(y[:512][None], cache=cache_list)
-                y = y[512:]
-            prefill_logits = model(y[None], cache=cache_list)
-            prefill_logits = prefill_logits[:, -1, :]
-            prefill_logprobs = prefill_logits - mx.logsumexp(
-                prefill_logits, keepdims=True
-            )
-            first_lp = np.array(
-                prefill_logprobs.astype(mx.float32).squeeze(0)
-            )
-
-            # Teacher-forced decode
-            logprob_list: list[np.ndarray] = [first_lp]
-            for forced_token_id in gen_ids[:-1]:
-                logits = model(
-                    mx.array([forced_token_id])[None], cache=cache_list
+                # Prefill
+                y = mx.array(prompt_ids)
+                while y.size > 512:
+                    model(y[:512][None], cache=cache_list)
+                    y = y[512:]
+                prefill_logits = model(y[None], cache=cache_list)
+                prefill_logits = prefill_logits[:, -1, :]
+                prefill_logprobs = prefill_logits - mx.logsumexp(
+                    prefill_logits, keepdims=True
                 )
-                logits = logits[:, -1, :]
-                logprobs = logits - mx.logsumexp(
-                    logits, keepdims=True
-                )
-                lp_np = np.array(
-                    logprobs.astype(mx.float32).squeeze(0)
-                )
-                logprob_list.append(lp_np)
-
-            assert len(logprob_list) == len(gen_ids), (
-                f"Teacher-forced length mismatch: "
-                f"{len(logprob_list)} log-probs for {len(gen_ids)} tokens"
-            )
-
-            # Collect proof counters from the session
-            counters = session.counters()
-            try:
-                n_layers = len(model.layers)
-            except Exception:
-                n_layers = 0
-            counters["layers_active"] = n_layers
-            self._last_runtime_counters = counters
-
-            # Verify no dense fallback occurred
-            if counters.get("dense_fallback_calls", 0) > 0:
-                raise RuntimeError(
-                    f"Strict mode violation: {counters['dense_fallback_calls']} "
-                    "dense fallback calls detected"
+                first_lp = np.array(
+                    prefill_logprobs.astype(mx.float32).squeeze(0)
                 )
 
-            # Store detailed runtime counters for instrumentation
-            self._runtime_counters = {
-                "packed_attention_calls": counters.get("packed_attention_calls", 0),
-                "dense_fallback_calls": counters.get("dense_fallback_calls", 0),
-                "packed_bytes_read": counters.get("packed_bytes_read", 0),
-                "packed_bytes_written": counters.get("packed_bytes_written", 0),
-                "decoded_block_bytes": counters.get("decoded_block_bytes", 0),
-                "scratch_bytes_peak": counters.get("scratch_bytes_peak", 0),
-                "block_seal_events": counters.get("block_seal_events", 0),
-                "execution_backend": counters.get("execution_backend", "unknown"),
-            }
+                # Teacher-forced decode
+                logprob_list: list[np.ndarray] = [first_lp]
+                for forced_token_id in gen_ids[:-1]:
+                    logits = model(
+                        mx.array([forced_token_id])[None], cache=cache_list
+                    )
+                    logits = logits[:, -1, :]
+                    logprobs = logits - mx.logsumexp(
+                        logits, keepdims=True
+                    )
+                    lp_np = np.array(
+                        logprobs.astype(mx.float32).squeeze(0)
+                    )
+                    logprob_list.append(lp_np)
 
-            return np.stack(logprob_list, axis=0)
+                assert len(logprob_list) == len(gen_ids), (
+                    f"Teacher-forced length mismatch: "
+                    f"{len(logprob_list)} log-probs for {len(gen_ids)} tokens"
+                )
+
+                # Collect proof counters from the session
+                try:
+                    n_layers = len(model.layers)
+                except Exception:
+                    n_layers = 0
+                self._last_runtime_counters = session.runtime_counters.to_dict()
+                self._last_runtime_counters["layers_active"] = n_layers
+
+                # Verify no dense fallback occurred using unified counters
+                if session.runtime_counters.dense_fallback_calls > 0:
+                    raise RuntimeError(
+                        f"Strict mode violation: {session.runtime_counters.dense_fallback_calls} "
+                        "dense fallback calls detected"
+                    )
+
+                # Store detailed runtime counters for instrumentation
+                self._runtime_counters = session.runtime_counters.to_dict()
+
+                return np.stack(logprob_list, axis=0)
         except Exception as exc:
-            print(f"ERROR in capture_logprobs for {self.name}: {exc}")
-            return None
+            # Raise structured error instead of swallowing
+            raise CandidateExecutionError(
+                candidate=self.name,
+                stage="capture_logprobs",
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                traceback_path="".join(traceback.format_tb(exc.__traceback__)),
+            ) from exc
 
     def run(
         self,
@@ -216,7 +224,11 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             import contextlib
             import io
 
-            from rfsn_v10.config import QuantizationConfig, RFSNConfig
+            from rfsn_v10.config import (
+                QuantizationConfig,
+                RFSNConfig,
+                RuntimeConfig,
+            )
             from rfsn_v10.runtime.generation import RFSNGenerator
 
             cfg = RFSNConfig(
@@ -224,7 +236,7 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                     default_bits=self.key_bits,
                     group_size=self.group_size,
                 ),
-                runtime=RFSNConfig.RuntimeConfig(
+                runtime=RuntimeConfig(
                     strict_packed_mode=True,  # Strict no-fallback
                 ),
             )

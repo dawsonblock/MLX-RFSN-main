@@ -86,19 +86,23 @@ class GenerationCacheSession:
 
     def increment(self, counter: str, delta: int = 1) -> None:
         self._counters[counter] = self._counters.get(counter, 0) + delta
-        # Sync typed runtime counters where field names map directly
+        # Sync typed runtime counters with new unified schema
+        # Only increment tokens_appended once (from new_tokens_received)
         if counter == "new_tokens_received":
-            self.runtime_counters.tokens_received += delta
+            self.runtime_counters.tokens_appended += delta
         elif counter == "new_tokens_encoded":
-            self.runtime_counters.tokens_staged += delta
+            # Don't double-count - already counted by new_tokens_received
+            pass
         elif counter == "packed_blocks_created":
-            self.runtime_counters.blocks_created += delta
+            self.runtime_counters.packed_blocks_created += delta
         elif counter == "sealed_blocks_read":
-            self.runtime_counters.blocks_read_reference += delta
+            self.runtime_counters.packed_blocks_read += delta
         elif counter == "fallback_attention_calls":
-            self.runtime_counters.fallback_calls += delta
+            self.runtime_counters.dense_fallback_calls += delta
         elif counter == "dense_shadow_bytes":
-            self.runtime_counters.cumulative_scratch_traffic_bytes += delta
+            self.runtime_counters.scratch_bytes_current += delta
+            if self.runtime_counters.scratch_bytes_current > self.runtime_counters.scratch_bytes_peak:
+                self.runtime_counters.scratch_bytes_peak = self.runtime_counters.scratch_bytes_current
 
     def get_counter(self, counter: str) -> int:
         return self._counters.get(counter, 0)

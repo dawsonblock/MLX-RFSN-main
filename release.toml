@@ -1,14 +1,16 @@
 # Release identity configuration
 # This is the single source of truth for release naming and versioning
+# Phase 6.23: Unified release manifest (release_id, channel, version)
 
 release_id = "alpha-8.4"
-display_name = "MLX-RFSN Fusion Alpha 8.4"
+display_name = "MLX-RFSN Fusion Alpha 8.4 - Direct-Packed Correctness Release"
 package_version = "10.2.0a84"
 artifact_schema = "3.0"
 proof_profile = "alpha84"
+channel = "alpha"
 
 # Release status
-status = "Validation Integrity Repair"
+status = "Direct-Packed Correctness Validation"
 is_promotion_allowed = false
 promoted_candidate = "NONE"
 
@@ -18,4 +20,4 @@ mlx_version = "0.21.1"
 mlx_lm_version = "0.20.6"
 
 # Release metadata
-description = "Research alpha for KV-cache compression on Apple Silicon"
+description = "Direct-packed K8/V8 correctness validation on Apple Silicon with zero fallback, zero full-history reconstruction, reproducible quality, and runtime-measured memory"

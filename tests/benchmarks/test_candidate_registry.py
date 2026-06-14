@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = pytest.mark.pure_python
+pytestmark = pytest.mark.portable
 
 
 @pytest.mark.unit
@@ -35,11 +35,13 @@ def test_turboquant_v2_name_includes_config():
 
 @pytest.mark.unit
 def test_build_candidates_registry_valid():
-    """Verify _build_candidates() only uses valid config names.
+    """Verify _build_candidates() only uses valid config names (Phase 0 scope freeze).
 
     This test ensures that invalid candidate names like "k8_v5_gs32" cannot
     silently enter the registry and cause runtime failures. The gs32 path
     was explicitly moved to legacy status as "legacy_k8_v5_gs32".
+    
+    Phase 0: Only direct-packed candidate is active for correctness validation.
     """
     import sys
     from pathlib import Path
@@ -60,17 +62,54 @@ def test_build_candidates_registry_valid():
             "Invalid gs32 config should not be in active registry"
         )
 
-        # Verify gs64 IS in the active registry
-        assert "rfsn_v10_k8_v5_gs64" in candidate_names, (
-            "Canonical gs64 config should be in active registry"
+        # Phase 0: Verify direct-packed candidate IS in the active registry
+        assert "rfsn_direct_packed_k8v8_gs64" in candidate_names, (
+            "Direct-packed K8/V8 should be in active registry for correctness validation"
         )
-
-        # Verify legacy gs32 only appears when explicitly requested
-        candidates_with_legacy = _build_candidates(quick=False, include_legacy=True)
-        legacy_names = [c.name for c in candidates_with_legacy]
-        assert "rfsn_v10_legacy_k8_v5_gs32" in legacy_names, (
-            "Legacy gs32 should appear when --include-legacy is set"
+        
+        # Verify baseline is always present
+        assert "mlx_lm_baseline" in candidate_names, (
+            "Baseline should be in active registry for comparison"
         )
 
     except ValueError as e:
         pytest.fail(f"_build_candidates() raised ValueError for valid registry: {e}")
+
+
+@pytest.mark.unit
+def test_declared_vs_available_candidates():
+    """Verify declared_candidates works without MLX, available_candidates requires MLX.
+    
+    This test ensures the separation between declared and available candidates:
+    - declared_candidates: returns all registered candidates (portable)
+    - available_candidates: returns only candidates with satisfied dependencies
+    """
+    import sys
+    from pathlib import Path
+
+    # Add benchmarks to path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent / "benchmarks"))
+
+    from benchmarks.candidate_registry import get_registry
+
+    registry = get_registry()
+    
+    # declared_candidates should work without MLX (portable)
+    declared = registry.declared_candidates()
+    assert isinstance(declared, list)
+    assert len(declared) > 0, "Should have declared candidates"
+    
+    # Verify baseline is always declared
+    assert "dense_mlx_baseline" in declared
+    
+    # available_candidates may return fewer candidates if MLX is not installed
+    available = registry.available_candidates()
+    assert isinstance(available, list)
+    
+    # available should be a subset of declared
+    for name in available:
+        assert name in declared, f"Available candidate {name} not in declared list"
+    
+    # If MLX is not installed, available may be empty or only baseline
+    # If MLX is installed, available should include MLX-dependent candidates
+    # This test is portable and works in both cases

@@ -79,8 +79,20 @@ class CandidateRegistry:
     def names(self) -> list[str]:
         return list(self._registry.keys())
 
-    def list_available(self) -> list[str]:
-        """Return names of candidates that report is_available() == True."""
+    def declared_candidates(self) -> list[str]:
+        """Return names of all declared candidates (no dependency checks).
+        
+        This is useful for portable tests that don't require MLX or other
+        runtime dependencies to be installed.
+        """
+        return self.names()
+
+    def available_candidates(self) -> list[str]:
+        """Return names of candidates that report is_available() == True.
+        
+        This checks runtime dependencies and only returns candidates that
+        can actually run in the current environment.
+        """
         available = []
         for name in self.names():
             try:

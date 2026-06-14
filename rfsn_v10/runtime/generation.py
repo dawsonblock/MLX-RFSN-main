@@ -340,6 +340,8 @@ class RFSNGenerator:
                     is_model_wrapped,
                 )
 
+                # Create session for direct packed path
+                session = self._adapter._new_session()
                 caches = [
                     RfsnDirectPackedKVCache(
                         layer_id=i,
@@ -347,11 +349,13 @@ class RFSNGenerator:
                         value_codec=self._adapter.value_codec,
                         staging_capacity=self._adapter.staging_capacity,
                         dense_residual_window=self._adapter.dense_residual_window,
+                        strict=self.config.runtime.strict_packed_mode,
+                        session=session,
                     )
                     for i in range(self._adapter.num_layers)
                 ]
                 if not is_model_wrapped(self.model):
-                    install_packed_attention(self.model, caches)
+                    install_packed_attention(self.model, caches, strict=self.config.runtime.strict_packed_mode)
                 gen_iter = _mlx_stream_generate(
                     self.model,
                     self.tokenizer,
@@ -369,6 +373,12 @@ class RFSNGenerator:
                             )
                             // self._adapter.num_layers,
                         }
+                        # Capture runtime counters from session
+                        if session:
+                            self._last_counters["runtime_counters"] = session.runtime_counters
+                        # Cleanup session
+                        if session:
+                            session.destroy()
                 return
 
             # Explicit per-layer cache path — dense reconstruction fallback.

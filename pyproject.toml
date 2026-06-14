@@ -126,7 +126,7 @@ exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 [tool.setuptools_scm]
 write_to = "rfsn_v10/_version.py"
 version_scheme = "release-branch-semver"
-fallback_version = "10.2.0.dev97"
+fallback_version = "10.2.0a84"  # Synchronized with release.toml package_version
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"
@@ -141,7 +141,9 @@ markers = [
     "integration: integration tests",
     "db: database tests (requires alembic/sqlalchemy)",
     "e2e: end-to-end tests (requires full stack)",
-    "mlx: requires Apple Silicon + MLX",
+    "portable: no MLX required, runs on any platform",
+    "mlx: requires MLX library",
+    "apple_metal: requires Apple Silicon and Metal backend",
     "mlx_required: requires MLX (same as mlx marker)",
     "pure_python: tests that don't require MLX",
     "slow: slow tests (>10s)",

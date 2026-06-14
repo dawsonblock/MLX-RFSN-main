@@ -47,6 +47,10 @@ def test_session_counters() -> None:
     assert session.get_counter("new_tokens_received") == 10
     assert session.get_counter("new_tokens_encoded") == 8
     assert session.get_counter("nonexistent") == 0
+    
+    # Verify unified RuntimeCounters are updated
+    # tokens_appended is only incremented by new_tokens_received to avoid double-counting
+    assert session.runtime_counters.tokens_appended == 10
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")

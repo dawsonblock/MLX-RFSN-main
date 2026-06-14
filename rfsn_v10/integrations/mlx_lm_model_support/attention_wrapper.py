@@ -24,6 +24,7 @@ The wrapper:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 from rfsn_v10.cache.cartesian_codec import CartesianCodec
@@ -302,6 +303,38 @@ def uninstall_packed_attention(model: Any) -> None:
         attn = getattr(layer, "self_attn", None)
         if isinstance(attn, _PackedAttentionWrapper):
             layer.self_attn = attn._original
+
+
+@contextmanager
+def packed_attention_context(model: Any, caches: list[RfsnDirectPackedKVCache], strict: bool = False):
+    """Context manager that installs packed attention wrappers and ensures cleanup.
+    
+    This ensures that wrappers are always uninstalled even if generation raises
+    an exception, preventing cross-run contamination.
+    
+    Parameters
+    ----------
+    model
+        An MLX-LM model (e.g. Qwen2Model).
+    caches
+        One ``RfsnDirectPackedKVCache`` per layer, in layer order.
+    strict
+        If ``True``, the wrapper raises instead of silently falling back
+        to dense attention when the cache is missing or of the wrong type.
+    
+    Example
+    -------
+    ::
+    
+        with packed_attention_context(model, caches, strict=True):
+            logits = model(prompt_ids, cache=caches)
+        # Wrappers are automatically uninstalled here
+    """
+    install_packed_attention(model, caches, strict=strict)
+    try:
+        yield
+    finally:
+        uninstall_packed_attention(model)
 
 
 def collect_backend_stats(model: Any) -> list[dict[str, Any]]:

@@ -301,7 +301,7 @@ class RfsnMLXReferenceAdapter:
                 for i in range(self.num_layers)
             ]
             if not is_model_wrapped(self.model):
-                install_packed_attention(self.model, caches)
+                install_packed_attention(self.model, caches, strict=self.strict)
             text = generate(
                 self.model,
                 self.tokenizer,
@@ -376,6 +376,8 @@ class RfsnMLXReferenceAdapter:
                 is_model_wrapped,
                 install_packed_attention,
             )
+            # Create session for direct packed path
+            self._session = self._new_session()
             caches = [
                 RfsnDirectPackedKVCache(
                     layer_id=i,
@@ -383,11 +385,13 @@ class RfsnMLXReferenceAdapter:
                     value_codec=self.value_codec,
                     staging_capacity=self.staging_capacity,
                     dense_residual_window=self.dense_residual_window,
+                    strict=self.strict,
+                    session=self._session,
                 )
                 for i in range(self.num_layers)
             ]
             if not is_model_wrapped(self.model):
-                install_packed_attention(self.model, caches)
+                install_packed_attention(self.model, caches, strict=self.strict)
             prompt_ids = (
                 prompt if isinstance(prompt, mx.array)
                 else mx.array(self.tokenizer.encode(prompt))
@@ -407,6 +411,12 @@ class RfsnMLXReferenceAdapter:
                     )
                     // self.num_layers,
                 }
+                # Capture runtime counters from session
+                if self._session:
+                    self._last_counters["runtime_counters"] = self._session.runtime_counters
+                # Destroy session
+                if self._session:
+                    self._session.destroy()
             return
 
         session = self._new_session()

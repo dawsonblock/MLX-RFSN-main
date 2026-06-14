@@ -67,10 +67,15 @@ def test_update_and_fetch_appends_and_reconstructs() -> None:
     assert full_v.shape == (B, Hkv, T, D)
     assert cache.offset == T
 
-    # Proof counters
+    # Proof counters (legacy dict)
     assert session.get_counter("new_tokens_received") == T
     assert session.get_counter("new_tokens_encoded") == T
     assert session.get_counter("fallback_attention_calls") == 1
+    
+    # Unified RuntimeCounters
+    # tokens_appended is only incremented by new_tokens_received to avoid double-counting
+    assert session.runtime_counters.tokens_appended == T
+    assert session.runtime_counters.dense_fallback_calls == 1
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
@@ -99,6 +104,11 @@ def test_update_and_fetch_accumulates() -> None:
     assert cache.offset == 30
     assert session.get_counter("new_tokens_received") == 30
     assert session.get_counter("fallback_attention_calls") == 3
+    
+    # Unified RuntimeCounters
+    # tokens_appended is only incremented by new_tokens_received to avoid double-counting
+    assert session.runtime_counters.tokens_appended == 30
+    assert session.runtime_counters.dense_fallback_calls == 3
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
