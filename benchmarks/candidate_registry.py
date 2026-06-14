@@ -6,8 +6,8 @@ external/mlx-turboquant) only raise when the specific candidate is requested.
 
 Canonical name conventions
 ---------------------------
-A1_wht_grouped_k8v4_gs64     — Phase 3: grouped WHT, keys 8-bit, values 4-bit, group 64
-A1b_wht_asym_k8v4            — Phase 4: asymmetric bit sweep
+A1_wht_grouped_k8v5_gs64     — Phase 3: grouped WHT, keys 8-bit, values 5-bit, group 64
+A1b_wht_asym_k8v5            — Phase 4: asymmetric bit sweep
 A2_wht_polar_4bit            — Phase 6: PolarQuant
 A3_wht_turboquant_mse_4bit   — Phase 5: TurboQuant MSE-only
 A4_wht_turboquant_qjl_4bit   — Phase 10: TurboQuant + QJL
@@ -91,12 +91,12 @@ def _make_dense_baseline() -> Any:
 
 
 def _make_a1() -> Any:
-    from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_Grouped
+    from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import A1_WHT_Grouped
     return A1_WHT_Grouped()
 
 
 def _make_a1b() -> Any:
-    from benchmarks.candidates.a1b_wht_asym_k8v4 import A1b_WHT_Asym
+    from benchmarks.candidates.a1b_wht_asym_k8v5 import A1b_WHT_Asym
     return A1b_WHT_Asym()
 
 
@@ -116,7 +116,7 @@ def _make_a4() -> Any:
 
 
 def _make_b1() -> Any:
-    from benchmarks.candidates.b1_sparsejl_grouped_k8v4_gs64 import B1_SparseJL_Grouped
+    from benchmarks.candidates.b1_sparsejl_grouped_k8v5_gs64 import B1_SparseJL_Grouped
     return B1_SparseJL_Grouped()
 
 
@@ -153,8 +153,8 @@ def build_default_registry() -> CandidateRegistry:
     """Build and return the standard registry with all known candidates."""
     reg = CandidateRegistry()
     reg.register("dense_mlx_baseline", _make_dense_baseline)
-    reg.register("A1_wht_grouped_k8v4_gs64", _make_a1)
-    reg.register("A1b_wht_asym_k8v4", _make_a1b)
+    reg.register("A1_wht_grouped_k8v5_gs64", _make_a1)
+    reg.register("A1b_wht_asym_k8v5", _make_a1b)
     reg.register("A2_wht_polar_4bit", _make_a2)
     reg.register("A3_wht_turboquant_mse_4bit", _make_a3)
     reg.register("A4_wht_turboquant_qjl_4bit", _make_a4)

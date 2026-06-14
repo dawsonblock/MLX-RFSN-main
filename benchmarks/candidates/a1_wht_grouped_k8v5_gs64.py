@@ -1,4 +1,4 @@
-"""Candidate A1: WHT + grouped symmetric quantization, keys 8-bit, values 4-bit, group_size=64.
+"""Candidate A1: WHT + grouped symmetric quantization, keys 8-bit, values 5-bit, group_size=64.
 
 This is the first compression candidate and the foundational baseline for all
 subsequent candidates in the promotion ladder.
@@ -13,7 +13,7 @@ Keys:
 
 Values:
   1. Apply WHT (WHT distributes energy more uniformly across coordinates).
-  2. Apply mx.quantize at 4 bits, group_size=64 (bit-packed).
+  2. Apply mx.quantize at 5 bits, group_size=64 (bit-packed).
   3. On fetch: mx.dequantize → inverse WHT.
 
 Design notes
@@ -27,18 +27,18 @@ Design notes
 - Both K and V buffers are pre-allocated with step=256 like mlx_lm's
   QuantizedKVCache to amortise allocation cost.
 
-Memory model (per layer, per token, head_dim=D, k=8, v=4, gs=64)
+Memory model (per layer, per token, head_dim=D, k=8, v=5, gs=64)
 -----------------------------------------------------------------
 Keys:   D*8/32 * 4 + D/64 * 4 + D/64 * 4  = D + D/8  bytes
          (packed codes)   (scales)  (biases)
-Values: D*4/32 * 4 + D/64 * 4 + D/64 * 4  = D/2 + D/8 bytes
-K+V total: D + D/8 + D/2 + D/8  = 1.75*D bytes
+Values: D*5/32 * 4 + D/64 * 4 + D/64 * 4  = 0.625*D + D/8 bytes
+K+V total: D + D/8 + 0.625*D + D/8  = 1.875*D bytes
 FP16 K+V : 2 * D * 2           = 4*D bytes
-Ratio    : 1.75 / 4            = 0.4375  → 56.25% reduction (passes 30% gate)
+Ratio    : 1.875 / 4           = 0.46875 → 53.125% reduction (passes 30% gate)
 
-For D=128: 224 bytes vs 512 FP16 bytes → compression_factor ≈ 2.29×
+For D=128: 240 bytes vs 512 FP16 bytes → compression_factor ≈ 2.13×
 
-Candidate name: A1_wht_grouped_k8v4_gs64
+Candidate name: A1_wht_grouped_k8v5_gs64
 """
 from __future__ import annotations
 
@@ -329,7 +329,7 @@ def _packed_dim(bits: int, dim: int) -> int:
 # ---------------------------------------------------------------------------
 
 class A1_WHT_Grouped(BenchmarkCandidate):
-    """A1: WHT grouped symmetric quantization — keys 8-bit, values 4-bit, gs64.
+    """A1: WHT grouped symmetric quantization — keys 8-bit, values 5-bit, gs64.
 
     This is the first rung on the compression ladder.  It must:
     - Reduce KV memory by >= 30 %
@@ -337,12 +337,12 @@ class A1_WHT_Grouped(BenchmarkCandidate):
     - Pass attention_score_cosine >= 0.995
     """
 
-    candidate_name = "A1_wht_grouped_k8v4_gs64"
+    candidate_name = "A1_wht_grouped_k8v5_gs64"
 
     def __init__(
         self,
         key_bits: int = 8,
-        value_bits: int = 4,
+        value_bits: int = 5,
         group_size: int = 64,
     ) -> None:
         self.key_bits = key_bits

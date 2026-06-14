@@ -427,7 +427,7 @@ class BenchmarkRunRequest(BaseModel):
     """Trigger a benchmark run."""
     model_config = ConfigDict(extra="ignore")
     candidate: str = Field(
-        default="A1_wht_grouped_k8v4_gs64",
+        default="A1_wht_grouped_k8v5_gs64",
         description="Candidate name to benchmark",
     )
     prompt_id: str = Field(

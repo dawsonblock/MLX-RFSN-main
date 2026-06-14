@@ -16,7 +16,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_Grouped
+from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import A1_WHT_Grouped
 from benchmarks.candidates.base_candidate import BenchmarkCandidate
 from benchmarks.schemas import CandidateResult
 

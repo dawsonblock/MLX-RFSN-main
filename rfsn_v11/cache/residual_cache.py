@@ -59,7 +59,7 @@ class ResidualKVCache:
         self.offset = 0
 
         # Compressed history (A1-style cache)
-        from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import (
+        from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import (
             A1_WHT_GroupedKVCache,
         )
         self.compressed_cache = A1_WHT_GroupedKVCache(

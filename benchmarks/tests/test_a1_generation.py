@@ -91,7 +91,7 @@ def _make_synthetic_baseline(
 def _make_synthetic_a1_high_quality(baseline: CandidateResult) -> CandidateResult:
     """Synthetic A1 result that should PROMOTE."""
     return CandidateResult(
-        candidate_name="A1_wht_grouped_k8v4_gs64",
+        candidate_name="A1_wht_grouped_k8v5_gs64",
         model_id=baseline.model_id,
         prompt_id=baseline.prompt_id,
         context_length=baseline.context_length,
@@ -265,7 +265,7 @@ class TestSchemaAndReport:
     def test_candidate_registry_smoke(self):
         from benchmarks.candidate_registry import build_default_registry
         reg = build_default_registry()
-        assert "A1_wht_grouped_k8v4_gs64" in reg.names()
+        assert "A1_wht_grouped_k8v5_gs64" in reg.names()
         assert "dense_mlx_baseline" in reg.names()
 
 

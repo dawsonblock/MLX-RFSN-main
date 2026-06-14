@@ -224,7 +224,7 @@ class TestA1CacheAttentionFidelity:
     """Tests the A1_WHT_GroupedKVCache.update_and_fetch path for attention fidelity."""
 
     def test_attention_score_cosine_via_cache(self):
-        from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_GroupedKVCache
+        from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import A1_WHT_GroupedKVCache
         cache = A1_WHT_GroupedKVCache(head_dim=128, key_bits=8, value_bits=4, group_size=64)
 
         rng = np.random.default_rng(42)

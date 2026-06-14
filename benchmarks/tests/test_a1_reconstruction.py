@@ -224,7 +224,7 @@ class TestA1KVCache:
 
     @pytest.fixture
     def cache(self):
-        from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_GroupedKVCache
+        from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import A1_WHT_GroupedKVCache
         return A1_WHT_GroupedKVCache(head_dim=128, key_bits=8, value_bits=4, group_size=64)
 
     def test_update_and_fetch_shape(self, cache):
@@ -274,7 +274,7 @@ class TestA1KVCache:
         assert cosine >= 0.990, f"A1 cache v cosine {cosine:.6f} < 0.990"
 
     def test_memory_estimate(self, cache):
-        from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_GroupedKVCache
+        from benchmarks.candidates.a1_wht_grouped_k8v5_gs64 import A1_WHT_GroupedKVCache
         cache2 = A1_WHT_GroupedKVCache(head_dim=128, key_bits=8, value_bits=4, group_size=64)
         B, H, T, D = 1, 8, 100, 128
         keys = mx.array(np.random.default_rng(0).standard_normal((B, H, T, D)).astype(np.float32))
