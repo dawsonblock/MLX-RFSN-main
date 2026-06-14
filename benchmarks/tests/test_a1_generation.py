@@ -99,7 +99,7 @@ def _make_synthetic_a1_high_quality(baseline: CandidateResult) -> CandidateResul
         preconditioner="wht",
         quantizer="grouped_sym",
         key_bits=8.0,
-        value_bits=5.0,
+        value_bits=4.0,
         group_size=64,
         logit_cosine=0.9975,
         top1_match_rate=0.98,

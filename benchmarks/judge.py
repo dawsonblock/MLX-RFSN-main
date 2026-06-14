@@ -366,11 +366,11 @@ class Judge:
         if counters.get("unknown_layer_events", 0) > 0:
             return f"unknown_layer_events={counters['unknown_layer_events']} > 0"
 
-        # Canonical format enforcement (K8/V5/gs64)
+        # Canonical format enforcement (K8/V4/gs64)
         if candidate.key_bits is not None and candidate.key_bits != 8:
             return f"noncanonical key_bits={candidate.key_bits} (required 8)"
-        if candidate.value_bits is not None and candidate.value_bits != 5:
-            return f"noncanonical value_bits={candidate.value_bits} (required 5)"
+        if candidate.value_bits is not None and candidate.value_bits != 4:
+            return f"noncanonical value_bits={candidate.value_bits} (required 4)"
         if candidate.group_size is not None and candidate.group_size != 64:
             return f"noncanonical group_size={candidate.group_size} (required 64)"
 

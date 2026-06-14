@@ -239,28 +239,30 @@ class A1_WHT_GroupedKVCache:
         v_buf_s = self.values[1][..., :total_T, :]
         v_buf_b = self.values[2][..., :total_T, :]
 
-        k_dec_wht = mx.dequantize(
-            k_buf_q.reshape(B * H * total_T, packed_k),
+        groups = D // self.group_size
+
+        k_deq = mx.dequantize(
+            k_buf_q.reshape(B * H * total_T, _packed_dim(self.key_bits, D)),
             k_buf_s.reshape(B * H * total_T, groups),
             k_buf_b.reshape(B * H * total_T, groups),
             group_size=self.group_size, bits=self.key_bits,
         ).reshape(B, H, total_T, D)
 
-        v_dec_wht = mx.dequantize(
-            v_buf_q.reshape(B * H * total_T, packed_v),
+        v_deq = mx.dequantize(
+            v_buf_q.reshape(B * H * total_T, _packed_dim(self.value_bits, D)),
             v_buf_s.reshape(B * H * total_T, groups),
             v_buf_b.reshape(B * H * total_T, groups),
             group_size=self.group_size, bits=self.value_bits,
         ).reshape(B, H, total_T, D)
 
-        # Inverse WHT
-        k_dec = self._apply_wht(k_dec_wht)
-        v_dec = self._apply_wht(v_dec_wht)
+        # Inverse WHT (self-inverse)
+        k_out = self._apply_wht(k_deq)
+        v_out = self._apply_wht(v_deq)
 
-        mx.eval(k_dec, v_dec)
+        mx.eval(k_out, v_out)
         self.decompression_time_ms += (time.perf_counter() - t0) * 1000.0
 
-        return k_dec, v_dec
+        return k_out, v_out
 
     def compressed_bytes(self) -> int:
         """Return current compressed buffer size in bytes."""

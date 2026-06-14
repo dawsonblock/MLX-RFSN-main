@@ -6,7 +6,7 @@ external/mlx-turboquant) only raise when the specific candidate is requested.
 
 Canonical name conventions
 ---------------------------
-A1_wht_grouped_k8v5_gs64     — Phase 3: grouped WHT, keys 8-bit, values 5-bit, group 64
+A1_wht_grouped_k8v4_gs64     — Phase 3: grouped WHT, keys 8-bit, values 4-bit, group 64
 A1b_wht_asym_k8v4            — Phase 4: asymmetric bit sweep
 A2_wht_polar_4bit            — Phase 6: PolarQuant
 A3_wht_turboquant_mse_4bit   — Phase 5: TurboQuant MSE-only
@@ -116,7 +116,7 @@ def _make_a4() -> Any:
 
 
 def _make_b1() -> Any:
-    from benchmarks.candidates.b1_sparsejl_grouped_k8v5_gs64 import B1_SparseJL_Grouped
+    from benchmarks.candidates.b1_sparsejl_grouped_k8v4_gs64 import B1_SparseJL_Grouped
     return B1_SparseJL_Grouped()
 
 
