@@ -309,6 +309,7 @@ class RuntimeCounters:
 
     # Attention execution
     packed_attention_calls: int = 0
+    packed_reference_calls: int = 0  # Alias for packed_attention_calls
     dense_fallback_calls: int = 0
     full_history_materialization_calls: int = 0
 

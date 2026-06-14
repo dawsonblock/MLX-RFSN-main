@@ -27,13 +27,16 @@ from .quality_gates import GATE_STATUS_PENDING_LOGIT_GATE
 
 
 @dataclass
-class CandidateExecutionError:
+class CandidateExecutionError(Exception):
     """Structured error for candidate execution failures."""
     candidate: str
     stage: str
     exception_type: str
     exception_message: str
     traceback_path: str
+    
+    def __str__(self) -> str:
+        return f"CandidateExecutionError({self.candidate}, {self.stage}, {self.exception_type}: {self.exception_message})"
 
 
 class RFSNDirectPackedCandidate(KVCompressionCandidate):
@@ -104,7 +107,7 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             key_codec = CartesianCodec(bits=self.key_bits, group_size=self.group_size)
             value_codec = CartesianCodec(bits=self.value_bits, group_size=self.group_size)
             session = GenerationCacheSession(
-                name="direct_packed_teacher_forced",
+                model_id="direct_packed_teacher_forced",
                 num_layers=len(model.layers),
                 key_codec=key_codec,
                 value_codec=value_codec,
