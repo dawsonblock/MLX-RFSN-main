@@ -213,9 +213,12 @@ def main() -> int:
             )
 
         _print_summary(all_verdicts)
+        if not all_baselines:
+            print("\nWARNING: No baseline results collected. Skipping report generation.")
+            return 1
         generator.write(
             candidates=all_a1,
-            baseline=all_baselines[0] if all_baselines else CandidateResult(),
+            baseline=all_baselines[0],
             verdicts=all_verdicts,
             run_tag="a1",
             metadata={"smoke": True, "model_id": model_id},
@@ -314,6 +317,9 @@ def main() -> int:
     _print_summary(all_verdicts)
 
     # Use first baseline as the report reference
+    if not all_baselines:
+        print("\nWARNING: No baseline results collected. Skipping report generation.")
+        return 1
     generator.write(
         candidates=all_a1,
         baseline=all_baselines[0],

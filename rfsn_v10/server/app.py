@@ -504,7 +504,7 @@ def create_app(config: RFSNConfig | None = None) -> FastAPI:
         max_tok_limit = srv_cfg.max_tokens_limit
 
         # Concurrency gate: try to acquire without blocking
-        if not s.semaphore._value:  # noqa: SLF001
+        if s.semaphore.locked():
             raise HTTPException(
                 status_code=429,
                 detail=(
@@ -674,6 +674,7 @@ async def _sse_stream(
     generator = state.generator
     assert generator is not None
 
+    # Concurrency gate: acquire semaphore (held for stream duration)
     await state.semaphore.acquire()
 
     queue: asyncio.Queue = asyncio.Queue()

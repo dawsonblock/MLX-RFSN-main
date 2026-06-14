@@ -227,10 +227,8 @@ class _PackedAttentionWrapper(nn.Module):
         return self.o_proj(output)
 
     def __getattr__(self, name: str) -> Any:
-        try:
-            return object.__getattribute__(self, name)
-        except AttributeError:
-            return super().__getattr__(name)
+        # Delegate to the wrapped original module
+        return getattr(self._original, name)
 
     def __repr__(self) -> str:
         return f"<_PackedAttentionWrapper wrapping {self._original!r}>"

@@ -497,7 +497,12 @@ class QuantizedLayerCache:
             _process_block(dense_k, dense_v, dense_T, token_offset)
 
         # Fully-masked rows return defined zero output.
-        output = mx.where(has_mass, output / running_sum, mx.zeros_like(output))
+        # Guard against running_sum == 0 due to numerical underflow.
+        output = mx.where(
+            has_mass & (running_sum > 0),
+            output / running_sum,
+            mx.zeros_like(output)
+        )
         return output.astype(queries.dtype)
 
     # ------------------------------------------------------------------

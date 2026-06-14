@@ -458,11 +458,19 @@ class CartesianCodec:
 
         # Inverse hash signs and WHT
         if block.sign_seed != 0:
+            # V4 blocks require layer_id and stream_id for correct sign patterns
+            layer_id = getattr(block, "layer_id", None)
+            stream_id = getattr(block, "stream_id", None)
+            if layer_id is None or stream_id is None:
+                raise ValueError(
+                    "Block missing required layer_id or stream_id attributes "
+                    "(V4 format requires both for hash sign correctness)"
+                )
             restored = CartesianCodec.apply_hash_signs(
                 restored,
                 block.sign_seed,
-                layer_id=getattr(block, "layer_id", 0),
-                stream_id=getattr(block, "stream_id", ""),
+                layer_id=layer_id,
+                stream_id=stream_id,
             )
         if block.wht_applied:
             restored = CartesianCodec.apply_wht(restored)
@@ -477,6 +485,12 @@ class CartesianCodec:
                 # Flat fallback for older blocks
                 flat_restored = flat_restored.reshape(-1)[: block.num_elements]
                 flat_restored = flat_restored.reshape(B, H, T, block.head_dim)
+            else:
+                raise ValueError(
+                    f"Unexpected num_elements ({block.num_elements}) "
+                    f"vs expected ({expected_elements}) and tensor size "
+                    f"({int(flat_restored.size)})"
+                )
 
         # Restore original dtype
         if block.original_dtype:

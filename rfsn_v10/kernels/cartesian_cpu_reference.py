@@ -167,6 +167,10 @@ def cartesian_qk_cpu_reference(
 
     for b in range(B):
         for hq in range(Hq):
+            if Hq % Hkv != 0:
+                raise ValueError(
+                    f"Hq ({Hq}) must be divisible by Hkv ({Hkv})"
+                )
             hkv = hq * Hkv // Hq  # GQA mapping
             for k_pos in range(Lkv):
                 # Dequantize the full K vector for this token
@@ -256,6 +260,10 @@ def cartesian_sv_cpu_reference(
 
     for b in range(B):
         for hq in range(Hq):
+            if Hq % Hkv != 0:
+                raise ValueError(
+                    f"Hq ({Hq}) must be divisible by Hkv ({Hkv})"
+                )
             hkv = hq * Hkv // Hq
             for q_pos in range(Lq):
                 # Accumulate weighted V in the ORIGINAL domain.

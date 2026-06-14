@@ -361,12 +361,13 @@ class RFSNGenerator:
                 try:
                     yield from gen_iter
                 finally:
-                    self._last_counters = {
-                        "direct_packed_tokens": sum(
-                            c.layer_cache.total_token_count() for c in caches
-                        )
-                        // self._adapter.num_layers,
-                    }
+                    if caches is not None:
+                        self._last_counters = {
+                            "direct_packed_tokens": sum(
+                                c.layer_cache.total_token_count() for c in caches
+                            )
+                            // self._adapter.num_layers,
+                        }
                 return
 
             # Explicit per-layer cache path — dense reconstruction fallback.

@@ -156,7 +156,12 @@ def attend(
         _process_region(dense_k, dense_v, dense_k.shape[2])
 
     # Fully-masked rows return defined zero output.
-    output = mx.where(has_mass, out / running_sum, mx.zeros_like(out))
+    # Guard against running_sum == 0 due to numerical underflow.
+    output = mx.where(
+        has_mass & (running_sum > 0),
+        out / running_sum,
+        mx.zeros_like(out)
+    )
     output = output.astype(queries.dtype)
 
     scratch = AttentionScratch(
