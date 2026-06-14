@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Release integrity checker for RFSN v10 Main 28."""
+"""Release integrity checker for MLX-RFSN Fusion.
+
+Reads release identity from release.toml for unified versioning.
+"""
 from __future__ import annotations
 
 import ast
@@ -8,6 +11,10 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 
 def _load_gitignore(root: Path) -> tuple[set[str], set[str], set[str]]:
@@ -33,11 +40,28 @@ def _load_gitignore(root: Path) -> tuple[set[str], set[str], set[str]]:
     return exact_names, dir_names, wildcards
 
 
+def _load_release_config(root: Path) -> dict:
+    """Load release.toml configuration."""
+    config_path = root / "release.toml"
+    if not config_path.exists():
+        return {}
+    try:
+        with config_path.open("rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
 def check() -> list[str]:
     errors: list[str] = []
 
     root = Path(".").resolve()
     exact_ign, dir_ign, wildcard_ign = _load_gitignore(root)
+
+    # Load release configuration
+    release_config = _load_release_config(root)
+    release_id = release_config.get("release_id", "unknown")
+    display_name = release_config.get("display_name", "unknown")
 
     def _is_gitignored(path: Path) -> bool:
         name = path.name
@@ -118,18 +142,20 @@ def check() -> list[str]:
         errors.append("README.md missing or unreadable")
 
     if readme:
-        # Check first 10 non-empty lines for Main 28 title
+        # Check first 10 non-empty lines for release title
         lines = readme.splitlines()
         non_empty = [ln for ln in lines if ln.strip()][:10]
+        expected_title = f"# {display_name}"
         has_title = any(
-            ln.startswith("# RFSN v10 Main 28") for ln in non_empty
+            ln.startswith(expected_title) for ln in non_empty
         )
         if not has_title:
-            errors.append("README title is not Main 28")
+            errors.append(f"README title is not '{display_name}'")
 
         # Check status section
-        if "## Status: RFSN v10 Main 28" not in readme:
-            errors.append("README status section is not Main 28")
+        expected_status = f"## Status: {display_name}"
+        if expected_status not in readme:
+            errors.append(f"README status section is not '{display_name}'")
 
         for stale in [
             "artifacts/proof/main23",
@@ -446,18 +472,24 @@ def check() -> list[str]:
     exp_dir = root / "artifacts" / "proof" / "experimental"
     manifest_path = exp_dir / "artifact_manifest.json"
     if not manifest_path.exists():
-        errors.append(
-            "artifacts/proof/experimental/artifact_manifest.json missing"
-        )
+        # For alpha releases, experimental artifacts may not exist yet
+        if release_config.get("status", "").startswith("Alpha"):
+            pass  # Skip experimental artifact check for alpha releases
+        else:
+            errors.append(
+                "artifacts/proof/experimental/artifact_manifest.json missing"
+            )
     else:
         try:
             manifest = json.loads(
                 manifest_path.read_text(encoding="utf-8")
             )
-            if manifest.get("release") != "experimental":
+            # Use release_id from config instead of hardcoded "experimental"
+            expected_release = release_config.get("release_id", "experimental")
+            if manifest.get("release") != expected_release:
                 errors.append(
-                    "artifact_manifest.json release "
-                    "field is not 'experimental'"
+                    f"artifact_manifest.json release "
+                    f"field is not '{expected_release}'"
                 )
             if manifest.get("stable_default") != "k8_v5_gs64":
                 errors.append(
@@ -501,97 +533,100 @@ def check() -> list[str]:
     # --- Stale artifact directories ---
     proof_dir = root / "artifacts" / "proof"
     if proof_dir.exists():
-        stale_releases = [
-            d.name for d in proof_dir.iterdir()
-            if d.is_dir() and d.name.startswith("main")
-            and d.name != "main28"
-        ]
-        for stale in stale_releases:
-            errors.append(
-                f"stale artifact directory found: artifacts/proof/{stale}"
-            )
-        for stale_manifest in proof_dir.glob("main*_release_manifest.json"):
-            if stale_manifest.name != "main28_release_manifest.json":
+        # For alpha releases, allow main* directories as historical
+        if not release_config.get("status", "").startswith("Alpha"):
+            stale_releases = [
+                d.name for d in proof_dir.iterdir()
+                if d.is_dir() and d.name.startswith("main")
+                and d.name != release_id
+            ]
+            for stale in stale_releases:
                 errors.append(
-                    f"stale release manifest found: {stale_manifest.name}"
+                    f"stale artifact directory found: artifacts/proof/{stale}"
                 )
-
-    # --- Main 28 artifact directory ---
-    artifact_dir = root / "artifacts" / "proof" / "main28"
-    if not artifact_dir.exists():
-        errors.append("artifacts/proof/main28 missing")
-    else:
-        required_artifacts = [
-            "kernel_benchmark.json",
-            "fused_kernel_benchmark.json",
-            "optimization_benchmark.json",
-            "real_model_validation.json",
-            "long_context_validation.json",
-            "generation_smoke.json",
-            "generation_throughput.json",
-            "proof_summary.md",
-            "summary.json",
-            "mlx_test_summary.md",
-            "mlx_pytest_raw.log",
-            "mlx_pytest_junit.xml",
-            "main28_release_manifest.json",
-        ]
-        for artifact in required_artifacts:
-            artifact_path = artifact_dir / artifact
-            if not artifact_path.exists():
-                errors.append(f"required artifact missing: {artifact}")
-                continue
-            # Every JSON artifact with a "release" field must say main28
-            if artifact.endswith(".json"):
-                try:
-                    data = json.loads(
-                        artifact_path.read_text(encoding="utf-8")
+            for stale_manifest in proof_dir.glob("main*_release_manifest.json"):
+                if stale_manifest.name != f"{release_id}_release_manifest.json":
+                    errors.append(
+                        f"stale release manifest found: {stale_manifest.name}"
                     )
-                    release_field = data.get("release")
-                    if release_field is not None and release_field != "main28":
-                        errors.append(
-                            f"{artifact} release field is "
-                            f"'{release_field}' (expected 'main28')"
+
+    # --- Release artifact directory (only for non-alpha releases) ---
+    if not release_config.get("status", "").startswith("Alpha"):
+        artifact_dir = root / "artifacts" / "proof" / release_id
+        if not artifact_dir.exists():
+            errors.append(f"artifacts/proof/{release_id} missing")
+        else:
+            required_artifacts = [
+                "kernel_benchmark.json",
+                "fused_kernel_benchmark.json",
+                "optimization_benchmark.json",
+                "real_model_validation.json",
+                "long_context_validation.json",
+                "generation_smoke.json",
+                "generation_throughput.json",
+                "proof_summary.md",
+                "summary.json",
+                "mlx_test_summary.md",
+                "mlx_pytest_raw.log",
+                "mlx_pytest_junit.xml",
+                f"{release_id}_release_manifest.json",
+            ]
+            for artifact in required_artifacts:
+                artifact_path = artifact_dir / artifact
+                if not artifact_path.exists():
+                    errors.append(f"required artifact missing: {artifact}")
+                    continue
+                # Every JSON artifact with a "release" field must match release_id
+                if artifact.endswith(".json"):
+                    try:
+                        data = json.loads(
+                            artifact_path.read_text(encoding="utf-8")
                         )
-                except (
-                    OSError, ValueError, TypeError, AttributeError
-                ):
+                        release_field = data.get("release")
+                        if release_field is not None and release_field != release_id:
+                            errors.append(
+                                f"{artifact} release field is "
+                                f"'{release_field}' (expected '{release_id}')"
+                            )
+                    except (
+                        OSError, ValueError, TypeError, AttributeError
+                    ):
+                        pass
+
+            # Manifest must declare release = release_id
+            manifest_path = artifact_dir / f"{release_id}_release_manifest.json"
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                    if manifest.get("release") != release_id:
+                        errors.append(
+                            f"{release_id}_release_manifest.json release "
+                            f"field is not '{release_id}'"
+                        )
+                except (OSError, ValueError, TypeError, AttributeError):
+                    errors.append(f"{release_id}_release_manifest.json is not valid JSON")
+
+            # MLX summary must identify release
+            mlx_summary_path = artifact_dir / "mlx_test_summary.md"
+            if mlx_summary_path.exists():
+                try:
+                    mlx_summary = mlx_summary_path.read_text(encoding="utf-8")
+                    if display_name not in mlx_summary:
+                        errors.append(f"MLX summary does not identify {display_name}")
+                except OSError:
                     pass
 
-        # Manifest must declare release = main28
-        manifest_path = artifact_dir / "main28_release_manifest.json"
-        if manifest_path.exists():
-            try:
-                manifest = json.loads(
-                    manifest_path.read_text(encoding="utf-8")
-                )
-                if manifest.get("release") != "main28":
-                    errors.append(
-                        "main28_release_manifest.json release "
-                        "field is not 'main28'"
-                    )
-            except (OSError, ValueError, TypeError, AttributeError):
-                errors.append("main28_release_manifest.json is not valid JSON")
-
-        # MLX summary must identify Main 28
-        mlx_summary_path = artifact_dir / "mlx_test_summary.md"
-        if mlx_summary_path.exists():
-            try:
-                mlx_summary = mlx_summary_path.read_text(encoding="utf-8")
-                if "Main 28" not in mlx_summary:
-                    errors.append("MLX summary does not identify Main 28")
-            except OSError:
-                pass
-
-        # proof_summary.md must identify Main 28
-        proof_path = artifact_dir / "proof_summary.md"
-        if proof_path.exists():
-            try:
-                proof = proof_path.read_text(encoding="utf-8")
-                if "Main 28" not in proof:
-                    errors.append("proof_summary.md does not identify Main 28")
-            except OSError:
-                pass
+            # proof_summary.md must identify release
+            proof_path = artifact_dir / "proof_summary.md"
+            if proof_path.exists():
+                try:
+                    proof = proof_path.read_text(encoding="utf-8")
+                    if display_name not in proof:
+                        errors.append(f"proof_summary.md does not identify {display_name}")
+                except OSError:
+                    pass
 
         # real_model_validation.json: no tiny-random model, sparse not enabled,
         # must evaluate >= 32 positions

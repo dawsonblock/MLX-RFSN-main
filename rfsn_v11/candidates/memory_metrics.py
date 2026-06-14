@@ -54,6 +54,19 @@ def estimate_kv_memory_mb(
     float | None
         Estimated KV-cache memory in MB, or None if model config cannot be
         read.
+
+    Note
+    ----
+    This is an analytical estimate and does not account for:
+    - K8 versus V5 asymmetry
+    - Scale tensors
+    - Padding
+    - Block metadata
+    - Staging buffers
+    - Dense residuals
+    - Temporary reconstructions
+    - Scratch space
+    - MLX allocator behavior
     """
     try:
         args = getattr(model, "args", None)
@@ -89,3 +102,53 @@ def estimate_kv_memory_mb(
         return bytes_to_mb(total_bytes)
     except Exception:
         return None
+
+
+def get_actual_kv_memory_mb(runtime_counters: dict[str, Any]) -> dict[str, float]:
+    """Get actual KV memory measurements from runtime counters.
+
+    Parameters
+    ----------
+    runtime_counters
+        Dictionary containing runtime instrumentation data.
+
+    Returns
+    -------
+    dict
+        Dictionary with actual memory measurements:
+        - estimated_payload_memory_mb: Analytical estimate
+        - measured_payload_memory_mb: Actual measured payload
+        - measured_staging_memory_mb: Staging buffer memory
+        - measured_dense_residual_memory_mb: Dense residual memory
+        - measured_scratch_peak_mb: Peak scratch memory
+        - measurement_kind: Type of measurement (RUNTIME_COUNTERS or ESTIMATED)
+    """
+    # Get analytical estimate for comparison
+    estimated = runtime_counters.get("estimated_payload_memory_mb", 0.0)
+
+    # Get actual measurements from runtime counters
+    measured_payload = runtime_counters.get("packed_bytes_written", 0)
+    measured_staging = runtime_counters.get("staging_bytes", 0)
+    measured_residual = runtime_counters.get("dense_residual_bytes", 0)
+    measured_scratch = runtime_counters.get("scratch_bytes_peak", 0)
+
+    # Convert to MB
+    measured_payload_mb = bytes_to_mb(measured_payload)
+    measured_staging_mb = bytes_to_mb(measured_staging)
+    measured_residual_mb = bytes_to_mb(measured_residual)
+    measured_scratch_mb = bytes_to_mb(measured_scratch)
+
+    # Determine measurement kind
+    if measured_payload > 0 or measured_staging > 0:
+        measurement_kind = "RUNTIME_COUNTERS"
+    else:
+        measurement_kind = "ESTIMATED"
+
+    return {
+        "estimated_payload_memory_mb": estimated,
+        "measured_payload_memory_mb": measured_payload_mb,
+        "measured_staging_memory_mb": measured_staging_mb,
+        "measured_dense_residual_memory_mb": measured_residual_mb,
+        "measured_scratch_peak_mb": measured_scratch_mb,
+        "measurement_kind": measurement_kind,
+    }

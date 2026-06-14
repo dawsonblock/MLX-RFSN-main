@@ -17,15 +17,22 @@ def test_pinned_constants_are_exact() -> None:
 
 
 def test_check_version_passes_with_installed() -> None:
-    try:
-        ok, msg = check_mlx_lm_version()
-        # On this machine, the pinned versions are installed
-        assert ok is True, msg
-        assert "pinned pair verified" in msg
-    except ImportError:
+    """Test that version check works when MLX is installed."""
+    ok, msg = check_mlx_lm_version()
+
+    # If MLX is not installed, the function returns False with a message
+    # It does NOT raise ImportError
+    if not ok and "not installed" in msg:
         pytest.skip("MLX not available on this platform")
-    except RuntimeError:
-        pytest.skip("MLX version mismatch on this platform")
+
+    # If versions don't match, the function returns False with a message
+    # It does NOT raise RuntimeError
+    if not ok and "!=" in msg:
+        pytest.skip(f"MLX version mismatch on this platform: {msg}")
+
+    # If we get here, versions should match
+    assert ok is True, msg
+    assert "pinned pair verified" in msg
 
 
 def test_require_pinned_versions_passes() -> None:

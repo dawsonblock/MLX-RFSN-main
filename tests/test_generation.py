@@ -54,12 +54,27 @@ class FakeTokenizer:
 
 
 def test_generator_creates_adapter_when_kv_enabled() -> None:
+    """Test that adapter is created when MLX-LM is available and KV is enabled."""
+    # This test only passes when MLX-LM is available
+    try:
+        import mlx_lm  # noqa: F401
+    except ImportError:
+        # On platforms without MLX, adapter should be None
+        gen = RFSNGenerator(
+            model=FakeModel(),
+            tokenizer=FakeTokenizer(),
+            enable_quantized_kv=True,
+        )
+        assert gen._adapter is None, "Adapter should be None when MLX-LM is unavailable"
+        return
+
+    # When MLX-LM is available, adapter should be created
     gen = RFSNGenerator(
         model=FakeModel(),
         tokenizer=FakeTokenizer(),
         enable_quantized_kv=True,
     )
-    assert gen._adapter is not None
+    assert gen._adapter is not None, "Adapter should be created when MLX-LM is available"
 
 
 def test_generator_no_adapter_when_kv_disabled() -> None:
@@ -73,6 +88,24 @@ def test_generator_no_adapter_when_kv_disabled() -> None:
 
 def test_generator_accepts_backward_compat_kwargs() -> None:
     """Deprecated kwargs (enable_sparse_decode, audit_mode, etc.) must not raise."""
+    # This test only passes when MLX-LM is available
+    try:
+        import mlx_lm  # noqa: F401
+    except ImportError:
+        # On platforms without MLX, just test that the kwargs are accepted
+        gen = RFSNGenerator(
+            model=FakeModel(),
+            tokenizer=FakeTokenizer(),
+            enable_quantized_kv=True,
+            enable_sparse_decode=True,  # deprecated no-op
+            audit_mode=True,              # deprecated no-op
+            use_compressed_on_miss=True,  # deprecated no-op
+        )
+        # Adapter will be None without MLX, but kwargs should not raise
+        assert gen._adapter is None
+        return
+
+    # When MLX-LM is available, test with adapter creation
     gen = RFSNGenerator(
         model=FakeModel(),
         tokenizer=FakeTokenizer(),

@@ -1,0 +1,21 @@
+# Release identity configuration
+# This is the single source of truth for release naming and versioning
+
+release_id = "alpha-8.4"
+display_name = "MLX-RFSN Fusion Alpha 8.4"
+package_version = "10.2.0a84"
+artifact_schema = "3.0"
+proof_profile = "alpha84"
+
+# Release status
+status = "Validation Integrity Repair"
+is_promotion_allowed = false
+promoted_candidate = "NONE"
+
+# Version requirements
+python_versions = ["3.11", "3.12"]
+mlx_version = "0.21.1"
+mlx_lm_version = "0.20.6"
+
+# Release metadata
+description = "Research alpha for KV-cache compression on Apple Silicon"

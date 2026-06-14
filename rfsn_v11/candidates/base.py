@@ -75,6 +75,16 @@ class CandidateResult:
     cache_bytes_written: int | None = None
     cache_bytes_read: int | None = None
 
+    # Detailed runtime counters (for instrumentation and validation)
+    packed_attention_calls: int = 0
+    dense_fallback_calls: int = 0
+    packed_bytes_read: int = 0
+    packed_bytes_written: int = 0
+    decoded_block_bytes: int = 0
+    scratch_bytes_peak: int = 0
+    block_seal_events: int = 0
+    execution_backend: str = ""  # e.g. "metal", "cpu", "reference"
+
     # Patch safety proof (for candidates that patch SDPA)
     patch_scope: str | None = None        # e.g. "controlled_context", "global"
     global_patch_restored: bool | None = None

@@ -1,7 +1,11 @@
-"""Candidate: RFSN v10 stable baseline (k8_v5_gs64).
+"""Candidate: RFSN v10 dense reconstruction reference (k8_v5_gs64).
 
-This wraps the validated rfsn_v10 quantization path so the shootout can
-compare it against newer candidates on equal footing.
+This wraps the rfsn_v10 quantization path with dense reconstruction fallback.
+This is a REFERENCE-ONLY implementation for correctness validation.
+
+IMPORTANT: This candidate reconstructs the full dense K/V history on every
+attention call. It is NOT a speed or memory candidate. It must never be ranked
+as a performance improvement.
 
 Config name mapping
 -------------------
@@ -29,9 +33,13 @@ _LEGACY_PRESETS: dict[str, dict[str, Any]] = {
 
 
 class RFSNV10Candidate(KVCompressionCandidate):
-    """RFSN v10 with a given quantization config."""
+    """RFSN v10 with a given quantization config.
 
-    candidate_status = CandidateStatus.BASELINE
+    This is a REFERENCE-ONLY implementation that uses dense reconstruction.
+    It is not eligible for speed or memory promotion.
+    """
+
+    candidate_status = CandidateStatus.REFERENCE_ONLY
 
     def __init__(self, config_name: str = "k8_v5_gs64") -> None:
         all_presets = {**_PRESET_MAP, **_LEGACY_PRESETS}
@@ -156,7 +164,10 @@ class RFSNV10Candidate(KVCompressionCandidate):
             self._last_runtime_counters = counters
 
             return np.stack(logprob_list, axis=0)
-        except Exception:
+        except Exception as exc:
+            # Return None to maintain backward compatibility with existing code
+            # The error will be captured in the run() method instead
+            print(f"ERROR in capture_logprobs for {self.name}: {exc}")
             return None
 
     def run(

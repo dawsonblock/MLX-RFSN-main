@@ -199,8 +199,57 @@ def _export_winner(
     models_tested: list[str],
     methodology_status: str = "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION",
     promotion_allowed: bool = False,
+    mode: str = "quick",
 ) -> None:
-    """Export winner artifacts when a candidate is promotion eligible."""
+    """Export winner artifacts when a candidate is promotion eligible.
+
+    Args:
+        rows: Candidate result rows.
+        models_tested: List of model IDs tested.
+        methodology_status: Methodology status string.
+        promotion_allowed: Whether promotion is globally allowed.
+        mode: Benchmark mode (quick, memory, full_logit, promotion).
+              Only 'promotion' mode writes to canonical winner directory.
+    """
+    # Only promotion mode can write to canonical winner directory
+    if mode != "promotion":
+        # Write mode-isolated winner artifacts instead
+        mode_winner_dir = ARTIFACTS_ROOT / mode / "winner"
+        mode_winner_dir.mkdir(parents=True, exist_ok=True)
+        eligible = [r for r in rows if r.get("promotion_eligible")]
+
+        if not promotion_allowed or not eligible:
+            winner_data = {
+                "winner": None,
+                "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
+                "reason": f"Mode={mode} artifacts are not promotion-eligible",
+                "methodology": "teacher_forced_logit_v1",
+                "methodology_status": methodology_status,
+                "promotion_allowed": False,
+                "mode": mode,
+            }
+        else:
+            best = max(eligible, key=lambda r: r.get("tokens_per_sec") or 0)
+            winner_data = {
+                "winner": best.get("name"),
+                "status": "MODE_ISOLATED",
+                "reason": (
+                    f"Mode={mode} winner; not canonical. "
+                    "Run --promotion-report for promotion consideration."
+                ),
+                "methodology": "teacher_forced_logit_v1",
+                "methodology_status": methodology_status,
+                "promotion_allowed": False,
+                "mode": mode,
+                "models_tested": models_tested,
+            }
+
+        json_path = mode_winner_dir / "winner.json"
+        with json_path.open("w", encoding="utf-8") as fh:
+            dump_json_strict(winner_data, fh, indent=2)
+        return
+
+    # Promotion mode: write to canonical winner directory
     eligible = [r for r in rows if r.get("promotion_eligible")]
     WINNER_DIR.mkdir(parents=True, exist_ok=True)
 

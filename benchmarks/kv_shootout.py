@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 import warnings
@@ -52,6 +53,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 # Suppress mlx-lm legacy sampling-arg deprecation warnings emitted during
 # generation. These are known and do not affect results.
@@ -77,7 +83,9 @@ from rfsn_v11.candidates.base import (  # noqa: E402
     CandidateResult,
     KVCompressionCandidate,
 )
-from rfsn_v11.candidates.candidate_status import CandidateStatus  # noqa: E402
+from rfsn_v11.candidates.candidate_status import (  # noqa: E402
+    CandidateStatus,
+)
 from rfsn_v11.candidates.logit_capture import (  # noqa: E402
     capture_teacher_forced_logprobs,
     compute_logit_metrics_from_logprobs,
@@ -95,8 +103,11 @@ from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     MAX_LOGIT_DELTA_MAX,
     TOP5_OVERLAP_MIN,
     TOP10_OVERLAP_MIN,
-    compute_promotion_eligibility,
+    compute_promotion_eligibility as compute_quality_gate_eligibility,
     evaluate_quality_gate,
+)
+from rfsn_v11.candidates.promotion_policy import (  # noqa: E402
+    evaluate_promotion_eligibility as evaluate_promotion_policy,
 )
 
 # ---------------------------------------------------------------------------
@@ -161,12 +172,26 @@ GENERATION_TEMP = 0.0
 ARTIFACTS_ROOT = Path("artifacts/bench/shootout")
 
 
+def _compute_file_sha256(file_path: Path) -> str:
+    """Compute SHA256 hash of a file for provenance tracking."""
+    sha256_hash = hashlib.sha256()
+    with file_path.open("rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Candidate registry
 # ---------------------------------------------------------------------------
 
-def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
-    """Instantiate all candidates. Skip unavailable ones gracefully."""
+def _build_candidates(quick: bool = False, include_legacy: bool = False) -> list[KVCompressionCandidate]:
+    """Instantiate all candidates. Skip unavailable ones gracefully.
+
+    Args:
+        quick: If True, use quick-mode candidate selection.
+        include_legacy: If True, include legacy/deprecated candidates.
+    """
     from rfsn_v11.candidates.mlx_lm_baseline import MLXLMBaseline
     from rfsn_v11.candidates.mlx_lm_quantized import MLXLMQuantizedKV
     from rfsn_v11.candidates.polar_reference_adapter import (
@@ -174,6 +199,7 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
     )
     from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
     from rfsn_v11.candidates.rfsn_v11_adapter import RFSNV11Candidate
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
     from rfsn_v11.candidates.turboquant_v2_adapter import TurboQuantV2Candidate
     from rfsn_v11.candidates.turbo_polar_adapter import TurboPolarAdapter
     from rfsn_v11.candidates.turbo_polar_config import TurboPolarConfig
@@ -181,8 +207,11 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
     all_candidates: list[KVCompressionCandidate] = [
         MLXLMBaseline(),
         MLXLMQuantizedKV(kv_bits=8),
-        RFSNV10Candidate("k8_v5_gs32"),
-        RFSNV10Candidate("k8_v5_gs64"),
+        RFSNV10Candidate("k8_v5_gs64"),  # Reference-only dense reconstruction
+        RFSNDirectPackedCandidate(  # Direct packed K8/V8 (correctness validation)
+            key_bits=8, value_bits=8, group_size=64,
+            staging_capacity=64, dense_residual_window=128,
+        ),
         RFSNV11Candidate(
             key_bits=8, value_bits=5, group_size=64,
             use_wht=True, dim=128,
@@ -191,6 +220,10 @@ def _build_candidates(quick: bool = False) -> list[KVCompressionCandidate]:
         PolarReferenceAdapter(bits=4, dim=128),
         TurboPolarAdapter(TurboPolarConfig()),
     ]
+
+    # Add legacy candidates only if explicitly requested
+    if include_legacy:
+        all_candidates.append(RFSNV10Candidate("legacy_k8_v5_gs32"))
 
     available = []
     for c in all_candidates:
@@ -254,13 +287,30 @@ def _run_once(
 ) -> CandidateResult:
     """Run one candidate on one prompt and apply quality gate."""
     _reset_peak_memory()
-    result = candidate.run(model, tokenizer, prompt, max_tokens, temp=temp)
+
+    # Wrap candidate.run() with structured error handling
+    try:
+        result = candidate.run(model, tokenizer, prompt, max_tokens, temp=temp)
+    except Exception as exc:
+        import traceback
+        # Return structured error result instead of letting exception propagate
+        result = CandidateResult(
+            name=candidate.name,
+            model_id=getattr(model, "name_or_path", "unknown"),
+            prompt=prompt,
+            gate_status="ERROR",
+            error=f"{type(exc).__name__}: {exc}",
+            promotion_eligible=False,
+        )
+        # Store detailed error info in notes field for now
+        result.notes = f"Exception in {type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+
     peak_mb = _peak_memory_mb()
     if peak_mb is not None:
         result.working_set_memory_mb = peak_mb
 
     # Error gate
-    if result.error:
+    if result.error or result.error_status == "ERROR":
         result.gate_status = "ERROR"
         result.promotion_eligible = False
         return result
@@ -487,7 +537,7 @@ def _run_once(
                     and result.compression_factor is not None
                 )
                 promotion_eligible, gate_status = (
-                    compute_promotion_eligibility(
+                    compute_quality_gate_eligibility(
                         logit_gate_passed=result.logit_gate_passed,
                         memory_gate_passed=result.memory_gate_passed,
                         actual_kv_memory_mb=result.actual_kv_memory_mb,
@@ -534,7 +584,7 @@ def _run_once(
                 and result.size_ratio is not None
                 and result.compression_factor is not None
             )
-            promotion_eligible, gate_status = compute_promotion_eligibility(
+            promotion_eligible, gate_status = compute_quality_gate_eligibility(
                 logit_gate_passed=result.logit_gate_passed,
                 memory_gate_passed=result.memory_gate_passed,
                 actual_kv_memory_mb=result.actual_kv_memory_mb,
@@ -568,7 +618,7 @@ def _run_once(
         else:
             result.memory_gate_passed = True
             # Even with memory gate passed, logit gate may still be pending
-            promotion_eligible, gate_status = compute_promotion_eligibility(
+            promotion_eligible, gate_status = compute_quality_gate_eligibility(
                 logit_gate_passed=result.logit_gate_passed,
                 memory_gate_passed=True,
                 actual_kv_memory_mb=result.actual_kv_memory_mb,
@@ -720,7 +770,15 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
         pending = [s for s in statuses if s != GATE_STATUS_PASS]
         agg["gate_status"] = pending[0] if pending else GATE_STATUS_PASS
 
-    agg["promotion_eligible"] = all(r.promotion_eligible for r in results)
+    # REFERENCE_ONLY candidates are never promotion-eligible
+    if candidate_status == CandidateStatus.REFERENCE_ONLY:
+        agg["promotion_eligible"] = False
+        agg["promotion_blocked_reason"] = (
+            "REFERENCE_ONLY candidates are not eligible for speed or memory promotion"
+        )
+    else:
+        agg["promotion_eligible"] = all(r.promotion_eligible for r in results)
+
     agg["real_cache_used"] = any(
         r.cache_backend_used and r.cache_backend_used != ""
         and r.cache_backend_used != "rfsn_v11_offline"
@@ -797,6 +855,7 @@ def _write_artifacts(
     out_dir: Path,
     mode: str = "quick",
     token_sequence_hash: str = "",
+    token_sequence_reference: dict[str, Any] | None = None,
     promotion_allowed: bool = False,
 ) -> None:
     """Write JSON, CSV, and Markdown artifacts."""
@@ -804,13 +863,20 @@ def _write_artifacts(
 
     gate_thresholds = LogitGateThresholds().to_dict()
 
+    # Build metadata with proper token provenance
+    metadata = _artifact_metadata(
+        mode=mode,
+        token_sequence_hash=token_sequence_hash,
+        promotion_allowed=promotion_allowed,
+        gate_thresholds=gate_thresholds,
+    )
+
+    # Include token sequence reference if available (for non-full-logit modes)
+    if token_sequence_reference:
+        metadata["token_sequence_provenance"] = token_sequence_reference
+
     payload = {
-        "metadata": _artifact_metadata(
-            mode=mode,
-            token_sequence_hash=token_sequence_hash,
-            promotion_allowed=promotion_allowed,
-            gate_thresholds=gate_thresholds,
-        ),
+        "metadata": metadata,
         "results": rows,
     }
 
@@ -903,6 +969,18 @@ def main() -> None:
         "--model", type=str, default=None,
         help="Specific model ID",
     )
+    parser.add_argument(
+        "--include-legacy", action="store_true",
+        help="Include legacy/deprecated candidates",
+    )
+    parser.add_argument(
+        "--require-model", action="store_true",
+        help="Require model to load successfully; exit nonzero on failure",
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="Strict mode: require all candidates to complete, exit on any error",
+    )
     args = parser.parse_args()
 
     # Determine mode and output directory
@@ -940,18 +1018,34 @@ def main() -> None:
     last_baseline_result: CandidateResult | None = None
     last_model_id: str = ""
 
+    # Track run validity for strict mode
+    models_requested = len(models)
+    models_loaded = 0
+    candidates_requested = 0
+    candidates_completed = 0
+    baseline_completed = False
+    run_errors = []
+    token_sequence_reference = None
+
     for model_id in models:
         model, tokenizer = _load_model(model_id)
         if model is None:
+            if args.require_model:
+                print(f"\nERROR: Required model {model_id} failed to load.")
+                sys.exit(1)
             continue
         any_model_loaded = True
+        models_loaded += 1
         models_tested.append(model_id)
         last_tokenizer = tokenizer
         last_model_id = model_id
 
-        candidates = _build_candidates(quick=args.quick)
+        candidates = _build_candidates(quick=args.quick, include_legacy=args.include_legacy)
+        candidates_requested += len(candidates)
         if not candidates:
             print("  No candidates available.")
+            if args.strict:
+                run_errors.append(f"No candidates available for model {model_id}")
             continue
 
         per_candidate_results: dict[str, list[CandidateResult]] = {}
@@ -974,9 +1068,19 @@ def main() -> None:
                     candidate.name, []
                 ).append(result)
 
+                # Track candidate completion
+                if result.gate_status != "ERROR":
+                    candidates_completed += 1
+                elif args.strict:
+                    run_errors.append(
+                        f"Candidate {candidate.name} failed: {result.error}"
+                    )
+
                 if candidate.name == "mlx_lm_baseline":
                     baseline_result = result
                     last_baseline_result = result
+                    if result.gate_status != "ERROR":
+                        baseline_completed = True
 
                 print(
                     f"{result.gate_status}  "
@@ -1134,21 +1238,119 @@ def main() -> None:
         except Exception:
             pass
     elif mode in ("memory", "quick", "promotion"):
-        # Non-full-logit modes should inherit the hash from full_logit
-        # artifacts so that promotion validation can cross-check.
+        # Non-full-logit modes should reference the full_logit artifact
+        # rather than copying the token hash directly. This preserves
+        # provenance by linking to the source artifact.
         full_logit_json = ARTIFACTS_ROOT / "full_logit" / "results.json"
         if full_logit_json.exists():
             try:
                 with full_logit_json.open("r", encoding="utf-8") as fh:
                     full_payload = json.load(fh)
+                # Reference the source artifact instead of copying hash
+                token_sequence_artifact = "full_logit/results.json"
                 token_sequence_hash = (
                     full_payload.get("metadata", {})
                     .get("token_sequence_hash", "")
                 )
+                # Store as reference, not direct copy
+                token_sequence_reference = {
+                    "token_sequence_hash": token_sequence_hash,
+                    "token_sequence_artifact": token_sequence_artifact,
+                    "token_sequence_artifact_sha256": _compute_file_sha256(full_logit_json),
+                }
             except Exception:
-                pass
+                token_sequence_reference = None
+        else:
+            token_sequence_reference = None
 
-    promotion_allowed = False
+    # Strict mode validation
+    if args.strict:
+        run_valid = True
+        validation_errors = []
+
+        if models_loaded == 0:
+            run_valid = False
+            validation_errors.append("No models loaded")
+
+        if models_loaded < models_requested:
+            run_valid = False
+            validation_errors.append(
+                f"Only {models_loaded}/{models_requested} models loaded"
+            )
+
+        if candidates_completed == 0:
+            run_valid = False
+            validation_errors.append("No candidates completed")
+
+        if candidates_completed < candidates_requested:
+            run_valid = False
+            validation_errors.append(
+                f"Only {candidates_completed}/{candidates_requested} candidates completed"
+            )
+
+        if not baseline_completed:
+            run_valid = False
+            validation_errors.append("Baseline did not complete")
+
+        if run_errors:
+            run_valid = False
+            validation_errors.extend(run_errors)
+
+        # Add run validity metadata
+        run_metadata = {
+            "models_requested": models_requested,
+            "models_loaded": models_loaded,
+            "candidates_requested": candidates_requested,
+            "candidates_completed": candidates_completed,
+            "baseline_completed": baseline_completed,
+            "run_valid": run_valid,
+        }
+
+        if validation_errors:
+            run_metadata["validation_errors"] = validation_errors
+
+        # Inject into first row or create a metadata row
+        if all_rows and isinstance(all_rows[0], dict):
+            if "metadata" not in all_rows[0]:
+                all_rows[0]["metadata"] = {}
+            all_rows[0]["metadata"].update(run_metadata)
+
+        if not run_valid:
+            print("\nSTRICT MODE VALIDATION FAILED:")
+            for error in validation_errors:
+                print(f"  - {error}")
+            sys.exit(1)
+
+    # Use evidence-based promotion policy instead of hardcoded boolean
+    # Load release configuration for policy context
+    release_config_path = Path("release.toml")
+    if release_config_path.exists():
+        with release_config_path.open("rb") as f:
+            release_config_data = tomllib.load(f)
+    else:
+        release_config_data = {}
+
+    # Build run bundle for policy evaluation
+    run_bundle = {
+        "metadata": {
+            "token_sequence_hash": token_sequence_hash,
+            "token_sequence_provenance": token_sequence_reference,
+            "models_tested": models_tested,
+            "release_id": release_config_data.get("release_id", "unknown"),
+        },
+        "results": all_rows,
+    }
+
+    # Evaluate promotion eligibility using policy
+    promotion_allowed, promotion_blockers = evaluate_promotion_policy(
+        run_bundle,
+        policy_config={"current_release_id": release_config_data.get("release_id", "alpha-8.4")}
+    )
+
+    if not promotion_allowed and promotion_blockers:
+        print(f"\nPromotion blocked by policy:")
+        for blocker in promotion_blockers:
+            print(f"  - {blocker}")
     if promotion_allowed:
         methodology_status = _METHODOLOGY_STATUS_RERUN_PROMO
     elif not token_sequence_hash:
@@ -1177,12 +1379,14 @@ def main() -> None:
         out_dir,
         mode=mode,
         token_sequence_hash=token_sequence_hash,
+        token_sequence_reference=token_sequence_reference if mode != "full_logit" else None,
         promotion_allowed=promotion_allowed,
     )
     _export_winner(
         all_rows, models_tested,
         methodology_status=methodology_status,
         promotion_allowed=promotion_allowed,
+        mode=mode,
     )
     print("\nDone.")
 

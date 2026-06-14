@@ -73,6 +73,29 @@ jobs:
       - run: |
           cat artifacts/bench/shootout/quick/results.md || true
 
+  apple-silicon-benchmark:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[fusion]"
+      - name: Run strict benchmark with direct-packed candidate
+        run: |
+          PYTHONPATH=. python benchmarks/kv_shootout.py \
+            --quick \
+            --require-model \
+            --strict \
+            --include-legacy
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-silicon-benchmark-results
+          path: artifacts/bench/shootout/quick/
+          retention-days: 7
+
   package:
     runs-on: ubuntu-latest
     strategy:
