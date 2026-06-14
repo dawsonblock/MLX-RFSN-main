@@ -313,7 +313,7 @@ def _run_once(
         result.working_set_memory_mb = peak_mb
 
     # Error gate
-    if result.error or result.error_status == "ERROR":
+    if result.error or result.gate_status == "ERROR":
         result.gate_status = "ERROR"
         result.promotion_eligible = False
         return result
