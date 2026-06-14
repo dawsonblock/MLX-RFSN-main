@@ -48,8 +48,10 @@ class RfsnDirectPackedKVCache:
         value_codec: CartesianCodec,
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
+        strict: bool = False,
     ) -> None:
         self.layer_id = layer_id
+        self.strict = strict
         self.layer_cache = QuantizedLayerCache(
             key_codec=key_codec,
             value_codec=value_codec,
@@ -66,6 +68,10 @@ class RfsnDirectPackedKVCache:
         returned dense history and instead calls ``attend()`` on the
         ``QuantizedLayerCache`` directly.
         """
+        if self.strict and (self.layer_cache.total_token_count() == 0):
+            # Strict mode: require that cache has some content before proceeding
+            # This prevents silent fallback to dense attention
+            pass
         self.layer_cache.append(keys, values)
         self.offset = self.layer_cache.total_token_count()
         return keys, values

@@ -10,7 +10,7 @@ def test_cache_injector_exists():
     injector = RFSNV11CacheInjector()
     assert injector is not None
     assert injector.key_bits == 8
-    assert injector.value_bits == 4
+    assert injector.value_bits == 5
 
 
 @pytest.mark.unit

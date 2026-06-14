@@ -12,6 +12,8 @@ except ImportError:
 
 def test_rfsn_quantized_kv_cache_interface() -> None:
     """RfsnQuantizedKVCache must satisfy the MLX-LM cache interface."""
+    if not HAS_MLX:
+        pytest.skip("MLX not available on this platform")
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
     from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.integrations.mlx_lm_adapter.adapter import RfsnQuantizedKVCache

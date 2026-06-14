@@ -45,7 +45,7 @@ class ResidualKVCache:
         head_dim: int,
         residual_length: int = 128,
         key_bits: int = 8,
-        value_bits: int = 4,
+        value_bits: int = 5,
         group_size: int = 64,
     ) -> None:
         if not _MLX_AVAILABLE:

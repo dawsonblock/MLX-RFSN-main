@@ -17,12 +17,18 @@ def test_pinned_constants_are_exact() -> None:
 
 
 def test_check_version_passes_with_installed() -> None:
-    ok, msg = check_mlx_lm_version()
-    # On this machine, the pinned versions are installed
-    assert ok is True, msg
-    assert "pinned pair verified" in msg
+    try:
+        ok, msg = check_mlx_lm_version()
+        # On this machine, the pinned versions are installed
+        assert ok is True, msg
+        assert "pinned pair verified" in msg
+    except ImportError:
+        pytest.skip("MLX not available on this platform")
 
 
 def test_require_pinned_versions_passes() -> None:
-    # Should not raise when versions match
-    require_pinned_versions()
+    try:
+        # Should not raise when versions match
+        require_pinned_versions()
+    except ImportError:
+        pytest.skip("MLX not available on this platform")

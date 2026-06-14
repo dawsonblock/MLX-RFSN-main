@@ -126,16 +126,21 @@ def numpy_packed_attention(
         block_max = np.max(scores, axis=-1, keepdims=True)
         new_max = np.maximum(running_max, block_max)
 
-        old_scale = np.exp(running_max - new_max)
-        # Guard exp(-inf - (-inf)) => NaN on rows with no valid mass yet.
-        old_scale = np.where(np.isfinite(old_scale), old_scale, 1.0)
+        # Safe exponent computation: only compute where running_max is finite
+        with np.errstate(invalid='ignore', divide='ignore'):
+            old_scale = np.exp(running_max - new_max)
+            # Replace NaN from -inf - (-inf) with 1.0 (no scaling needed)
+            old_scale = np.where(np.isfinite(old_scale), old_scale, 1.0)
 
         running_sum = running_sum * old_scale
         out = out * old_scale
 
-        block_exp = np.exp(scores.astype(np.float32) - new_max)
-        # Zero out exp(NaN) from masked positions when new_max is also -inf.
-        block_exp = np.where(np.isfinite(block_exp), block_exp, 0.0)
+        # Safe block exponent computation
+        with np.errstate(invalid='ignore'):
+            block_exp = np.exp(scores.astype(np.float32) - new_max)
+            # Replace NaN from masked positions with 0
+            block_exp = np.where(np.isfinite(block_exp), block_exp, 0.0)
+
         running_sum = running_sum + np.sum(block_exp, axis=-1, keepdims=True)
         out = out + np.matmul(block_exp, v_block_bhtd.astype(np.float32))
 
@@ -159,11 +164,12 @@ def numpy_packed_attention(
 
     # Fully-masked rows return defined zero output.
     # Guard against running_sum == 0 due to numerical underflow.
-    output = np.where(
-        has_mass & (running_sum > 0),
-        out / running_sum,
-        np.zeros_like(out)
-    )
+    with np.errstate(invalid='ignore', divide='ignore'):
+        output = np.divide(
+            out, running_sum,
+            where=has_mass & (running_sum > 0),
+            out=np.zeros_like(out)
+        )
     return output.astype(queries.dtype)
 
 

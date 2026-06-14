@@ -153,9 +153,9 @@ _CONFIG_REGISTRY: dict[str, dict[str, Any]] = {
     "mixed_L0k8v4_restk6v4_gs64": {"name": "mixed_L0k8v4_restk6v4_gs64", "k_bits": 6, "v_bits": 4, "group_size": 64, "layer_map": {0: (8, 4)}},
     "k8_v3_gs64": {"name": "k8_v3_gs64", "k_bits": 8, "v_bits": 3, "group_size": 64},
     "k8_v4_gs64": {"name": "k8_v4_gs64", "k_bits": 8, "v_bits": 4, "group_size": 64},
-    "k8_v5_gs64": {"name": "k8_v5_gs64", "k_bits": 8, "v_bits": 4, "group_size": 64},
+    "k8_v5_gs64": {"name": "k8_v5_gs64", "k_bits": 8, "v_bits": 5, "group_size": 64},
     "k8_v4_gs32": {"name": "k8_v4_gs32", "k_bits": 8, "v_bits": 4, "group_size": 32},
-    "k8_v5_gs32": {"name": "k8_v5_gs32", "k_bits": 8, "v_bits": 4, "group_size": 32},
+    "k8_v5_gs32": {"name": "k8_v5_gs32", "k_bits": 8, "v_bits": 5, "group_size": 32},
     "k6_v6_gs64": {"name": "k6_v6_gs64", "k_bits": 6, "v_bits": 6, "group_size": 64},
     "k4_v4_gs64": {"name": "k4_v4_gs64", "k_bits": 4, "v_bits": 4, "group_size": 64},
 }

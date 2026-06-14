@@ -197,6 +197,10 @@ class RuntimeConfig(BaseModel):
         default=False,
         description="Use direct packed-reference attention (no dense reconstruction).",
     )
+    strict_packed_mode: bool = Field(
+        default=True,
+        description="Require packed cache and reject fallback to dense attention.",
+    )
 
 
 def _resolve_kv_compression_env() -> bool:

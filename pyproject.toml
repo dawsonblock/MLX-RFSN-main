@@ -126,7 +126,7 @@ exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 [tool.setuptools_scm]
 write_to = "rfsn_v10/_version.py"
 version_scheme = "release-branch-semver"
-fallback_version = "10.1.0.dev0"
+fallback_version = "10.2.0.dev97"
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"

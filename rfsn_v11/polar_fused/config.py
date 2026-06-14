@@ -41,8 +41,8 @@ class PolarFusedConfig:
         Enforce batch_size == 1 (initial restriction).
     """
 
-    key_bits: int = 4
-    value_bits: int = 4
+    key_bits: int = 8
+    value_bits: int = 5
     head_dim: int = 128
     key_rotation_seed: int = 42
     value_rotation_seed: int = 43
@@ -57,11 +57,11 @@ class PolarFusedConfig:
     require_batch_size_one: bool = True
 
     def __post_init__(self) -> None:
-        # Bits must be 2, 3, or 4
-        if self.key_bits not in (2, 3, 4):
-            raise ValueError(f"key_bits must be 2, 3, or 4; got {self.key_bits}")
-        if self.value_bits not in (2, 3, 4):
-            raise ValueError(f"value_bits must be 2, 3, or 4; got {self.value_bits}")
+        # Bits must be 2, 3, 4, 5, 6, or 8
+        if self.key_bits not in (2, 3, 4, 5, 6, 8):
+            raise ValueError(f"key_bits must be 2, 3, 4, 5, 6, or 8; got {self.key_bits}")
+        if self.value_bits not in (2, 3, 4, 5, 6, 8):
+            raise ValueError(f"value_bits must be 2, 3, 4, 5, 6, or 8; got {self.value_bits}")
 
         # Head dimension must initially be 64 or 128
         if self.head_dim not in (64, 128):
@@ -97,10 +97,10 @@ class PolarFusedConfig:
 
     @classmethod
     def polar_safe(cls) -> PolarFusedConfig:
-        """Conservative K4/V4 profile."""
+        """Conservative K8/V5 profile."""
         return cls(
-            key_bits=4,
-            value_bits=4,
+            key_bits=8,
+            value_bits=5,
             boundary_layers=2,
             lazy_quantization_tokens=1024,
             enable_sparse_v=False,
@@ -108,10 +108,10 @@ class PolarFusedConfig:
 
     @classmethod
     def polar_balanced(cls) -> PolarFusedConfig:
-        """Balanced K4/V3 profile."""
+        """Balanced K8/V5 profile."""
         return cls(
-            key_bits=4,
-            value_bits=3,
+            key_bits=8,
+            value_bits=5,
             boundary_layers=2,
             lazy_quantization_tokens=1024,
             enable_sparse_v=False,
@@ -119,10 +119,10 @@ class PolarFusedConfig:
 
     @classmethod
     def polar_aggressive(cls) -> PolarFusedConfig:
-        """Aggressive K3/V3 profile (experimental only)."""
+        """Aggressive K6/V5 profile (experimental only)."""
         return cls(
-            key_bits=3,
-            value_bits=3,
+            key_bits=6,
+            value_bits=5,
             boundary_layers=4,
             lazy_quantization_tokens=1024,
             enable_sparse_v=False,

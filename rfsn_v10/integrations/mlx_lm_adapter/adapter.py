@@ -90,6 +90,8 @@ class RfsnDenseReconstructionReferenceCache:
             self.session.increment("sealed_blocks_created", stats.sealed_blocks)
 
         # Fallback: reconstruct dense cache
+        if self.strict:
+            raise RuntimeError("Strict mode enabled: fallback to dense reconstruction is prohibited")
         dense_k, dense_v = self._reconstruct_dense()
         self.offset = dense_k.shape[2]
 
@@ -251,6 +253,10 @@ class RfsnMLXReferenceAdapter:
         self._last_counters: dict[str, int] = {}
         self._last_memory_report: dict[str, Any] = {}
 
+        # Strict mode: require packed cache and reject fallback
+        if self.strict and not self.use_direct_packed:
+            raise ValueError("Strict mode requires use_direct_packed=True")
+
     # ------------------------------------------------------------------
     # Generation
     # ------------------------------------------------------------------
@@ -287,6 +293,7 @@ class RfsnMLXReferenceAdapter:
                     value_codec=self.value_codec,
                     staging_capacity=self.staging_capacity,
                     dense_residual_window=self.dense_residual_window,
+                    strict=self.strict,
                 )
                 for i in range(self.num_layers)
             ]

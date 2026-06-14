@@ -20,7 +20,7 @@ class RFSNV11CacheInjector:
     def __init__(
         self,
         key_bits: int = 8,
-        value_bits: int = 4,
+        value_bits: int = 5,
         group_size: int = 64,
         use_wht: bool = True,
         dim: int = 128,

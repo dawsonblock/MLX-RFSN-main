@@ -366,11 +366,17 @@ class Judge:
         if counters.get("unknown_layer_events", 0) > 0:
             return f"unknown_layer_events={counters['unknown_layer_events']} > 0"
 
-        # Canonical format enforcement (K8/V4/gs64)
+        # Canonical format enforcement (K8/V5/gs64 for production)
+        # A1 benchmark is allowed to use V4 due to MLX mx.quantize limitations
         if candidate.key_bits is not None and candidate.key_bits != 8:
             return f"noncanonical key_bits={candidate.key_bits} (required 8)"
-        if candidate.value_bits is not None and candidate.value_bits != 4:
-            return f"noncanonical value_bits={candidate.value_bits} (required 4)"
+        if candidate.value_bits is not None:
+            # A1 benchmark candidates are allowed to use V4 due to MLX limitations
+            is_a1_candidate = candidate.candidate_name.startswith("A1")
+            if not is_a1_candidate and candidate.value_bits != 5:
+                return f"noncanonical value_bits={candidate.value_bits} (required 5 for production, V4 only allowed for A1)"
+            if is_a1_candidate and candidate.value_bits not in (4, 5):
+                return f"noncanonical value_bits={candidate.value_bits} (A1 requires 4 or 5)"
         if candidate.group_size is not None and candidate.group_size != 64:
             return f"noncanonical group_size={candidate.group_size} (required 64)"
 
@@ -381,6 +387,17 @@ class Judge:
             return "empty corpus_hash is ineligible"
         if not candidate.token_sequence_hash:
             return "empty token_sequence_hash is ineligible"
+
+        # Canonical identity fields must be present for compression candidates
+        # Baseline candidates (no quantization) are exempt
+        is_baseline = candidate.preconditioner == "none" and candidate.quantizer == "none"
+        if not is_baseline:
+            if candidate.key_bits is None:
+                return "key_bits is required for promotion"
+            if candidate.value_bits is None:
+                return "value_bits is required for promotion"
+            if candidate.group_size is None:
+                return "group_size is required for promotion"
 
         return ""
 

@@ -27,16 +27,20 @@ Design notes
 - Both K and V buffers are pre-allocated with step=256 like mlx_lm's
   QuantizedKVCache to amortise allocation cost.
 
-Memory model (per layer, per token, head_dim=D, k=8, v=5, gs=64)
+Memory model (per layer, per token, head_dim=D, k=8, v=4, gs=64)
 -----------------------------------------------------------------
 Keys:   D*8/32 * 4 + D/64 * 4 + D/64 * 4  = D + D/8  bytes
          (packed codes)   (scales)  (biases)
-Values: D*5/32 * 4 + D/64 * 4 + D/64 * 4  = 0.625*D + D/8 bytes
-K+V total: D + D/8 + 0.625*D + D/8  = 1.875*D bytes
+Values: D*4/32 * 4 + D/64 * 4 + D/64 * 4  = 0.5*D + D/8 bytes
+K+V total: D + D/8 + 0.5*D + D/8  = 1.75*D bytes
 FP16 K+V : 2 * D * 2           = 4*D bytes
-Ratio    : 1.875 / 4           = 0.46875 → 53.125% reduction (passes 30% gate)
+Ratio    : 1.75 / 4           = 0.4375 → 56.25% reduction (passes 30% gate)
 
-For D=128: 240 bytes vs 512 FP16 bytes → compression_factor ≈ 2.13×
+For D=128: 224 bytes vs 512 FP16 bytes → compression_factor ≈ 2.29×
+
+NOTE: This candidate uses MLX's mx.quantize which only supports bits 2,3,4,6,8.
+The production runtime uses GroupedCartesianQuantizer which supports arbitrary bit widths including 5-bit.
+This A1 benchmark therefore tests V4 due to MLX limitations, while the production runtime uses V5.
 
 Candidate name: A1_wht_grouped_k8v4_gs64
 """
