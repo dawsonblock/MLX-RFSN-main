@@ -312,14 +312,21 @@ class RuntimeCounters:
     dense_fallback_calls: int = 0
     full_history_materialization_calls: int = 0
 
-    # Byte accounting
+    # Byte accounting (Phase 5.20: Real memory accounting)
     packed_bytes_written: int = 0
     packed_bytes_read: int = 0
     decoded_block_bytes: int = 0
+    logical_payload_bytes: int = 0  # Actual compressed KV data bytes
+    staging_bytes_peak: int = 0  # Peak staging buffer usage
+    dense_residual_bytes_peak: int = 0  # Peak dense residual window usage
 
     # Scratch memory
     scratch_bytes_current: int = 0
     scratch_bytes_peak: int = 0
+
+    # Layer-by-layer divergence tracing (Phase 4.14)
+    layer_divergence_count: int = 0  # Number of layers with divergence detected
+    layers_processed: int = 0  # Total layers processed
 
     def to_dict(self) -> dict[str, int]:
         """Convert to dictionary for serialization."""
@@ -335,6 +342,11 @@ class RuntimeCounters:
             "packed_bytes_written": self.packed_bytes_written,
             "packed_bytes_read": self.packed_bytes_read,
             "decoded_block_bytes": self.decoded_block_bytes,
+            "logical_payload_bytes": self.logical_payload_bytes,
+            "staging_bytes_peak": self.staging_bytes_peak,
+            "dense_residual_bytes_peak": self.dense_residual_bytes_peak,
             "scratch_bytes_current": self.scratch_bytes_current,
             "scratch_bytes_peak": self.scratch_bytes_peak,
+            "layer_divergence_count": self.layer_divergence_count,
+            "layers_processed": self.layers_processed,
         }

@@ -1,0 +1,3 @@
+{"id": "fixture_001", "model_id": "Qwen/Qwen2.5-0.5B-Instruct", "prompt": "What is the capital of France?", "expected_tokens": ["Paris"], "description": "Simple factual question for baseline validation"}
+{"id": "fixture_002", "model_id": "Qwen/Qwen2.5-0.5B-Instruct", "prompt": "Explain quantum computing in one sentence.", "description": "Short explanation for token boundary testing"}
+{"id": "fixture_003", "model_id": "Qwen/Qwen2.5-0.5B-Instruct", "prompt": "The quick brown fox jumps over the lazy dog. Complete the sentence.", "description": "Classic sentence completion for quality validation"}

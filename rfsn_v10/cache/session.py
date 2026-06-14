@@ -104,6 +104,16 @@ class GenerationCacheSession:
             if self.runtime_counters.scratch_bytes_current > self.runtime_counters.scratch_bytes_peak:
                 self.runtime_counters.scratch_bytes_peak = self.runtime_counters.scratch_bytes_current
 
+    def track_layer_divergence(self, layer_id: int, has_divergence: bool) -> None:
+        """Track layer-by-layer divergence for debugging (Phase 4.14)."""
+        self.runtime_counters.layers_processed += 1
+        if has_divergence:
+            self.runtime_counters.layer_divergence_count += 1
+
+    def track_payload_bytes(self, bytes_count: int) -> None:
+        """Track actual compressed KV payload bytes (Phase 5.20)."""
+        self.runtime_counters.logical_payload_bytes += bytes_count
+
     def get_counter(self, counter: str) -> int:
         return self._counters.get(counter, 0)
 
