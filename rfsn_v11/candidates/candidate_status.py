@@ -29,7 +29,7 @@ CANDIDATE_STATUSES: dict[str, CandidateStatus] = {
     "mlx_lm_quantized_kv_b8": CandidateStatus.CONTROL,
     "legacy_k8_v5_gs32": CandidateStatus.LEGACY,
     "rfsn_v10_k8_v5_gs64": CandidateStatus.BASELINE,
-    "rfsn_v11_offline_asymmetric_kv_k8v4_gs64": CandidateStatus.OFFLINE_ONLY,
+    "rfsn_v11_offline_asymmetric_kv_k8v5_gs64": CandidateStatus.OFFLINE_ONLY,
     "turboquant_v2_b4_gs64_rot": CandidateStatus.EXPERIMENTAL,
     "turboquant_v2_b4_gs64_norot": CandidateStatus.EXPERIMENTAL,
     "polar_reference_offline_b4_d128": CandidateStatus.REFERENCE_ONLY,

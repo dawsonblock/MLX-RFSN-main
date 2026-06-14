@@ -1,22 +1,28 @@
 """RFSN candidate registry.
 
 Maps canonical candidate names to instantiated candidate objects.
-All imports are lazy — missing optional dependencies (mlx, external/turboquant-mlx,
-external/mlx-turboquant) only raise when the specific candidate is requested.
+All imports are lazy — missing optional dependencies (mlx,
+    external/turboquant-mlx, external/mlx-turboquant) only raise
+    when the specific candidate is requested.
 
 Canonical name conventions
 ---------------------------
-A1_wht_grouped_k8v5_gs64     — Phase 3: grouped WHT, keys 8-bit, values 5-bit, group 64
+A1_wht_grouped_k8v5_gs64  — Phase 3: grouped WHT, keys 8-bit,
+    values 5-bit, group 64
 A1b_wht_asym_k8v5            — Phase 4: asymmetric bit sweep
 A2_wht_polar_4bit            — Phase 6: PolarQuant
 A3_wht_turboquant_mse_4bit   — Phase 5: TurboQuant MSE-only
 A4_wht_turboquant_qjl_4bit   — Phase 10: TurboQuant + QJL
-B1_sparsejl_grouped_k8v5_gs64 — Phase 9: Sparse JL ablation
-R1_wht_grouped_residual128   — Phase 7: grouped WHT + FP16 residual window R=128
-R2_turboquant_mse_residual128 — Phase 7: TurboQuant MSE + FP16 residual window R=128
+B1_sparsejl_grouped_k8v5_gs64 — Phase 9:
+    Sparse JL ablation
+R1_wht_grouped_residual128 — Phase 7: grouped WHT +
+    FP16 residual window R=128
+R2_turboquant_mse_residual128 — Phase 7:
+    TurboQuant MSE + FP16 residual window R=128
 S1_snapkv_prune_only         — Phase 8: SnapKV pruning only
 S2_snapkv_plus_grouped       — Phase 8: SnapKV + grouped WHT
-S3_snapkv_plus_turboquant_mse_residual128 — Phase 8: SnapKV + TurboQuant MSE + residual
+S3_snapkv_plus_turboquant_mse_residual128 — Phase 8:
+    SnapKV + TurboQuant MSE + residual
 dense_mlx_baseline           — Phase 1: dense FP16 baseline (always available)
 """
 from __future__ import annotations
@@ -42,7 +48,8 @@ class CandidateRegistry:
     """Lazy registry of all benchmark candidates.
 
     get(name) instantiates the candidate on first call.
-    list_available() returns names of candidates whose dependencies are satisfied.
+    list_available() returns names of candidates whose
+    dependencies are satisfied.
     """
 
     def __init__(self) -> None:
@@ -96,7 +103,7 @@ def _make_a1() -> Any:
 
 
 def _make_a1b() -> Any:
-    from benchmarks.candidates.a1b_wht_asym_k8v5 import A1b_WHT_Asym
+    from benchmarks.candidates.a1b_wht_asym_k8v4 import A1b_WHT_Asym
     return A1b_WHT_Asym()
 
 
@@ -106,27 +113,37 @@ def _make_a2() -> Any:
 
 
 def _make_a3() -> Any:
-    from benchmarks.candidates.a3_wht_turboquant_mse_4bit import A3_WHT_TurboQuant_MSE
+    from benchmarks.candidates.a3_wht_turboquant_mse_4bit import (
+        A3_WHT_TurboQuant_MSE,
+    )
     return A3_WHT_TurboQuant_MSE()
 
 
 def _make_a4() -> Any:
-    from benchmarks.candidates.a4_wht_turboquant_qjl_4bit import A4_WHT_TurboQuant_QJL
+    from benchmarks.candidates.a4_wht_turboquant_qjl_4bit import (
+        A4_WHT_TurboQuant_QJL,
+    )
     return A4_WHT_TurboQuant_QJL()
 
 
 def _make_b1() -> Any:
-    from benchmarks.candidates.b1_sparsejl_grouped_k8v5_gs64 import B1_SparseJL_Grouped
+    from benchmarks.candidates.b1_sparsejl_grouped_k8v5_gs64 import (
+        B1_SparseJL_Grouped,
+    )
     return B1_SparseJL_Grouped()
 
 
 def _make_r1() -> Any:
-    from benchmarks.candidates.r1_wht_grouped_residual128 import R1_WHT_Grouped_Residual
+    from benchmarks.candidates.r1_wht_grouped_residual128 import (
+        R1_WHT_Grouped_Residual,
+    )
     return R1_WHT_Grouped_Residual()
 
 
 def _make_r2() -> Any:
-    from benchmarks.candidates.r2_turboquant_mse_residual128 import R2_TurboQuant_MSE_Residual
+    from benchmarks.candidates.r2_turboquant_mse_residual128 import (
+        R2_TurboQuant_MSE_Residual,
+    )
     return R2_TurboQuant_MSE_Residual()
 
 
@@ -136,12 +153,16 @@ def _make_s1() -> Any:
 
 
 def _make_s2() -> Any:
-    from benchmarks.candidates.s2_snapkv_plus_grouped import S2_SnapKV_PlusGrouped
+    from benchmarks.candidates.s2_snapkv_plus_grouped import (
+        S2_SnapKV_PlusGrouped,
+    )
     return S2_SnapKV_PlusGrouped()
 
 
 def _make_s3() -> Any:
-    from benchmarks.candidates.s3_snapkv_plus_turboquant_mse_residual128 import S3_SnapKV_PlusTurboQuantMSEResidual
+    from benchmarks.candidates.s3_snapkv_plus_turboquant_mse_residual128 import (  # noqa: E501
+        S3_SnapKV_PlusTurboQuantMSEResidual,
+    )
     return S3_SnapKV_PlusTurboQuantMSEResidual()
 
 
