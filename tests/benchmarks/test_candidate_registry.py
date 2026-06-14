@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.pure_python
+
 
 @pytest.mark.unit
 def test_rfsn_v11_name_is_offline():

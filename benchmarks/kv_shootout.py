@@ -18,6 +18,9 @@ Usage
     # Promotion report (only promotion-eligible candidates)
     python benchmarks/kv_shootout.py --promotion-report
 
+    # Governance-only mode (no MLX required, for CI smoke testing)
+    python benchmarks/kv_shootout.py --governance-only
+
     # Specific model only
     python benchmarks/kv_shootout.py --model Qwen/Qwen2.5-1.5B-Instruct
 
@@ -981,7 +984,82 @@ def main() -> None:
         "--strict", action="store_true",
         help="Strict mode: require all candidates to complete, exit on any error",
     )
+    parser.add_argument(
+        "--governance-only", action="store_true",
+        help="Governance-only mode: test schema validation without MLX (for CI smoke testing)",
+    )
     args = parser.parse_args()
+
+    # Governance-only mode: test schema validation without MLX
+    if args.governance_only:
+        print("Governance-only mode: testing schema validation without MLX")
+        try:
+            # Test CandidateResult schema
+            from benchmarks.schemas import CandidateResult
+            test_result = CandidateResult(
+                candidate_name="test",
+                model_id="test_model",
+                prompt_id="test_prompt",
+                context_length=128,
+                output_tokens=32,
+            )
+            # Test JSON serialization
+            json_str = test_result.to_json()
+            loaded = CandidateResult.from_dict(json.loads(json_str))
+            assert loaded.candidate_name == "test"
+            
+            # Test token sequence hash
+            from rfsn_v11.candidates.logit_capture import compute_token_sequence_hash
+            test_hash = compute_token_sequence_hash(
+                model_id="test",
+                prompt_id="test",
+                prompt_text="Hello",
+                target_token_ids=[1, 2, 3],
+                max_tokens=10,
+                temperature=0.0,
+            )
+            assert len(test_hash) == 64  # SHA256 hex string
+            
+            # Test judge logic
+            from benchmarks.judge import Judge
+            judge = Judge()
+            baseline = CandidateResult(
+                candidate_name="baseline",
+                model_id="test",
+                prompt_id="test",
+                context_length=128,
+                output_tokens=32,
+                logit_cosine=1.0,
+                top5_overlap=1.0,
+                attention_score_cosine=1.0,
+                attention_top5_overlap=1.0,
+                perplexity_delta=0.0,
+                visible_output_drift_score=0.0,
+                peak_memory_mb=1000.0,
+                kv_cache_memory_mb=64.0,
+                compressed_kv_memory_mb=64.0,
+                decode_tps=100.0,
+                # Add required promotion fields
+                commit_hash="test_commit",
+                corpus_hash="test_corpus",
+                token_sequence_hash="test_hash",
+            )
+            # Just verify judge runs without error
+            verdict = judge.evaluate(baseline, baseline)
+            print(f"  Judge evaluation successful: {verdict.label.value}")
+            # Don't assert specific verdict since baseline vs baseline may be rejected
+            
+            print("✓ Governance-only tests passed")
+            print("  - CandidateResult schema validation")
+            print("  - JSON serialization round-trip")
+            print("  - Token sequence hash computation")
+            print("  - Judge logic evaluation")
+            sys.exit(0)
+        except Exception as e:
+            print(f"✗ Governance-only tests failed: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
     # Determine mode and output directory
     if args.promotion_report:

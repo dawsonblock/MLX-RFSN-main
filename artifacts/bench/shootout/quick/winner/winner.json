@@ -1,0 +1,9 @@
+{
+  "winner": null,
+  "status": "NO_PROMOTION_ELIGIBLE_CANDIDATE",
+  "reason": "Mode=quick artifacts are not promotion-eligible",
+  "methodology": "teacher_forced_logit_v1",
+  "methodology_status": "TEACHER_FORCED_RERUN_INCOMPLETE_NO_PROMOTION",
+  "promotion_allowed": false,
+  "mode": "quick"
+}

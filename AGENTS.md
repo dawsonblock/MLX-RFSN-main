@@ -11,6 +11,9 @@
 - Model support tests: `pytest rfsn_v10/integrations/mlx_lm_model_support/tests/ -q`
 - Kernel tests: `pytest rfsn_v10/kernels/tests/ -q`
 - Benchmark tests: `pytest benchmarks/tests/ -q`
+- Governance tests (no MLX required): `pytest tests/governance/ -q`
+- Pure Python tests (no MLX): `pytest -m pure_python -q`
+- MLX-required tests: `pytest -m mlx_required -q`
 - Alembic migrations (skips gracefully if deps missing): `pytest tests/test_alembic_migrations.py -q`
 - Identity tests: `pytest rfsn_v10/cache/tests/test_identity.py -q`
 - Full test suite (CI gate): `pytest tests/test_generation.py rfsn_v10/cache/tests/ rfsn_v10/integrations/mlx_lm_adapter/tests/ rfsn_v10/integrations/mlx_lm_model_support/tests/ rfsn_v10/kernels/tests/ benchmarks/tests/ tests/server/ -q`
@@ -18,6 +21,7 @@
 - Slow real-model tests: `pytest rfsn_v10/cache/tests/test_real_model_promotion.py -v --slow -k "packed_reference or multi_turn or long_context"`
 - Polar fused end-to-end: `pytest rfsn_v11/polar_fused/tests/test_end_to_end.py -v --slow -k "quantized"`
 - Server integration: `pytest tests/server/test_chat_completions.py -v -k "concurrent"`
+- Governance-only benchmark mode: `python benchmarks/kv_shootout.py --governance-only`
 
 ## Key Architecture
 - Dense/chunked prefill → encode each K/V block once → discard complete dense history → direct packed QK → online softmax → direct packed SV → bounded staging or dense tail only.

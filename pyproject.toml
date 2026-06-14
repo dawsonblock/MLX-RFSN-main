@@ -130,7 +130,7 @@ fallback_version = "10.2.0.dev97"
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"
-testpaths = ["tests", "rfsn_v11/tests", "rfsn_v10/cache/tests", "rfsn_v10/integrations/mlx_lm_adapter/tests"]
+testpaths = ["tests", "tests/governance", "rfsn_v11/tests", "rfsn_v10/cache/tests", "rfsn_v10/integrations/mlx_lm_adapter/tests"]
 timeout = 300
 filterwarnings = [
     "ignore::DeprecationWarning:mlx",
@@ -142,6 +142,8 @@ markers = [
     "db: database tests (requires alembic/sqlalchemy)",
     "e2e: end-to-end tests (requires full stack)",
     "mlx: requires Apple Silicon + MLX",
+    "mlx_required: requires MLX (same as mlx marker)",
+    "pure_python: tests that don't require MLX",
     "slow: slow tests (>10s)",
     "security: security and privacy tests",
     "benchmark: benchmark tests (not for CI)",

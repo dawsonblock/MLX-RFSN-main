@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.pure_python
+
 from rfsn_v10.runtime.generation import RFSNGenerator
 
 

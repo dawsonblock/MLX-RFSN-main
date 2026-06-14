@@ -35,7 +35,11 @@ try:
 except ImportError:
     MLX_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+pytestmark = [
+    pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed"),
+    pytest.mark.mlx_required,
+    pytest.mark.unit,
+]
 
 
 # ---------------------------------------------------------------------------
