@@ -77,8 +77,12 @@ class RfsnDenseReconstructionReferenceCache:
         if self._shape_meta is None:
             self._shape_meta = (B, Hkv, D)
 
-        # Append to quantized cache (this will increment new_tokens_received)
+        # Append to quantized cache and track both legacy counter names.
+        # new_tokens_received: how many K/V tokens the model passed in.
+        # new_tokens_encoded: how many were encoded into the quantized cache.
+        # record_token_appended is NOT called here; layer_cache.append() handles it.
         self.layer_cache.append(keys, values)
+        self.session.increment("new_tokens_received", new_T)
         self.session.increment("new_tokens_encoded", new_T)
 
         # Track sealed blocks

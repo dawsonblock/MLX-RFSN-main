@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "benchmark_methodology": "teacher_forced_logit_v1",
+    "methodology_status": "NO_NATIVE_EVIDENCE_YET",
+    "promotion_allowed": false,
+    "artifact_schema_version": "2.0",
+    "mode": "memory",
+    "note": "No native Apple Silicon memory benchmark has been run yet. Memory evidence requires actual tensor allocation accounting (measurement_kind == MEASURED), not estimates."
+  },
+  "results": [
+    {
+      "note": "Memory benchmark not yet run on native Apple Silicon. Run the benchmark with --mode memory --strict on Apple Silicon to generate this artifact.",
+      "promotion_allowed": false
+    }
+  ]
+}

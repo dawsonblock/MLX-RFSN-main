@@ -67,8 +67,8 @@ def test_build_candidates_registry_valid():
             "Direct-packed K8/V8 should be in active registry for correctness validation"
         )
         
-        # Verify baseline is always present
-        assert "mlx_lm_baseline" in candidate_names, (
+        # Verify baseline is always present (canonical name is dense_mlx_baseline)
+        assert "dense_mlx_baseline" in candidate_names, (
             "Baseline should be in active registry for comparison"
         )
 

@@ -62,9 +62,11 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
         self.group_size = group_size
         self.staging_capacity = staging_capacity
         self.dense_residual_window = dense_residual_window
-        # Encode block size in name for transparency
+        # Only append _bs suffix for non-canonical block sizes (smoke/test variants).
+        # Canonical BS64 uses the plain name: rfsn_direct_packed_k{k}v{v}_gs{gs}
+        _bs_suffix = f"_bs{staging_capacity}" if staging_capacity != 64 else ""
         self.name = (
-            f"rfsn_direct_packed_k{key_bits}v{value_bits}_gs{group_size}_bs{staging_capacity}"
+            f"rfsn_direct_packed_k{key_bits}v{value_bits}_gs{group_size}{_bs_suffix}"
         )
 
     @property

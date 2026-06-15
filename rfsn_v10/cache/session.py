@@ -94,10 +94,12 @@ class GenerationCacheSession:
         This method is kept for backward compatibility but will be removed in future.
         """
         self._counters[counter] = self._counters.get(counter, 0) + delta
-        # Sync typed runtime counters with new unified schema using typed methods
-        # Only increment tokens_appended once (from new_tokens_received)
+        # Sync typed runtime counters with new unified schema using typed methods.
+        # tokens_appended is owned by layer_cache.append() via record_token_appended();
+        # do NOT also increment it here from new_tokens_received to avoid double-counting.
         if counter == "new_tokens_received":
-            self.runtime_counters.record_token_appended(delta)
+            # Legacy dict-counter only; tokens_appended is handled by layer_cache.append()
+            pass
         elif counter == "new_tokens_encoded":
             # Don't double-count - already counted by new_tokens_received
             pass

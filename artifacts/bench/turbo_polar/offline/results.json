@@ -1,0 +1,16 @@
+{
+  "candidate": "turbo_polar_offline",
+  "gate_status": "PASS",
+  "methodology": "offline_polar_uniform_quant",
+  "notes": "4-bit+2-bit deep PASSES strict gate on synthetic data. 4-bit alone FAILS gate (cosine ~0.993). Deep refinement is essential at this bit width. Production would benefit from Lloyd-Max codebooks for additional margin.",
+  "metrics": {
+    "reconstruction_cosine": 0.9995968945573027,
+    "reconstruction_mse": 0.0008067842572927475,
+    "attention_score_cosine": 0.9995878094302825,
+    "attention_top5_overlap": 0.8,
+    "attention_top10_overlap": 1.0,
+    "size_ratio": 1.0,
+    "compression_factor": 1.0,
+    "nan_inf_detected": false
+  }
+}

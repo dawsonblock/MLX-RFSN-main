@@ -1,0 +1,11 @@
+{
+  "status": "no_native_run_completed",
+  "description": "Decode-append KV diff requires Apple Silicon with MLX. Run: python tools/run_decode_trace.py to generate.",
+  "results": [
+    {
+      "error": "no_native_run: Apple Silicon with MLX required to generate decode-append KV diff artifacts",
+      "config": null,
+      "prompt_tokens": null
+    }
+  ]
+}

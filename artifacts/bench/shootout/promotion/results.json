@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "benchmark_methodology": "teacher_forced_logit_v1",
+    "methodology_status": "NO_NATIVE_EVIDENCE_YET",
+    "promotion_allowed": false,
+    "artifact_schema_version": "2.0",
+    "mode": "promotion",
+    "note": "No native Apple Silicon run has been completed yet. Promotion requires: non-empty token_sequence_hash, runtime-instrumented cache traces (packed_bytes_written > 0), full_history_materialization_calls == 0, and measurement_kind == MEASURED."
+  },
+  "results": [
+    {
+      "note": "Promotion blocked: no native evidence bundle exists. Run the benchmark on Apple Silicon with --strict --require-compressed-execution to generate promotion-grade artifacts.",
+      "promotion_allowed": false
+    }
+  ]
+}

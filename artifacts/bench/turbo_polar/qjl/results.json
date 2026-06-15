@@ -1,0 +1,10 @@
+{
+  "candidate": "turbo_polar_qjl",
+  "gate_status": "QJL_DISABLED_NO_GAIN",
+  "qjl_kept": false,
+  "without_qjl_score_error": 0.24814057350158691,
+  "with_qjl_score_error": 0.2710253596305847,
+  "without_qjl_top10_overlap": 1.0,
+  "with_qjl_top10_overlap": 1.0,
+  "notes": "Simple random-projection sign-sketch does not improve score error. Historical QJL artifact also failed. Production QJL needs better sketch design."
+}
