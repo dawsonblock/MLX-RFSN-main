@@ -196,7 +196,7 @@ def _analyze_allocations(events: list[dict[str, Any]]) -> dict[str, Any]:
         "packed_attention_calls": counters.get("packed_attention_calls", 0),
         "scratch_bytes_peak": counters.get("scratch_bytes_peak", 0),
         "decoded_block_bytes": counters.get("decoded_block_bytes", 0),
-        "block_seal_events": counters.get("block_seal_events", 0),
+        "packed_blocks_created": counters.get("packed_blocks_created", 0),
     }
 
 
@@ -291,7 +291,7 @@ def main() -> int:
     print(f"  Dense fallback calls: {summary['dense_fallback_calls']}")
     print(f"  Packed attention calls: {summary['packed_attention_calls']}")
     print(f"  Scratch bytes peak: {summary['scratch_bytes_peak']:,} bytes")
-    print(f"  Block seal events: {summary['block_seal_events']}")
+    print(f"  Packed blocks created: {summary['packed_blocks_created']}")
 
     if summary["dense_fallback_calls"] > 0:
         print("\n⚠️  WARNING: Dense fallback allocations detected")
