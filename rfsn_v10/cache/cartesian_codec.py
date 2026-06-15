@@ -592,6 +592,9 @@ def _reference_hash_signs(
     mixed = np.uint32(seed)
     mixed = np.uint32(mixed ^ np.uint32((layer_id * 0x9E3779B9) & 0xFFFFFFFF))
     mixed = np.uint32(mixed ^ np.uint32(stream_hash & 0xFFFFFFFF))
+    # Mask to signed-32-bit range so that the same seed can be passed as an
+    # MLX inline-kernel template argument (which rejects unsigned > INT_MAX).
+    mixed = np.uint32(int(mixed) & 0x7FFFFFFF)
     seed_val = mx.array(mixed)
 
     # Build signs using the same integer hash as the NumPy backend

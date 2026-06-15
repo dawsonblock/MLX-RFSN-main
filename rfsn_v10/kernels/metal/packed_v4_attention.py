@@ -59,45 +59,75 @@ from rfsn_v10.cache.cartesian_codec import _reference_wht64, _reference_hash_sig
 # ---------------------------------------------------------------------------
 
 def _self_test() -> bool:
-    """Quick self-test that the kernel can compile and run on synthetic data.
+    """Self-test that the real packed kernel source compiles and runs.
 
-    Returns ``False`` on any failure so that production dispatch falls back
-    safely to the blockwise reference.
+    Uses a minimal synthetic fixture to verify the Metal pipeline accepts
+    the actual ``_PACKED_V4_KERNEL_K8`` source and buffer layout.  Full
+    numerical validation is performed in the test suite, not at import
+    time.
     """
     if not HAS_MLX:
         return False
     try:
-        # Try a trivial kernel compilation to verify Metal pipeline works
-        _src = """
-        uint idx = thread_position_in_grid.x;
-        if (idx >= 1) return;
-        output[0] = 1.0f;
-        """
+        # Minimal fixture: 1 Q-head, 1 Q-token, 1 KV-head, 2 KV-tokens, D=64
+        wht_queries = mx.zeros((1, 1, 64), dtype=mx.float32)
+        packed_codes_k = mx.zeros((1, 2, 16), dtype=mx.uint32)
+        scales_k = mx.ones((1, 2, 1), dtype=mx.float32)
+        packed_codes_v = mx.zeros((1, 2, 16), dtype=mx.uint32)
+        scales_v = mx.ones((1, 2, 1), dtype=mx.float32)
+        block_starts = mx.array([0], dtype=mx.int32)
+        block_counts = mx.array([2], dtype=mx.int32)
+        scale_arr = mx.array([1.0], dtype=mx.float32)
+        query_start_arr = mx.array([2], dtype=mx.int32)
+
         k = mx.fast.metal_kernel(
-            name="_rfsn_self_test",
-            input_names=[],
-            output_names=["output"],
-            source=_src,
+            name="packed_v4_attention_k8_selftest",
+            input_names=[
+                "wht_queries",
+                "packed_codes_k", "scales_k",
+                "packed_codes_v", "scales_v",
+                "block_starts", "block_counts",
+                "scale_arr", "query_start_arr",
+            ],
+            output_names=["output", "running_max_arr", "running_sum_arr"],
+            source=_PACKED_V4_KERNEL_K8,
         )
         out = k(
-            inputs=[],
-            template=[],
+            inputs=[
+                wht_queries,
+                packed_codes_k, scales_k,
+                packed_codes_v, scales_v,
+                block_starts, block_counts,
+                scale_arr, query_start_arr,
+            ],
+            template=[
+                ("NUM_Q_HEADS", 1),
+                ("NUM_Q_TOKENS", 1),
+                ("HEAD_DIM", 64),
+                ("NUM_BLOCKS", 1),
+                ("TOTAL_T", 2),
+                ("BITS", 8),
+                ("CODES_PER_WORD", 4),
+                ("WORDS_PER_VECTOR", 16),
+                ("GROUP_SIZE", 64),
+                ("GROUPS_PER_VECTOR", 1),
+                ("QMAX", 127),
+                ("SEED_VAL_K", 0),
+                ("SEED_VAL_V", 0),
+                ("CAUSAL", 1),
+                ("Q_PER_KV", 1),
+                ("QUERY_START", 2),
+            ],
             grid=(1, 1, 1),
             threadgroup=(1, 1, 1),
-            output_shapes=[(1,)],
-            output_dtypes=[mx.float32],
+            output_shapes=[(1, 1, 64), (1, 1), (1, 1)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
         )
-        return int(out[0].item()) == 1
+        if len(out) != 3 or out[0].shape != (1, 1, 64):
+            return False
+        return True
     except Exception:
         return False
-
-
-# The canonical true-packed kernel is available ONLY when:
-# 1. MLX + Metal are present
-# 2. The explicit opt-in environment variable is set
-# 3. A trivial self-test compiles and executes successfully
-_ENABLED_BY_ENV = os.environ.get("RFSN_ENABLE_TRUE_PACKED", "0") == "1"
-HAS_TRUE_PACKED_KERNEL = HAS_MLX and _ENABLED_BY_ENV and _self_test()
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +372,14 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
 """
 
 
+# The canonical true-packed kernel is available ONLY when:
+# 1. MLX + Metal are present
+# 2. The explicit opt-in environment variable is set
+# 3. The real kernel self-test compiles and executes successfully
+_ENABLED_BY_ENV = os.environ.get("RFSN_ENABLE_TRUE_PACKED", "0") == "1"
+HAS_TRUE_PACKED_KERNEL = HAS_MLX and _ENABLED_BY_ENV and _self_test()
+
+
 # ---------------------------------------------------------------------------
 # Kernel wrapper
 # ---------------------------------------------------------------------------
@@ -393,14 +431,20 @@ class PackedV4AttentionKernel:
             raise ValueError("no blocks provided")
 
         for i, (kb, vb) in enumerate(zip(key_blocks, value_blocks)):
-            if kb.bits != self.bits:
-                raise ValueError(f"block[{i}] key bits={kb.bits}, expected {self.bits}")
-            if vb.bits != self.bits:
-                raise ValueError(f"block[{i}] value bits={vb.bits}, expected {self.bits}")
+            # Format gate first — V3 blocks must be rejected before V4-only checks.
             if kb.format_version != 4:
                 raise ValueError(f"block[{i}] key format_version={kb.format_version}, expected 4")
             if vb.format_version != 4:
                 raise ValueError(f"block[{i}] value format_version={vb.format_version}, expected 4")
+
+            # P1.4: call validate() on every block
+            kb.validate()
+            vb.validate()
+
+            if kb.bits != self.bits:
+                raise ValueError(f"block[{i}] key bits={kb.bits}, expected {self.bits}")
+            if vb.bits != self.bits:
+                raise ValueError(f"block[{i}] value bits={vb.bits}, expected {self.bits}")
             if kb.packing_layout.value != "VECTOR_ALIGNED_UINT32_V4":
                 raise ValueError(f"block[{i}] key packing_layout={kb.packing_layout}")
             if kb.scale_layout.value != "BHTG_V4":
@@ -417,6 +461,72 @@ class PackedV4AttentionKernel:
             if kb.logical_start != vb.logical_start:
                 raise ValueError(
                     f"block[{i}] key/value logical_start mismatch: {kb.logical_start} vs {vb.logical_start}"
+                )
+
+        # Reference metadata from first block for cross-block consistency.
+        ref_kb = key_blocks[0]
+        ref_vb = value_blocks[0]
+        expected_words_per_vector = ref_kb.words_per_vector
+        expected_groups_per_vector = ref_kb.groups_per_vector
+        ref_layer_id = ref_kb.layer_id
+        ref_stream_k = ref_kb.stream_id
+        ref_stream_v = ref_vb.stream_id
+        ref_sign_seed = ref_kb.sign_seed
+        ref_codec_sig = ref_kb.codec_signature
+        ref_batch = ref_kb.batch_size
+        ref_heads = ref_kb.n_kv_heads
+        ref_dim = ref_kb.head_dim
+        prev_end = 0
+
+        for i, (kb, vb) in enumerate(zip(key_blocks, value_blocks)):
+            # P1.4: contiguous, non-overlapping logical positions
+            if i > 0 and kb.logical_start != prev_end:
+                raise ValueError(
+                    f"block[{i}] logical_start={kb.logical_start} != previous_end={prev_end}; "
+                    "blocks must be contiguous"
+                )
+            prev_end = kb.logical_end
+
+            # P1.4: consistent geometry
+            if kb.batch_size != ref_batch or vb.batch_size != ref_batch:
+                raise ValueError(f"block[{i}] batch_size mismatch")
+            if kb.n_kv_heads != ref_heads or vb.n_kv_heads != ref_heads:
+                raise ValueError(f"block[{i}] n_kv_heads mismatch")
+            if kb.head_dim != ref_dim or vb.head_dim != ref_dim:
+                raise ValueError(f"block[{i}] head_dim mismatch")
+
+            # P1.4: consistent codec metadata
+            if kb.layer_id != ref_layer_id or vb.layer_id != ref_layer_id:
+                raise ValueError(f"block[{i}] layer_id mismatch")
+            if kb.stream_id != ref_stream_k:
+                raise ValueError(f"block[{i}] key stream_id mismatch")
+            if vb.stream_id != ref_stream_v:
+                raise ValueError(f"block[{i}] value stream_id mismatch")
+            if kb.sign_seed != ref_sign_seed or vb.sign_seed != ref_sign_seed:
+                raise ValueError(f"block[{i}] sign_seed mismatch")
+            if ref_codec_sig and kb.codec_signature != ref_codec_sig:
+                raise ValueError(f"block[{i}] codec_signature mismatch")
+
+            # P1.4: consistent format geometry
+            if kb.words_per_vector != expected_words_per_vector:
+                raise ValueError(
+                    f"block[{i}] words_per_vector={kb.words_per_vector}, expected {expected_words_per_vector}"
+                )
+            if kb.groups_per_vector != expected_groups_per_vector:
+                raise ValueError(
+                    f"block[{i}] groups_per_vector={kb.groups_per_vector}, expected {expected_groups_per_vector}"
+                )
+
+            # P1.4: buffer shape sanity
+            expected_code_shape = (ref_batch, ref_heads, kb.token_count, expected_words_per_vector)
+            if kb.packed_codes is not None and tuple(kb.packed_codes.shape) != expected_code_shape:
+                raise ValueError(
+                    f"block[{i}] key packed_codes shape {tuple(kb.packed_codes.shape)} != {expected_code_shape}"
+                )
+            expected_scale_shape = (ref_batch, ref_heads, kb.token_count, expected_groups_per_vector)
+            if kb.scales is not None and tuple(kb.scales.shape) != expected_scale_shape:
+                raise ValueError(
+                    f"block[{i}] key scales shape {tuple(kb.scales.shape)} != {expected_scale_shape}"
                 )
 
     def _concatenate_blocks(self, blocks: list[PackedBlockV4]) -> tuple[Any, Any, Any, Any]:
@@ -451,6 +561,11 @@ class PackedV4AttentionKernel:
 
         The shader receives a single pre-mixed uint32 seed; it does not
         recompute the string hashing or layer mixing per thread.
+
+        The result is masked to ``0x7FFFFFFF`` so that it always fits in a
+        signed 32-bit integer.  MLX's ``metal_kernel`` template system
+        rejects unsigned values that exceed ``INT_MAX`` because they appear
+        in generated C++ kernel function names.
         """
         stream_hash = 0
         for ch in stream_id:
@@ -458,7 +573,7 @@ class PackedV4AttentionKernel:
         mixed = np.uint32(self.sign_seed)
         mixed = np.uint32(mixed ^ np.uint32((layer_id * 0x9E3779B9) & 0xFFFFFFFF))
         mixed = np.uint32(mixed ^ np.uint32(stream_hash & 0xFFFFFFFF))
-        return int(mixed)
+        return int(mixed) & 0x7FFFFFFF
 
     def __call__(
         self,
@@ -601,7 +716,13 @@ class PackedV4AttentionKernel:
         output = _reference_wht64(output_grouped)
         output = output.reshape(1, Hq, Lq, D).astype(queries.dtype)
 
+        # P1.5: synchronize before timing so execution_ms reflects actual kernel work
+        mx.eval(output, running_max, running_sum)
         execution_ms = (time.perf_counter() - start_time) * 1000.0
+
+        # P1.5: measured counters (true-packed path: no dense K/V materialised)
+        materialized_bytes = 0
+        decoded_tokens = 0
 
         contract = ExecutionContract(
             backend="true_packed_metal_v4_k8",
@@ -613,8 +734,8 @@ class PackedV4AttentionKernel:
             num_kv_heads=num_kv_heads,
             head_dim=D,
             bits=self.bits,
-            materialized_bytes=0,
-            decoded_tokens=0,
+            materialized_bytes=materialized_bytes,
+            decoded_tokens=decoded_tokens,
             execution_ms=execution_ms,
         )
 

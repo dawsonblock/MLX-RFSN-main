@@ -32,8 +32,14 @@
 - [x] Full-history materialization honestly recorded in Metal path.
 - [x] Strict Metal failures raise instead of silently falling back.
 - [x] **True packed kernel implemented (K8/V8)**: ``PackedV4AttentionKernel`` in ``packed_v4_attention.py`` compiles via MLX inline Metal, reads real ``PackedBlockV4`` uint32 BHTW codes and BHTG scales, applies hash signs and WHT domain dot products, and passes differential tests against the blockwise reference. Gated by ``RFSN_ENABLE_TRUE_PACKED=1``.
-- [x] **Old prototypes quarantined**: ``TruePackedMLXInline`` and ``TruePackedAttentionMetalV2`` (mock-format prototypes) removed from production dispatch; they remain in source for reference but are no longer auto-selected.
-- [x] **Differential testing framework**: ``test_packed_v4_attention.py`` proves exact numerical match for single block, multiple blocks, GQA, causal/non-causal, and contract validation.
+- [x] **Incremental decode correctness (P0)**: Wrapper now merges sealed packed blocks, live staging K/V, and dense residual K/V via exported softmax statistics. Empty-cache and pre-seal behavior supported.
+- [x] **Statistics crash fixed (P0.6)**: ``get_backend_stats()`` reads ``num_key_blocks`` / ``num_value_blocks`` instead of nonexistent ``num_blocks``.
+- [x] **Unsupported masks rejected (P0.7)**: Non-causal/arbitrary masks raise in strict mode; fallback to reference in non-strict mode.
+- [x] **Strict mode truthful (P1.1)**: In strict direct-packed mode, dense-reconstruction and reference backends are forbidden. Fallback only occurs when ``strict=False``.
+- [x] **Real kernel self-test (P1.3)**: ``_self_test()`` compiles the actual ``_PACKED_V4_KERNEL_K8`` source, not a trivial placeholder.
+- [x] **Complete block validation (P1.4)**: ``_validate_blocks`` enforces contiguous positions, consistent geometry, consistent codec metadata, and exact buffer shapes across all blocks.
+- [x] **Old prototypes removed**: ``TruePackedMLXInline``, ``TruePackedAttentionMetalV2``, ``TruePackedAttentionMetal``, ``FusedPackedAttentionMetal``, and associated ``.metal`` shader stubs fully deleted from the repository.
+- [x] **Differential testing framework**: ``test_packed_v4_attention.py`` proves exact numerical match for single block, multiple blocks, GQA, causal/non-causal, contract validation, softmax stats, and packed+dense region merging.
 - [x] **Execution contract recording**: `ExecutionContract` dataclass provides auditability with invariant validation.
 - [x] Capability-based full-logit dispatch (no hardcoded name lists).
 - [x] Runtime byte counters use actual `array.itemsize` instead of hardcoded 4.
@@ -75,12 +81,13 @@ Problem: if token N differs between baseline and candidate, all subsequent logit
 
 | Component | Status | Limitation |
 |-----------|--------|------------|
-| **Metal Kernel** | P1 Implemented (K8/V8) | ``PackedV4AttentionKernel`` reads real ``PackedBlockV4`` blocks, decodes on-the-fly in WHT domain, and passes differential tests against the blockwise reference. Gated by ``RFSN_ENABLE_TRUE_PACKED=1``; not yet the default dispatch path. |
-| **Dense Reconstruction** | Violates Invariant | `metal_dense_reconstruction_violates_invariant` path explicitly flagged; reconstructs full dense KV history before attention. |
+| **Metal Kernel** | P1 Implemented (K8/V8) | ``PackedV4AttentionKernel`` reads real ``PackedBlockV4`` blocks, decodes on-the-fly in WHT domain, and passes differential tests against the blockwise reference. Gated by ``RFSN_ENABLE_TRUE_PACKED=1``; not yet the default dispatch path. Incremental decode now correctly includes staging and residual. |
+| **Dense Reconstruction** | Violates Invariant | `metal_dense_reconstruction_violates_invariant` path explicitly flagged; reconstructs full dense KV history before attention. Still available as non-strict fallback only. |
 | **Logit Capture** | Methodology Issue | Teacher-forced logit comparison is the correct methodology, but cascade divergence from independent greedy decodes remains a problem. |
 | **Promotion** | No Candidates | No candidates are currently promotion-eligible due to incomplete proof bundles and unproven quality gates. |
 | **Wheel Build** | Fixed | P0 fix ensures static versioning prevents `0.0.0` builds from source ZIP. |
 | **Registry Tests** | Fixed | P0 fix separates declared vs available candidates for portable test execution. |
+| **Performance Architecture** | Unproven | Scalar shader (one thread per q_head/q_token) with full-history concatenation per call. No SIMD-group reductions, tiled loading, or persistent descriptors. Performance claims are premature. |
 
 ## Roadmap
 

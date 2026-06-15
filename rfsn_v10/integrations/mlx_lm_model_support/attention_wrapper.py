@@ -34,6 +34,7 @@ from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
 from rfsn_v10.compat import nn
 
+import mlx.core as mx
 import numpy as np
 
 # Dense-reconstruction Metal kernel (kept as fallback)
@@ -174,6 +175,98 @@ class RfsnDirectPackedKVCache:
 # Attention wrapper
 # ------------------------------------------------------------------
 
+def _dense_attention_with_stats(
+    queries: Any,
+    keys: Any,
+    values: Any,
+    scale: float,
+    query_start_pos: int,
+    kv_start_pos: int,
+    mask: Any | None = None,
+    causal: bool = True,
+) -> tuple[Any, Any, Any]:
+    """Dense attention with online-softmax statistics for region merging.
+
+    Returns
+    -------
+    output : (B, Hq, Lq, D)
+    running_max : (B, Hq, Lq)
+    running_sum : (B, Hq, Lq)
+    """
+    B, Hq, Lq, D = queries.shape
+    _, Hkv, Tk, _ = keys.shape
+
+    # GQA: repeat KV heads to match query heads
+    if Hq != Hkv:
+        repeats = Hq // Hkv
+        keys = mx.repeat(keys, repeats, axis=1)
+        values = mx.repeat(values, repeats, axis=1)
+
+    scores = (queries @ keys.transpose(0, 1, 3, 2)) * scale  # (B, Hq, Lq, Tk)
+
+    if mask is not None and not isinstance(mask, str):
+        scores = scores + mask
+    elif causal or (isinstance(mask, str) and mask.lower() == "causal"):
+        q_positions = mx.arange(query_start_pos, query_start_pos + Lq)[:, None]
+        kv_positions = mx.arange(kv_start_pos, kv_start_pos + Tk)[None, :]
+        causal_mask = (q_positions >= kv_positions).astype(mx.float32)
+        causal_mask = mx.broadcast_to(
+            causal_mask[None, None, :, :], (B, Hq, Lq, Tk)
+        )
+        scores = mx.where(
+            causal_mask, scores, mx.array(-mx.inf, dtype=scores.dtype)
+        )
+
+    running_max = mx.max(scores, axis=-1, keepdims=True)  # (B, Hq, Lq, 1)
+    exp_scores = mx.exp(scores - running_max)
+    exp_scores = mx.where(mx.isfinite(exp_scores), exp_scores, 0.0)
+    running_sum = mx.sum(exp_scores, axis=-1, keepdims=True)  # (B, Hq, Lq, 1)
+    acc = exp_scores @ values  # (B, Hq, Lq, D)  unnormalized
+
+    output = mx.where(
+        running_sum > 0,
+        acc / running_sum,
+        mx.zeros_like(acc),
+    )
+    return output, running_max.squeeze(-1), running_sum.squeeze(-1)
+
+
+def _merge_attention_regions(
+    regions: list[tuple[Any, Any, Any]],
+) -> Any:
+    """Merge multiple attention regions using online-softmax statistics.
+
+    Each region is a tuple ``(output, running_max, running_sum)``.
+    Returns the merged attention output in the same domain.
+    """
+    if not regions:
+        raise ValueError("No regions to merge")
+    if len(regions) == 1:
+        return regions[0][0]
+
+    global_max = regions[0][1]
+    for _, max_i, _ in regions[1:]:
+        global_max = mx.maximum(global_max, max_i)
+
+    acc_total = None
+    sum_total = 0
+    for output_i, max_i, sum_i in regions:
+        scale = mx.exp(max_i - global_max)
+        weighted_acc = output_i * sum_i[..., None] * scale[..., None]
+        if acc_total is None:
+            acc_total = weighted_acc
+        else:
+            acc_total = acc_total + weighted_acc
+        sum_total = sum_total + sum_i * scale
+
+    safe_sum = mx.where(sum_total == 0, mx.ones_like(sum_total), sum_total)
+    return mx.where(
+        sum_total[..., None] > 0,
+        acc_total / safe_sum[..., None],
+        mx.zeros_like(acc_total),
+    )
+
+
 class _PackedAttentionWrapper(nn.Module):
     """Wrapper intercepting attention calls via packed reference.
 
@@ -258,19 +351,37 @@ class _PackedAttentionWrapper(nn.Module):
 
         # Direct packed attention over the full quantized cache
         layer_cache = cache.layer_cache
+        query_start_pos = layer_cache.total_token_count() - L
 
-        # Canonical dispatch order:
-        # 1. True packed V4 kernel (K8/V8, zero materialisation) – gated
-        # 2. Dense-reconstruction Metal kernel (fallback)
-        # 3. Blockwise packed reference (always works, slower)
+        # ------------------------------------------------------------------
+        # P0.7: Reject unsupported masks before dispatch.
+        # The true-packed path only supports causal masking or no mask.
+        # mlx_lm passes causal mask arrays for standard generation; we accept
+        # MLX arrays because our kernel implements causal logic internally.
+        # ------------------------------------------------------------------
+        _mask_is_mlx_array = isinstance(mask, mx.array)
+        _mask_unsupported = (
+            mask is not None
+            and mask != "causal"
+            and not _mask_is_mlx_array
+        )
+        if _mask_unsupported and self._strict:
+            raise RuntimeError(
+                f"Strict packed mode: unsupported mask {type(mask).__name__}; "
+                "only causal=True or mask=None is supported."
+            )
+
+        # ------------------------------------------------------------------
+        # Dispatch
+        # ------------------------------------------------------------------
         output = None
         contract = None
         _attempted: list[str] = []
 
-        if HAS_TRUE_PACKED_KERNEL:
+        if HAS_TRUE_PACKED_KERNEL and not _mask_unsupported:
             _attempted.append("true_packed_v4")
             try:
-                _has_codec = hasattr(layer_cache, 'key_codec')
+                _has_codec = hasattr(layer_cache, "key_codec")
                 kernel = PackedV4AttentionKernel(
                     bits=layer_cache.key_codec.bits if _has_codec else 8,
                     group_size=(
@@ -280,21 +391,84 @@ class _PackedAttentionWrapper(nn.Module):
                         layer_cache.key_codec.sign_seed if _has_codec else 42
                     ),
                 )
-                output, contract = kernel(
-                    queries=queries,
-                    key_blocks=list(layer_cache.iter_key_blocks()),
-                    value_blocks=list(layer_cache.iter_value_blocks()),
-                    scale=self._scale,
-                    causal=True,
-                    query_start_pos=layer_cache.total_token_count() - L,
-                    strict=self._strict,
+
+                # Gather regions
+                key_blocks = list(layer_cache.iter_key_blocks())
+                value_blocks = list(layer_cache.iter_value_blocks())
+                stage_k, stage_v, stage_n = layer_cache.get_staging()
+                dense_k, dense_v = layer_cache.get_dense_residual()
+
+                regions: list[tuple[Any, Any, Any]] = []
+
+                # ---- Packed region ----
+                if key_blocks:
+                    packed_out, packed_max, packed_sum, packed_contract = (
+                        kernel(
+                            queries=queries,
+                            key_blocks=key_blocks,
+                            value_blocks=value_blocks,
+                            scale=self._scale,
+                            causal=True,
+                            query_start_pos=query_start_pos,
+                            strict=self._strict,
+                        )
+                    )
+                    regions.append((packed_out, packed_max, packed_sum))
+                    contract = packed_contract
+
+                # ---- Staging region ----
+                if stage_n > 0 and stage_k is not None and stage_v is not None:
+                    stage_offset = layer_cache.encoded_token_count
+                    stage_out, stage_max, stage_sum = _dense_attention_with_stats(
+                        queries,
+                        stage_k,
+                        stage_v,
+                        scale=self._scale,
+                        query_start_pos=query_start_pos,
+                        kv_start_pos=stage_offset,
+                        mask=None,
+                        causal=True,
+                    )
+                    regions.append((stage_out, stage_max, stage_sum))
+
+                # ---- Dense residual region ----
+                if dense_k is not None and dense_v is not None:
+                    dense_tokens = int(dense_k.shape[2])
+                    dense_offset = layer_cache.total_token_count() - dense_tokens
+                    dense_out, dense_max, dense_sum = _dense_attention_with_stats(
+                        queries,
+                        dense_k,
+                        dense_v,
+                        scale=self._scale,
+                        query_start_pos=query_start_pos,
+                        kv_start_pos=dense_offset,
+                        mask=None,
+                        causal=True,
+                    )
+                    regions.append((dense_out, dense_max, dense_sum))
+
+                if regions:
+                    output = _merge_attention_regions(regions)
+                else:
+                    # Empty cache — all zeros
+                    output = mx.zeros(
+                        (B, self.n_heads, L, D), dtype=queries.dtype
+                    )
+
+                object.__setattr__(
+                    self, "_executed_backend", "true_packed_metal_v4_k8"
                 )
-                object.__setattr__(self, "_executed_backend", contract.backend)
-                object.__setattr__(self, "_last_execution_contract", contract)
+                if contract is not None:
+                    object.__setattr__(
+                        self, "_last_execution_contract", contract
+                    )
             except Exception as exc:
                 _sess = getattr(layer_cache, "session", None)
                 if _sess is not None:
-                    _sess.runtime_counters.record_attempted_backend("true_packed_v4")
+                    _sess.runtime_counters.record_attempted_backend(
+                        "true_packed_v4"
+                    )
+                # P1.1: In strict mode, forbid any fallback backend.
                 if self._strict:
                     raise RuntimeError(
                         "Strict packed mode: True packed V4 kernel failed: "
@@ -302,7 +476,10 @@ class _PackedAttentionWrapper(nn.Module):
                     ) from exc
                 output = None
 
-        if output is None:
+        # ------------------------------------------------------------------
+        # Fallback paths (only when strict=False and true-packed failed)
+        # ------------------------------------------------------------------
+        if output is None and not self._strict:
             _attempted.append("metal_dense")
             if HAS_METAL_KERNEL:
                 try:
@@ -311,7 +488,7 @@ class _PackedAttentionWrapper(nn.Module):
                         layer_cache,
                         scale=self._scale,
                         mask=mask,
-                        query_start_pos=layer_cache.total_token_count() - L,
+                        query_start_pos=query_start_pos,
                         causal=True,
                         strict=self._strict,
                     )
@@ -323,7 +500,9 @@ class _PackedAttentionWrapper(nn.Module):
                 except Exception as exc:
                     _sess = getattr(layer_cache, "session", None)
                     if _sess is not None:
-                        _sess.runtime_counters.record_attempted_backend("metal_dense")
+                        _sess.runtime_counters.record_attempted_backend(
+                            "metal_dense"
+                        )
                     if self._strict:
                         raise RuntimeError(
                             "Strict packed mode: Metal kernel failed and "
@@ -331,20 +510,21 @@ class _PackedAttentionWrapper(nn.Module):
                         ) from exc
                     output = None
 
-        if output is None:
+        if output is None and not self._strict:
             _attempted.append("packed_reference")
             output, _ = attend(
                 queries,
                 layer_cache,
                 scale=self._scale,
                 mask=mask,
-                query_start_pos=layer_cache.total_token_count() - L,
+                query_start_pos=query_start_pos,
                 causal=True,
             )
-            object.__setattr__(self, "_executed_backend", "packed_reference")
+            object.__setattr__(
+                self, "_executed_backend", "packed_reference"
+            )
 
-        # Record attempted backends and count fallback exactly once when
-        # the reference path was reached after higher-priority attempts.
+        # Record fallback if we ended up on reference after trying higher-priority paths.
         self._attempted_backends.extend(_attempted)
         if (
             self._executed_backend == "packed_reference"

@@ -255,6 +255,17 @@ jobs:
       - name: Adapter tests (MLX)
         run: pytest rfsn_v10/integrations/mlx_lm_adapter/tests/ -q
 
+      - name: Model support tests (MLX)
+        run: pytest rfsn_v10/integrations/mlx_lm_model_support/tests/ -q
+
+      - name: Kernel tests — true-packed V4 (MLX + Metal)
+        env:
+          RFSN_ENABLE_TRUE_PACKED: "1"
+        run: pytest rfsn_v10/kernels/tests/ -q
+
+      - name: Generation tests (MLX)
+        run: pytest tests/test_generation.py -q
+
       - name: Coverage gate — tested subsystems >= 60%
         run: |
           pytest tests/test_generation.py rfsn_v10/cache/tests/ rfsn_v10/integrations/mlx_lm_adapter/tests/ \

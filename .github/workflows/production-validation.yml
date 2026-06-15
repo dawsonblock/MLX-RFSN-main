@@ -78,6 +78,8 @@ jobs:
           fi
 
       - name: Run production validation
+        env:
+          RFSN_ENABLE_TRUE_PACKED: "1"
         run: |
           MODEL_PATH=$(find "$MODEL_DIR" -name "config.json" -exec dirname {} \; | head -1)
           echo "Using model at: $MODEL_PATH"

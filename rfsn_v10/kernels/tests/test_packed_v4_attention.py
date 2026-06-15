@@ -139,7 +139,7 @@ class TestPackedV4AgainstReference:
         )
 
         kernel = PackedV4AttentionKernel()
-        out, contract = kernel(
+        out, _, _, contract = kernel(
             queries=queries,
             key_blocks=[k_block],
             value_blocks=[v_block],
@@ -175,7 +175,7 @@ class TestPackedV4AgainstReference:
         )
 
         kernel = PackedV4AttentionKernel()
-        out, contract = kernel(
+        out, _, _, contract = kernel(
             queries=queries,
             key_blocks=k_blocks,
             value_blocks=v_blocks,
@@ -205,7 +205,7 @@ class TestPackedV4AgainstReference:
         )
 
         kernel = PackedV4AttentionKernel()
-        out, contract = kernel(
+        out, _, _, contract = kernel(
             queries=queries,
             key_blocks=[k_block],
             value_blocks=[v_block],
@@ -235,7 +235,7 @@ class TestPackedV4AgainstReference:
         )
 
         kernel = PackedV4AttentionKernel()
-        out, contract = kernel(
+        out, _, _, contract = kernel(
             queries=queries,
             key_blocks=[k_block],
             value_blocks=[v_block],
@@ -262,7 +262,7 @@ class TestPackedV4AgainstReference:
         )
 
         kernel = PackedV4AttentionKernel()
-        out, contract = kernel(
+        out, _, _, contract = kernel(
             queries=queries,
             key_blocks=[k_block],
             value_blocks=[v_block],
@@ -284,7 +284,7 @@ class TestPackedV4AgainstReference:
         k_block, v_block = _encode_kv_tensors(keys, values)
 
         kernel = PackedV4AttentionKernel()
-        _, contract = kernel(
+        _, _, _, contract = kernel(
             queries=queries,
             key_blocks=[k_block],
             value_blocks=[v_block],
@@ -326,7 +326,7 @@ class TestConvenienceWrapper:
 
         k_block, v_block = _encode_kv_tensors(keys, values)
 
-        out, contract = packed_v4_attention(
+        out, _, _, contract = packed_v4_attention(
             queries=queries,
             key_blocks=[k_block],
             value_blocks=[v_block],
@@ -337,3 +337,126 @@ class TestConvenienceWrapper:
 
         assert out.shape == queries.shape
         assert contract.backend == "true_packed_metal_v4_k8"
+
+
+class TestPackedV4SoftmaxStats:
+    """Verify the kernel exports correct softmax statistics for region merging."""
+
+    def test_returns_valid_stats(self):
+        """Kernel must return running_max and running_sum with correct shapes."""
+        B, Hq, Hkv, T, D = 1, 4, 4, 16, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+        keys = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+        values = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+
+        k_block, v_block = _encode_kv_tensors(keys, values)
+        kernel = PackedV4AttentionKernel()
+        out, max_arr, sum_arr, contract = kernel(
+            queries=queries,
+            key_blocks=[k_block],
+            value_blocks=[v_block],
+            scale=1.0 / np.sqrt(D),
+            causal=True,
+            query_start_pos=T,
+        )
+        assert max_arr.shape == (Hq, 1)
+        assert sum_arr.shape == (Hq, 1)
+        assert float(mx.min(sum_arr).item()) > 0, "running_sum must be positive"
+        assert contract.backend == "true_packed_metal_v4_k8"
+
+    def test_merge_with_dense_region(self):
+        """Merging packed + dense region must match full dense oracle."""
+        B, Hq, Hkv, T, D = 1, 4, 4, 16, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+        scale = 1.0 / np.sqrt(D)
+
+        # Sealed packed block (first 8 tokens)
+        keys_packed = mx.random.normal((B, Hkv, 8, D), dtype=mx.float32)
+        values_packed = mx.random.normal((B, Hkv, 8, D), dtype=mx.float32)
+        k_block, v_block = _encode_kv_tensors(keys_packed, values_packed, logical_start=0)
+
+        # Staging (next 8 tokens)
+        keys_staging = mx.random.normal((B, Hkv, 8, D), dtype=mx.float32)
+        values_staging = mx.random.normal((B, Hkv, 8, D), dtype=mx.float32)
+
+        # Full dense oracle over all 16 tokens
+        all_keys = mx.concatenate([keys_packed, keys_staging], axis=2)
+        all_values = mx.concatenate([values_packed, values_staging], axis=2)
+        scores = (queries @ all_keys.transpose(0, 1, 3, 2)) * scale
+        max_score = mx.max(scores, axis=-1, keepdims=True)
+        exp_scores = mx.exp(scores - max_score)
+        sum_exp = mx.sum(exp_scores, axis=-1, keepdims=True)
+        oracle = (exp_scores @ all_values) / sum_exp
+
+        # Packed region via kernel
+        kernel = PackedV4AttentionKernel()
+        packed_out, packed_max, packed_sum, _ = kernel(
+            queries=queries,
+            key_blocks=[k_block],
+            value_blocks=[v_block],
+            scale=scale,
+            causal=True,
+            query_start_pos=16,
+        )
+
+        # Staging region via dense helper
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            _dense_attention_with_stats,
+            _merge_attention_regions,
+        )
+        stage_out, stage_max, stage_sum = _dense_attention_with_stats(
+            queries,
+            keys_staging,
+            values_staging,
+            scale,
+            query_start_pos=16,
+            kv_start_pos=8,
+        )
+
+        # Merge
+        merged = _merge_attention_regions([
+            (packed_out, packed_max, packed_sum),
+            (stage_out, stage_max, stage_sum),
+        ])
+
+        abs_diff = float(mx.max(mx.abs(merged - oracle)).item())
+        rel_diff = abs_diff / (float(mx.max(mx.abs(oracle)).item()) + 1e-8)
+        # Tolerance relaxed to 5e-2 because the packed region introduces
+        # quantization error; the test verifies the merge math, not bit-exactness.
+        assert rel_diff < 5e-2, f"merge mismatch: rel={rel_diff}, abs={abs_diff}"
+
+    def test_empty_packed_with_staging_matches_oracle(self):
+        """When no packed blocks exist, staging-only must match dense oracle."""
+        B, Hq, Hkv, T, D = 1, 4, 4, 8, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+        scale = 1.0 / np.sqrt(D)
+
+        keys_staging = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+        values_staging = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+
+        # Oracle
+        scores = (queries @ keys_staging.transpose(0, 1, 3, 2)) * scale
+        max_score = mx.max(scores, axis=-1, keepdims=True)
+        exp_scores = mx.exp(scores - max_score)
+        sum_exp = mx.sum(exp_scores, axis=-1, keepdims=True)
+        oracle = (exp_scores @ values_staging) / sum_exp
+
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            _dense_attention_with_stats,
+            _merge_attention_regions,
+        )
+        stage_out, stage_max, stage_sum = _dense_attention_with_stats(
+            queries,
+            keys_staging,
+            values_staging,
+            scale,
+            query_start_pos=T,
+            kv_start_pos=0,
+        )
+        merged = _merge_attention_regions([
+            (stage_out, stage_max, stage_sum),
+        ])
+
+        abs_diff = float(mx.max(mx.abs(merged - oracle)).item())
+        rel_diff = abs_diff / (float(mx.max(mx.abs(oracle)).item()) + 1e-8)
+        assert rel_diff < 1e-3, f"staging-only mismatch: rel={rel_diff}, abs={abs_diff}"

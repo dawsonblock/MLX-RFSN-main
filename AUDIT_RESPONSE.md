@@ -118,13 +118,8 @@ object.__setattr__(self, "_executed_backend", "metal_dense_reconstruction_violat
 - Causal masking and GQA support
 - Block metadata struct matching `PackedBlockV4`
 
-#### 4.2 Python Wrapper (`true_packed_wrapper.py`)
-```python
-class TruePackedAttentionMetal:
-    def __call__(... ) -> tuple[mx.array, ExecutionContract]:
-        # P1: Currently falls back to CPU reference
-        # Returns execution contract for auditability
-```
+#### 4.2 Python Wrapper (`true_packed_wrapper.py`) — REMOVED
+The original `TruePackedAttentionMetal` scaffold has been superseded by `PackedV4AttentionKernel` in `packed_v4_attention.py` and the prototype files have been deleted.
 
 #### 4.3 Execution Contract Recording
 ```python
@@ -141,16 +136,11 @@ class ExecutionContract:
 ```
 
 #### 4.4 Differential Testing Framework
-- `test_true_packed_kernel.py` - Four-level testing:
-  - Level 1: Unit tests (decode, dot product)
-  - Level 2: Integration tests (buffer prep)
-  - Level 3: Fidelity tests (vs reference)
-  - Level 4: Stress tests (boundaries, GQA, large contexts)
+- `test_packed_v4_attention.py` — The canonical differential test suite for the production `PackedV4AttentionKernel`.
 
 **Files Created**:
-- `rfsn_v10/kernels/metal/true_packed_attention.metal`
-- `rfsn_v10/kernels/metal/true_packed_wrapper.py`
-- `rfsn_v10/kernels/tests/test_true_packed_kernel.py`
+- `rfsn_v10/kernels/metal/packed_v4_attention.py` — Canonical true-packed kernel (replaces all prior prototypes).
+- `rfsn_v10/kernels/tests/test_packed_v4_attention.py`
 
 **Files Modified**:
 - `rfsn_v10/integrations/mlx_lm_model_support/attention_wrapper.py` - Added true packed dispatch path
@@ -554,39 +544,8 @@ requires = ["setuptools>=70.0", "wheel"]
 - GQA support
 - Two-pass attention (scores then weighted accumulation)
 
-#### 16.3 Python Wrapper (`true_packed_wrapper_v2.py`)
-```python
-class TruePackedAttentionMetalV2:
-    def __call__(... ) -> tuple[mx.array, ExecutionContract]:
-        # P1: Dispatches to Metal kernel when available
-        # Falls back to CPU reference with contract recording
-```
-
-#### 16.4 Integration into Attention Dispatch
-- Updated `attention_wrapper.py` to try v2 kernel first
-- Falls back to legacy true packed, then dense Metal, then reference
-- Execution contract validation in strict mode
-
-#### 16.5 Differential Tests (`test_true_packed_kernel_v2.py`)
-- Level 1: Unit tests for Cartesian decode
-- Level 2: Integration tests for buffer preparation
-- Level 3: Fidelity tests comparing Metal vs reference
-- Level 4: Stress tests for boundaries and edge cases
-
-**Files Created**:
-- `rfsn_v10/kernels/metal/cartesian_decode.metal`
-- `rfsn_v10/kernels/metal/true_packed_attention_v2.metal`
-- `rfsn_v10/kernels/metal/true_packed_wrapper_v2.py`
-- `rfsn_v10/kernels/tests/test_true_packed_kernel_v2.py`
-
-**Files Modified**:
-- `rfsn_v10/integrations/mlx_lm_model_support/attention_wrapper.py` - Added v2 dispatch
-
-**Verification**:
-```bash
-pytest rfsn_v10/kernels/tests/test_true_packed_kernel_v2.py -v
-# 23 passed, 2 skipped (Metal-specific)
-```
+#### 16.3–16.5 V2 Prototype — REMOVED
+The `TruePackedAttentionMetalV2` scaffold, its `.metal` shader stub, and the `test_true_packed_kernel_v2.py` test file have been fully deleted.  The canonical true-packed path is now `PackedV4AttentionKernel` in `packed_v4_attention.py`.
 
 ---
 
@@ -607,7 +566,7 @@ pytest rfsn_v10/kernels/tests/test_true_packed_kernel_v2.py -v
 ### What Changed
 
 1. **Production dispatch cleaned** (`attention_wrapper.py`)
-   - Removed the mock-format ``TruePackedMLXInline`` and ``TruePackedAttentionMetalV2`` from the default dispatch chain.
+   - Removed the mock-format ``TruePackedMLXInline``, ``TruePackedAttentionMetalV2``, and all associated `.metal`/`.py` stub files from the repository.
    - Added ``_attempted_backends`` tracking and ``record_attempted_backend()`` to distinguish "tried and failed" from actual fallback.
    - True-packed path now requires explicit ``RFSN_ENABLE_TRUE_PACKED=1`` and a successful self-test.
 
@@ -649,3 +608,93 @@ pytest rfsn_v10/kernels/tests/test_true_packed_kernel_v2.py -v
 - Kernel requires explicit ``RFSN_ENABLE_TRUE_PACKED=1``; not yet the default.
 - No performance benchmark or real-model logit proof bundle exists yet.
 - Teacher-forced logit comparison methodology is still the critical path blocker.
+
+---
+
+## Fourth Audit Response: Incremental Decode Correctness & Strict Mode (COMPLETED)
+
+**Audit Date**: 2026-06-15  
+**Response Date**: 2026-06-15  
+**Scope**: Address Archive 7 critical blockers for real incremental decoding.
+
+### P0 Fixes — Correct Real Incremental Attention
+
+#### 1. Kernel exports softmax statistics (packed_v4_attention.py)
+- **Issue**: The kernel returned only the WHT-domain output. Without per-query softmax statistics, the wrapper could not merge packed-block attention with live staging or dense-residual attention.
+- **Fix**: The Metal shader now writes ``running_max_arr`` and ``running_sum_arr`` as additional outputs. ``PackedV4AttentionKernel.__call__`` returns a 4-tuple: ``(output, running_max, running_sum, contract)``.
+- **Impact**: Enables mathematically correct softmax merging across multiple KV regions.
+
+#### 2. Three-region attention merge (attention_wrapper.py)
+- **Issue**: The wrapper passed only sealed packed blocks to the kernel, omitting live staging tokens and dense residual windows. This invalidated real incremental decoding.
+- **Fix**: ``_PackedAttentionWrapper.__call__`` now:
+  1. Calls the kernel on sealed packed blocks (if any exist).
+  2. Computes dense attention with softmax stats on staging K/V (if present).
+  3. Computes dense attention with softmax stats on dense residual K/V (if present).
+  4. Merges all regions via ``_merge_attention_regions()`` using online-softmax statistics.
+  5. Handles empty-cache (zero-blocks, zero-staging) by returning zeros.
+- **Helper functions added**: ``_dense_attention_with_stats()`` and ``_merge_attention_regions()``.
+
+#### 3. Empty-cache and pre-seal behavior
+- **Issue**: The kernel rejected empty input with ``ValueError("no blocks provided")``, so strict true-packed generation failed before the first block sealed.
+- **Fix**: The wrapper skips the kernel call when no sealed blocks exist and computes attention purely from staging/residual. The kernel still rejects empty blocks (preserving its own contract), but the orchestration layer handles the lifecycle.
+
+#### 4. Statistics crash fixed (P0.6)
+- **Issue**: ``get_backend_stats()`` read ``contract.num_blocks``, which does not exist on ``ExecutionContract`` (fields are ``num_key_blocks`` and ``num_value_blocks``). This caused a deterministic ``AttributeError`` after every true-packed call.
+- **Fix**: Changed ``get_backend_stats()`` to use ``contract.num_key_blocks`` and ``contract.num_value_blocks``.
+
+#### 5. Unsupported masks rejected (P0.7)
+- **Issue**: The wrapper received arbitrary ``mask`` arguments but passed only ``causal=True`` to the kernel, silently ignoring padding masks, sliding-window masks, etc.
+- **Fix**: In strict mode, non-None/non-causal masks raise ``RuntimeError``. In non-strict mode, unsupported masks cause the true-packed path to be skipped and fall back to the reference path.
+
+### P1 Fixes — Make Strict Execution Truthful
+
+#### 6. Strict mode forbids invalid backends (P1.1)
+- **Issue**: Strict mode meant "raise on backend failure," not "forbid invalid backends." The wrapper could still dispatch dense-reconstruction Metal or the reference path in strict mode.
+- **Fix**: When ``strict=True``, the wrapper:
+  - Raises immediately if the true-packed path fails (no fallback to metal_dense or packed_reference).
+  - Only attempts fallback paths when ``strict=False``.
+
+#### 7. Real kernel self-test (P1.3)
+- **Issue**: ``_self_test()`` compiled a trivial ``output[0] = 1.0f`` shader, not the actual ``_PACKED_V4_KERNEL_K8`` source. ``HAS_TRUE_PACKED_KERNEL=True`` proved only that basic Metal dispatch worked, not that the real kernel compiled.
+- **Fix**: ``_self_test()`` now compiles the real ``_PACKED_V4_KERNEL_K8`` source with a minimal 2-token fixture and verifies output shapes. The module-level feature-gate is moved to after the kernel source definition to avoid a forward-reference ``NameError``.
+
+#### 8. Complete block-list validation (P1.4)
+- **Issue**: The validator checked only selected fields; it did not ensure the block list was safe and coherent.
+- **Fix**: ``_validate_blocks()`` now enforces:
+  - ``PackedBlockV4.validate()`` on every block.
+  - Contiguous, non-overlapping logical positions.
+  - Consistent batch size, head count, head dimension across all blocks.
+  - Consistent layer IDs, stream IDs, sign seeds, codec signatures.
+  - Consistent ``words_per_vector`` and ``groups_per_vector``.
+  - Exact buffer shape verification for ``packed_codes`` and ``scales``.
+
+### Tests Added
+
+| Test | File | Purpose |
+|------|------|---------|
+| ``test_returns_valid_stats`` | ``test_packed_v4_attention.py`` | Verify ``running_max`` and ``running_sum`` shapes and positivity. |
+| ``test_merge_with_dense_region`` | ``test_packed_v4_attention.py`` | Prove packed + staging merge matches dense oracle (within quantization tolerance). |
+| ``test_empty_packed_with_staging_matches_oracle`` | ``test_packed_v4_attention.py`` | Prove staging-only attention matches dense oracle. |
+
+### Verification Results
+
+```bash
+# Kernel differential tests (14 tests, all pass on Apple Silicon)
+RFSN_ENABLE_TRUE_PACKED=1 pytest rfsn_v10/kernels/tests/test_packed_v4_attention.py -v
+
+# Full CI gate (all pass)
+RFSN_ENABLE_TRUE_PACKED=1 pytest tests/test_generation.py rfsn_v10/cache/tests/ \
+  rfsn_v10/integrations/mlx_lm_adapter/tests/ \
+  rfsn_v10/integrations/mlx_lm_model_support/tests/ \
+  rfsn_v10/kernels/tests/ benchmarks/tests/ tests/server/ -q
+```
+
+### Remaining Honest Limitations
+
+| Limitation | Status | Note |
+|---|---|---|
+| Scalar shader prototype | Unchanged | One thread per (q_head, q_token); lacks SIMD-group reductions, tiled loading, vectorized decode. Correctness proven, performance unproven. |
+| O(T²) concatenation | Unchanged | ``_concatenate_blocks`` still concatenates full packed history on every call. Persistent block descriptors deferred to P2. |
+| Real-model proof bundle | Missing | No native Apple-Silicon incremental-decode artifact with per-step backend counters and full-logit metrics. |
+| Performance claims | Unproven | No evidence that the kernel outperforms dense MLX attention. |
+| Release decision | Still NO-GO | Correctness prototype is functional, but production serving requires proven real-model integration and performance validation. |

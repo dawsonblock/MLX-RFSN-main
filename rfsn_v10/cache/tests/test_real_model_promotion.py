@@ -373,3 +373,176 @@ class TestRealModelPromotion:
 
         finally:
             unwrap_model_attention(model)
+
+    def test_true_packed_metal_matches_dense_baseline(self, model_and_tokenizer):
+        """True-packed V4 kernel (K8/V8) with real model: token-exact, strict backend.
+
+        This test proves that the canonical true-packed Metal kernel produces
+        identical greedy tokens to the dense baseline across incremental
+        decode steps, with every layer using ``true_packed_metal_v4_k8`` and
+        zero requantization.
+        """
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            collect_backend_stats,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+        from rfsn_v10.kernels.metal.packed_v4_attention import (
+            HAS_TRUE_PACKED_KERNEL,
+        )
+
+        if not HAS_TRUE_PACKED_KERNEL:
+            pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
+
+        model, tokenizer = model_and_tokenizer
+        prompt = "What is the capital of France?"
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        prompt_len = len(prompt_ids)
+        max_tokens = 16
+
+        # Dense baseline
+        baseline_tokens = []
+        for token, _ in generate_step(
+            prompt_ids, model, max_tokens=max_tokens, temp=0.0
+        ):
+            baseline_tokens.append(int(token))
+
+        # True-packed path (K8/V8 — kernel only supports bits==8)
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+                strict=True,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        wrap_model_attention(model, caches, strict=True)
+        try:
+            packed_tokens = []
+            for token, _ in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed_tokens.append(int(token))
+
+            # Backend audit: must collect BEFORE unwrapping
+            stats = collect_backend_stats(model)
+        finally:
+            unwrap_model_attention(model)
+
+        # Token-exact match
+        assert packed_tokens == baseline_tokens, (
+            f"True-packed divergence at step(s): "
+            f"baseline={baseline_tokens}, packed={packed_tokens}"
+        )
+
+        # Cache lifecycle proof
+        layer0 = caches[0].layer_cache
+        total = prompt_len + max_tokens
+        assert layer0.total_token_count() == total, (
+            f"Total token count mismatch: expected {total}, got {layer0.total_token_count()}"
+        )
+        assert layer0.requantized_token_count == 0, (
+            f"Requantization detected: {layer0.requantized_token_count}"
+        )
+
+        # Backend audit: every layer must have used true_packed_metal_v4_k8
+        assert len(stats) == len(model.layers), (
+            f"Backend stats missing for some layers: {len(stats)} vs {len(model.layers)}"
+        )
+        for st in stats:
+            assert st["executed_backend"] == "true_packed_metal_v4_k8", (
+                f"Layer {st.get('layer_id')} used wrong backend: {st['executed_backend']}"
+            )
+            contract = st.get("execution_contract")
+            if contract is not None:
+                assert contract["backend"] == "true_packed_metal_v4_k8"
+                assert contract["materialized_bytes"] == 0
+                assert contract["decoded_tokens"] == 0
+
+    def test_true_packed_staging_lifecycle(self, model_and_tokenizer):
+        """Verify staging accumulates, seals, and remains coherent across blocks.
+
+        Prompt length chosen so that prefill leaves a non-zero remainder in
+        staging. Generation must then append decode tokens to staging until
+        the next seal, proving the three-region merge works across the
+        boundary.
+        """
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+        from rfsn_v10.kernels.metal.packed_v4_attention import (
+            HAS_TRUE_PACKED_KERNEL,
+        )
+
+        if not HAS_TRUE_PACKED_KERNEL:
+            pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
+
+        model, tokenizer = model_and_tokenizer
+        # Choose a prompt length that is NOT a multiple of 64 so staging
+        # has a remainder after prefill.
+        sentence = "The quick brown fox jumps over the lazy dog. "
+        repeat_count = 8  # ~216 chars → ~50-60 tokens (not a multiple of 64)
+        prompt = "Summarize: " + sentence * repeat_count
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        prompt_len = len(prompt_ids)
+        max_tokens = 32  # Enough to cross at least one block seal boundary
+
+        # True-packed path
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+                strict=True,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        wrap_model_attention(model, caches, strict=True)
+        try:
+            generated = []
+            for token, _ in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                generated.append(int(token))
+        finally:
+            unwrap_model_attention(model)
+
+        layer0 = caches[0].layer_cache
+        total = prompt_len + len(generated)
+        assert layer0.total_token_count() == total
+        assert layer0.requantized_token_count == 0
+
+        # Staging lifecycle: because prompt_len is not a multiple of 64,
+        # there must be at least one sealed block AND some staging OR
+        # additional sealed blocks from generation.
+        sealed_count = len(list(layer0.iter_key_blocks()))
+        assert sealed_count > 0, "Expected at least one sealed block after generation"
+
+        # If total tokens crossed a 64-token boundary during generation,
+        # we should have more than floor(prompt_len/64) blocks.
+        min_expected_blocks = total // 64
+        assert sealed_count >= min_expected_blocks, (
+            f"Block count too low: {sealed_count} < {min_expected_blocks}"
+        )
