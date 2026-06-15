@@ -141,20 +141,31 @@ def attend(
 
     # Sealed blocks (use decode_bhtd directly)
     # Fix #2: Use typed methods instead of string-based increment
+    # Fix #4: Record actual block creation, block reads, packed calls and bytes
     if hasattr(layer_cache, "session") and layer_cache.session is not None:
         layer_cache.session.runtime_counters.record_block_read(len(key_blocks))
-        # Track bytes read for keys and values
+        # Track bytes read for keys and values including scales
         for kb, vb in zip(key_blocks, value_blocks):
+            # Code arrays
             if kb.packed_codes is not None:
                 layer_cache.session.runtime_counters.record_packed_read(int(kb.packed_codes.size) * 4)
             if vb.packed_codes is not None:
                 layer_cache.session.runtime_counters.record_packed_read(int(vb.packed_codes.size) * 4)
-            # Track decoded block bytes
-            layer_cache.session.runtime_counters.record_decoded_block(int(kb.token_count) * D * 4 * 2)  # K and V
+            # Scale arrays
+            if kb.scales is not None:
+                layer_cache.session.runtime_counters.record_packed_read(int(kb.scales.size) * 4)
+            if vb.scales is not None:
+                layer_cache.session.runtime_counters.record_packed_read(int(vb.scales.size) * 4)
     
     for kb, vb in zip(key_blocks, value_blocks):
         k_dense = layer_cache.key_codec.decode_bhtd(kb)
         v_dense = layer_cache.value_codec.decode_bhtd(vb)
+        # Fix #4: Track decoded block bytes using actual tensor sizes
+        if hasattr(layer_cache, "session") and layer_cache.session is not None:
+            if hasattr(k_dense, 'nbytes'):
+                layer_cache.session.runtime_counters.record_decoded_block(k_dense.nbytes)
+            if hasattr(v_dense, 'nbytes'):
+                layer_cache.session.runtime_counters.record_decoded_block(v_dense.nbytes)
         _process_region(k_dense, v_dense, kb.token_count)
 
     # Staging

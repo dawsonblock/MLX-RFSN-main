@@ -221,13 +221,18 @@ class QuantizedLayerCache:
             self._value_blocks.append(value_block)
             
             # Fix #2: Use typed methods instead of string-based increment
+            # Fix #4: Record actual block creation and bytes written including scales
             if self.session:
                 self.session.runtime_counters.record_block_created()
-                # Track bytes written for keys and values
+                # Track bytes written for keys and values including scales
                 if key_block.packed_codes is not None:
                     self.session.runtime_counters.record_packed_write(int(key_block.packed_codes.size) * 4)
                 if value_block.packed_codes is not None:
                     self.session.runtime_counters.record_packed_write(int(value_block.packed_codes.size) * 4)
+                if key_block.scales is not None:
+                    self.session.runtime_counters.record_packed_write(int(key_block.scales.size) * 4)
+                if value_block.scales is not None:
+                    self.session.runtime_counters.record_packed_write(int(value_block.scales.size) * 4)
 
         self._encoded_tokens += n_full_blocks * block_size
 
