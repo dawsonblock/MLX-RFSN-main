@@ -65,7 +65,7 @@ class PromotionPolicy:
         
         # Separate candidate results from baseline results
         candidate_results = [r for r in results if r.get("name") == candidate_name]
-        baseline_results = [r for r in results if r.get("name") == "mlx_lm_baseline"]
+        baseline_results = [r for r in results if r.get("name") == "dense_mlx_baseline"]
         
         # Build the bundle structure
         bundle = {
@@ -74,7 +74,7 @@ class PromotionPolicy:
                 "results": candidate_results,
             },
             "linked_baseline": {
-                "name": "mlx_lm_baseline",
+                "name": "dense_mlx_baseline",
                 "results": baseline_results,
             },
             "quality_evidence": [],  # Will be populated from candidate results

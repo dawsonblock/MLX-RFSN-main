@@ -76,7 +76,7 @@ def test_promotion_eligibility_fields():
             "results": [],
         },
         "linked_baseline": {
-            "name": "mlx_lm_baseline",
+            "name": "dense_mlx_baseline",
             "results": [],
         },
         "quality_evidence": [],

@@ -34,7 +34,7 @@ Outputs
 Decision rule
 -------------
 The candidate with the best quality-gated tokens/sec wins.
-If no candidate beats mlx_lm_baseline in quality, the baseline wins.
+If no candidate beats dense_mlx_baseline in quality, the baseline wins.
 
 Metric definitions
 ------------------
@@ -328,7 +328,8 @@ def _run_once(
         result.working_set_memory_mb = peak_mb
 
     # Fix #5: Hard compressed-execution gate
-    if require_compressed_execution:
+    # Only applies to packed candidates, not baseline
+    if require_compressed_execution and candidate.name != "dense_mlx_baseline":
         # Valid direct-packed run must have:
         # packed_blocks_created > 0
         # packed_blocks_read > 0
@@ -374,7 +375,7 @@ def _run_once(
 
     # Baseline always passes logit gate by definition, but CONTROL never
     # promotes — it is the comparison target, not a candidate.
-    if candidate.name == "mlx_lm_baseline":
+    if candidate.name == "dense_mlx_baseline":
         result.logit_cosine = 1.0
         result.kl_divergence = 0.0
         result.top1_match = 1.0
@@ -386,7 +387,15 @@ def _run_once(
         result.memory_gate_passed = True
         result.gate_status = "PASS_NO_PROMOTE"
         result.promotion_eligible = False
-        result.candidate_status = CandidateStatus.CONTROL
+        result.candidate_status = "CONTROL"
+        # Set packed fields to 0 for baseline (no compression)
+        result.packed_blocks_created = 0
+        result.packed_blocks_read = 0
+        result.packed_attention_calls = 0
+        result.dense_fallback_calls = 0
+        result.full_history_materialization_calls = 0
+        result.packed_bytes_written = 0
+        result.packed_bytes_read = 0
         return result
 
     # In quick mode, we only have text heuristic — no real logit gate
@@ -415,7 +424,7 @@ def _run_once(
         baseline_logprobs = None
         candidate_logprobs = None
 
-        if candidate.name == "mlx_lm_baseline":
+        if candidate.name == "dense_mlx_baseline":
             # Baseline is the reference — perfect by definition
             result.logit_cosine = 1.0
             result.kl_divergence = 0.0
@@ -428,6 +437,15 @@ def _run_once(
             result.memory_gate_passed = True
             result.gate_status = "PASS_NO_PROMOTE"
             result.promotion_eligible = False
+            result.candidate_status = "CONTROL"
+            # Set packed fields to 0 for baseline (no compression)
+            result.packed_blocks_created = 0
+            result.packed_blocks_read = 0
+            result.packed_attention_calls = 0
+            result.dense_fallback_calls = 0
+            result.full_history_materialization_calls = 0
+            result.packed_bytes_written = 0
+            result.packed_bytes_read = 0
             return result
 
         if not baseline_text:
@@ -1214,7 +1232,7 @@ def main() -> None:
                         f"Candidate {candidate.name} failed: {result.error}"
                     )
 
-                if candidate.name == "mlx_lm_baseline":
+                if candidate.name == "dense_mlx_baseline":
                     baseline_result = result
                     last_baseline_result = result
                     if result.gate_status != "ERROR":
