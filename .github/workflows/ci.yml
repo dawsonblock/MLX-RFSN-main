@@ -258,6 +258,20 @@ jobs:
       - name: Model support tests (MLX)
         run: pytest rfsn_v10/integrations/mlx_lm_model_support/tests/ -q
 
+      - name: Kernel availability guard — must NOT skip when enabled
+        env:
+          RFSN_ENABLE_TRUE_PACKED: "1"
+        run: |
+          python -c "
+          import os, sys
+          from rfsn_v10.kernels.metal.packed_v4_attention import HAS_TRUE_PACKED_KERNEL
+          if not HAS_TRUE_PACKED_KERNEL:
+              print('FATAL: RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False')
+              print('      The Metal self-test failed; kernel tests would be skipped.')
+              sys.exit(1)
+          print('OK: HAS_TRUE_PACKED_KERNEL is True')
+          "
+
       - name: Kernel tests — true-packed V4 (MLX + Metal)
         env:
           RFSN_ENABLE_TRUE_PACKED: "1"

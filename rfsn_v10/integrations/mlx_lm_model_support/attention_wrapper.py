@@ -356,19 +356,35 @@ class _PackedAttentionWrapper(nn.Module):
         # ------------------------------------------------------------------
         # P0.7: Reject unsupported masks before dispatch.
         # The true-packed path only supports causal masking or no mask.
-        # mlx_lm passes causal mask arrays for standard generation; we accept
+        # mlx_lm passes causal mask arrays during prefill (T>1); we accept
         # MLX arrays because our kernel implements causal logic internally.
+        # Non-causal masks (additive, sliding-window, padding) are not yet
+        # supported and will be ignored — this is a known limitation tracked
+        # in the P3 repair plan.
         # ------------------------------------------------------------------
         _mask_is_mlx_array = isinstance(mask, mx.array)
-        _mask_unsupported = (
-            mask is not None
-            and mask != "causal"
-            and not _mask_is_mlx_array
-        )
+        _mask_unsupported = False
+        if mask is not None:
+            if isinstance(mask, str):
+                _mask_unsupported = mask.lower() != "causal"
+            elif not _mask_is_mlx_array:
+                _mask_unsupported = True
+
         if _mask_unsupported and self._strict:
             raise RuntimeError(
                 f"Strict packed mode: unsupported mask {type(mask).__name__}; "
                 "only causal=True or mask=None is supported."
+            )
+
+        # ------------------------------------------------------------------
+        # P0: Strict mode must fail immediately if the packed kernel is
+        # unavailable, rather than falling through to a cryptic None output.
+        # ------------------------------------------------------------------
+        if self._strict and not HAS_TRUE_PACKED_KERNEL:
+            raise RuntimeError(
+                "Strict packed mode: HAS_TRUE_PACKED_KERNEL is False. "
+                "Set RFSN_ENABLE_TRUE_PACKED=1 and ensure the Metal "
+                "self-test passes on Apple Silicon."
             )
 
         # ------------------------------------------------------------------
@@ -377,6 +393,9 @@ class _PackedAttentionWrapper(nn.Module):
         output = None
         contract = None
         _attempted: list[str] = []
+        _packed_kernel_dispatched = False
+        _staging_dispatched = False
+        _dense_residual_dispatched = False
 
         if HAS_TRUE_PACKED_KERNEL and not _mask_unsupported:
             _attempted.append("true_packed_v4")
@@ -426,6 +445,7 @@ class _PackedAttentionWrapper(nn.Module):
                     )
                     regions.append((packed_out, packed_max, packed_sum))
                     contract = packed_contract
+                    _packed_kernel_dispatched = True
 
                 # ---- Staging region ----
                 if stage_n > 0 and stage_k is not None and stage_v is not None:
@@ -441,6 +461,7 @@ class _PackedAttentionWrapper(nn.Module):
                         causal=True,
                     )
                     regions.append((stage_out, stage_max, stage_sum))
+                    _staging_dispatched = True
 
                 # ---- Dense residual region ----
                 if dense_k is not None and dense_v is not None:
@@ -457,6 +478,7 @@ class _PackedAttentionWrapper(nn.Module):
                         causal=True,
                     )
                     regions.append((dense_out, dense_max, dense_sum))
+                    _dense_residual_dispatched = True
 
                 if regions:
                     output = _merge_attention_regions(regions)
@@ -466,13 +488,39 @@ class _PackedAttentionWrapper(nn.Module):
                         (B, self.n_heads, L, D), dtype=queries.dtype
                     )
 
-                object.__setattr__(
-                    self, "_executed_backend", "true_packed_metal_v4_k8"
-                )
+                # P0: truthful backend attribution based on what actually ran
+                if _packed_kernel_dispatched:
+                    if _staging_dispatched and _dense_residual_dispatched:
+                        backend_label = "packed_metal_plus_staging_residual"
+                    elif _staging_dispatched:
+                        backend_label = "packed_metal_plus_staging"
+                    elif _dense_residual_dispatched:
+                        backend_label = "packed_metal_plus_residual"
+                    else:
+                        backend_label = "packed_metal_only"
+                elif _staging_dispatched:
+                    backend_label = "dense_staging_only"
+                elif _dense_residual_dispatched:
+                    backend_label = "dense_residual_only"
+                else:
+                    backend_label = "empty_cache"
+
+                object.__setattr__(self, "_executed_backend", backend_label)
                 if contract is not None:
                     object.__setattr__(
                         self, "_last_execution_contract", contract
                     )
+
+                # P0: record packed attention only when the kernel actually ran
+                if _packed_kernel_dispatched:
+                    _sess = getattr(layer_cache, "session", None)
+                    if _sess is not None:
+                        _sess.runtime_counters.record_packed_attention()
+                        # Record per-block reads and bytes from contract
+                        if contract is not None:
+                            _sess.runtime_counters.record_block_read(
+                                contract.num_key_blocks
+                            )
             except Exception as exc:
                 _sess = getattr(layer_cache, "session", None)
                 if _sess is not None:
@@ -548,9 +596,9 @@ class _PackedAttentionWrapper(nn.Module):
             if _sess is not None:
                 _sess.runtime_counters.record_fallback()
 
-        # Fix #2: Use typed method instead of string-based increment
-        if hasattr(layer_cache, "session") and layer_cache.session is not None:
-            layer_cache.session.runtime_counters.record_packed_attention()
+        # P0: record_packed_attention() is now called inside the packed-kernel
+        # branch only when the kernel actually dispatches.  Do NOT infer packed
+        # execution from wrapper exit.
 
         # Reshape back and output projection
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -573,7 +621,7 @@ class _PackedAttentionWrapper(nn.Module):
             "strict": self._strict,
         }
 
-        # P1: Include execution contract if available
+        # P0: Include execution contract with truthful measured counters
         if self._last_execution_contract is not None:
             contract = self._last_execution_contract
             stats["execution_contract"] = {
@@ -582,6 +630,12 @@ class _PackedAttentionWrapper(nn.Module):
                 "num_key_blocks": contract.num_key_blocks,
                 "num_value_blocks": contract.num_value_blocks,
                 "total_kv_tokens": contract.total_kv_tokens,
+                "dense_kv_materialized_bytes": contract.dense_kv_materialized_bytes,
+                "packed_history_copy_bytes": contract.packed_history_copy_bytes,
+                "query_transform_bytes": contract.query_transform_bytes,
+                "scratch_bytes": contract.scratch_bytes,
+                "output_bytes": contract.output_bytes,
+                "decoded_dense_tokens": contract.decoded_dense_tokens,
                 "materialized_bytes": contract.materialized_bytes,
                 "decoded_tokens": contract.decoded_tokens,
                 "execution_ms": contract.execution_ms,

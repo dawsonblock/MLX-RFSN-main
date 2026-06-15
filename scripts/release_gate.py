@@ -399,14 +399,25 @@ def check_wheel_installation() -> dict:
             shutil.rmtree(venv_dir, ignore_errors=True)
 
 
-def run_pytest(markers: str, label: str) -> dict:
-    """Run pytest with the given marker expression."""
+def run_pytest(markers: str, label: str, dirs: list[str] | None = None) -> dict:
+    """Run pytest with the given marker expression.
+
+    Parameters
+    ----------
+    markers
+        pytest ``-m`` expression.
+    label
+        Human-readable label for the check name.
+    dirs
+        List of directories to test.  Defaults to ``tests/``.
+    """
+    targets = [str(REPO_ROOT / d) for d in (dirs or ["tests"])]
     cmd = [
         sys.executable, "-m", "pytest",
         "-q", "--tb=short",
         f"-m={markers}",
         f"--rootdir={REPO_ROOT}",
-        str(REPO_ROOT / "tests"),
+        *targets,
     ]
     t0 = time.perf_counter()
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
@@ -457,7 +468,22 @@ def main() -> int:
     ))
 
     if args.mlx or args.full:
+        # P0: run marker-filtered tests from tests/
         checks.append(run_pytest("mlx", "mlx"))
+        # P0: also run kernel, cache, and model-support suites which live
+        # outside tests/ and are omitted by the marker-only path.
+        checks.append(run_pytest(
+            "mlx", "mlx_kernels",
+            dirs=["rfsn_v10/kernels/tests"],
+        ))
+        checks.append(run_pytest(
+            "mlx", "mlx_cache",
+            dirs=["rfsn_v10/cache/tests"],
+        ))
+        checks.append(run_pytest(
+            "mlx", "mlx_model_support",
+            dirs=["rfsn_v10/integrations/mlx_lm_model_support/tests"],
+        ))
 
     if args.full:
         checks.append(run_pytest("benchmark", "benchmark_smoke"))

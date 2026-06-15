@@ -144,6 +144,14 @@ class ExecutionContract:
     num_kv_heads: int
     head_dim: int
     bits: int
+    # P0: measured counters instead of hardcoded zeros
+    dense_kv_materialized_bytes: int = 0
+    packed_history_copy_bytes: int = 0
+    query_transform_bytes: int = 0
+    scratch_bytes: int = 0
+    output_bytes: int = 0
+    decoded_dense_tokens: int = 0
+    # Legacy aliases for backward compatibility
     materialized_bytes: int = 0
     decoded_tokens: int = 0
     fallback_reason: str | None = None
@@ -152,12 +160,15 @@ class ExecutionContract:
 
     def validate_invariant(self) -> tuple[bool, list[str]]:
         violations = []
-        if self.materialized_bytes > 0:
+        # P0: the true-packed path must not materialise dense historical K/V
+        if self.dense_kv_materialized_bytes > 0:
             violations.append(
-                f"materialized_bytes={self.materialized_bytes} > 0"
+                f"dense_kv_materialized_bytes={self.dense_kv_materialized_bytes} > 0"
             )
-        if self.decoded_tokens > 0:
-            violations.append(f"decoded_tokens={self.decoded_tokens} > 0")
+        if self.decoded_dense_tokens > 0:
+            violations.append(
+                f"decoded_dense_tokens={self.decoded_dense_tokens} > 0"
+            )
         if "true_packed_metal" not in self.backend:
             violations.append(f"backend={self.backend}")
         return len(violations) == 0, violations
@@ -768,9 +779,32 @@ class PackedV4AttentionKernel:
         mx.eval(output, running_max, running_sum)
         execution_ms = (time.perf_counter() - start_time) * 1000.0
 
-        # P1.5: measured counters (true-packed path: no dense K/V materialised)
-        materialized_bytes = 0
-        decoded_tokens = 0
+        # P0: measured counters — derive from actual buffer sizes, not constants
+        # Dense historical K/V materialisation: zero by design
+        dense_kv_materialized_bytes = 0
+        decoded_dense_tokens = 0
+
+        # Packed history copies (concatenated codes + scales)
+        def _buffer_bytes(arr: mx.array) -> int:
+            return int(arr.size) * arr.dtype.size
+
+        packed_history_copy_bytes = (
+            _buffer_bytes(packed_codes_k)
+            + _buffer_bytes(scales_k)
+            + _buffer_bytes(packed_codes_v)
+            + _buffer_bytes(scales_v)
+        )
+
+        # Query WHT transform and flat reshape
+        query_transform_bytes = _buffer_bytes(wht_queries_flat)
+
+        # Scratch = output + running_max + running_sum
+        scratch_bytes = (
+            _buffer_bytes(output)
+            + _buffer_bytes(running_max)
+            + _buffer_bytes(running_sum)
+        )
+        output_bytes = _buffer_bytes(output)
 
         contract = ExecutionContract(
             backend="true_packed_metal_v4_k8",
@@ -782,8 +816,14 @@ class PackedV4AttentionKernel:
             num_kv_heads=num_kv_heads,
             head_dim=D,
             bits=self.bits,
-            materialized_bytes=materialized_bytes,
-            decoded_tokens=decoded_tokens,
+            dense_kv_materialized_bytes=dense_kv_materialized_bytes,
+            packed_history_copy_bytes=packed_history_copy_bytes,
+            query_transform_bytes=query_transform_bytes,
+            scratch_bytes=scratch_bytes,
+            output_bytes=output_bytes,
+            decoded_dense_tokens=decoded_dense_tokens,
+            materialized_bytes=0,
+            decoded_tokens=0,
             execution_ms=execution_ms,
         )
 
