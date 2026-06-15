@@ -54,17 +54,22 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
         key_bits: int = 8,
         value_bits: int = 8,
         group_size: int = 64,
-        staging_capacity: int = 8,  # Reduced from 64 to force block creation during benchmark
-        dense_residual_window: int = 0,  # Set to 0 for initial validation to force compressed execution
+        staging_capacity: int = 64,  # Canonical block size
+        dense_residual_window: int = 0,
     ) -> None:
         self.key_bits = key_bits
         self.value_bits = value_bits
         self.group_size = group_size
         self.staging_capacity = staging_capacity
         self.dense_residual_window = dense_residual_window
+        # Encode block size in name for transparency
         self.name = (
-            f"rfsn_direct_packed_k{key_bits}v{value_bits}_gs{group_size}"
+            f"rfsn_direct_packed_k{key_bits}v{value_bits}_gs{group_size}_bs{staging_capacity}"
         )
+
+    @property
+    def supports_teacher_forced_capture(self) -> bool:
+        return True
 
     def is_available(self) -> bool:
         try:
@@ -303,7 +308,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             packed_bytes_written = 0
             decoded_block_bytes = 0
             scratch_bytes_peak = 0
-            block_seal_events = 0
             execution_backend = "unknown"
             packed_blocks_created = 0
             packed_blocks_read = 0
@@ -331,7 +335,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 packed_bytes_written = counters.get("packed_bytes_written", packed_bytes_written)
                 decoded_block_bytes = counters.get("decoded_block_bytes", decoded_block_bytes)
                 scratch_bytes_peak = counters.get("scratch_bytes_peak", scratch_bytes_peak)
-                block_seal_events = counters.get("block_seal_events", block_seal_events)
                 execution_backend = counters.get("execution_backend", "unknown")
                 packed_blocks_created = counters.get("packed_blocks_created", packed_blocks_created)
                 packed_blocks_read = counters.get("packed_blocks_read", packed_blocks_read)
@@ -351,7 +354,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                         packed_bytes_written=packed_bytes_written,
                         decoded_block_bytes=decoded_block_bytes,
                         scratch_bytes_peak=scratch_bytes_peak,
-                        block_seal_events=block_seal_events,
                         execution_backend=execution_backend,
                         packed_blocks_created=packed_blocks_created,
                         packed_blocks_read=packed_blocks_read,
@@ -380,7 +382,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 packed_bytes_written=packed_bytes_written,
                 decoded_block_bytes=decoded_block_bytes,
                 scratch_bytes_peak=scratch_bytes_peak,
-                block_seal_events=block_seal_events,
                 execution_backend=execution_backend,
                 packed_blocks_created=packed_blocks_created,
                 packed_blocks_read=packed_blocks_read,

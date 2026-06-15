@@ -247,9 +247,15 @@ def _make_s3() -> Any:
 
 
 def _make_rfsn_direct_packed_k8v8() -> Any:
-    """Fix #8: RFSN direct-packed K8/V8 candidate."""
+    """Fix #8: RFSN direct-packed K8/V8 candidate (canonical BS64)."""
     from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
-    return RFSNDirectPackedCandidate(key_bits=8, value_bits=8, group_size=64)
+    return RFSNDirectPackedCandidate(key_bits=8, value_bits=8, group_size=64, staging_capacity=64)
+
+
+def _make_rfsn_direct_packed_k8v8_smoke() -> Any:
+    """Fix #8: RFSN direct-packed K8/V8 smoke candidate (BS8 for fast tests)."""
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
+    return RFSNDirectPackedCandidate(key_bits=8, value_bits=8, group_size=64, staging_capacity=8)
 
 
 def _make_rfsn_direct_packed_k8v5() -> Any:
@@ -321,6 +327,7 @@ def build_default_registry() -> CandidateRegistry:
     reg.register("S3_snapkv_plus_turboquant_mse_residual128", _make_s3)
     # Fix #8: RFSN candidates (current active candidates)
     reg.register("rfsn_direct_packed_k8v8", _make_rfsn_direct_packed_k8v8)
+    reg.register("rfsn_direct_packed_k8v8_smoke", _make_rfsn_direct_packed_k8v8_smoke)
     reg.register("rfsn_direct_packed_k8v5", _make_rfsn_direct_packed_k8v5)
     reg.register("rfsn_direct_packed_k8v6", _make_rfsn_direct_packed_k8v6)
     reg.register("rfsn_direct_packed_k16v8", _make_rfsn_direct_packed_k16v8)

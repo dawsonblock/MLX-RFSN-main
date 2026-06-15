@@ -86,6 +86,34 @@ class BenchmarkCandidate(ABC):
         """Return True if all dependencies for this candidate are importable."""
         return True
 
+    @property
+    def supports_teacher_forced_capture(self) -> bool:
+        """Return True if this candidate can capture teacher-forced logprobs.
+        
+        Subclasses that implement capture_logprobs() should override this.
+        """
+        return False
+
+    def capture_logprobs(
+        self,
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        target_text: str,
+    ) -> list[float] | None:
+        """Capture teacher-forced log probabilities for quality comparison.
+        
+        Args:
+            model: Loaded model
+            tokenizer: Tokenizer
+            prompt: Input prompt
+            target_text: Target text to compute logprobs for
+            
+        Returns:
+            List of log probabilities per token, or None if not supported.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Common quality helpers (used by subclasses)
     # ------------------------------------------------------------------

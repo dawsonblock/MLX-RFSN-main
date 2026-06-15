@@ -86,7 +86,7 @@ class CandidateResult:
     packed_bytes_written: int = 0
     decoded_block_bytes: int = 0
     scratch_bytes_peak: int = 0
-    block_seal_events: int = 0
+    # Fix P1: removed block_seal_events; use packed_blocks_created instead
     execution_backend: str = ""  # e.g. "metal", "cpu", "reference"
 
     # Patch safety proof (for candidates that patch SDPA)

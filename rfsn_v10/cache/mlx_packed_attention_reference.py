@@ -191,17 +191,18 @@ def attend(
     if hasattr(layer_cache, "session") and layer_cache.session is not None:
         layer_cache.session.runtime_counters.record_block_read(len(key_blocks))
         # Track bytes read for keys and values including scales
+        from rfsn_v10.cache.contracts import _array_itemsize
         for kb, vb in zip(key_blocks, value_blocks):
             # Code arrays
             if kb.packed_codes is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(kb.packed_codes.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(kb.packed_codes.size) * _array_itemsize(kb.packed_codes))
             if vb.packed_codes is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(vb.packed_codes.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(vb.packed_codes.size) * _array_itemsize(vb.packed_codes))
             # Scale arrays
             if kb.scales is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(kb.scales.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(kb.scales.size) * _array_itemsize(kb.scales))
             if vb.scales is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(vb.scales.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(vb.scales.size) * _array_itemsize(vb.scales))
     
     for kb, vb in zip(key_blocks, value_blocks):
         k_dense = layer_cache.key_codec.decode_bhtd(kb)
@@ -277,10 +278,11 @@ def attend(
         if hasattr(has_mass, 'nbytes'):
             layer_cache.session.runtime_counters.record_scratch_free(has_mass.nbytes)
 
+    from rfsn_v10.cache.contracts import _array_itemsize
     scratch = AttentionScratch(
         max_reconstructed_block_tokens=max_block_tokens,
         score_vector_bytes=0,
-        output_accumulator_bytes=int(out.size) * 4,
+        output_accumulator_bytes=int(out.size) * _array_itemsize(out),
     )
     
     # P0 #5: Instrument runtime counters - track scratch bytes

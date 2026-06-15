@@ -212,6 +212,7 @@ def _build_candidates(quick: bool = False, include_legacy: bool = False, bit_wid
     
     # Fix #8: Use the authoritative registry for direct-packed candidates
     # Map bit-width config to registry names
+    # P0 #7: Canonical candidates use BS64; smoke variants use BS8 for fast tests
     bit_config_to_name = {
         "k16v16": "rfsn_direct_packed_k16v16",
         "k8v16": "rfsn_direct_packed_k8v16",
@@ -220,6 +221,9 @@ def _build_candidates(quick: bool = False, include_legacy: bool = False, bit_wid
         "k8v6": "rfsn_direct_packed_k8v6",
         "k8v5": "rfsn_direct_packed_k8v5",
     }
+    # Quick mode uses smoke candidates for faster structural tests
+    if quick:
+        bit_config_to_name["k8v8"] = "rfsn_direct_packed_k8v8_smoke"
     
     candidate_name = bit_config_to_name.get(bit_width_config, "rfsn_direct_packed_k8v8")
     
@@ -539,18 +543,9 @@ def _run_once(
                     _revert_polar_patch()
             except Exception:
                 candidate_logprobs = None
-        elif candidate.name in (
-            "rfsn_v10_k8_v5_gs64",
-            "legacy_k8_v5_gs32",
-            "turbo_polar_k4_qjl64",
-            "rfsn_direct_packed_k8v8_gs64",
-            "rfsn_direct_packed_k8v8_gs64_smoke",
-        ):
-            # RFSN v10 with enable_sparse_decode=True activates the SDPA
-            # patch so the RFSNRuntime + KVManager are used during both
-            # generation and teacher-forced capture.
-            # TurboPolar uses a custom MLX-LM cache adapter that compresses
-            # keys with PolarQuant and stores values dense.
+        elif getattr(candidate, "supports_teacher_forced_capture", False):
+            # Capability-based dispatch: any candidate that declares support
+            # for teacher-forced capture can be called here.
             candidate_logprobs = candidate.capture_logprobs(
                 model, tokenizer, prompt, baseline_text,
             )

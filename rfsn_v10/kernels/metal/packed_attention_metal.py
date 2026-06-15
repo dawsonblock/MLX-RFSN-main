@@ -362,16 +362,17 @@ def attend_metal(
     if hasattr(layer_cache, "session") and layer_cache.session is not None:
         layer_cache.session.runtime_counters.record_full_history_materialization()
         # Also record block reads since we decoded them
+        from rfsn_v10.cache.contracts import _array_itemsize
         layer_cache.session.runtime_counters.record_block_read(len(key_blocks))
         for kb, vb in zip(key_blocks, value_blocks):
             if kb.packed_codes is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(kb.packed_codes.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(kb.packed_codes.size) * _array_itemsize(kb.packed_codes))
             if vb.packed_codes is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(vb.packed_codes.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(vb.packed_codes.size) * _array_itemsize(vb.packed_codes))
             if kb.scales is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(kb.scales.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(kb.scales.size) * _array_itemsize(kb.scales))
             if vb.scales is not None:
-                layer_cache.session.runtime_counters.record_packed_read(int(vb.scales.size) * 4)
+                layer_cache.session.runtime_counters.record_packed_read(int(vb.scales.size) * _array_itemsize(vb.scales))
 
     # If a string mask was passed (e.g. "causal"), override the causal arg
     if isinstance(mask, str) and mask.lower() == "causal":

@@ -223,16 +223,17 @@ class QuantizedLayerCache:
             # Fix #2: Use typed methods instead of string-based increment
             # Fix #4: Record actual block creation and bytes written including scales
             if self.session:
+                from rfsn_v10.cache.contracts import _array_itemsize
                 self.session.runtime_counters.record_block_created()
                 # Track bytes written for keys and values including scales
                 if key_block.packed_codes is not None:
-                    self.session.runtime_counters.record_packed_write(int(key_block.packed_codes.size) * 4)
+                    self.session.runtime_counters.record_packed_write(int(key_block.packed_codes.size) * _array_itemsize(key_block.packed_codes))
                 if value_block.packed_codes is not None:
-                    self.session.runtime_counters.record_packed_write(int(value_block.packed_codes.size) * 4)
+                    self.session.runtime_counters.record_packed_write(int(value_block.packed_codes.size) * _array_itemsize(value_block.packed_codes))
                 if key_block.scales is not None:
-                    self.session.runtime_counters.record_packed_write(int(key_block.scales.size) * 4)
+                    self.session.runtime_counters.record_packed_write(int(key_block.scales.size) * _array_itemsize(key_block.scales))
                 if value_block.scales is not None:
-                    self.session.runtime_counters.record_packed_write(int(value_block.scales.size) * 4)
+                    self.session.runtime_counters.record_packed_write(int(value_block.scales.size) * _array_itemsize(value_block.scales))
 
         self._encoded_tokens += n_full_blocks * block_size
 
@@ -368,10 +369,11 @@ class QuantizedLayerCache:
         """Bytes in staging buffers."""
         self._check_destroyed()
         total = 0
+        from rfsn_v10.cache.contracts import _array_itemsize
         for k in self._stage_keys:
-            total += int(k.size) * 4  # float32
+            total += int(k.size) * _array_itemsize(k)
         for v in self._stage_values:
-            total += int(v.size) * 4
+            total += int(v.size) * _array_itemsize(v)
         return total
 
     def total_memory_bytes(self) -> int:

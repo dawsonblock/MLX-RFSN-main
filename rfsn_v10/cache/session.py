@@ -161,22 +161,23 @@ class GenerationCacheSession:
             )
 
             # Payload: sealed blocks
+            from rfsn_v10.cache.contracts import _array_itemsize
             for kb in lc.iter_key_blocks():
-                report.packed_key_codes_bytes += int(kb.packed_codes.size) * 4
-                report.key_scales_bytes += int(kb.scales.size) * 4
+                report.packed_key_codes_bytes += int(kb.packed_codes.size) * _array_itemsize(kb.packed_codes)
+                report.key_scales_bytes += int(kb.scales.size) * _array_itemsize(kb.scales)
                 report.block_metadata_bytes += 32  # approximate per-block header
 
             for vb in lc.iter_value_blocks():
-                report.packed_value_codes_bytes += int(vb.packed_codes.size) * 4
-                report.value_scales_bytes += int(vb.scales.size) * 4
+                report.packed_value_codes_bytes += int(vb.packed_codes.size) * _array_itemsize(vb.packed_codes)
+                report.value_scales_bytes += int(vb.scales.size) * _array_itemsize(vb.scales)
                 report.block_metadata_bytes += 32
 
             # Staging
             sk, sv, sn = lc.get_staging()
             if sk is not None:
-                report.staging_keys_bytes += int(sk.size) * 4
+                report.staging_keys_bytes += int(sk.size) * _array_itemsize(sk)
             if sv is not None:
-                report.staging_values_bytes += int(sv.size) * 4
+                report.staging_values_bytes += int(sv.size) * _array_itemsize(sv)
 
             # Dense residual
             dk, dv = lc.get_dense_residual()

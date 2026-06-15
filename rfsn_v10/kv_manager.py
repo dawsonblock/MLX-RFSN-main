@@ -964,11 +964,12 @@ class RFSNTurboQuantKVManager:
                 total += int(cache.v_qjl.signs.size) * 4
                 total += int(cache.v_qjl.residual_norm.size) * 4
             return total
+        from rfsn_v10.cache.contracts import _array_itemsize
         base = (
-            cache.k_packed.size * 4  # uint32
-            + cache.k_scales.size * 4  # float32
-            + cache.v_packed.size * 4  # uint32
-            + cache.v_scales.size * 4  # float32
+            cache.k_packed.size * _array_itemsize(cache.k_packed)
+            + cache.k_scales.size * _array_itemsize(cache.k_scales)
+            + cache.v_packed.size * _array_itemsize(cache.v_packed)
+            + cache.v_scales.size * _array_itemsize(cache.v_scales)
         )
         # Account for Python list overhead of block metadata (approximate)
         if cache.num_blocks > 0:

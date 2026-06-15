@@ -17,6 +17,23 @@ except ImportError:  # pragma: no cover
     HAS_MLX = False
 
 
+def _array_itemsize(arr: Any) -> int:
+    """Return element size in bytes for MLX, NumPy, or similar arrays.
+
+    Falls back to 4 for objects without dtype/size info.
+    """
+    if arr is None:
+        return 0
+    # MLX arrays
+    if hasattr(arr, "dtype") and hasattr(arr.dtype, "size"):
+        return int(arr.dtype.size)
+    # NumPy arrays
+    if hasattr(arr, "itemsize"):
+        return int(arr.itemsize)
+    # Generic fallback
+    return 4
+
+
 class TensorLayout(StrEnum):
     BHTD = "BHTD"
 
@@ -65,11 +82,11 @@ class PackedBlock:
 
     def payload_bytes(self) -> int:
         if self.packed_codes is not None and hasattr(self.packed_codes, "size"):
-            code_bytes = int(self.packed_codes.size) * 4
+            code_bytes = int(self.packed_codes.size) * _array_itemsize(self.packed_codes)
         else:
             code_bytes = 0
         if self.scales is not None and hasattr(self.scales, "size"):
-            scale_bytes = int(self.scales.size) * 4
+            scale_bytes = int(self.scales.size) * _array_itemsize(self.scales)
         else:
             scale_bytes = 0
         return code_bytes + scale_bytes
@@ -186,11 +203,11 @@ class PackedBlockV4:
                 raise TypeError(
                     f"packed_codes must have a 'size' attribute, got {type(self.packed_codes)}"
                 )
-            code_bytes = int(self.packed_codes.size) * 4
+            code_bytes = int(self.packed_codes.size) * _array_itemsize(self.packed_codes)
         else:
             code_bytes = 0
         if self.scales is not None and hasattr(self.scales, "size"):
-            scale_bytes = int(self.scales.size) * 4
+            scale_bytes = int(self.scales.size) * _array_itemsize(self.scales)
         else:
             scale_bytes = 0
         return code_bytes + scale_bytes
