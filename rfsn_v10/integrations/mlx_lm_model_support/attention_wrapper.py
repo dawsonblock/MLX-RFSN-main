@@ -29,10 +29,12 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
-from rfsn_v10.cache.cartesian_codec import CartesianCodec
+from rfsn_v10.cache.cartesian_codec import CartesianCodec, _reference_wht64
 from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
 from rfsn_v10.compat import nn
+
+import numpy as np
 
 # Dense-reconstruction Metal kernel (kept as fallback)
 from rfsn_v10.kernels.metal.packed_attention_metal import (
@@ -386,7 +388,8 @@ class _PackedAttentionWrapper(nn.Module):
             stats["execution_contract"] = {
                 "backend": contract.backend,
                 "kernel_hash": contract.kernel_hash,
-                "num_blocks": contract.num_blocks,
+                "num_key_blocks": contract.num_key_blocks,
+                "num_value_blocks": contract.num_value_blocks,
                 "total_kv_tokens": contract.total_kv_tokens,
                 "materialized_bytes": contract.materialized_bytes,
                 "decoded_tokens": contract.decoded_tokens,

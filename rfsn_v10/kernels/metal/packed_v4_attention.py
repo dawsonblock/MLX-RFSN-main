@@ -240,6 +240,10 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
     }
 }
 
+uint stat_idx = q_head * NUM_Q_TOKENS + q_token;
+running_max_arr[stat_idx] = running_max;
+running_sum_arr[stat_idx] = running_sum;
+
 // fully-masked row → zeros
 if (running_sum == 0.0) {
     for (uint d = 0; d < HEAD_DIM; d++) {
@@ -466,7 +470,7 @@ class PackedV4AttentionKernel:
         causal: bool = True,
         query_start_pos: int = 0,
         strict: bool = False,
-    ) -> tuple["mx.array", ExecutionContract]:
+    ) -> tuple["mx.array", "mx.array", "mx.array", ExecutionContract]:
         """Execute true-packed attention.
 
         Parameters
@@ -552,7 +556,7 @@ class PackedV4AttentionKernel:
                 "block_starts", "block_counts",
                 "scale_arr", "query_start_arr",
             ],
-            output_names=["output"],
+            output_names=["output", "running_max_arr", "running_sum_arr"],
             source=_PACKED_V4_KERNEL_K8,
         )
 
@@ -584,11 +588,13 @@ class PackedV4AttentionKernel:
             ],
             grid=(Hq, Lq, 1),
             threadgroup=(8, 8, 1),
-            output_shapes=[(Hq, Lq, D)],
-            output_dtypes=[mx.float32],
+            output_shapes=[(Hq, Lq, D), (Hq, Lq), (Hq, Lq)],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
         )
 
         output_wht = outputs[0]  # shape (Hq, Lq, D)
+        running_max = outputs[1]  # shape (Hq, Lq)
+        running_sum = outputs[2]  # shape (Hq, Lq)
 
         # Apply inverse WHT to return to original domain
         output_grouped = output_wht.reshape(Hq, Lq, groups, self.group_size)
@@ -620,7 +626,7 @@ class PackedV4AttentionKernel:
                     "\n".join(f"  - {v}" for v in violations)
                 )
 
-        return output, contract
+        return output, running_max, running_sum, contract
 
 
 def packed_v4_attention(
@@ -635,7 +641,7 @@ def packed_v4_attention(
     group_size: int = 64,
     sign_seed: int = 42,
     strict: bool = False,
-) -> tuple["mx.array", ExecutionContract]:
+) -> tuple["mx.array", "mx.array", "mx.array", ExecutionContract]:
     """Convenience wrapper around ``PackedV4AttentionKernel``."""
     kernel = PackedV4AttentionKernel(bits=bits, group_size=group_size, sign_seed=sign_seed)
     return kernel(
