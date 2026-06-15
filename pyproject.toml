@@ -130,7 +130,7 @@ fallback_version = "10.2.0a84"  # Synchronized with release.toml package_version
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"
-testpaths = ["tests", "tests/governance", "rfsn_v11/tests", "rfsn_v10/cache/tests", "rfsn_v10/integrations/mlx_lm_adapter/tests"]
+testpaths = ["tests", "tests/governance", "rfsn_v11/tests", "rfsn_v10/cache/tests", "rfsn_v10/integrations/mlx_lm_adapter/tests", "rfsn_v10/kernels/metal/tests"]
 timeout = 300
 filterwarnings = [
     "ignore::DeprecationWarning:mlx",
