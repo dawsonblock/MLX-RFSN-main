@@ -4,9 +4,9 @@
 
 | Field | Value |
 |-------|-------|
-| Release | MLX-RFSN Fusion Alpha 8.3 |
+| Release | MLX-RFSN Fusion Alpha 8.4 |
 | Branch | `mlx-rfsn-fusion-alpha-8-3` |
-| Snapshot | `mlx-rfsn-fusion-alpha-8-2-snapshot` (preserved) |
+| Snapshot | `mlx-rfsn-fusion-alpha-8-4-snapshot` (preserved) |
 
 ## Alpha 8.2 status (frozen)
 
@@ -18,16 +18,18 @@
 - TurboQuant V2 remains pending logit gate.
 - RFSN v11 remains offline-only.
 
-## Alpha 8.3 results
+## Alpha 8.4 results
 
-- [x] `mlx_gate.sh` strict (no `|| true` masking).
-- [x] TurboQuant V2 real logit metrics captured via `capture_logprobs()`.
-- [x] Polar reference real logit metrics captured via `capture_logprobs()`.
-- [x] Memory metrics complete for all candidates (estimation helper added).
-- [x] `cache_policy.py` distinguishes control / baseline / promoted.
-- [x] Manifest wording sharpened (PARTIAL vs PASS).
-- [x] Active artifacts regenerated on Apple Silicon.
-- [x] Promotion report refreshed.
+- [x] Direct-packed K8/V8 canonical BS64 configuration (smoke BS8 separated).
+- [x] Full-history materialization honestly recorded in Metal path.
+- [x] Strict Metal failures raise instead of silently falling back.
+- [x] Metal kernel renamed to `metal_dense_attention_over_reconstructed_kv`.
+- [x] Capability-based full-logit dispatch (no hardcoded name lists).
+- [x] Runtime byte counters use actual `array.itemsize` instead of hardcoded 4.
+- [x] Promotion aggregation preserves all required fields.
+- [x] Promotion policy rejects `execution_backend="unknown"`.
+- [x] Strict mode exits nonzero when promotion policy fails.
+- [x] Release identity unified (README, release.toml, _version.py).
 - [x] No candidate falsely promoted.
 
 ## Critical blocker discovered in Alpha 8.3
