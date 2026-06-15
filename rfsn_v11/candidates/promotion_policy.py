@@ -373,30 +373,32 @@ class PromotionPolicy:
 
 
 # Legacy function for backward compatibility
-def evaluate_promotion_eligibility(run_bundle: dict[str, Any]) -> dict[str, Any]:
+def evaluate_promotion_eligibility(run_bundle: dict[str, Any], policy_config: dict[str, Any] | None = None) -> tuple[bool, list[str]]:
     """Evaluate promotion eligibility for all candidates in a run bundle.
     
     Fix #9: This now builds per-candidate bundles and evaluates each one.
     
     Args:
         run_bundle: Dictionary containing run metadata and all results.
+        policy_config: Optional policy configuration (e.g., current_release_id).
     
     Returns:
-        Dictionary mapping candidate names to promotion eligibility results.
+        Tuple of (promotion_allowed, promotion_blockers) for compatibility with kv_shootout.py.
     """
     policy = PromotionPolicy()
+    if policy_config:
+        policy.config.update(policy_config)
+    
     results = run_bundle.get("results", [])
     
     # Get unique candidate names (excluding baseline)
-    candidate_names = set(r.get("name") for r in results if r.get("name") != "mlx_lm_baseline")
+    candidate_names = set(r.get("name") for r in results if r.get("name") != "dense_mlx_baseline")
     
-    eligibility_results = {}
+    blockers = []
     for candidate_name in candidate_names:
         bundle = policy.build_candidate_bundle(candidate_name, run_bundle)
         eligible = policy.all_prerequisites_satisfied(bundle)
-        eligibility_results[candidate_name] = {
-            "eligible": eligible,
-            "bundle": bundle,
-        }
+        if not eligible:
+            blockers.append(f"{candidate_name}: prerequisites not satisfied")
     
-    return eligibility_results
+    return (len(blockers) == 0, blockers)
