@@ -29,7 +29,6 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
 # ---------------------------------------------------------------------------
 # Hardware info
 # ---------------------------------------------------------------------------
@@ -93,9 +92,10 @@ def _clone_legacy_cache(legacy: list) -> list:
 
 
 def _compress_past(past_legacy: list, config: dict, device: torch.device) -> list:
-    from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
     import mlx.core as mx
     import numpy as np
+
+    from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 
     k_bits = config["k_bits"]
     v_bits = config["v_bits"]

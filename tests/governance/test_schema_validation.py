@@ -6,6 +6,7 @@ enabling CI smoke testing on non-Apple Silicon environments.
 from __future__ import annotations
 
 import json
+
 import pytest
 
 pytestmark = pytest.mark.pure_python
@@ -289,8 +290,9 @@ def test_candidate_status_registry():
 
 def test_json_utils_strict_serialization():
     """Test JSON utilities handle non-serializable types correctly."""
-    from rfsn_v11.candidates.json_utils import dump_json_strict
     import tempfile
+
+    from rfsn_v11.candidates.json_utils import dump_json_strict
 
     data = {
         "string": "test",
@@ -308,7 +310,7 @@ def test_json_utils_strict_serialization():
         temp_path = f.name
 
     # Should deserialize correctly
-    with open(temp_path, 'r') as f:
+    with open(temp_path) as f:
         loaded = json.load(f)
     assert loaded == data
 
@@ -319,8 +321,8 @@ def test_json_utils_strict_serialization():
 
 def test_artifact_utils_json_roundtrip():
     """Test artifact utilities handle JSON correctly."""
-    from rfsn_v11.candidates.artifact_utils import _export_winner
     from benchmarks.schemas import CandidateResult
+    from rfsn_v11.candidates.artifact_utils import _export_winner
 
     winner = CandidateResult(
         candidate_name="test_winner",

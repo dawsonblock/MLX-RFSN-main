@@ -30,18 +30,18 @@ Outputs
 """
 from __future__ import annotations
 
-import json
 import sys
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
-from .schemas import CandidateResult
-from .judge import Verdict, VerdictLabel
 
+from .judge import Verdict, VerdictLabel
+from .schemas import CandidateResult
 
 # ---------------------------------------------------------------------------
 # ReportGenerator
@@ -78,7 +78,7 @@ class ReportGenerator:
         baseline: CandidateResult,
         verdicts: Sequence[Verdict],
         run_tag: str = "benchmark",
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> tuple[Path, Path]:
         """Write JSON + Markdown.  Returns (json_path, md_path) for the latest files."""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -103,7 +103,7 @@ class ReportGenerator:
         baseline: CandidateResult,
         verdicts: Sequence[Verdict],
         run_tag: str = "benchmark",
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         payload = _build_json_payload(candidates, baseline, verdicts, timestamp, metadata or {})
@@ -192,8 +192,8 @@ def _build_markdown(
 
     summary = _build_summary(candidates, verdicts)
     lines += [
-        f"| Verdict | Count |",
-        f"|---|---|",
+        "| Verdict | Count |",
+        "|---|---|",
     ]
     for label, count in summary["verdict_counts"].items():
         lines.append(f"| {label} | {count} |")
@@ -218,8 +218,8 @@ def _build_markdown(
             "",
             "#### Quality",
             "",
-            f"| metric | candidate | baseline |",
-            f"|---|---|---|",
+            "| metric | candidate | baseline |",
+            "|---|---|---|",
             f"| logit_cosine | {_f(c.logit_cosine, '.5f')} | 1.00000 |",
             f"| top5_overlap | {_f(c.top5_overlap)} | 1.000 |",
             f"| top10_overlap | {_f(c.top10_overlap)} | 1.000 |",
@@ -230,8 +230,8 @@ def _build_markdown(
             "",
             "#### Memory",
             "",
-            f"| metric | value |",
-            f"|---|---|",
+            "| metric | value |",
+            "|---|---|",
             f"| peak_memory_mb | {_f(c.peak_memory_mb, '.1f')} |",
             f"| kv_cache_memory_mb (dense est.) | {_f(c.kv_cache_memory_mb, '.1f')} |",
             f"| compressed_kv_memory_mb | {_f(c.compressed_kv_memory_mb, '.1f')} |",
@@ -241,8 +241,8 @@ def _build_markdown(
             "",
             "#### Runtime",
             "",
-            f"| metric | value |",
-            f"|---|---|",
+            "| metric | value |",
+            "|---|---|",
             f"| prefill_tps | {_f(c.prefill_tps, '.1f')} |",
             f"| decode_tps | {_f(c.decode_tps, '.1f')} |",
             f"| first_token_latency_ms | {_f(c.first_token_latency_ms, '.1f')} |",
@@ -260,8 +260,8 @@ def _build_markdown(
     lines += [
         "## Dense Baseline Reference",
         "",
-        f"| metric | value |",
-        f"|---|---|",
+        "| metric | value |",
+        "|---|---|",
         f"| model_id | `{baseline.model_id}` |",
         f"| decode_tps | {_f(baseline.decode_tps, '.1f')} |",
         f"| peak_memory_mb | {_f(baseline.peak_memory_mb, '.1f')} |",

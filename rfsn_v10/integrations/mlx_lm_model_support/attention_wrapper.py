@@ -29,30 +29,29 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
-from rfsn_v10.cache.cartesian_codec import CartesianCodec, _reference_wht64
+import mlx.core as mx
+
+from rfsn_v10.cache.cartesian_codec import CartesianCodec
 from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
 from rfsn_v10.compat import nn
 
-import mlx.core as mx
-import numpy as np
-
 # Dense-reconstruction Metal kernel (kept as fallback)
 from rfsn_v10.kernels.metal.packed_attention_metal import (
-    metal_available,
     attend_metal,
+    metal_available,
 )
-HAS_METAL_KERNEL = metal_available()
 
 # Canonical true-packed kernel for PackedBlockV4 (K8/V8 only).
 # This is gated by an explicit opt-in environment variable and a
 # self-test; it is NOT automatically enabled merely because MLX
 # imports.  See ``rfsn_v10.kernels.metal.packed_v4_attention``.
 from rfsn_v10.kernels.metal.packed_v4_attention import (
-    PackedV4AttentionKernel,
-    ExecutionContract,
     HAS_TRUE_PACKED_KERNEL,
+    PackedV4AttentionKernel,
 )
+
+HAS_METAL_KERNEL = metal_available()
 
 
 class RfsnDirectPackedKVCache:
@@ -306,6 +305,7 @@ class _PackedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_layer_id", layer_id)
         # P1: Execution contract storage for auditability
         object.__setattr__(self, "_last_execution_contract", None)
+        object.__setattr__(self, "_cached_kernel", None)
 
     def __call__(
         self,
@@ -382,15 +382,26 @@ class _PackedAttentionWrapper(nn.Module):
             _attempted.append("true_packed_v4")
             try:
                 _has_codec = hasattr(layer_cache, "key_codec")
-                kernel = PackedV4AttentionKernel(
-                    bits=layer_cache.key_codec.bits if _has_codec else 8,
-                    group_size=(
-                        layer_cache.key_codec.group_size if _has_codec else 64
-                    ),
-                    sign_seed=(
-                        layer_cache.key_codec.sign_seed if _has_codec else 42
-                    ),
-                )
+                if self._cached_kernel is None:
+                    object.__setattr__(
+                        self,
+                        "_cached_kernel",
+                        PackedV4AttentionKernel(
+                            bits=layer_cache.key_codec.bits if _has_codec else 8,
+                            group_size=(
+                                layer_cache.key_codec.group_size
+                                if _has_codec
+                                else 64
+                            ),
+                            sign_seed=(
+                                layer_cache.key_codec.sign_seed
+                                if _has_codec
+                                else 42
+                            ),
+                        ),
+                    )
+                kernel = self._cached_kernel
+                assert kernel is not None
 
                 # Gather regions
                 key_blocks = list(layer_cache.iter_key_blocks())

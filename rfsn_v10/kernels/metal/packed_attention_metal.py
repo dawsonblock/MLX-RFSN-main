@@ -11,7 +11,6 @@ codes and scales directly inside the shader.
 """
 from __future__ import annotations
 
-import math
 import time
 from typing import Any
 
@@ -329,8 +328,8 @@ def attend_metal(
     Raises:
         StrictPackedExecutionError: If strict=True and Metal execution fails.
     """
-    from rfsn_v10.cache.mlx_packed_attention_reference import attend
     from rfsn_v10.cache.contracts import AttentionScratch
+    from rfsn_v10.cache.mlx_packed_attention_reference import attend
 
     if not HAS_MLX or not metal_available():
         if strict:

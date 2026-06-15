@@ -139,9 +139,7 @@ class RFSNGenerator:
 
         self._adapter = None
         if MLX_LM_AVAILABLE and enable_quantized_kv:
-            from ..integrations.mlx_lm_adapter.adapter import (
-                RfsnMLXReferenceAdapter
-            )
+            from ..integrations.mlx_lm_adapter.adapter import RfsnMLXReferenceAdapter
             self._adapter = RfsnMLXReferenceAdapter(
                 model=model,
                 tokenizer=tokenizer,

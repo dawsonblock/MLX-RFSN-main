@@ -116,10 +116,10 @@ def test_metal_kernel_shape_variations():
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_attend_metal_vs_reference():
     """Test attend_metal against reference attend using real quantized blocks."""
-    from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
-    from rfsn_v10.kernels.metal.packed_attention_metal import attend_metal
     from rfsn_v10.cache.mlx_packed_attention_reference import attend
+    from rfsn_v10.cache.session import GenerationCacheSession
+    from rfsn_v10.kernels.metal.packed_attention_metal import attend_metal
 
     # Create session with small staging to force block creation
     session = GenerationCacheSession(
@@ -167,8 +167,8 @@ def test_attend_metal_vs_reference():
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_attend_metal_records_full_history_materialization():
     """Verify that attend_metal records full_history_materialization_calls."""
-    from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.kernels.metal.packed_attention_metal import attend_metal
 
     session = GenerationCacheSession(
@@ -211,10 +211,11 @@ def test_attend_metal_records_full_history_materialization():
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_attend_metal_strict_mode():
     """Verify that strict mode raises on failure instead of falling back."""
-    from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.kernels.metal.packed_attention_metal import (
-        attend_metal, StrictPackedExecutionError,
+        StrictPackedExecutionError,
+        attend_metal,
     )
 
     session = GenerationCacheSession(
@@ -240,11 +241,11 @@ def test_attend_metal_strict_mode():
 def test_metal_kernel_imports():
     """Test that all Metal kernel modules can be imported."""
     from rfsn_v10.kernels.metal.packed_attention_metal import (
-        metal_dense_attention_over_reconstructed_kv,
+        StrictPackedExecutionError,
         attend_metal,
         benchmark_metal_vs_reference,
         metal_available,
-        StrictPackedExecutionError,
+        metal_dense_attention_over_reconstructed_kv,
     )
 
     assert callable(metal_dense_attention_over_reconstructed_kv)

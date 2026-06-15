@@ -160,7 +160,7 @@ class QuantizedLayerCache:
                 self._add_to_staging(evicted_k, evicted_v)
         else:
             self._add_to_staging(keys, values)
-        
+
         # Fix #2: Use typed method instead of string-based increment
         if self.session:
             self.session.runtime_counters.record_token_appended(new_T)
@@ -219,7 +219,7 @@ class QuantizedLayerCache:
 
             self._key_blocks.append(key_block)
             self._value_blocks.append(value_block)
-            
+
             # Fix #2: Use typed methods instead of string-based increment
             # Fix #4: Record actual block creation and bytes written including scales
             if self.session:

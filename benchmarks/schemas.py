@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
@@ -41,10 +41,10 @@ class CandidateResult:
     output_tokens: int = 0
     preconditioner: str = ""       # e.g. "wht", "sparse_jl", "none"
     quantizer: str = ""            # e.g. "grouped_sym", "polar", "turboquant_mse"
-    key_bits: Optional[float] = None
-    value_bits: Optional[float] = None
-    group_size: Optional[int] = None
-    residual_length: Optional[int] = None
+    key_bits: float | None = None
+    value_bits: float | None = None
+    group_size: int | None = None
+    residual_length: int | None = None
     snapkv_enabled: bool = False
     paged_cache_enabled: bool = False
     is_benchmark_only: bool = False  # True for benchmark-only candidates (e.g., A1 with MLX limitations)
@@ -59,89 +59,89 @@ class CandidateResult:
     # ------------------------------------------------------------------
     # Quality metrics (vs dense baseline logits)
     # ------------------------------------------------------------------
-    logit_cosine: Optional[float] = None
-    kl_divergence: Optional[float] = None
-    top1_match: Optional[float] = None
-    top1_match_rate: Optional[float] = None
-    top5_overlap: Optional[float] = None
-    top10_overlap: Optional[float] = None
-    perplexity_delta: Optional[float] = None          # candidate_ppl - baseline_ppl
-    visible_output_drift_score: Optional[float] = None  # 0=identical, 1=completely different
-    max_logit_delta: Optional[float] = None
-    first_divergent_token: Optional[int] = None
-    text_heuristic_passed: Optional[bool] = None
-    logit_gate_passed: Optional[bool] = None
-    memory_gate_passed: Optional[bool] = None
+    logit_cosine: float | None = None
+    kl_divergence: float | None = None
+    top1_match: float | None = None
+    top1_match_rate: float | None = None
+    top5_overlap: float | None = None
+    top10_overlap: float | None = None
+    perplexity_delta: float | None = None          # candidate_ppl - baseline_ppl
+    visible_output_drift_score: float | None = None  # 0=identical, 1=completely different
+    max_logit_delta: float | None = None
+    first_divergent_token: int | None = None
+    text_heuristic_passed: bool | None = None
+    logit_gate_passed: bool | None = None
+    memory_gate_passed: bool | None = None
 
     # ------------------------------------------------------------------
     # Attention metrics
     # ------------------------------------------------------------------
-    attention_score_cosine: Optional[float] = None
-    attention_score_mae: Optional[float] = None
-    attention_top5_overlap: Optional[float] = None
-    softmax_kl: Optional[float] = None
+    attention_score_cosine: float | None = None
+    attention_score_mae: float | None = None
+    attention_top5_overlap: float | None = None
+    softmax_kl: float | None = None
 
     # ------------------------------------------------------------------
     # Memory metrics (all in MB)
     # ------------------------------------------------------------------
-    peak_memory_mb: Optional[float] = None            # peak device memory during generation
-    kv_cache_memory_mb: Optional[float] = None        # dense FP16 KV size for this run
-    compressed_kv_memory_mb: Optional[float] = None   # compressed representation size
-    metadata_memory_mb: Optional[float] = None        # codebook indices, norms, scales, etc.
-    effective_bits_per_kv_element: Optional[float] = None
-    compression_factor: Optional[float] = None        # kv_cache_memory_mb / compressed_kv_memory_mb
+    peak_memory_mb: float | None = None            # peak device memory during generation
+    kv_cache_memory_mb: float | None = None        # dense FP16 KV size for this run
+    compressed_kv_memory_mb: float | None = None   # compressed representation size
+    metadata_memory_mb: float | None = None        # codebook indices, norms, scales, etc.
+    effective_bits_per_kv_element: float | None = None
+    compression_factor: float | None = None        # kv_cache_memory_mb / compressed_kv_memory_mb
 
     # ------------------------------------------------------------------
     # Runtime metrics
     # ------------------------------------------------------------------
-    prefill_tps: Optional[float] = None               # tokens/sec during prefill
-    decode_tps: Optional[float] = None                # tokens/sec during decode
-    tokens_per_sec: Optional[float] = None            # alias for decode_tps
-    first_token_latency_ms: Optional[float] = None
-    total_latency_ms: Optional[float] = None
-    total_ms: Optional[float] = None                  # alias for total_latency_ms
-    compression_time_ms: Optional[float] = None       # time to compress KV vectors
-    decompression_time_ms: Optional[float] = None     # time to decompress for attention
-    attention_time_ms: Optional[float] = None         # time for attention computation
+    prefill_tps: float | None = None               # tokens/sec during prefill
+    decode_tps: float | None = None                # tokens/sec during decode
+    tokens_per_sec: float | None = None            # alias for decode_tps
+    first_token_latency_ms: float | None = None
+    total_latency_ms: float | None = None
+    total_ms: float | None = None                  # alias for total_latency_ms
+    compression_time_ms: float | None = None       # time to compress KV vectors
+    decompression_time_ms: float | None = None     # time to decompress for attention
+    attention_time_ms: float | None = None         # time for attention computation
 
     # ------------------------------------------------------------------
     # Candidate-specific optional metrics
     # ------------------------------------------------------------------
     # Residual cache
-    residual_memory_mb: Optional[float] = None
-    compressed_history_memory_mb: Optional[float] = None
-    streaming_logit_cosine: Optional[float] = None
-    multi_turn_drift_score: Optional[float] = None
+    residual_memory_mb: float | None = None
+    compressed_history_memory_mb: float | None = None
+    streaming_logit_cosine: float | None = None
+    multi_turn_drift_score: float | None = None
 
     # SnapKV
-    snapkv_vote_time_ms: Optional[float] = None
-    snapkv_retention_ratio_actual: Optional[float] = None
-    snapkv_selected_tokens: Optional[int] = None
-    snapkv_hit_rate: Optional[float] = None           # fraction of selected positions that matched dense attention top-k
-    snapkv_memory_saved_mb: Optional[float] = None
+    snapkv_vote_time_ms: float | None = None
+    snapkv_retention_ratio_actual: float | None = None
+    snapkv_selected_tokens: int | None = None
+    snapkv_hit_rate: float | None = None           # fraction of selected positions that matched dense attention top-k
+    snapkv_memory_saved_mb: float | None = None
 
     # Prefix cache
-    prefix_cache_hit_rate: Optional[float] = None
-    prefix_cache_blocks_reused: Optional[int] = None
-    prefix_cache_blocks_evicted: Optional[int] = None
-    prefix_cache_memory_saved_mb: Optional[float] = None
-    prefix_cache_allocator_overhead_ms: Optional[float] = None
+    prefix_cache_hit_rate: float | None = None
+    prefix_cache_blocks_reused: int | None = None
+    prefix_cache_blocks_evicted: int | None = None
+    prefix_cache_memory_saved_mb: float | None = None
+    prefix_cache_allocator_overhead_ms: float | None = None
 
     # Sparse JL specific
-    sparse_selection_overhead_ms: Optional[float] = None
+    sparse_selection_overhead_ms: float | None = None
 
     # PolarQuant specific
-    angle_codebook_kl: Optional[float] = None
-    angle_quantization_p95: Optional[float] = None
-    radius_relative_error_p95: Optional[float] = None
+    angle_codebook_kl: float | None = None
+    angle_quantization_p95: float | None = None
+    radius_relative_error_p95: float | None = None
 
     # Reconstruction (set by test_a1_reconstruction)
-    k_reconstruction_cosine: Optional[float] = None
-    v_reconstruction_cosine: Optional[float] = None
-    k_mse: Optional[float] = None
-    v_mse: Optional[float] = None
-    k_snr_db: Optional[float] = None
-    v_snr_db: Optional[float] = None
+    k_reconstruction_cosine: float | None = None
+    v_reconstruction_cosine: float | None = None
+    k_mse: float | None = None
+    v_mse: float | None = None
+    k_snr_db: float | None = None
+    v_snr_db: float | None = None
 
     # ------------------------------------------------------------------
     # Output text (for drift inspection)
@@ -173,7 +173,7 @@ class CandidateResult:
     # Proof counters (strict mode validation)
     # ------------------------------------------------------------------
     proof_counters: dict[str, Any] = field(default_factory=dict)
-    
+
     # ------------------------------------------------------------------
     # Runtime counters (Fix #4, #5, #6: actual block creation, packed calls, bytes)
     # ------------------------------------------------------------------
@@ -184,9 +184,9 @@ class CandidateResult:
     full_history_materialization_calls: int = 0
     packed_bytes_written: int = 0
     packed_bytes_read: int = 0
-    actual_kv_memory_mb: Optional[float] = None
-    working_set_memory_mb: Optional[float] = None
-    scratch_memory_mb: Optional[float] = None
+    actual_kv_memory_mb: float | None = None
+    working_set_memory_mb: float | None = None
+    scratch_memory_mb: float | None = None
     measurement_kind: str = "UNKNOWN"  # "ACTUAL" | "ESTIMATED" | "UNKNOWN"
 
     # ------------------------------------------------------------------
@@ -216,7 +216,7 @@ class CandidateResult:
         return json.dumps(self.to_dict(include_logits=include_logits), indent=indent, default=str)
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "CandidateResult":
+    def from_dict(cls, d: dict[str, Any]) -> CandidateResult:
         valid = {f for f in cls.__dataclass_fields__}
         filtered = {k: v for k, v in d.items() if k in valid}
         return cls(**filtered)

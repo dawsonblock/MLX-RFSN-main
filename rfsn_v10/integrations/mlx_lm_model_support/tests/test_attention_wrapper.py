@@ -398,11 +398,11 @@ def test_wrap_preserves_parameter_and_state_parity() -> None:
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_wrap_model_mismatched_layer_count_raises() -> None:
     """Mismatch between model layers and caches must raise."""
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
     from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
         RfsnDirectPackedKVCache,
         install_packed_attention,
     )
-    from rfsn_v10.cache.cartesian_codec import CartesianCodec
 
     k_codec = CartesianCodec(bits=8, group_size=64)
     v_codec = CartesianCodec(bits=5, group_size=64)

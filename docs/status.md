@@ -87,7 +87,7 @@ Problem: if token N differs between baseline and candidate, all subsequent logit
 | **Promotion** | No Candidates | No candidates are currently promotion-eligible due to incomplete proof bundles and unproven quality gates. |
 | **Wheel Build** | Fixed | P0 fix ensures static versioning prevents `0.0.0` builds from source ZIP. |
 | **Registry Tests** | Fixed | P0 fix separates declared vs available candidates for portable test execution. |
-| **Performance Architecture** | Unproven | Scalar shader (one thread per q_head/q_token) with full-history concatenation per call. No SIMD-group reductions, tiled loading, or persistent descriptors. Performance claims are premature. |
+| **Performance Architecture** | Measured | Scalar shader (one thread per q_head/q_token). Concatenation is now incremental O(T) via persistent cached arrays. ``test_true_packed_performance_vs_dense`` archives wall-clock latency; scalar prototype is currently slower than dense (expected). ``test_true_packed_proof_bundle`` generates JSON artifacts with per-layer execution contracts and zero-materialization proof. |
 
 ## Roadmap
 

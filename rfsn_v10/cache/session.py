@@ -89,7 +89,7 @@ class GenerationCacheSession:
 
     def increment(self, counter: str, delta: int = 1) -> None:
         """Legacy string-based counter increment.
-        
+
         Fix #2: This method is deprecated. Use typed methods on runtime_counters directly.
         This method is kept for backward compatibility but will be removed in future.
         """

@@ -53,9 +53,6 @@ def test_numpy_codec_v5_vector_boundary_isolation() -> None:
     x = np.random.randn(B, H, T, D).astype(np.float32)
     block = codec.encode_bhtd(x, logical_start=0, layer_id=0, stream_id="V")
 
-    codes_per_word = 6
-    words_per_vector = 11
-
     # Unpack and verify each vector independently
     unpacked = codec.decode_bhtd(block)
     # Round-trip should be close (quantization is lossy)

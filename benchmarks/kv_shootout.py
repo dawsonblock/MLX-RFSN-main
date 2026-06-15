@@ -81,7 +81,6 @@ from rfsn_v11.candidates.artifact_utils import (  # noqa: E402
     _export_rfsn_v10_proof_trace,
     _export_winner,
 )
-from rfsn_v11.candidates.json_utils import dump_json_strict  # noqa: E402
 from rfsn_v11.candidates.base import (  # noqa: E402
     CandidateResult,
     KVCompressionCandidate,
@@ -89,10 +88,13 @@ from rfsn_v11.candidates.base import (  # noqa: E402
 from rfsn_v11.candidates.candidate_status import (  # noqa: E402
     CandidateStatus,
 )
+from rfsn_v11.candidates.json_utils import dump_json_strict  # noqa: E402
 from rfsn_v11.candidates.logit_capture import (  # noqa: E402
     capture_teacher_forced_logprobs,
     compute_logit_metrics_from_logprobs,
-    compute_token_sequence_hash,
+)
+from rfsn_v11.candidates.promotion_policy import (  # noqa: E402
+    evaluate_promotion_eligibility as evaluate_promotion_policy,
 )
 from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     GATE_STATUS_FAIL,
@@ -100,17 +102,11 @@ from rfsn_v11.candidates.quality_gates import (  # noqa: E402
     GATE_STATUS_PENDING_LOGIT_GATE,
     GATE_STATUS_PENDING_MEMORY_METRICS,
     GATE_STATUS_PENDING_REAL_CACHE_INJECTION,
-    KL_DIVERGENCE_MAX,
-    LOGIT_COSINE_MIN,
     LogitGateThresholds,
-    MAX_LOGIT_DELTA_MAX,
-    TOP5_OVERLAP_MIN,
-    TOP10_OVERLAP_MIN,
-    compute_promotion_eligibility as compute_quality_gate_eligibility,
     evaluate_quality_gate,
 )
-from rfsn_v11.candidates.promotion_policy import (  # noqa: E402
-    evaluate_promotion_eligibility as evaluate_promotion_policy,
+from rfsn_v11.candidates.quality_gates import (
+    compute_promotion_eligibility as compute_quality_gate_eligibility,
 )
 
 # ---------------------------------------------------------------------------
@@ -236,7 +232,7 @@ def _build_candidates(
         bit_config_to_name["k8v8"] = "rfsn_direct_packed_k8v8_smoke"
 
     candidate_name = bit_config_to_name.get(bit_width_config, "rfsn_direct_packed_k8v8")
-    
+
     # Phase 0: Freeze scope to only the direct-packed candidate for correctness validation
     all_candidates: list[KVCompressionCandidate] = [
         baseline,  # From authoritative registry
@@ -491,6 +487,7 @@ def _run_once(
             tq_candidate = candidate
             try:
                 import sys
+
                 import turboquant.patch as tq_patch
 
                 head_dim = tq_candidate._detect_head_dim(model)
@@ -532,6 +529,7 @@ def _run_once(
             polar_candidate = candidate
             try:
                 from mlx_turboquant.cache import TurboQuantKVCache
+
                 from rfsn_v11.candidates.polar_reference_adapter import (
                     _apply_polar_patch,
                     _revert_polar_patch,
@@ -1128,7 +1126,7 @@ def main() -> None:
             json_str = test_result.to_json()
             loaded = CandidateResult.from_dict(json.loads(json_str))
             assert loaded.candidate_name == "test"
-            
+
             # Test token sequence hash
             from rfsn_v11.candidates.logit_capture import compute_token_sequence_hash
             test_hash = compute_token_sequence_hash(
@@ -1140,7 +1138,7 @@ def main() -> None:
                 temperature=0.0,
             )
             assert len(test_hash) == 64  # SHA256 hex string
-            
+
             # Test judge logic
             from benchmarks.judge import Judge
             judge = Judge()
@@ -1169,7 +1167,7 @@ def main() -> None:
             verdict = judge.evaluate(baseline, baseline)
             print(f"  Judge evaluation successful: {verdict.label.value}")
             # Don't assert specific verdict since baseline vs baseline may be rejected
-            
+
             print("✓ Governance-only tests passed")
             print("  - CandidateResult schema validation")
             print("  - JSON serialization round-trip")
@@ -1559,7 +1557,7 @@ def main() -> None:
     )
 
     if not promotion_allowed and promotion_blockers:
-        print(f"\nPromotion blocked by policy:")
+        print("\nPromotion blocked by policy:")
         for blocker in promotion_blockers:
             print(f"  - {blocker}")
     if promotion_allowed:
@@ -1599,7 +1597,7 @@ def main() -> None:
         promotion_allowed=promotion_allowed,
         mode=mode,
     )
-    
+
     # P0 Fix: Final strict execution checks (variables defined at function start)
     if strict_execution:
         # Check for any failed quality gates
@@ -1632,12 +1630,12 @@ def main() -> None:
     # Quick mode can pass strict-execution but will fail strict-promotion
     if strict_promotion:
         if not promotion_allowed and promotion_blockers:
-            print(f"\nSTRICT PROMOTION: Promotion policy failed:")
+            print("\nSTRICT PROMOTION: Promotion policy failed:")
             for blocker in promotion_blockers:
                 print(f"  - {blocker}")
             sys.exit(2)
         elif not promotion_allowed:
-            print(f"\nSTRICT PROMOTION: Promotion not allowed (no blockers listed)")
+            print("\nSTRICT PROMOTION: Promotion not allowed (no blockers listed)")
             sys.exit(2)
 
     print("\nDone.")

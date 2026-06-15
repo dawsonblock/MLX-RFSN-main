@@ -24,7 +24,6 @@ Pass condition:
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 from pathlib import Path
@@ -32,17 +31,15 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
-
 import mlx.core as mx
 import numpy as np
 
 from rfsn_v10.quantization.hybrid_polar_cartesian import (
     HybridPolarCartesianQuantizer,
 )
-from rfsn_v10.quantization.qjl_score_correction import QJLScoreCorrector
 from rfsn_v10.quantization.polar_quant import PolarQuantizer
-
+from rfsn_v10.quantization.qjl_score_correction import QJLScoreCorrector
+from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
 
 # ------------------------------------------------------------------
 # Helpers

@@ -15,10 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import asdict
 from typing import Any
-
-import numpy as np
 
 try:
     import mlx.core as mx
@@ -251,7 +248,7 @@ def run_evidence_collection(
         "dense_results": dense_results,
         "packed_results": packed_results,
         "comparisons": comparisons,
-        "codec_signature": f"k8_v5_gs64_wht64",
+        "codec_signature": "k8_v5_gs64_wht64",
     }
 
     return evidence

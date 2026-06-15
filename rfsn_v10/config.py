@@ -78,7 +78,7 @@ class SparseAttentionConfig(BaseModel):
 
 class QuantizationConfig(BaseModel):
     """Quantization configuration.
-    
+
     Production configuration constrained to 2-8 bits.
     K16 diagnostic configurations should use KVCodecConfig with reference_only=True.
     """
@@ -93,10 +93,10 @@ class QuantizationConfig(BaseModel):
 
 class KVCodecConfig(BaseModel):
     """Separate runtime key-codec bit width from legacy QuantizationConfig.
-    
+
     This allows asymmetric K/V configurations (e.g., K16/V8) and diagnostic
     K16 configurations without conflicting with the legacy default_bits constraint.
-    
+
     Fix #7: Use this for K16 diagnostic configurations with reference_only=True.
     """
 

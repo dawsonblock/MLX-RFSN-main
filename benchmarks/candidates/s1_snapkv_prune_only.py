@@ -89,9 +89,9 @@ class S1_SnapKV_PruneOnly(BenchmarkCandidate):
         seed: int,
     ) -> CandidateResult:
         import mlx.core as mx
-        import mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.utils import generate_step
+
         from rfsn_v11.pruning.snapkv_selector import SnapKVSelector
 
         mx.random.seed(seed)

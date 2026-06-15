@@ -87,10 +87,9 @@ class A3_WHT_TurboQuant_MSE(BenchmarkCandidate):
         seed: int,
     ) -> CandidateResult:
         import mlx.core as mx
-        import mlx_lm
+        import turboquant.patch
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.utils import generate_step
-        import turboquant.patch
         from turboquant.cache_v2 import TurboQuantKVCacheV2
 
         mx.random.seed(seed)

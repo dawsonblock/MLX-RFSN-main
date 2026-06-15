@@ -67,7 +67,7 @@ class CandidateRegistry:
     # Public API
     # ------------------------------------------------------------------
 
-    def get(self, name: str) -> "BenchmarkCandidate":
+    def get(self, name: str) -> BenchmarkCandidate:
         if name not in self._registry:
             raise KeyError(
                 f"Unknown candidate: {name!r}\n"
@@ -125,7 +125,7 @@ class CandidateRegistry:
                 pass
         return available
 
-    def select(self, names: list[str], environment: str = "auto") -> list["BenchmarkCandidate"]:
+    def select(self, names: list[str], environment: str = "auto") -> list[BenchmarkCandidate]:
         """Get specific candidates by name.
         
         Fix #8: This is the authoritative way to get candidates for benchmarking.

@@ -8,12 +8,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-try:
-    import mlx.core as mx
-    HAS_MLX = True
-except ImportError:
-    HAS_MLX = False
-
 
 def _make_cache_from_blocks(
     key_blocks: list, value_blocks: list
@@ -88,7 +82,7 @@ def test_packed_attention_matches_dense_single_block() -> None:
 
 def test_packed_attention_matches_dense_multiple_blocks() -> None:
     """Packed attention over multiple blocks must match dense attention."""
-    from rfsn_v10.cache.numpy_attention_oracle import numpy_packed_attention, numpy_dense_attention
+    from rfsn_v10.cache.numpy_attention_oracle import numpy_dense_attention, numpy_packed_attention
     from rfsn_v10.cache.numpy_codec_oracle import NumpyCartesianCodec
 
     B, Hq, Lq, D = 1, 4, 8, 64

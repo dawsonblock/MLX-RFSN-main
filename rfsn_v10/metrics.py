@@ -154,7 +154,7 @@ class MetricsCollector:
             try:
                 metrics = collector()
                 for metric_name, value in metrics.items():
-                    if isinstance(value, (int, float)):
+                    if isinstance(value, int | float):
                         self.registry.gauge(f"{name}_{metric_name}", value)
             except Exception:
                 pass

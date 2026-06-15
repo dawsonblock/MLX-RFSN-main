@@ -87,9 +87,9 @@ class R1_WHT_Grouped_Residual(BenchmarkCandidate):
         seed: int,
     ) -> CandidateResult:
         import mlx.core as mx
-        import mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.utils import generate_step
+
         from rfsn_v11.cache.residual_cache import ResidualKVCache
 
         mx.random.seed(seed)

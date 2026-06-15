@@ -11,8 +11,6 @@ Requirements
 """
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import pytest
 
@@ -24,14 +22,12 @@ except ImportError:
     mx = None  # type: ignore
 
 from rfsn_v10.cache.cartesian_codec import CartesianCodec
-from rfsn_v10.cache.contracts import PackedBlockV4, validate_block_positions
-from rfsn_v10.cache.mlx_packed_attention_reference import attend as reference_attend
 from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
-
+from rfsn_v10.cache.mlx_packed_attention_reference import attend as reference_attend
 from rfsn_v10.kernels.metal.packed_v4_attention import (
+    HAS_TRUE_PACKED_KERNEL,
     PackedV4AttentionKernel,
     packed_v4_attention,
-    HAS_TRUE_PACKED_KERNEL,
 )
 
 pytestmark = [
@@ -366,7 +362,7 @@ class TestPackedV4SoftmaxStats:
 
     def test_merge_with_dense_region(self):
         """Merging packed + dense region must match full dense oracle."""
-        B, Hq, Hkv, T, D = 1, 4, 4, 16, 64
+        B, Hq, Hkv, D = 1, 4, 4, 64
         queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
         scale = 1.0 / np.sqrt(D)
 

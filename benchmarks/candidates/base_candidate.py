@@ -7,7 +7,6 @@ logit quality computation, and result construction.
 from __future__ import annotations
 
 import math
-import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -39,7 +38,7 @@ class BenchmarkCandidate(ABC):
         prompt: str,
         max_tokens: int = 100,
         temp: float = 0.0,
-    ) -> "CandidateResult":
+    ) -> CandidateResult:
         """Run the candidate with simplified interface for benchmark harness.
         
         This is a convenience wrapper around run_on_model() that provides
@@ -57,7 +56,7 @@ class BenchmarkCandidate(ABC):
         """
         model_id = getattr(model, "name_or_path", "unknown")
         prompt_id = "benchmark_prompt"
-        
+
         return self.run_on_model(
             model=model,
             tokenizer=tokenizer,

@@ -65,6 +65,7 @@ class A1b_WHT_Asym(BenchmarkCandidate):
             return False
         try:
             import mlx_lm  # noqa: F401
+
             from rfsn_v11.quant.key_quant import KeyQuant  # noqa: F401
             return True
         except ImportError:
@@ -100,7 +101,6 @@ class A1b_WHT_Asym(BenchmarkCandidate):
         output_tokens: int,
         seed: int,
     ) -> CandidateResult:
-        import mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.utils import generate_step
 

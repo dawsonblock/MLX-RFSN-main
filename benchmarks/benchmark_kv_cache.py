@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import json
 import platform
-from statistics import median
 import time
 from datetime import datetime, timezone
+from statistics import median
 
 import mlx.core as mx
 

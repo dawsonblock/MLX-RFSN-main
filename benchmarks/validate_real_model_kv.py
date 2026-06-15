@@ -30,7 +30,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 
-
 # Alpha pass thresholds
 COSINE_MEAN_THRESHOLD = 0.995
 COSINE_MIN_THRESHOLD = 0.990

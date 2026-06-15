@@ -39,7 +39,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 from .schemas import CandidateResult
 
@@ -150,7 +149,7 @@ class Judge:
 
     def __init__(
         self,
-        stable_reference: Optional[CandidateResult] = None,
+        stable_reference: CandidateResult | None = None,
         strict: bool = False,
     ) -> None:
         self.stable_reference = stable_reference
@@ -576,7 +575,7 @@ def _check_regression(
     """Return non-empty list if candidate is worse than the stable reference on key metrics."""
     issues: list[str] = []
 
-    def _worse(c_val: Optional[float], s_val: Optional[float], name: str, higher_is_better: bool = True) -> None:
+    def _worse(c_val: float | None, s_val: float | None, name: str, higher_is_better: bool = True) -> None:
         if c_val is None or s_val is None:
             return
         if higher_is_better and c_val < s_val - 1e-6:

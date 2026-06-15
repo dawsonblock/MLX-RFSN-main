@@ -7,13 +7,11 @@ This is the executable specification for correct packed attention.
 """
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 
-from rfsn_v10.cache.contracts import PackedBlockV4, Preconditioner
+from rfsn_v10.cache.contracts import PackedBlockV4
 
-from .numpy_codec_oracle import NumpyCartesianCodec, _numpy_wht64, _numpy_hash_signs
+from .numpy_codec_oracle import NumpyCartesianCodec
 
 
 def _decode_block_bhtd(

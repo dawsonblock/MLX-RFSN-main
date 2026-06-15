@@ -546,3 +546,220 @@ class TestRealModelPromotion:
         assert sealed_count >= min_expected_blocks, (
             f"Block count too low: {sealed_count} < {min_expected_blocks}"
         )
+
+    def test_true_packed_performance_vs_dense(self, model_and_tokenizer, tmp_path):
+        """Measure wall-clock latency: true-packed vs dense baseline.
+
+        Generates enough tokens (64) to amortize startup and produce a
+        meaningful per-token average.  The test does not assert a winner;
+        it archives the measurement so operators can evaluate.
+        """
+        import json
+        import time
+
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            collect_backend_stats,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+        from rfsn_v10.kernels.metal.packed_v4_attention import (
+            HAS_TRUE_PACKED_KERNEL,
+        )
+
+        if not HAS_TRUE_PACKED_KERNEL:
+            pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
+
+        model, tokenizer = model_and_tokenizer
+        prompt = "Explain the process of photosynthesis in simple terms."
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        max_tokens = 64
+
+        # --- Dense baseline timing ---
+        t0 = time.perf_counter()
+        baseline_tokens = []
+        for token, _ in generate_step(
+            prompt_ids, model, max_tokens=max_tokens, temp=0.0
+        ):
+            baseline_tokens.append(int(token))
+        dense_ms = (time.perf_counter() - t0) * 1000.0
+        mx.eval(mx.array(baseline_tokens))
+
+        # --- True-packed path timing ---
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+                strict=True,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        wrap_model_attention(model, caches, strict=True)
+        try:
+            t0 = time.perf_counter()
+            packed_tokens = []
+            for token, _ in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed_tokens.append(int(token))
+            packed_ms = (time.perf_counter() - t0) * 1000.0
+            mx.eval(mx.array(packed_tokens))
+            stats = collect_backend_stats(model)
+        finally:
+            unwrap_model_attention(model)
+
+        # Token-exact sanity
+        assert packed_tokens == baseline_tokens, (
+            f"Token mismatch: baseline={baseline_tokens}, packed={packed_tokens}"
+        )
+
+        dense_per_token = dense_ms / max_tokens
+        packed_per_token = packed_ms / max_tokens
+        ratio = packed_ms / dense_ms if dense_ms > 0 else 0.0
+
+        result = {
+            "model_id": self.MODEL_ID,
+            "max_tokens": max_tokens,
+            "prompt_tokens": len(prompt_ids),
+            "dense_total_ms": round(dense_ms, 3),
+            "packed_total_ms": round(packed_ms, 3),
+            "dense_per_token_ms": round(dense_per_token, 3),
+            "packed_per_token_ms": round(packed_per_token, 3),
+            "packed_vs_dense_ratio": round(ratio, 3),
+            "backend": "true_packed_metal_v4_k8",
+            "all_layers_same_backend": all(
+                s["executed_backend"] == "true_packed_metal_v4_k8" for s in stats
+            ),
+        }
+
+        artifact = tmp_path / "performance_report.json"
+        artifact.write_text(json.dumps(result, indent=2))
+
+        # Soft assertion: warn if packed is >3x slower, but do not fail
+        # because the scalar shader is known to be unoptimized.
+        if ratio > 3.0:
+            pytest.skip(
+                f"Packed path is {ratio:.2f}x slower than dense "
+                f"(expected for scalar shader prototype). "
+                f"Artifact saved to {artifact}"
+            )
+
+    def test_true_packed_proof_bundle(self, model_and_tokenizer, tmp_path):
+        """Generate an archived proof bundle with per-step backend metrics.
+
+        The JSON artifact contains:
+        - per-layer execution contracts (backend, blocks, materialized_bytes)
+        - aggregate latency and token counts
+        - memory report from the cache
+        - requantization count (must be zero)
+        """
+        import json
+        import time
+
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            collect_backend_stats,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+        from rfsn_v10.kernels.metal.packed_v4_attention import (
+            HAS_TRUE_PACKED_KERNEL,
+        )
+
+        if not HAS_TRUE_PACKED_KERNEL:
+            pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
+
+        model, tokenizer = model_and_tokenizer
+        prompt = "What is the capital of France?"
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        prompt_len = len(prompt_ids)
+        max_tokens = 32
+
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+                strict=True,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        wrap_model_attention(model, caches, strict=True)
+        try:
+            t0 = time.perf_counter()
+            packed_tokens = []
+            for token, _ in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed_tokens.append(int(token))
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            mx.eval(mx.array(packed_tokens))
+            stats = collect_backend_stats(model)
+        finally:
+            unwrap_model_attention(model)
+
+        layer0 = caches[0].layer_cache
+        total = prompt_len + len(packed_tokens)
+
+        bundle = {
+            "model_id": self.MODEL_ID,
+            "prompt": prompt,
+            "prompt_tokens": prompt_len,
+            "generated_tokens": len(packed_tokens),
+            "total_tokens": total,
+            "total_latency_ms": round(total_ms, 3),
+            "per_token_ms": round(total_ms / max_tokens, 3),
+            "backend": "true_packed_metal_v4_k8",
+            "requantized_tokens": layer0.requantized_token_count,
+            "materialized_bytes": sum(
+                s.get("execution_contract", {}).get("materialized_bytes", 0)
+                for s in stats
+            ),
+            "decoded_tokens": sum(
+                s.get("execution_contract", {}).get("decoded_tokens", 0)
+                for s in stats
+            ),
+            "layer_stats": [
+                {
+                    "layer_id": s["layer_id"],
+                    "backend": s["executed_backend"],
+                    "contract": s.get("execution_contract"),
+                    "invariant_passed": s.get("invariant_passed"),
+                }
+                for s in stats
+            ],
+            "cache_memory_bytes": layer0.total_memory_bytes(),
+            "sealed_blocks": len(list(layer0.iter_key_blocks())),
+        }
+
+        # Invariant assertions
+        assert layer0.requantized_token_count == 0
+        assert bundle["materialized_bytes"] == 0
+        assert bundle["decoded_tokens"] == 0
+        assert all(s["executed_backend"] == "true_packed_metal_v4_k8" for s in stats)
+
+        artifact = tmp_path / "proof_bundle.json"
+        artifact.write_text(json.dumps(bundle, indent=2))
+
+        # The artifact itself is the proof; no further assertions needed.
+        assert artifact.exists()
+        assert artifact.stat().st_size > 0

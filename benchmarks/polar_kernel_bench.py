@@ -23,9 +23,9 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from rfsn_v11.polar_fused.attention import NaivePolarAttention
 from rfsn_v11.polar_fused.config import PolarFusedConfig
 from rfsn_v11.polar_fused.quantize import PolarQuantizer
-from rfsn_v11.polar_fused.attention import NaivePolarAttention
 
 
 @dataclass
@@ -114,7 +114,6 @@ def _measure_decode(model: Any, tokenizer: Any, cache_list: list[Any], n_tokens:
 def _benchmark_fp16_baseline(config: BenchmarkConfig, ctx: int) -> BenchmarkResult:
     """Standard MLX FP16 attention baseline."""
     from mlx_lm import load
-    from mlx_lm.models import cache as mlx_cache
 
     model, tokenizer = load(config.model_id)
     prompt = "Hello " * (ctx // 2)
@@ -148,8 +147,9 @@ def _benchmark_fp16_baseline(config: BenchmarkConfig, ctx: int) -> BenchmarkResu
 def _benchmark_rfsn_stable(config: BenchmarkConfig, ctx: int) -> BenchmarkResult | None:
     """RFSN K8/V5 stable baseline."""
     try:
-        from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
         from mlx_lm import load
+
+        from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
 
         model, tokenizer = load(config.model_id)
         prompt = "Hello " * (ctx // 2)

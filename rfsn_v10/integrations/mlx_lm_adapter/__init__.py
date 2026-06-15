@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from .adapter import (
     RfsnDenseReconstructionReferenceCache,
-    RfsnMLXReferenceAdapter,
     RfsnMLXModelAdapter,
+    RfsnMLXReferenceAdapter,
     RfsnQuantizedKVCache,
 )
 from .compatibility import (

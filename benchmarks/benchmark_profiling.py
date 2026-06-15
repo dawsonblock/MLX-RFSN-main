@@ -12,6 +12,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from rfsn_v10.bitpack import BitPackedQuantizer
 from rfsn_v10.kernels import (
     apply_hash_signs_metal,
     packed_dequant_metal,
@@ -19,7 +20,6 @@ from rfsn_v10.kernels import (
     wht64_metal,
 )
 from rfsn_v10.profiler import RFSNProfiler, profile_kernel_execution
-from rfsn_v10.bitpack import BitPackedQuantizer
 
 
 def main() -> None:

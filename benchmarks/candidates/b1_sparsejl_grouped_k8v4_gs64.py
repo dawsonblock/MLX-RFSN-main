@@ -20,7 +20,6 @@ Candidate name: B1_sparsejl_grouped_k8v4_gs64
 """
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -62,7 +61,7 @@ class B1_SparseJL_Grouped(BenchmarkCandidate):
         signs = np.where(rng.random(dim) < 0.5, 1.0, -1.0).astype(np.float32)
         return perm, signs
 
-    def _apply_sparse_jl(self, x: "mx.array", seed: int) -> "mx.array":
+    def _apply_sparse_jl(self, x: mx.array, seed: int) -> mx.array:
         """Apply deterministic sparse JL to last dimension."""
         dim = x.shape[-1]
         perm, signs = self._make_transform(dim, seed)
@@ -70,7 +69,7 @@ class B1_SparseJL_Grouped(BenchmarkCandidate):
         signs_mx = mx.array(signs)
         return x[..., perm_mx] * signs_mx
 
-    def _inverse_sparse_jl(self, x: "mx.array", seed: int) -> "mx.array":
+    def _inverse_sparse_jl(self, x: mx.array, seed: int) -> mx.array:
         """Inverse: permute back and apply same signs (signs are self-inverse)."""
         dim = x.shape[-1]
         perm, signs = self._make_transform(dim, seed)
@@ -118,7 +117,6 @@ class B1_SparseJL_Grouped(BenchmarkCandidate):
         seed: int,
     ) -> CandidateResult:
         import mlx.core as mx
-        import mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.utils import generate_step
 

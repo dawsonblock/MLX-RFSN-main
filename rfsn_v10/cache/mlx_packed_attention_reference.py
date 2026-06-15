@@ -88,7 +88,7 @@ def attend(
     running_sum = mx.zeros((B, Hq, Lq, 1), dtype=mx.float32)
     out = mx.zeros((B, Hq, Lq, D), dtype=mx.float32)
     has_mass = mx.zeros((B, Hq, Lq, 1), dtype=mx.bool_)
-    
+
     # Fix #6: Track scratch memory for initial allocations
     if hasattr(layer_cache, "session") and layer_cache.session is not None:
         if hasattr(out, 'nbytes'):
@@ -165,7 +165,7 @@ def attend(
         if hasattr(layer_cache, "session") and layer_cache.session is not None:
             if hasattr(block_exp, 'nbytes'):
                 layer_cache.session.runtime_counters.record_scratch_allocation(block_exp.nbytes)
-        
+
         # Fix #6: Free scratch memory for scores and intermediates
         if hasattr(layer_cache, "session") and layer_cache.session is not None:
             if hasattr(scores, 'nbytes'):
@@ -203,7 +203,7 @@ def attend(
                 layer_cache.session.runtime_counters.record_packed_read(int(kb.scales.size) * _array_itemsize(kb.scales))
             if vb.scales is not None:
                 layer_cache.session.runtime_counters.record_packed_read(int(vb.scales.size) * _array_itemsize(vb.scales))
-    
+
     for kb, vb in zip(key_blocks, value_blocks):
         k_dense = layer_cache.key_codec.decode_bhtd(kb)
         v_dense = layer_cache.value_codec.decode_bhtd(vb)
@@ -266,7 +266,7 @@ def attend(
         mx.zeros_like(out)
     )
     output = output.astype(queries.dtype)
-    
+
     # Fix #6: Free initial scratch allocations
     if hasattr(layer_cache, "session") and layer_cache.session is not None:
         if hasattr(out, 'nbytes'):
@@ -284,11 +284,11 @@ def attend(
         score_vector_bytes=0,
         output_accumulator_bytes=int(out.size) * _array_itemsize(out),
     )
-    
+
     # P0 #5: Instrument runtime counters - track scratch bytes
     if hasattr(layer_cache, "session") and layer_cache.session is not None:
         layer_cache.session.runtime_counters.scratch_bytes_current = scratch.output_accumulator_bytes
         if scratch.output_accumulator_bytes > layer_cache.session.runtime_counters.scratch_bytes_peak:
             layer_cache.session.runtime_counters.scratch_bytes_peak = scratch.output_accumulator_bytes
-    
+
     return output, scratch

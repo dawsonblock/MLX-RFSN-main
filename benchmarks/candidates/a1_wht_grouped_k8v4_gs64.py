@@ -120,7 +120,7 @@ class A1_WHT_GroupedKVCache:
             )
         return self._key_quant
 
-    def _apply_wht(self, x: "mx.array") -> "mx.array":
+    def _apply_wht(self, x: mx.array) -> mx.array:
         """Apply WHT to last dimension.  Self-inverse."""
         kq = self._get_key_quant()
         return kq._apply_wht_pretransform(x)
@@ -132,7 +132,7 @@ class A1_WHT_GroupedKVCache:
         new_steps: int,
         k_dim: int,
         v_dim: int,
-        dtype: "mx.Dtype",
+        dtype: mx.Dtype,
     ) -> None:
         prev = self.offset
         if self.keys is not None and (prev + new_steps) <= self.keys[0].shape[-2]:
@@ -177,9 +177,9 @@ class A1_WHT_GroupedKVCache:
 
     def update_and_fetch(
         self,
-        keys: "mx.array",
-        values: "mx.array",
-    ) -> tuple["mx.array", "mx.array"]:
+        keys: mx.array,
+        values: mx.array,
+    ) -> tuple[mx.array, mx.array]:
         """Compress new keys/values, store, and return full decompressed history.
 
         Parameters
@@ -358,6 +358,7 @@ class A1_WHT_Grouped(BenchmarkCandidate):
             return False
         try:
             import mlx_lm  # noqa: F401
+
             from rfsn_v11.quant.key_quant import KeyQuant  # noqa: F401
             return True
         except ImportError:
@@ -400,7 +401,6 @@ class A1_WHT_Grouped(BenchmarkCandidate):
         output_tokens: int,
         seed: int,
     ) -> CandidateResult:
-        import mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.utils import generate_step
 

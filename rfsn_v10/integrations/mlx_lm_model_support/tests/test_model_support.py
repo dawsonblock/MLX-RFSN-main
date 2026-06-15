@@ -4,13 +4,6 @@ from __future__ import annotations
 import pytest
 
 
-try:
-    import mlx.core as mx
-    HAS_MLX = True
-except ImportError:
-    HAS_MLX = False
-
-
 class FakeArgs:
     def __init__(self, **kwargs) -> None:
         for k, v in kwargs.items():

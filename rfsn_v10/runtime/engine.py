@@ -21,11 +21,12 @@ from dataclasses import dataclass
 from ..adaptive_sparsity import AdaptiveSparsityController
 from ..attention import AdaptiveBlockSparseAttention
 from ..attention_reference import causal_attention_dense
+
+# P0 #6: Use unified RuntimeCounters from cache.contracts
+from ..cache.contracts import RuntimeCounters
 from ..compat import mx
 from ..kv_manager import RFSNTurboQuantKVManager
 from ..memory_guard import MemoryGuard
-# P0 #6: Use unified RuntimeCounters from cache.contracts
-from ..cache.contracts import RuntimeCounters
 
 
 @dataclass
@@ -112,7 +113,7 @@ class RFSNRuntime:
         adapter / generator prefill path.  This method lets those paths
         report real prefill counts back into the same counter object so
         the exported trace is fully runtime-instrumented.
-        
+
         P0 #6: Map to unified RuntimeCounters schema
         """
         # Map old field to new unified schema

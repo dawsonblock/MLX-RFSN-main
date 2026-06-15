@@ -394,8 +394,8 @@ class RfsnMLXReferenceAdapter:
         if self.use_direct_packed:
             from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
                 RfsnDirectPackedKVCache,
-                is_model_wrapped,
                 install_packed_attention,
+                is_model_wrapped,
             )
             # Create session for direct packed path
             self._session = self._new_session()

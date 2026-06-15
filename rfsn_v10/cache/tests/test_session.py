@@ -45,7 +45,7 @@ def test_session_counters() -> None:
     session.runtime_counters.record_token_appended(10)
 
     assert session.runtime_counters.tokens_appended == 10
-    
+
     # Verify unified RuntimeCounters are updated
     # tokens_appended is only incremented by new_tokens_received to avoid double-counting
     assert session.runtime_counters.tokens_appended == 10

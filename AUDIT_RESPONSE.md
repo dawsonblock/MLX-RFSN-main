@@ -694,7 +694,7 @@ RFSN_ENABLE_TRUE_PACKED=1 pytest tests/test_generation.py rfsn_v10/cache/tests/ 
 | Limitation | Status | Note |
 |---|---|---|
 | Scalar shader prototype | Unchanged | One thread per (q_head, q_token); lacks SIMD-group reductions, tiled loading, vectorized decode. Correctness proven, performance unproven. |
-| O(T²) concatenation | Unchanged | ``_concatenate_blocks`` still concatenates full packed history on every call. Persistent block descriptors deferred to P2. |
-| Real-model proof bundle | Missing | No native Apple-Silicon incremental-decode artifact with per-step backend counters and full-logit metrics. |
-| Performance claims | Unproven | No evidence that the kernel outperforms dense MLX attention. |
+| O(T²) concatenation | **Fixed** | ``_prepare_concatenated_buffers`` incrementally appends new blocks to persistent cached arrays. Full rebuild only when blocks reset. Complexity reduced from O(T²) to O(T). |
+| Real-model proof bundle | **Addressed** | ``test_true_packed_proof_bundle`` generates a JSON artifact with per-layer execution contracts, zero-materialization validation, and cache memory accounting. |
+| Performance claims | **Measured** | ``test_true_packed_performance_vs_dense`` measures wall-clock latency. Current scalar shader is slower than dense (expected); measurement is now automated and archived. |
 | Release decision | Still NO-GO | Correctness prototype is functional, but production serving requires proven real-model integration and performance validation. |

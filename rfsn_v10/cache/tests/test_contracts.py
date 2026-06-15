@@ -227,6 +227,7 @@ class TestAttentionScratch:
 class TestPackedBlockV4:
     def test_minimal_valid_block(self) -> None:
         import numpy as np
+
         from rfsn_v10.cache.contracts import (
             PackedBlockV4,
             PackingLayout,
@@ -267,6 +268,7 @@ class TestPackedBlockV4:
 
     def test_rejects_non_v4_format(self) -> None:
         import numpy as np
+
         from rfsn_v10.cache.contracts import (
             PackedBlockV4,
             PackingLayout,
@@ -308,6 +310,7 @@ class TestPackedBlockV4:
 
     def test_rejects_logical_range_mismatch(self) -> None:
         import numpy as np
+
         from rfsn_v10.cache.contracts import (
             PackedBlockV4,
             PackingLayout,
@@ -349,6 +352,7 @@ class TestPackedBlockV4:
 
     def test_rejects_shape_mismatch(self) -> None:
         import numpy as np
+
         from rfsn_v10.cache.contracts import (
             PackedBlockV4,
             PackingLayout,

@@ -37,7 +37,6 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,9 +49,8 @@ except ImportError:  # pragma: no cover
     mx = None  # type: ignore
     np = None  # type: ignore
 
+from rfsn_v10.cache.cartesian_codec import _reference_wht64
 from rfsn_v10.cache.contracts import PackedBlockV4
-from rfsn_v10.cache.cartesian_codec import _reference_wht64, _reference_hash_signs
-
 
 # ---------------------------------------------------------------------------
 # Feature gate – do not claim availability merely because MLX imports.
@@ -420,6 +418,15 @@ class PackedV4AttentionKernel:
         self._kernel_hash = hashlib.sha256(
             _PACKED_V4_KERNEL_K8.encode()
         ).hexdigest()[:16]
+        # Persistent concatenation cache for O(T) incremental decode
+        self._cached_key_blocks: list[PackedBlockV4] = []
+        self._cached_value_blocks: list[PackedBlockV4] = []
+        self._cached_k_codes: Any | None = None
+        self._cached_k_scales: Any | None = None
+        self._cached_v_codes: Any | None = None
+        self._cached_v_scales: Any | None = None
+        self._cached_block_starts: Any | None = None
+        self._cached_block_counts: Any | None = None
 
     def _validate_blocks(self, key_blocks: list[PackedBlockV4], value_blocks: list[PackedBlockV4]) -> None:
         """Fail-fast validation of block compatibility."""
@@ -529,32 +536,70 @@ class PackedV4AttentionKernel:
                     f"block[{i}] key scales shape {tuple(kb.scales.shape)} != {expected_scale_shape}"
                 )
 
-    def _concatenate_blocks(self, blocks: list[PackedBlockV4]) -> tuple[Any, Any, Any, Any]:
-        """Concatenate block packed_codes and scales along the T axis.
+    def _prepare_concatenated_buffers(
+        self, key_blocks: list[PackedBlockV4], value_blocks: list[PackedBlockV4]
+    ) -> tuple[Any, Any, Any, Any, Any, Any]:
+        """Return concatenated K/V buffers, using incremental append when possible.
 
-        Returns
-        -------
-        packed_codes
-            Concatenated uint32 array of shape (B, H, total_T, W).
-        scales
-            Concatenated float32 array of shape (B, H, total_T, G).
-        block_starts
-            MLX int32 array of logical_start per block.
-        block_counts
-            MLX int32 array of token_count per block.
+        Blocks are immutable and append-only in normal operation.  When the
+        new block lists extend the previously-cached lists we only concatenate
+        the new suffix, giving O(new_tokens) work per decode step instead of
+        O(total_tokens) = O(T^2) over the full sequence.
         """
-        # packed_codes per block: (B, H, T, W)
-        # scales per block:       (B, H, T, G)
-        code_list = [b.packed_codes for b in blocks]
-        scale_list = [b.scales for b in blocks]
-        starts = [b.logical_start for b in blocks]
-        counts = [b.token_count for b in blocks]
+        # Fast-path: check if we can reuse the cached prefix for both K and V.
+        k_cache = self._cached_key_blocks
+        v_cache = self._cached_value_blocks
+        can_append = False
 
-        packed_codes = mx.concatenate(code_list, axis=2)
-        scales = mx.concatenate(scale_list, axis=2)
-        block_starts_arr = mx.array(starts, dtype=mx.int32)
-        block_counts_arr = mx.array(counts, dtype=mx.int32)
-        return packed_codes, scales, block_starts_arr, block_counts_arr
+        if k_cache and v_cache:
+            n_k = len(k_cache)
+            n_v = len(v_cache)
+            if (
+                len(key_blocks) >= n_k
+                and len(value_blocks) >= n_v
+                and (n_k == 0 or key_blocks[n_k - 1] is k_cache[-1])
+                and (n_v == 0 or value_blocks[n_v - 1] is v_cache[-1])
+            ):
+                can_append = True
+
+        if can_append:
+            # Append new key blocks
+            new_k = key_blocks[len(k_cache):]
+            if new_k:
+                new_k_codes = mx.concatenate([b.packed_codes for b in new_k], axis=2)
+                new_k_scales = mx.concatenate([b.scales for b in new_k], axis=2)
+                self._cached_k_codes = mx.concatenate([self._cached_k_codes, new_k_codes], axis=2)
+                self._cached_k_scales = mx.concatenate([self._cached_k_scales, new_k_scales], axis=2)
+            # Append new value blocks
+            new_v = value_blocks[len(v_cache):]
+            if new_v:
+                new_v_codes = mx.concatenate([b.packed_codes for b in new_v], axis=2)
+                new_v_scales = mx.concatenate([b.scales for b in new_v], axis=2)
+                self._cached_v_codes = mx.concatenate([self._cached_v_codes, new_v_codes], axis=2)
+                self._cached_v_scales = mx.concatenate([self._cached_v_scales, new_v_scales], axis=2)
+        else:
+            # Rebuild from scratch
+            self._cached_k_codes = mx.concatenate([b.packed_codes for b in key_blocks], axis=2)
+            self._cached_k_scales = mx.concatenate([b.scales for b in key_blocks], axis=2)
+            self._cached_v_codes = mx.concatenate([b.packed_codes for b in value_blocks], axis=2)
+            self._cached_v_scales = mx.concatenate([b.scales for b in value_blocks], axis=2)
+
+        # Always rebuild starts/counts (cheap: just int32 arrays)
+        starts = [b.logical_start for b in key_blocks]
+        counts = [b.token_count for b in key_blocks]
+        self._cached_block_starts = mx.array(starts, dtype=mx.int32)
+        self._cached_block_counts = mx.array(counts, dtype=mx.int32)
+        self._cached_key_blocks = list(key_blocks)
+        self._cached_value_blocks = list(value_blocks)
+
+        return (
+            self._cached_k_codes,
+            self._cached_k_scales,
+            self._cached_v_codes,
+            self._cached_v_scales,
+            self._cached_block_starts,
+            self._cached_block_counts,
+        )
 
     def _derive_mixed_seed(self, layer_id: int, stream_id: str) -> int:
         """Reproduce the seed mixing from ``_reference_hash_signs`` exactly.
@@ -577,7 +622,7 @@ class PackedV4AttentionKernel:
 
     def __call__(
         self,
-        queries: "mx.array",
+        queries: mx.array,
         key_blocks: list[PackedBlockV4],
         value_blocks: list[PackedBlockV4],
         *,
@@ -585,7 +630,7 @@ class PackedV4AttentionKernel:
         causal: bool = True,
         query_start_pos: int = 0,
         strict: bool = False,
-    ) -> tuple["mx.array", "mx.array", "mx.array", ExecutionContract]:
+    ) -> tuple[mx.array, mx.array, mx.array, ExecutionContract]:
         """Execute true-packed attention.
 
         Parameters
@@ -647,9 +692,12 @@ class PackedV4AttentionKernel:
         # Flatten batch=1 for kernel
         wht_queries_flat = wht_queries.reshape(Hq, Lq, D)
 
-        # Concatenate blocks along T
-        packed_codes_k, scales_k, block_starts, block_counts = self._concatenate_blocks(key_blocks)
-        packed_codes_v, scales_v, _, _ = self._concatenate_blocks(value_blocks)
+        # Concatenate blocks along T (incremental O(T) when kernel persists)
+        (
+            packed_codes_k, scales_k,
+            packed_codes_v, scales_v,
+            block_starts, block_counts,
+        ) = self._prepare_concatenated_buffers(key_blocks, value_blocks)
 
         # Flatten batch=1 for kernel buffers
         packed_codes_k = packed_codes_k.reshape(num_kv_heads, total_tokens, -1)
@@ -751,7 +799,7 @@ class PackedV4AttentionKernel:
 
 
 def packed_v4_attention(
-    queries: "mx.array",
+    queries: mx.array,
     key_blocks: list[PackedBlockV4],
     value_blocks: list[PackedBlockV4],
     *,
@@ -762,7 +810,7 @@ def packed_v4_attention(
     group_size: int = 64,
     sign_seed: int = 42,
     strict: bool = False,
-) -> tuple["mx.array", "mx.array", "mx.array", ExecutionContract]:
+) -> tuple[mx.array, mx.array, mx.array, ExecutionContract]:
     """Convenience wrapper around ``PackedV4AttentionKernel``."""
     kernel = PackedV4AttentionKernel(bits=bits, group_size=group_size, sign_seed=sign_seed)
     return kernel(

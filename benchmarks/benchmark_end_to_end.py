@@ -7,14 +7,14 @@ from __future__ import annotations
 
 import json
 import platform
-from statistics import median
 import tempfile
 from datetime import datetime, timezone
+from statistics import median
 
 import mlx.core as mx
 
-from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 from rfsn_v10 import RFSNRuntime
+from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 
 
 def get_metadata() -> dict:

@@ -6,11 +6,6 @@ packed blockwise attention over an RFSN quantized cache.
 """
 from __future__ import annotations
 
-from .model_support import (
-    ModelArchitecture,
-    inspect_model_architecture,
-    is_supported_architecture,
-)
 from .attention_wrapper import (
     RfsnDirectPackedKVCache,
     install_packed_attention,
@@ -19,6 +14,11 @@ from .attention_wrapper import (
     uninstall_packed_attention,
     unwrap_model_attention,
     wrap_model_attention,
+)
+from .model_support import (
+    ModelArchitecture,
+    inspect_model_architecture,
+    is_supported_architecture,
 )
 
 __all__ = [

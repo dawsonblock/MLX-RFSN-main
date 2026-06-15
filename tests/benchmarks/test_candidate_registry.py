@@ -93,23 +93,23 @@ def test_declared_vs_available_candidates():
     from benchmarks.candidate_registry import get_registry
 
     registry = get_registry()
-    
+
     # declared_candidates should work without MLX (portable)
     declared = registry.declared_candidates()
     assert isinstance(declared, list)
     assert len(declared) > 0, "Should have declared candidates"
-    
+
     # Verify baseline is always declared
     assert "dense_mlx_baseline" in declared
-    
+
     # available_candidates may return fewer candidates if MLX is not installed
     available = registry.available_candidates()
     assert isinstance(available, list)
-    
+
     # available should be a subset of declared
     for name in available:
         assert name in declared, f"Available candidate {name} not in declared list"
-    
+
     # If MLX is not installed, available may be empty or only baseline
     # If MLX is installed, available should include MLX-dependent candidates
     # This test is portable and works in both cases

@@ -93,7 +93,7 @@ class PackedBlock:
 
     def validate(self) -> None:
         """Fail-fast validation. Call immediately after construction.
-        
+
         Fix #7: Reject K16 in production blocks unless explicitly marked as diagnostic.
         """
         if self.bits not in (2, 3, 4, 5, 6, 7, 8, 16):
@@ -322,7 +322,7 @@ class RuntimeCounters:
         packed_bytes_read > 0
         dense_fallback_calls == 0
         full_history_materialization_calls == 0
-    
+
     Fix #2: Use typed methods instead of string-based increment calls
     """
     # Token flow
@@ -419,7 +419,7 @@ class RuntimeCounters:
 
     def to_dict(self) -> dict[str, int]:
         """Convert to dictionary for serialization.
-        
+
         Fix #2: Include all required fields in serialization.
         """
         return {

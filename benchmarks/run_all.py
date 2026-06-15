@@ -22,9 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
-import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -230,6 +228,7 @@ def suite_kv_roundtrip_mlx() -> dict:
 
     try:
         import tempfile
+
         from rfsn_v10.kv_manager import RFSNTurboQuantKVManager
 
         rng = np.random.default_rng(99) if _HAS_NUMPY else None
