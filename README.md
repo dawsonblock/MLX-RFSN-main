@@ -36,7 +36,7 @@ bash scripts/release_gate.sh
 | Research server | FastAPI server — `/v1/chat/completions` with SSE streaming, authentication, and proper wheel packaging (mlx/numpy). Not production-hardened. |
 | Docker | Healthcheck validation + ClickHouse telemetry (CPU-only, no inference) |
 | >8-bit compression | Uses raw uint32 fallback — bit-packing is real for 2-8 bit only |
-| Experimental Metal | No Metal kernels exist for the experimental quantization paths |
+| Metal kernel | **Scaffold/stub with CPU fallback** — actual Metal GPU computation NOT yet implemented |
 | Experimental throughput | No experimental throughput speedup is proven |
 
 ---

@@ -1,14 +1,16 @@
 """Tests for fused Metal packed attention kernel.
 
-The Metal kernel is now functional and implements:
-- Packed descriptor parsing
-- Decode K in Metal
-- Decode V in Metal
-- Compute QK
-- Apply scale and mask
-- Maintain online-softmax state
-- Accumulate weighted V
-- Write final output
+Fix #15: Remove claims that Metal kernel is functional.
+
+The Metal kernel is currently a scaffold/stub implementation with CPU fallback.
+It does not yet implement actual Metal GPU computation for packed attention.
+
+Current status:
+- Metal kernel framework exists (stub with CPU fallback)
+- Kernel comparison infrastructure exists
+- CPU fallback for testing is functional
+- Actual Metal GPU computation is NOT yet implemented
+- Experimental Metal kernels for experimental quantization paths do NOT exist
 
 Tests verify:
 - Wrapper initialization
