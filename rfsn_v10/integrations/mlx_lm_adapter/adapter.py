@@ -458,6 +458,9 @@ class RfsnMLXReferenceAdapter:
             staging_capacity=self.staging_capacity,
             dense_residual_window=self.dense_residual_window,
         )
+        # Fix #1: Track strict mode in session runtime counters
+        self._session.runtime_counters.requested_strict_mode = self.strict
+        self._session.runtime_counters.effective_strict_mode = self.strict
         return self._session
 
     # ------------------------------------------------------------------

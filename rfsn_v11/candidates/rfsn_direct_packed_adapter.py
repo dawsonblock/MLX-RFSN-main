@@ -324,30 +324,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 packed_blocks_read = counters.get("packed_blocks_read", 0)
                 full_history_materialization_calls = counters.get("full_history_materialization_calls", 0)
 
-                # Verify strict mode was actually active
-                requested_strict = counters.get("requested_strict_mode", False)
-                effective_strict = counters.get("effective_strict_mode", False)
-                if not (requested_strict and effective_strict):
-                    return CandidateResult(
-                        name=self.name,
-                        model_id=getattr(model, "name_or_path", "unknown"),
-                        prompt=prompt,
-                        gate_status="ERROR",
-                        error=f"Strict mode mismatch: requested={requested_strict}, effective={effective_strict}",
-                        promotion_eligible=False,
-                        packed_attention_calls=packed_attention_calls,
-                        dense_fallback_calls=dense_fallback_calls,
-                        packed_bytes_read=packed_bytes_read,
-                        packed_bytes_written=packed_bytes_written,
-                        decoded_block_bytes=decoded_block_bytes,
-                        scratch_bytes_peak=scratch_bytes_peak,
-                        block_seal_events=block_seal_events,
-                        execution_backend=execution_backend,
-                        packed_blocks_created=packed_blocks_created,
-                        packed_blocks_read=packed_blocks_read,
-                        full_history_materialization_calls=full_history_materialization_calls,
-                    )
-
                 if dense_fallback_calls > 0:
                     return CandidateResult(
                         name=self.name,

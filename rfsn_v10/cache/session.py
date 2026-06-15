@@ -67,6 +67,9 @@ class GenerationCacheSession:
 
         # Typed runtime counters (Phase 10)
         self.runtime_counters = RuntimeCounters()
+        # Fix #1: Track strict mode in runtime counters
+        self.runtime_counters.requested_strict_mode = False
+        self.runtime_counters.effective_strict_mode = False
 
     # ------------------------------------------------------------------
     # Access

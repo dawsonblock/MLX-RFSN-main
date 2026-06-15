@@ -339,6 +339,10 @@ class RuntimeCounters:
     layer_divergence_count: int = 0  # Number of layers with divergence detected
     layers_processed: int = 0  # Total layers processed
 
+    # Strict mode tracking (Fix #1: Pass explicit strict configuration)
+    requested_strict_mode: bool = False
+    effective_strict_mode: bool = False
+
     # Fix #2: Typed methods for counter operations
     def record_block_created(self, delta: int = 1) -> None:
         """Record a block creation event."""
@@ -412,4 +416,6 @@ class RuntimeCounters:
             "scratch_bytes_peak": self.scratch_bytes_peak,
             "layer_divergence_count": self.layer_divergence_count,
             "layers_processed": self.layers_processed,
+            "requested_strict_mode": self.requested_strict_mode,
+            "effective_strict_mode": self.effective_strict_mode,
         }
