@@ -280,6 +280,7 @@ def run_single(
 
         return CandidateResult(
             candidate_name="dense_mlx_baseline",
+            name="dense_mlx_baseline",
             model_id=model_id,
             prompt_id=prompt_id,
             context_length=context_length,
@@ -305,21 +306,51 @@ def run_single(
             compression_factor=1.0,
             prefill_tps=prefill_tps,
             decode_tps=decode_tps,
+            tokens_per_sec=decode_tps,
             first_token_latency_ms=first_token_latency_ms,
             total_latency_ms=total_latency_ms,
+            total_ms=total_latency_ms,
+            # Packed fields (baseline has no compression)
+            packed_blocks_created=0,
+            packed_blocks_read=0,
+            packed_attention_calls=0,
+            dense_fallback_calls=0,
+            full_history_materialization_calls=0,
+            packed_bytes_written=0,
+            packed_bytes_read=0,
+            actual_kv_memory_mb=kv_cache_memory_mb,
+            working_set_memory_mb=peak_memory_mb,
+            measurement_kind="ESTIMATED",
+            # Gate status
+            gate_status="PASS_NO_PROMOTE",
+            promotion_eligible=False,
+            candidate_status="CONTROL",
+            logit_gate_passed=True,
+            memory_gate_passed=True,
+            generated_text=generated_text,
             compression_time_ms=0.0,
             decompression_time_ms=0.0,
             attention_time_ms=None,  # not measured at the dense level
-            generated_text=generated_text,
             notes="FP16 dense baseline — no compression applied",
         )
 
     except Exception as exc:
         return CandidateResult(
             candidate_name="dense_mlx_baseline",
+            name="dense_mlx_baseline",
             model_id=model_id,
             prompt_id=prompt_id,
             error=str(exc),
+            gate_status="ERROR",
+            promotion_eligible=False,
+            # Packed fields (baseline has no compression)
+            packed_blocks_created=0,
+            packed_blocks_read=0,
+            packed_attention_calls=0,
+            dense_fallback_calls=0,
+            full_history_materialization_calls=0,
+            packed_bytes_written=0,
+            packed_bytes_read=0,
         )
 
 
