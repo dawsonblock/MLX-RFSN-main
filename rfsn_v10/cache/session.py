@@ -85,24 +85,27 @@ class GenerationCacheSession:
     # ------------------------------------------------------------------
 
     def increment(self, counter: str, delta: int = 1) -> None:
+        """Legacy string-based counter increment.
+        
+        Fix #2: This method is deprecated. Use typed methods on runtime_counters directly.
+        This method is kept for backward compatibility but will be removed in future.
+        """
         self._counters[counter] = self._counters.get(counter, 0) + delta
-        # Sync typed runtime counters with new unified schema
+        # Sync typed runtime counters with new unified schema using typed methods
         # Only increment tokens_appended once (from new_tokens_received)
         if counter == "new_tokens_received":
-            self.runtime_counters.tokens_appended += delta
+            self.runtime_counters.record_token_appended(delta)
         elif counter == "new_tokens_encoded":
             # Don't double-count - already counted by new_tokens_received
             pass
         elif counter == "packed_blocks_created":
-            self.runtime_counters.packed_blocks_created += delta
+            self.runtime_counters.record_block_created(delta)
         elif counter == "sealed_blocks_read":
-            self.runtime_counters.packed_blocks_read += delta
+            self.runtime_counters.record_block_read(delta)
         elif counter == "fallback_attention_calls":
-            self.runtime_counters.dense_fallback_calls += delta
+            self.runtime_counters.record_fallback(delta)
         elif counter == "dense_shadow_bytes":
-            self.runtime_counters.scratch_bytes_current += delta
-            if self.runtime_counters.scratch_bytes_current > self.runtime_counters.scratch_bytes_peak:
-                self.runtime_counters.scratch_bytes_peak = self.runtime_counters.scratch_bytes_current
+            self.runtime_counters.record_scratch_allocation(delta)
 
     def track_layer_divergence(self, layer_id: int, has_divergence: bool) -> None:
         """Track layer-by-layer divergence for debugging (Phase 4.14)."""

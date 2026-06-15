@@ -161,9 +161,9 @@ class QuantizedLayerCache:
         else:
             self._add_to_staging(keys, values)
         
-        # P0 #5: Instrument runtime counters - increment token count
+        # Fix #2: Use typed method instead of string-based increment
         if self.session:
-            self.session.increment("new_tokens_received", new_T)
+            self.session.runtime_counters.record_token_appended(new_T)
 
     def _add_to_staging(self, keys: Any, values: Any) -> None:
         """Add full-shaped tensors to staging."""
@@ -220,14 +220,14 @@ class QuantizedLayerCache:
             self._key_blocks.append(key_block)
             self._value_blocks.append(value_block)
             
-            # P0 #5: Instrument runtime counters - increment block creation and bytes written
+            # Fix #2: Use typed methods instead of string-based increment
             if self.session:
-                self.session.increment("packed_blocks_created")
+                self.session.runtime_counters.record_block_created()
                 # Track bytes written for keys and values
                 if key_block.packed_codes is not None:
-                    self.session.track_payload_bytes(int(key_block.packed_codes.size) * 4)
+                    self.session.runtime_counters.record_packed_write(int(key_block.packed_codes.size) * 4)
                 if value_block.packed_codes is not None:
-                    self.session.track_payload_bytes(int(value_block.packed_codes.size) * 4)
+                    self.session.runtime_counters.record_packed_write(int(value_block.packed_codes.size) * 4)
 
         self._encoded_tokens += n_full_blocks * block_size
 

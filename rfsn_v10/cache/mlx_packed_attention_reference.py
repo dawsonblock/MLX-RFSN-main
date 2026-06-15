@@ -140,17 +140,17 @@ def attend(
         position_offset += region_tokens
 
     # Sealed blocks (use decode_bhtd directly)
-    # P0 #5: Instrument runtime counters - track block reads and bytes read
+    # Fix #2: Use typed methods instead of string-based increment
     if hasattr(layer_cache, "session") and layer_cache.session is not None:
-        layer_cache.session.increment("packed_blocks_read", len(key_blocks))
+        layer_cache.session.runtime_counters.record_block_read(len(key_blocks))
         # Track bytes read for keys and values
         for kb, vb in zip(key_blocks, value_blocks):
             if kb.packed_codes is not None:
-                layer_cache.session.runtime_counters.packed_bytes_read += int(kb.packed_codes.size) * 4
+                layer_cache.session.runtime_counters.record_packed_read(int(kb.packed_codes.size) * 4)
             if vb.packed_codes is not None:
-                layer_cache.session.runtime_counters.packed_bytes_read += int(vb.packed_codes.size) * 4
+                layer_cache.session.runtime_counters.record_packed_read(int(vb.packed_codes.size) * 4)
             # Track decoded block bytes
-            layer_cache.session.runtime_counters.decoded_block_bytes += int(kb.token_count) * D * 4 * 2  # K and V
+            layer_cache.session.runtime_counters.record_decoded_block(int(kb.token_count) * D * 4 * 2)  # K and V
     
     for kb, vb in zip(key_blocks, value_blocks):
         k_dense = layer_cache.key_codec.decode_bhtd(kb)

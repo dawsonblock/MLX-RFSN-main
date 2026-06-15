@@ -41,12 +41,10 @@ def test_session_counters() -> None:
     v_codec = CartesianCodec(bits=5, group_size=64)
     session = GenerationCacheSession("test-model", 2, k_codec, v_codec)
 
-    session.increment("new_tokens_received", 10)
-    session.increment("new_tokens_encoded", 8)
+    # Fix #2: Use typed methods instead of string-based increment
+    session.runtime_counters.record_token_appended(10)
 
-    assert session.get_counter("new_tokens_received") == 10
-    assert session.get_counter("new_tokens_encoded") == 8
-    assert session.get_counter("nonexistent") == 0
+    assert session.runtime_counters.tokens_appended == 10
     
     # Verify unified RuntimeCounters are updated
     # tokens_appended is only incremented by new_tokens_received to avoid double-counting

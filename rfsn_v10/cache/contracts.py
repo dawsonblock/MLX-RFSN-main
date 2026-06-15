@@ -297,6 +297,8 @@ class RuntimeCounters:
         packed_bytes_read > 0
         dense_fallback_calls == 0
         full_history_materialization_calls == 0
+    
+    Fix #2: Use typed methods instead of string-based increment calls
     """
     # Token flow
     tokens_appended: int = 0
@@ -329,8 +331,59 @@ class RuntimeCounters:
     layer_divergence_count: int = 0  # Number of layers with divergence detected
     layers_processed: int = 0  # Total layers processed
 
+    # Fix #2: Typed methods for counter operations
+    def record_block_created(self, delta: int = 1) -> None:
+        """Record a block creation event."""
+        self.packed_blocks_created += delta
+
+    def record_block_read(self, delta: int = 1) -> None:
+        """Record a block read event."""
+        self.packed_blocks_read += delta
+
+    def record_packed_attention(self, delta: int = 1) -> None:
+        """Record a packed attention call."""
+        self.packed_attention_calls += delta
+        self.packed_reference_calls += delta  # Keep alias in sync
+
+    def record_packed_write(self, bytes_written: int) -> None:
+        """Record packed bytes written."""
+        self.packed_bytes_written += bytes_written
+
+    def record_packed_read(self, bytes_read: int) -> None:
+        """Record packed bytes read."""
+        self.packed_bytes_read += bytes_read
+
+    def record_fallback(self, delta: int = 1) -> None:
+        """Record a dense fallback event."""
+        self.dense_fallback_calls += delta
+
+    def record_full_history_materialization(self, delta: int = 1) -> None:
+        """Record a full-history materialization event."""
+        self.full_history_materialization_calls += delta
+
+    def record_token_appended(self, delta: int = 1) -> None:
+        """Record tokens appended."""
+        self.tokens_appended += delta
+
+    def record_scratch_allocation(self, bytes_allocated: int) -> None:
+        """Record scratch memory allocation."""
+        self.scratch_bytes_current += bytes_allocated
+        if self.scratch_bytes_current > self.scratch_bytes_peak:
+            self.scratch_bytes_peak = self.scratch_bytes_current
+
+    def record_scratch_free(self, bytes_freed: int) -> None:
+        """Record scratch memory deallocation."""
+        self.scratch_bytes_current -= bytes_freed
+
+    def record_decoded_block(self, bytes_decoded: int) -> None:
+        """Record decoded block bytes."""
+        self.decoded_block_bytes += bytes_decoded
+
     def to_dict(self) -> dict[str, int]:
-        """Convert to dictionary for serialization."""
+        """Convert to dictionary for serialization.
+        
+        Fix #2: Include all required fields in serialization.
+        """
         return {
             "tokens_appended": self.tokens_appended,
             "staging_tokens_peak": self.staging_tokens_peak,
@@ -338,6 +391,7 @@ class RuntimeCounters:
             "packed_blocks_created": self.packed_blocks_created,
             "packed_blocks_read": self.packed_blocks_read,
             "packed_attention_calls": self.packed_attention_calls,
+            "packed_reference_calls": self.packed_reference_calls,  # Fix #2: Include in serialization
             "dense_fallback_calls": self.dense_fallback_calls,
             "full_history_materialization_calls": self.full_history_materialization_calls,
             "packed_bytes_written": self.packed_bytes_written,
