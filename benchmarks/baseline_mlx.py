@@ -282,8 +282,6 @@ def run_single(
             name="dense_mlx_baseline",
             model_id=model_id,
             prompt_id=prompt_id,
-            context_length=context_length,
-            output_tokens=gen_tokens,
             prompt=prompt,
             # Dense baseline has perfect quality by definition
             logit_cosine=1.0,
