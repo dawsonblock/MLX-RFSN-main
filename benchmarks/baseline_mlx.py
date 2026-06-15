@@ -279,40 +279,33 @@ def run_single(
         kv_cache_memory_mb = _estimate_kv_memory_mb(model, context_length)
 
         return CandidateResult(
-            candidate_name="dense_mlx_baseline",
             name="dense_mlx_baseline",
             model_id=model_id,
             prompt_id=prompt_id,
             context_length=context_length,
             output_tokens=gen_tokens,
-            preconditioner="none",
-            quantizer="none",
+            prompt=prompt,
             # Dense baseline has perfect quality by definition
             logit_cosine=1.0,
             kl_divergence=0.0,
             top1_match=1.0,
-            top1_match_rate=1.0,
             top5_overlap=1.0,
             top10_overlap=1.0,
-            perplexity_delta=0.0,
-            visible_output_drift_score=0.0,
             max_logit_delta=0.0,
             first_divergent_token=None,
-            attention_score_cosine=1.0,
-            attention_score_mae=0.0,
-            attention_top5_overlap=1.0,
-            softmax_kl=0.0,
-            peak_memory_mb=peak_memory_mb,
-            kv_cache_memory_mb=kv_cache_memory_mb,
-            compressed_kv_memory_mb=kv_cache_memory_mb,
-            metadata_memory_mb=0.0,
-            effective_bits_per_kv_element=16.0,
-            prefill_tps=prefill_tps,
-            decode_tps=decode_tps,
-            tokens_per_sec=decode_tps,
-            first_token_latency_ms=first_token_latency_ms,
-            total_latency_ms=total_latency_ms,
+            # Memory
+            actual_kv_memory_mb=kv_cache_memory_mb,
+            working_set_memory_mb=peak_memory_mb,
+            measurement_kind="ESTIMATED",
+            # Compression
+            size_ratio=1.0,
+            compression_factor=1.0,
+            # Timing
+            prefill_ms=None,
+            decode_ms=None,
             total_ms=total_latency_ms,
+            # Throughput
+            tokens_per_sec=decode_tps,
             # Packed fields (baseline has no compression)
             packed_blocks_created=0,
             packed_blocks_read=0,
@@ -321,12 +314,6 @@ def run_single(
             full_history_materialization_calls=0,
             packed_bytes_written=0,
             packed_bytes_read=0,
-            actual_kv_memory_mb=kv_cache_memory_mb,
-            working_set_memory_mb=peak_memory_mb,
-            measurement_kind="ESTIMATED",
-            # Compression metrics (baseline has no compression)
-            size_ratio=1.0,
-            compression_factor=1.0,
             # Gate status
             gate_status="PASS_NO_PROMOTE",
             promotion_eligible=False,
@@ -334,15 +321,12 @@ def run_single(
             logit_gate_passed=True,
             memory_gate_passed=True,
             generated_text=generated_text,
-            compression_time_ms=0.0,
-            decompression_time_ms=0.0,
-            attention_time_ms=None,  # not measured at the dense level
+            generated_tokens=gen_tokens,
             notes="FP16 dense baseline — no compression applied",
         )
 
     except Exception as exc:
         return CandidateResult(
-            candidate_name="dense_mlx_baseline",
             name="dense_mlx_baseline",
             model_id=model_id,
             prompt_id=prompt_id,
@@ -357,9 +341,6 @@ def run_single(
             full_history_materialization_calls=0,
             packed_bytes_written=0,
             packed_bytes_read=0,
-            # Compression metrics (baseline has no compression)
-            size_ratio=1.0,
-            compression_factor=1.0,
         )
 
 
