@@ -289,11 +289,15 @@ def run_single(
             quantizer="none",
             # Dense baseline has perfect quality by definition
             logit_cosine=1.0,
+            kl_divergence=0.0,
+            top1_match=1.0,
             top1_match_rate=1.0,
             top5_overlap=1.0,
             top10_overlap=1.0,
             perplexity_delta=0.0,
             visible_output_drift_score=0.0,
+            max_logit_delta=0.0,
+            first_divergent_token=None,
             attention_score_cosine=1.0,
             attention_score_mae=0.0,
             attention_top5_overlap=1.0,
@@ -303,7 +307,6 @@ def run_single(
             compressed_kv_memory_mb=kv_cache_memory_mb,
             metadata_memory_mb=0.0,
             effective_bits_per_kv_element=16.0,
-            compression_factor=1.0,
             prefill_tps=prefill_tps,
             decode_tps=decode_tps,
             tokens_per_sec=decode_tps,
@@ -354,6 +357,9 @@ def run_single(
             full_history_materialization_calls=0,
             packed_bytes_written=0,
             packed_bytes_read=0,
+            # Compression metrics (baseline has no compression)
+            size_ratio=1.0,
+            compression_factor=1.0,
         )
 
 
