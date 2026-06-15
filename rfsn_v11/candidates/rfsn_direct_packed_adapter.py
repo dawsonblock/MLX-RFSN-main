@@ -243,6 +243,13 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 RFSNConfig,
                 RuntimeConfig,
             )
+            from rfsn_v10.cache.session import GenerationCacheSession
+            from rfsn_v10.cache.cartesian_codec import CartesianCodec
+            from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+                RfsnDirectPackedKVCache,
+                install_packed_attention,
+                packed_attention_context,
+            )
 
             # Fix #1: Pass explicit strict configuration into normal generation
             # Construct one explicit runtime configuration with strict_packed_mode=True
@@ -253,6 +260,30 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             explicit_config = RFSNConfig(
                 runtime=runtime_config,
             )
+
+            # Create session for direct packed path
+            session = GenerationCacheSession(
+                model_id=getattr(model, "name_or_path", "unknown"),
+                num_layers=len(model.layers),
+                key_codec=CartesianCodec(bits=self.key_bits, group_size=self.group_size),
+                value_codec=CartesianCodec(bits=self.value_bits, group_size=self.group_size),
+                staging_capacity=self.staging_capacity,
+                dense_residual_window=self.dense_residual_window,
+            )
+
+            # Create direct-packed caches
+            caches = [
+                RfsnDirectPackedKVCache(
+                    layer_id=i,
+                    key_codec=CartesianCodec(bits=self.key_bits, group_size=self.group_size),
+                    value_codec=CartesianCodec(bits=self.value_bits, group_size=self.group_size),
+                    staging_capacity=self.staging_capacity,
+                    dense_residual_window=self.dense_residual_window,
+                    strict=True,  # Strict mode for validation
+                    session=session,
+                )
+                for i in range(len(model.layers))
+            ]
 
             # Pass exact key and value bits to generator
             # The candidate's key_bits and value_bits must be used in generation,
@@ -273,9 +304,11 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             # Suppress mlx-lm deprecated-arg print()s from internals
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(io.StringIO()):
-                tokens = list(generator.generate(
-                    prompt, max_new_tokens=max_tokens, temperature=temp,
-                ))
+                # Use packed_attention_context to ensure direct-packed path is used
+                with packed_attention_context(model, caches, strict=True):
+                    tokens = list(generator.generate(
+                        prompt, max_new_tokens=max_tokens, temperature=temp,
+                    ))
             total_ms = (time.perf_counter() - t0) * 1000
             result_text = "".join(tokens)
 
@@ -301,6 +334,9 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             scratch_bytes_peak = 0
             block_seal_events = 0
             execution_backend = "unknown"
+            packed_blocks_created = 0
+            packed_blocks_read = 0
+            full_history_materialization_calls = 0
 
             if hasattr(generator, "_last_counters"):
                 counters = generator._last_counters
@@ -313,6 +349,9 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 scratch_bytes_peak = counters.get("scratch_bytes_peak", 0)
                 block_seal_events = counters.get("block_seal_events", 0)
                 execution_backend = counters.get("execution_backend", "unknown")
+                packed_blocks_created = counters.get("packed_blocks_created", 0)
+                packed_blocks_read = counters.get("packed_blocks_read", 0)
+                full_history_materialization_calls = counters.get("full_history_materialization_calls", 0)
 
                 # Verify strict mode was actually active
                 requested_strict = counters.get("requested_strict_mode", False)
@@ -333,6 +372,9 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                         scratch_bytes_peak=scratch_bytes_peak,
                         block_seal_events=block_seal_events,
                         execution_backend=execution_backend,
+                        packed_blocks_created=packed_blocks_created,
+                        packed_blocks_read=packed_blocks_read,
+                        full_history_materialization_calls=full_history_materialization_calls,
                     )
 
                 if dense_fallback_calls > 0:
@@ -351,7 +393,13 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                         scratch_bytes_peak=scratch_bytes_peak,
                         block_seal_events=block_seal_events,
                         execution_backend=execution_backend,
+                        packed_blocks_created=packed_blocks_created,
+                        packed_blocks_read=packed_blocks_read,
+                        full_history_materialization_calls=full_history_materialization_calls,
                     )
+
+            # Cleanup session
+            session.destroy()
 
             return CandidateResult(
                 name=self.name,
@@ -377,6 +425,9 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 scratch_bytes_peak=scratch_bytes_peak,
                 block_seal_events=block_seal_events,
                 execution_backend=execution_backend,
+                packed_blocks_created=packed_blocks_created,
+                packed_blocks_read=packed_blocks_read,
+                full_history_materialization_calls=full_history_materialization_calls,
             )
         except Exception as exc:
             import traceback
