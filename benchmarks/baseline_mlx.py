@@ -321,6 +321,9 @@ def run_single(
             actual_kv_memory_mb=kv_cache_memory_mb,
             working_set_memory_mb=peak_memory_mb,
             measurement_kind="ESTIMATED",
+            # Compression metrics (baseline has no compression)
+            size_ratio=1.0,
+            compression_factor=1.0,
             # Gate status
             gate_status="PASS_NO_PROMOTE",
             promotion_eligible=False,
