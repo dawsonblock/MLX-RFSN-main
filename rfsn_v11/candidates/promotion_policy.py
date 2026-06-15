@@ -2,6 +2,24 @@
 
 This module replaces hardcoded promotion decisions with policy-based
 validation that checks actual prerequisites before allowing promotion.
+
+P0 #9: Known limitation - policy structure needs refactoring
+The current policy iterates over all result rows including baselines and controls,
+which guarantees failure because baselines are classified as controls.
+
+Required fix: Evaluate promotion for one candidate at a time with structure:
+{
+  "candidate": {},
+  "linked_baseline": {},
+  "quality_evidence": [],
+  "runtime_evidence": [],
+  "memory_evidence": [],
+  "speed_evidence": [],
+  "provenance": {}
+}
+
+The baseline should be supporting evidence, not a candidate being promoted.
+This requires significant refactoring of benchmark aggregation logic.
 """
 from __future__ import annotations
 
@@ -33,6 +51,10 @@ class PromotionPolicy:
 
     def all_prerequisites_satisfied(self, run_bundle: dict[str, Any]) -> bool:
         """Check if all promotion prerequisites are satisfied.
+
+        P0 #9: Known limitation - this iterates over all results including baselines/controls.
+        The baseline is classified as a control, so it guarantees failure.
+        This requires refactoring to evaluate one candidate at a time with proper structure.
 
         Args:
             run_bundle: Dictionary containing run metadata and results.
