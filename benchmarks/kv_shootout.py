@@ -293,8 +293,12 @@ def _run_once(
     baseline_result: CandidateResult | None,
     temp: float = GENERATION_TEMP,
     mode: str = "quick",
+    require_compressed_execution: bool = False,
 ) -> CandidateResult:
-    """Run one candidate on one prompt and apply quality gate."""
+    """Run one candidate on one prompt and apply quality gate.
+    
+    Fix #5: Added require_compressed_execution parameter for hard compressed-execution gate.
+    """
     _reset_peak_memory()
 
     # Wrap candidate.run() with structured error handling
@@ -317,6 +321,39 @@ def _run_once(
     peak_mb = _peak_memory_mb()
     if peak_mb is not None:
         result.working_set_memory_mb = peak_mb
+
+    # Fix #5: Hard compressed-execution gate
+    if require_compressed_execution:
+        # Valid direct-packed run must have:
+        # packed_blocks_created > 0
+        # packed_blocks_read > 0
+        # packed_attention_calls > 0
+        # packed_bytes_written > 0
+        # packed_bytes_read > 0
+        # dense_fallback_calls == 0
+        # full_history_materialization_calls == 0
+        if not (
+            result.packed_blocks_created > 0
+            and result.packed_blocks_read > 0
+            and result.packed_attention_calls > 0
+            and result.packed_bytes_written > 0
+            and result.packed_bytes_read > 0
+            and result.dense_fallback_calls == 0
+            and result.full_history_materialization_calls == 0
+        ):
+            result.gate_status = "ERROR"
+            result.promotion_eligible = False
+            result.error = (
+                f"Compressed-execution gate failed: "
+                f"packed_blocks_created={result.packed_blocks_created}, "
+                f"packed_blocks_read={result.packed_blocks_read}, "
+                f"packed_attention_calls={result.packed_attention_calls}, "
+                f"packed_bytes_written={result.packed_bytes_written}, "
+                f"packed_bytes_read={result.packed_bytes_read}, "
+                f"dense_fallback_calls={result.dense_fallback_calls}, "
+                f"full_history_materialization_calls={result.full_history_materialization_calls}"
+            )
+            return result
 
     # Error gate
     if result.error or result.gate_status == "ERROR":
@@ -993,6 +1030,10 @@ def main() -> None:
         help="Strict mode: require all candidates to complete, exit on any error",
     )
     parser.add_argument(
+        "--require-compressed-execution", action="store_true",
+        help="Fix #5: Require packed blocks to be created and read, no fallback",
+    )
+    parser.add_argument(
         "--governance-only", action="store_true",
         help="Governance-only mode: test schema validation without MLX (for CI smoke testing)",
     )
@@ -1154,6 +1195,7 @@ def main() -> None:
                 result = _run_once(
                     candidate, model, tokenizer, prompt, max_tokens,
                     baseline_result=baseline_result, mode=mode,
+                    require_compressed_execution=args.require_compressed_execution,
                 )
                 per_candidate_results.setdefault(
                     candidate.name, []

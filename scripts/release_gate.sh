@@ -39,9 +39,9 @@ echo "[5/8] Benchmark tests..."
 PYTHONPATH=. pytest -q tests/benchmarks
 
 # 6. Quick shootout smoke (strict — requires model for meaningful validation)
-# P0 #10: Use strict flags in release gate
+# Fix #5: Use strict flags and require compressed execution in release gate
 echo "[6/8] Quick shootout smoke..."
-PYTHONPATH=. python benchmarks/kv_shootout.py --quick --strict --require-model
+PYTHONPATH=. python benchmarks/kv_shootout.py --quick --strict --require-model --require-compressed-execution
 echo "  Quick shootout completed."
 
 # 7. Release integrity check
