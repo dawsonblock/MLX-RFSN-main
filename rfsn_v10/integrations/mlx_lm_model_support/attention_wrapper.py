@@ -33,11 +33,8 @@ from rfsn_v10.cache.mlx_packed_attention_reference import attend
 from rfsn_v10.compat import nn
 
 # Try to import Metal kernel
-try:
-    from rfsn_v10.kernels.metal.packed_attention_metal import attend_metal
-    HAS_METAL_KERNEL = True
-except ImportError:
-    HAS_METAL_KERNEL = False
+from rfsn_v10.kernels.metal.packed_attention_metal import metal_available, attend_metal
+HAS_METAL_KERNEL = metal_available()
 
 
 class RfsnDirectPackedKVCache:
@@ -244,9 +241,17 @@ class _PackedAttentionWrapper(nn.Module):
                     mask=mask,
                     query_start_pos=layer_cache.total_token_count() - L,
                     causal=True,
+                    strict=self._strict,
                 )
-                object.__setattr__(self, "_executed_backend", "metal")
-            except Exception:
+                object.__setattr__(self, "_executed_backend", "metal_dense_reconstructed_kv")
+            except Exception as exc:
+                # Record fallback
+                if hasattr(layer_cache, "session") and layer_cache.session is not None:
+                    layer_cache.session.runtime_counters.record_fallback()
+                if self._strict:
+                    raise RuntimeError(
+                        f"Strict packed mode: Metal kernel failed and fallback is disabled: {exc}"
+                    ) from exc
                 # Fallback to reference implementation
                 output, _ = attend(
                     queries,

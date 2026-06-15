@@ -1,7 +1,12 @@
-"""Tests for the Metal packed attention kernel.
+"""Tests for the Metal dense attention over reconstructed KV kernel.
 
 This tests the mx.fast.metal_kernel based implementation against the
 MLX reference implementation for numerical correctness.
+
+NOTE: These tests verify the transitional dense-attention Metal kernel,
+NOT a true packed attention kernel. The current implementation decodes all
+compressed blocks to dense tensors and runs dense attention. A true packed
+Metal kernel that consumes packed codes inside the shader is future work.
 """
 from __future__ import annotations
 
@@ -17,7 +22,9 @@ except ImportError:
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_metal_kernel_basic():
     """Test that the Metal kernel module can be imported and run."""
-    from rfsn_v10.kernels.metal.packed_attention_metal import metal_packed_attention
+    from rfsn_v10.kernels.metal.packed_attention_metal import (
+        metal_dense_attention_over_reconstructed_kv,
+    )
 
     B, Hq, Lq, D = 1, 2, 4, 8
     Hkv, Lkv = 1, 16
@@ -27,7 +34,9 @@ def test_metal_kernel_basic():
     values = mx.random.normal((B, Hkv, Lkv, D)).astype(mx.float32)
     scale = D ** -0.5
 
-    output = metal_packed_attention(queries, keys, values, scale, causal=True)
+    output = metal_dense_attention_over_reconstructed_kv(
+        queries, keys, values, scale, causal=True
+    )
 
     assert output.shape == (B, Hq, Lq, D)
     assert output.dtype == mx.float32
@@ -38,7 +47,9 @@ def test_metal_kernel_basic():
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_metal_kernel_vs_reference():
     """Compare Metal kernel output against MLX reference for numerical match."""
-    from rfsn_v10.kernels.metal.packed_attention_metal import metal_packed_attention
+    from rfsn_v10.kernels.metal.packed_attention_metal import (
+        metal_dense_attention_over_reconstructed_kv,
+    )
 
     B, Hq, Lq, D = 1, 2, 4, 8
     Hkv, Lkv = 1, 16
@@ -49,7 +60,9 @@ def test_metal_kernel_vs_reference():
     scale = D ** -0.5
 
     # Metal output
-    metal_output = metal_packed_attention(queries, keys, values, scale, causal=True)
+    metal_output = metal_dense_attention_over_reconstructed_kv(
+        queries, keys, values, scale, causal=True
+    )
 
     # Reference: MLX built-in causal attention with GQA repeat
     keys_rep = mx.repeat(keys, Hq // Hkv, axis=1)
@@ -76,7 +89,9 @@ def test_metal_kernel_vs_reference():
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_metal_kernel_shape_variations():
     """Test Metal kernel with different shapes."""
-    from rfsn_v10.kernels.metal.packed_attention_metal import metal_packed_attention
+    from rfsn_v10.kernels.metal.packed_attention_metal import (
+        metal_dense_attention_over_reconstructed_kv,
+    )
 
     test_cases = [
         (1, 1, 2, 4, 1, 8),
@@ -90,7 +105,9 @@ def test_metal_kernel_shape_variations():
         values = mx.random.normal((B, Hkv, Lkv, D)).astype(mx.float32)
         scale = D ** -0.5
 
-        output = metal_packed_attention(queries, keys, values, scale, causal=True)
+        output = metal_dense_attention_over_reconstructed_kv(
+            queries, keys, values, scale, causal=True
+        )
 
         assert output.shape == (B, Hq, Lq, D), f"Shape mismatch for case {(B, Hq, Lq, D, Hkv, Lkv)}"
         assert not mx.any(mx.isnan(output)), f"NaN detected for case {(B, Hq, Lq, D, Hkv, Lkv)}"
@@ -148,8 +165,8 @@ def test_attend_metal_vs_reference():
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
-def test_attend_metal_records_counters():
-    """Verify that attend_metal records proof counters correctly."""
+def test_attend_metal_records_full_history_materialization():
+    """Verify that attend_metal records full_history_materialization_calls."""
     from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
     from rfsn_v10.kernels.metal.packed_attention_metal import attend_metal
@@ -180,22 +197,58 @@ def test_attend_metal_records_counters():
     # Record counters after
     after = session.runtime_counters.to_dict()
 
-    # Verify counters increased
+    # Verify full_history_materialization_calls increased
+    assert after["full_history_materialization_calls"] > before["full_history_materialization_calls"], \
+        "full_history_materialization_calls should increase after Metal attention"
+    # Verify packed_blocks_read increased
     assert after["packed_blocks_read"] > before["packed_blocks_read"], \
         "packed_blocks_read should increase after Metal attention"
+    # Verify packed_bytes_read increased
     assert after["packed_bytes_read"] > before["packed_bytes_read"], \
         "packed_bytes_read should increase after Metal attention"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_attend_metal_strict_mode():
+    """Verify that strict mode raises on failure instead of falling back."""
+    from rfsn_v10.cache.session import GenerationCacheSession
+    from rfsn_v10.cache.cartesian_codec import CartesianCodec
+    from rfsn_v10.kernels.metal.packed_attention_metal import (
+        attend_metal, StrictPackedExecutionError,
+    )
+
+    session = GenerationCacheSession(
+        model_id="test",
+        num_layers=1,
+        key_codec=CartesianCodec(bits=8, group_size=64),
+        value_codec=CartesianCodec(bits=8, group_size=64),
+        staging_capacity=8,
+        dense_residual_window=0,
+    )
+
+    lc = session.get_layer_cache(0)
+
+    # Empty cache with strict mode should raise
+    queries = mx.random.normal((1, 2, 1, 64)).astype(mx.float32)
+
+    # In strict mode with empty cache, it should raise
+    with pytest.raises(StrictPackedExecutionError):
+        attend_metal(queries, lc, scale=64**-0.5, causal=True, strict=True)
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_metal_kernel_imports():
     """Test that all Metal kernel modules can be imported."""
     from rfsn_v10.kernels.metal.packed_attention_metal import (
-        metal_packed_attention,
+        metal_dense_attention_over_reconstructed_kv,
         attend_metal,
         benchmark_metal_vs_reference,
+        metal_available,
+        StrictPackedExecutionError,
     )
 
-    assert callable(metal_packed_attention)
+    assert callable(metal_dense_attention_over_reconstructed_kv)
     assert callable(attend_metal)
     assert callable(benchmark_metal_vs_reference)
+    assert callable(metal_available)
+    assert issubclass(StrictPackedExecutionError, RuntimeError)

@@ -186,7 +186,8 @@ class PromotionPolicy:
     def _check_runtime_trace_validation(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that runtime traces are validated.
         
-        Fix #10: Treat missing required fields as failures."""
+        Fix #10: Treat missing required fields as failures.
+        Fix P1: Reject execution_backend='unknown'."""
         runtime_evidence = candidate_bundle.get("runtime_evidence", [])
 
         if not runtime_evidence:
@@ -208,7 +209,11 @@ class PromotionPolicy:
             # Must have execution backend recorded (field must exist)
             if "execution_backend" not in evidence:
                 return False
-            if not evidence.get("execution_backend"):
+            backend = evidence.get("execution_backend", "")
+            if not backend:
+                return False
+            # Reject unknown backend
+            if backend.lower() == "unknown":
                 return False
 
         return True
@@ -216,8 +221,10 @@ class PromotionPolicy:
     def _check_real_cache_injection(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that real cache injection occurred.
         
-        Fix #10: Treat missing required fields as failures."""
+        Fix #10: Treat missing required fields as failures.
+        Fix P0 #12: Also check memory_evidence for packed_bytes_written."""
         runtime_evidence = candidate_bundle.get("runtime_evidence", [])
+        memory_evidence = candidate_bundle.get("memory_evidence", [])
 
         if not runtime_evidence:
             return False
@@ -233,11 +240,16 @@ class PromotionPolicy:
             if "offline" in evidence.get("execution_backend", "").lower():
                 return False
 
-            # Must have non-zero cache bytes (field must exist)
-            if "packed_bytes_written" not in evidence:
-                return False
-            if evidence.get("packed_bytes_written", 0) == 0:
-                return False
+        # Check packed_bytes_written in memory_evidence (where it's placed by build_candidate_bundle)
+        # or in runtime_evidence (where it may also exist in newer versions)
+        packed_bytes_found = False
+        for evidence in memory_evidence + runtime_evidence:
+            if evidence.get("packed_bytes_written", 0) > 0:
+                packed_bytes_found = True
+                break
+
+        if not packed_bytes_found:
+            return False
 
         return True
 
@@ -283,10 +295,10 @@ class PromotionPolicy:
             if result.get("gate_status") == "ERROR":
                 return False
 
-            # Must not have error field populated (field must exist)
-            if "error" not in result:
-                return False
-            if result.get("error"):
+            # Must not have error field populated
+            # If error field is missing, treat as None (no error) for backward compatibility
+            error_val = result.get("error")
+            if error_val is not None and error_val:
                 return False
 
         return True

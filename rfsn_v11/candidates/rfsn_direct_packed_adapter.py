@@ -311,18 +311,31 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
 
             if hasattr(generator, "_last_counters"):
                 counters = generator._last_counters
-                # Counters are now flattened at top level, not nested in runtime_counters
-                packed_attention_calls = counters.get("packed_attention_calls", 0)
-                dense_fallback_calls = counters.get("dense_fallback_calls", 0)
-                packed_bytes_read = counters.get("packed_bytes_read", 0)
-                packed_bytes_written = counters.get("packed_bytes_written", 0)
-                decoded_block_bytes = counters.get("decoded_block_bytes", 0)
-                scratch_bytes_peak = counters.get("scratch_bytes_peak", 0)
-                block_seal_events = counters.get("block_seal_events", 0)
+                # Read from runtime_counters object (which has typed methods)
+                runtime_counters = counters.get("runtime_counters")
+                if runtime_counters is not None:
+                    counters_dict = runtime_counters.to_dict()
+                    packed_attention_calls = counters_dict.get("packed_attention_calls", 0)
+                    dense_fallback_calls = counters_dict.get("dense_fallback_calls", 0)
+                    packed_bytes_read = counters_dict.get("packed_bytes_read", 0)
+                    packed_bytes_written = counters_dict.get("packed_bytes_written", 0)
+                    decoded_block_bytes = counters_dict.get("decoded_block_bytes", 0)
+                    scratch_bytes_peak = counters_dict.get("scratch_bytes_peak", 0)
+                    packed_blocks_created = counters_dict.get("packed_blocks_created", 0)
+                    packed_blocks_read = counters_dict.get("packed_blocks_read", 0)
+                    full_history_materialization_calls = counters_dict.get("full_history_materialization_calls", 0)
+                # Fallback: also check top-level counters for backward compat
+                packed_attention_calls = counters.get("packed_attention_calls", packed_attention_calls)
+                dense_fallback_calls = counters.get("dense_fallback_calls", dense_fallback_calls)
+                packed_bytes_read = counters.get("packed_bytes_read", packed_bytes_read)
+                packed_bytes_written = counters.get("packed_bytes_written", packed_bytes_written)
+                decoded_block_bytes = counters.get("decoded_block_bytes", decoded_block_bytes)
+                scratch_bytes_peak = counters.get("scratch_bytes_peak", scratch_bytes_peak)
+                block_seal_events = counters.get("block_seal_events", block_seal_events)
                 execution_backend = counters.get("execution_backend", "unknown")
-                packed_blocks_created = counters.get("packed_blocks_created", 0)
-                packed_blocks_read = counters.get("packed_blocks_read", 0)
-                full_history_materialization_calls = counters.get("full_history_materialization_calls", 0)
+                packed_blocks_created = counters.get("packed_blocks_created", packed_blocks_created)
+                packed_blocks_read = counters.get("packed_blocks_read", packed_blocks_read)
+                full_history_materialization_calls = counters.get("full_history_materialization_calls", full_history_materialization_calls)
 
                 if dense_fallback_calls > 0:
                     return CandidateResult(

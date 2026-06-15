@@ -317,6 +317,26 @@ class RfsnMLXReferenceAdapter:
             # Capture runtime counters from session
             if self._session:
                 self._last_counters["runtime_counters"] = self._session.runtime_counters
+            # Capture execution backend from wrappers
+            try:
+                from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+                    collect_backend_stats,
+                )
+                backend_stats = collect_backend_stats(self.model)
+                if backend_stats:
+                    backends = [s.get("executed_backend", "unknown") for s in backend_stats]
+                    # Use the most specific backend (not "packed" which is set before Metal)
+                    metal_backends = [b for b in backends if b.startswith("metal_")]
+                    if metal_backends:
+                        self._last_counters["execution_backend"] = metal_backends[0]
+                    elif "packed_reference" in backends:
+                        self._last_counters["execution_backend"] = "packed_reference"
+                    elif "dense" in backends:
+                        self._last_counters["execution_backend"] = "dense"
+                    else:
+                        self._last_counters["execution_backend"] = backends[0]
+            except Exception:
+                self._last_counters["execution_backend"] = "unknown"
             # Destroy session
             if self._session:
                 self._session.destroy()
@@ -411,6 +431,25 @@ class RfsnMLXReferenceAdapter:
                 # Capture runtime counters from session
                 if self._session:
                     self._last_counters["runtime_counters"] = self._session.runtime_counters
+                # Capture execution backend from wrappers
+                try:
+                    from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+                        collect_backend_stats,
+                    )
+                    backend_stats = collect_backend_stats(self.model)
+                    if backend_stats:
+                        backends = [s.get("executed_backend", "unknown") for s in backend_stats]
+                        metal_backends = [b for b in backends if b.startswith("metal_")]
+                        if metal_backends:
+                            self._last_counters["execution_backend"] = metal_backends[0]
+                        elif "packed_reference" in backends:
+                            self._last_counters["execution_backend"] = "packed_reference"
+                        elif "dense" in backends:
+                            self._last_counters["execution_backend"] = "dense"
+                        else:
+                            self._last_counters["execution_backend"] = backends[0]
+                except Exception:
+                    self._last_counters["execution_backend"] = "unknown"
                 # Destroy session
                 if self._session:
                     self._session.destroy()

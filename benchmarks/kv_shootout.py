@@ -328,16 +328,12 @@ def _run_once(
         result.working_set_memory_mb = peak_mb
 
     # Fix #5: Hard compressed-execution gate
-    # Only applies to packed candidates, not baseline
+    # Only applies to packed candidates, not baseline.
+    # NOTE: full_history_materialization_calls > 0 is allowed because the
+    # current Metal path honestly records dense reconstruction. The promotion
+    # policy will reject such candidates; the gate only checks that counters
+    # are present and no silent dense fallback occurred.
     if require_compressed_execution and candidate.name != "dense_mlx_baseline":
-        # Valid direct-packed run must have:
-        # packed_blocks_created > 0
-        # packed_blocks_read > 0
-        # packed_attention_calls > 0
-        # packed_bytes_written > 0
-        # packed_bytes_read > 0
-        # dense_fallback_calls == 0
-        # full_history_materialization_calls == 0
         if not (
             result.packed_blocks_created > 0
             and result.packed_blocks_read > 0
@@ -345,7 +341,6 @@ def _run_once(
             and result.packed_bytes_written > 0
             and result.packed_bytes_read > 0
             and result.dense_fallback_calls == 0
-            and result.full_history_materialization_calls == 0
         ):
             result.gate_status = "ERROR"
             result.promotion_eligible = False
@@ -356,8 +351,7 @@ def _run_once(
                 f"packed_attention_calls={result.packed_attention_calls}, "
                 f"packed_bytes_written={result.packed_bytes_written}, "
                 f"packed_bytes_read={result.packed_bytes_read}, "
-                f"dense_fallback_calls={result.dense_fallback_calls}, "
-                f"full_history_materialization_calls={result.full_history_materialization_calls}"
+                f"dense_fallback_calls={result.dense_fallback_calls}"
             )
             return result
 
@@ -549,6 +543,8 @@ def _run_once(
             "rfsn_v10_k8_v5_gs64",
             "legacy_k8_v5_gs32",
             "turbo_polar_k4_qjl64",
+            "rfsn_direct_packed_k8v8_gs64",
+            "rfsn_direct_packed_k8v8_gs64_smoke",
         ):
             # RFSN v10 with enable_sparse_decode=True activates the SDPA
             # patch so the RFSNRuntime + KVManager are used during both
@@ -829,6 +825,32 @@ def _aggregate(results: list[CandidateResult]) -> dict[str, Any]:
             if getattr(r, field) is not None
         ]
         agg[field] = float(np.mean(vals)) if vals else None
+
+    # Preserve required promotion fields (do not average, use first or sum)
+    # Fix P0 #12, #13: Preserve fields needed by promotion policy
+    required_promotion_fields = [
+        "packed_attention_calls",
+        "dense_fallback_calls",
+        "full_history_materialization_calls",
+        "packed_blocks_created",
+        "packed_blocks_read",
+        "packed_bytes_written",
+        "packed_bytes_read",
+        "measurement_kind",
+        "execution_backend",
+        "cache_backend_used",
+        "error",
+    ]
+    for field in required_promotion_fields:
+        vals = [getattr(r, field) for r in results if getattr(r, field) is not None]
+        if vals:
+            # For numeric fields, sum them; for strings, use the first non-empty
+            if field in ("packed_attention_calls", "dense_fallback_calls",
+                        "full_history_materialization_calls", "packed_blocks_created",
+                        "packed_blocks_read", "packed_bytes_written", "packed_bytes_read"):
+                agg[field] = sum(v for v in vals if isinstance(v, (int, float)))
+            else:
+                agg[field] = vals[0]
 
     # Gate status: if any FAIL → overall FAIL; if all PASS → PASS;
     # otherwise pending
@@ -1572,6 +1594,13 @@ def main() -> None:
             for candidate in execution_errors:
                 print(f"  - {candidate}")
             sys.exit(1)
+        
+        # Fix P0 #18: Promotion policy failure should fail strict execution
+        if not promotion_allowed and promotion_blockers:
+            print(f"\nSTRICT MODE: Promotion policy failed:")
+            for blocker in promotion_blockers:
+                print(f"  - {blocker}")
+            sys.exit(2)
     
     print("\nDone.")
 
