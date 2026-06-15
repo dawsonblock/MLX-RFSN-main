@@ -472,8 +472,8 @@ def check() -> list[str]:
     exp_dir = root / "artifacts" / "proof" / "experimental"
     manifest_path = exp_dir / "artifact_manifest.json"
     if not manifest_path.exists():
-        # For alpha releases, experimental artifacts may not exist yet
-        if release_config.get("status", "").startswith("Alpha"):
+        # P0 Fix: Use channel field (not status) to detect alpha releases
+        if release_config.get("channel") == "alpha":
             pass  # Skip experimental artifact check for alpha releases
         else:
             errors.append(
@@ -491,26 +491,26 @@ def check() -> list[str]:
                     f"artifact_manifest.json release "
                     f"field is not '{expected_release}'"
                 )
-            if manifest.get("stable_default") != "k8_v5_gs64":
-                errors.append(
-                    "artifact_manifest.json stable_default is not 'k8_v5_gs64'"
-                )
-            if manifest.get("qjl_status") != "failed_disabled":
-                errors.append(
-                    "artifact_manifest.json qjl_status "
-                    "is not 'failed_disabled'"
-                )
+            # P0 Fix: Skip Main 28 specific checks for alpha releases
+            if release_config.get("channel") != "alpha":
+                if manifest.get("stable_default") != "k8_v5_gs64":
+                    errors.append(
+                        "artifact_manifest.json stable_default is not 'k8_v5_gs64'"
+                    )
+                if manifest.get("qjl_status") != "failed_disabled":
+                    errors.append(
+                        "artifact_manifest.json qjl_status "
+                        "is not 'failed_disabled'"
+                    )
             if manifest.get("promoted_to_default") is not False:
                 errors.append(
                     "artifact_manifest.json promoted_to_default must be false"
                 )
+            # P0 Fix: Remove Main 28 hardcoded artifact names
             expected_artifacts = {
                 "comparison": "comparison_summary.json",
                 "memory": "memory_accounting.json",
                 "throughput": "throughput.json",
-                "qjl": "qjl_attention_score.json",
-                "layer_policy": "layer_policy.json",
-                "qwen_1_5b": "qwen_1_5b/",
             }
             actual_artifacts = manifest.get("artifacts", {})
             for key, expected_path in expected_artifacts.items():
@@ -533,8 +533,8 @@ def check() -> list[str]:
     # --- Stale artifact directories ---
     proof_dir = root / "artifacts" / "proof"
     if proof_dir.exists():
-        # For alpha releases, allow main* directories as historical
-        if not release_config.get("status", "").startswith("Alpha"):
+        # P0 Fix: Use channel field (not status) to detect alpha releases
+        if release_config.get("channel") != "alpha":
             stale_releases = [
                 d.name for d in proof_dir.iterdir()
                 if d.is_dir() and d.name.startswith("main")
@@ -551,7 +551,8 @@ def check() -> list[str]:
                     )
 
     # --- Release artifact directory (only for non-alpha releases) ---
-    if not release_config.get("status", "").startswith("Alpha"):
+    # P0 Fix: Use channel field (not status) to detect alpha releases
+    if release_config.get("channel") != "alpha":
         artifact_dir = root / "artifacts" / "proof" / release_id
         if not artifact_dir.exists():
             errors.append(f"artifacts/proof/{release_id} missing")
@@ -651,10 +652,12 @@ def check() -> list[str]:
                             f"config {cfg.get('name')!r} evaluated only "
                             f"{pos} positions (minimum 32 required)"
                         )
-                if data.get("release") != "main28":
+                # P0 Fix: Check release field matches configured release_id, not hardcoded main28
+                expected_rel = release_config.get("release_id", "unknown")
+                if data.get("release") != expected_rel:
                     errors.append(
-                        "real_model_validation.json release "
-                        "field is not 'main28'"
+                        f"real_model_validation.json release "
+                        f"field is not '{expected_rel}'"
                     )
             except (
                 OSError, ValueError, TypeError, AttributeError

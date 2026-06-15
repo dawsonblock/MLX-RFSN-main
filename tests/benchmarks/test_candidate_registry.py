@@ -40,7 +40,7 @@ def test_build_candidates_registry_valid():
     This test ensures that invalid candidate names like "k8_v5_gs32" cannot
     silently enter the registry and cause runtime failures. The gs32 path
     was explicitly moved to legacy status as "legacy_k8_v5_gs32".
-    
+
     Phase 0: Only direct-packed candidate is active for correctness validation.
     """
     import sys
@@ -51,10 +51,10 @@ def test_build_candidates_registry_valid():
 
     from benchmarks.kv_shootout import _build_candidates
 
-    # Mock availability to test registry construction without MLX
-    # This should not raise ValueError for invalid config names
+    # P0 Fix: Use check_available=False to test registry structure without requiring MLX
+    # This ensures the test is truly portable and validates declared candidates
     try:
-        candidates = _build_candidates(quick=False, include_legacy=False)
+        candidates = _build_candidates(quick=False, include_legacy=False, check_available=False)
         candidate_names = [c.name for c in candidates]
 
         # Verify gs32 is NOT in the active registry
@@ -66,7 +66,7 @@ def test_build_candidates_registry_valid():
         assert "rfsn_direct_packed_k8v8_gs64" in candidate_names, (
             "Direct-packed K8/V8 should be in active registry for correctness validation"
         )
-        
+
         # Verify baseline is always present (canonical name is dense_mlx_baseline)
         assert "dense_mlx_baseline" in candidate_names, (
             "Baseline should be in active registry for comparison"

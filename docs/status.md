@@ -20,10 +20,20 @@
 
 ## Alpha 8.4 results
 
+### P0 Critical Fixes (Completed)
+
+- [x] **Wheel versioning fixed**: Static `version = "10.2.0a84"` in pyproject.toml prevents `0.0.0` builds.
+- [x] **Registry test fixed**: `check_available=False` parameter allows portable tests to validate declared candidates without requiring MLX.
+- [x] **Metal backend honestly named**: `metal_dense_reconstruction_violates_invariant` explicitly flags that this path violates the zero-reconstruction invariant.
+
+### P1 Implementation Progress
+
 - [x] Direct-packed K8/V8 canonical BS64 configuration (smoke BS8 separated).
 - [x] Full-history materialization honestly recorded in Metal path.
 - [x] Strict Metal failures raise instead of silently falling back.
-- [x] Metal kernel renamed to `metal_dense_attention_over_reconstructed_kv`.
+- [x] **True packed kernel scaffold created**: `true_packed_attention.metal` and `true_packed_wrapper.py` provide the framework for zero-reconstruction GPU attention (not yet functional, falls back to reference).
+- [x] **Differential testing framework**: `test_true_packed_kernel.py` establishes testing levels for kernel validation.
+- [x] **Execution contract recording**: `ExecutionContract` dataclass provides auditability with invariant validation.
 - [x] Capability-based full-logit dispatch (no hardcoded name lists).
 - [x] Runtime byte counters use actual `array.itemsize` instead of hardcoded 4.
 - [x] Promotion aggregation preserves all required fields.
@@ -31,6 +41,7 @@
 - [x] Strict mode exits nonzero when promotion policy fails.
 - [x] Release identity unified (README, release.toml, _version.py).
 - [x] No candidate falsely promoted.
+- [x] **Quality gate thresholds unified**: Single source of truth in `LogitGateThresholds` dataclass.
 
 ## Critical blocker discovered in Alpha 8.3
 
@@ -59,12 +70,24 @@ Problem: if token N differs between baseline and candidate, all subsequent logit
 | turboquant_v2_b4_gs64 | EXPERIMENTAL | **Logit gate methodology flaw** |
 | polar_reference_offline_b4_d128 | REFERENCE_ONLY | **Logit gate methodology flaw** |
 
+## Current Limitations (Post P0/P1 Fixes)
+
+| Component | Status | Limitation |
+|-----------|--------|------------|
+| **Metal Kernel** | P1 Scaffold | True packed Metal kernel exists as scaffold only; actual GPU dispatch not yet functional. Falls back to CPU reference. |
+| **Dense Reconstruction** | Violates Invariant | `metal_dense_reconstruction_violates_invariant` path explicitly flagged; reconstructs full dense KV history before attention. |
+| **Logit Capture** | Methodology Issue | Teacher-forced logit comparison is the correct methodology, but cascade divergence from independent greedy decodes remains a problem. |
+| **Promotion** | No Candidates | No candidates are currently promotion-eligible due to incomplete proof bundles and unproven quality gates. |
+| **Wheel Build** | Fixed | P0 fix ensures static versioning prevents `0.0.0` builds from source ZIP. |
+| **Registry Tests** | Fixed | P0 fix separates declared vs available candidates for portable test execution. |
+
 ## Roadmap
 
 See [roadmap_alpha9.md](roadmap_alpha9.md) for the detailed path forward.
 
 Phase A (critical): Fix the logit gate methodology → teacher-forced comparison.
-Phase B (high): Candidate hardening once measurement is honest.
-Phase C (medium): Benchmark expansion (larger models, longer contexts).
-Phase D (low/deferred): CUDA backend, server hardening.
-Phase E (research): Sparse decode, QJL, adaptive controller — indefinite deferral.
+Phase B (high): Complete true packed Metal kernel implementation (vectorized QK, full decode, online softmax).
+Phase C (high): Candidate hardening once measurement is honest.
+Phase D (medium): Benchmark expansion (larger models, longer contexts).
+Phase E (low/deferred): CUDA backend, server hardening.
+Phase F (research): Sparse decode, QJL, adaptive controller — indefinite deferral.

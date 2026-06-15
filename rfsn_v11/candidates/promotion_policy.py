@@ -185,9 +185,10 @@ class PromotionPolicy:
 
     def _check_runtime_trace_validation(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that runtime traces are validated.
-        
+
         Fix #10: Treat missing required fields as failures.
-        Fix P1: Reject execution_backend='unknown'."""
+        Fix P1: Reject execution_backend='unknown'.
+        P0 Fix: Enforce zero full-history materialization."""
         runtime_evidence = candidate_bundle.get("runtime_evidence", [])
 
         if not runtime_evidence:
@@ -206,6 +207,12 @@ class PromotionPolicy:
             if evidence.get("dense_fallback_calls", 0) > 0:
                 return False
 
+            # P0 Fix: Enforce zero full-history materialization (invariant check)
+            if "full_history_materialization_calls" not in evidence:
+                return False
+            if evidence.get("full_history_materialization_calls", 0) != 0:
+                return False
+
             # Must have execution backend recorded (field must exist)
             if "execution_backend" not in evidence:
                 return False
@@ -214,6 +221,9 @@ class PromotionPolicy:
                 return False
             # Reject unknown backend
             if backend.lower() == "unknown":
+                return False
+            # P0 Fix: Reject dense reconstruction backend for packed promotion
+            if "dense_reconstruction" in backend.lower():
                 return False
 
         return True

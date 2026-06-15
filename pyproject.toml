@@ -1,10 +1,11 @@
 [build-system]
-requires = ["setuptools>=70.0", "wheel", "setuptools_scm>=8.0"]
+# P0 Fix: Removed setuptools_scm to ensure static version is always used
+requires = ["setuptools>=70.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-rfsn"
-dynamic = ["version"]
+version = "10.2.0a84"
 description = "MLX-RFSN Fusion Alpha - Quantized KV-cache + sparse-attention runtime for Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -123,10 +124,10 @@ exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 [tool.setuptools.exclude-package-data]
 "*" = ["*.pyc", "__pycache__/*", "*.so", "*.dylib"]
 
-[tool.setuptools_scm]
-write_to = "rfsn_v10/_version.py"
-version_scheme = "release-branch-semver"
-fallback_version = "10.2.0a84"  # Synchronized with release.toml package_version  # Synchronized with release.toml package_version
+# [tool.setuptools_scm]  # P0 Fix: Disabled - using static version for reproducible builds
+# write_to = "rfsn_v10/_version.py"
+# version_scheme = "release-branch-semver"
+# fallback_version = "10.2.0a84"  # Now using static version in [project] section
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"

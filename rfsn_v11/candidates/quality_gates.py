@@ -25,19 +25,25 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Thresholds
+# Thresholds - Single Source of Truth (P2 Unification)
 # ---------------------------------------------------------------------------
-
-LOGIT_COSINE_MIN: float = 0.999
-KL_DIVERGENCE_MAX: float = 0.1
-TOP5_OVERLAP_MIN: float = 0.85
-TOP10_OVERLAP_MIN: float = 0.90
-MAX_LOGIT_DELTA_MAX: float = 10.0
-
+# P2 Fix: All thresholds are defined in ONE place - LogitGateThresholds dataclass.
+# Module-level constants reference the dataclass to ensure consistency.
 
 @dataclass(frozen=True)
 class LogitGateThresholds:
-    """Single source of truth for full-logit quality gate thresholds."""
+    """Single source of truth for full-logit quality gate thresholds.
+
+    P2 Unification: This dataclass is the authoritative definition of all
+    quality gate thresholds. All other code must reference these values
+    rather than defining their own.
+
+    Calibration data (Alpha 8.3, mlx_lm_quantized_kv_b8, 0.5B, teacher-forced):
+        cosine=0.99983  KL=0.055  top5=0.889  top10=0.904  delta=7.46  top1=1.0
+
+    These thresholds pass the upstream-maintained 8-bit KV baseline while
+    still rejecting genuinely degraded candidates.
+    """
 
     logit_cosine_min: float = 0.999
     kl_divergence_max: float = 0.1
@@ -53,6 +59,15 @@ class LogitGateThresholds:
             "top10_overlap_min": self.top10_overlap_min,
             "max_logit_delta_max": self.max_logit_delta_max,
         }
+
+
+# P2: Module-level constants reference the single source of truth
+_DEFAULT_THRESHOLDS = LogitGateThresholds()
+LOGIT_COSINE_MIN: float = _DEFAULT_THRESHOLDS.logit_cosine_min
+KL_DIVERGENCE_MAX: float = _DEFAULT_THRESHOLDS.kl_divergence_max
+TOP5_OVERLAP_MIN: float = _DEFAULT_THRESHOLDS.top5_overlap_min
+TOP10_OVERLAP_MIN: float = _DEFAULT_THRESHOLDS.top10_overlap_min
+MAX_LOGIT_DELTA_MAX: float = _DEFAULT_THRESHOLDS.max_logit_delta_max
 
 
 # ---------------------------------------------------------------------------

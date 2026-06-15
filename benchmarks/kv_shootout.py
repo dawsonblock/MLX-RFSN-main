@@ -188,9 +188,15 @@ def _compute_file_sha256(file_path: Path) -> str:
 # Candidate registry
 # ---------------------------------------------------------------------------
 
-def _build_candidates(quick: bool = False, include_legacy: bool = False, bit_width_config: str = "k8v8") -> list[KVCompressionCandidate]:
+def _build_candidates(
+    quick: bool = False,
+    include_legacy: bool = False,
+    bit_width_config: str = "k8v8",
+    check_available: bool = True,
+    canonical: bool = False,
+) -> list[KVCompressionCandidate]:
     """Instantiate all candidates using the authoritative registry.
-    
+
     Fix #8: This now delegates to the one authoritative candidate_registry.
     No longer duplicates candidate construction logic.
 
@@ -198,18 +204,21 @@ def _build_candidates(quick: bool = False, include_legacy: bool = False, bit_wid
         quick: If True, use quick-mode candidate selection.
         include_legacy: If True, include legacy/deprecated candidates.
         bit_width_config: Bit-width configuration for bit-width isolation ladder (k16v16, k8v16, k16v8, k8v8, k8v6, k8v5)
+        check_available: If True, filter candidates by is_available(). If False, return all declared candidates.
+            P0 Fix: Set to False for portable tests that verify registry structure without requiring MLX.
+        canonical: P0 Fix: If True, force canonical BS64 configuration regardless of quick mode.
 
     Phase 0 Scope Freeze: Only rfsn_direct_packed candidates are active for initial validation.
     Other candidates (RFSN K8/V5 dense reconstruction, RFSN v11, TurboQuant, Polar, QJL, Sparse) remain in source
     but are excluded from the active promotion matrix until the direct-packed path is proven correct.
     """
     from benchmarks.candidate_registry import get_registry
-    
+
     registry = get_registry()
-    
+
     # Fix #8: Use the authoritative registry for baseline
     baseline = registry.get("dense_mlx_baseline")
-    
+
     # Fix #8: Use the authoritative registry for direct-packed candidates
     # Map bit-width config to registry names
     # P0 #7: Canonical candidates use BS64; smoke variants use BS8 for fast tests
@@ -222,9 +231,10 @@ def _build_candidates(quick: bool = False, include_legacy: bool = False, bit_wid
         "k8v5": "rfsn_direct_packed_k8v5",
     }
     # Quick mode uses smoke candidates for faster structural tests
-    if quick:
+    # P0 Fix: canonical=True overrides quick mode to use BS64
+    if quick and not canonical:
         bit_config_to_name["k8v8"] = "rfsn_direct_packed_k8v8_smoke"
-    
+
     candidate_name = bit_config_to_name.get(bit_width_config, "rfsn_direct_packed_k8v8")
     
     # Phase 0: Freeze scope to only the direct-packed candidate for correctness validation
@@ -242,6 +252,11 @@ def _build_candidates(quick: bool = False, include_legacy: bool = False, bit_wid
     # - QJL variants
     # - Sparse variants
     # These remain in source tree but don't participate in initial validation
+
+    # P0 Fix: Support both declared (portable test) and available (runtime) modes
+    if not check_available:
+        # Return declared candidates without checking runtime dependencies
+        return all_candidates
 
     available = []
     for c in all_candidates:
@@ -1042,6 +1057,10 @@ def main() -> None:
     )
     parser.add_argument("--quick", action="store_true", help="Fast smoke run")
     parser.add_argument(
+        "--canonical", action="store_true",
+        help="P0 Fix: Use canonical BS64 configuration (overrides quick mode smoke variant)",
+    )
+    parser.add_argument(
         "--full-logit-gate", action="store_true",
         help="Run real logit comparison",
     )
@@ -1067,7 +1086,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--strict", action="store_true",
-        help="Strict mode: require all candidates to complete, exit on any error",
+        help="Strict mode (legacy): equivalent to --strict-execution --strict-promotion",
+    )
+    parser.add_argument(
+        "--strict-execution", action="store_true",
+        help="P0 Fix: Fail if any candidate has execution errors (independent of promotion)",
+    )
+    parser.add_argument(
+        "--strict-promotion", action="store_true",
+        help="P0 Fix: Fail if promotion policy rejects (independent of execution)",
     )
     parser.add_argument(
         "--require-compressed-execution", action="store_true",
@@ -1199,6 +1226,10 @@ def main() -> None:
     run_errors = []
     token_sequence_reference = None
 
+    # P0 Fix: Define strict mode flags early for use throughout function
+    strict_execution = args.strict or args.strict_execution
+    strict_promotion = args.strict or args.strict_promotion
+
     for model_id in models:
         model, tokenizer = _load_model(model_id)
         if model is None:
@@ -1212,11 +1243,16 @@ def main() -> None:
         last_tokenizer = tokenizer
         last_model_id = model_id
 
-        candidates = _build_candidates(quick=args.quick, include_legacy=args.include_legacy, bit_width_config=args.bit_width)
+        candidates = _build_candidates(
+            quick=args.quick,
+            include_legacy=args.include_legacy,
+            bit_width_config=args.bit_width,
+            canonical=args.canonical,
+        )
         candidates_requested += len(candidates)
         if not candidates:
             print("  No candidates available.")
-            if args.strict:
+            if strict_execution:
                 run_errors.append(f"No candidates available for model {model_id}")
             continue
 
@@ -1244,7 +1280,7 @@ def main() -> None:
                 # Track candidate completion
                 if result.gate_status != "ERROR":
                     candidates_completed += 1
-                elif args.strict:
+                elif strict_execution:
                     run_errors.append(
                         f"Candidate {candidate.name} failed: {result.error}"
                     )
@@ -1436,8 +1472,8 @@ def main() -> None:
         else:
             token_sequence_reference = None
 
-    # Strict mode validation
-    if args.strict:
+    # P0 Fix: Strict execution validation (separate from strict promotion)
+    if strict_execution:
         run_valid = True
         validation_errors = []
 
@@ -1477,6 +1513,8 @@ def main() -> None:
             "candidates_completed": candidates_completed,
             "baseline_completed": baseline_completed,
             "run_valid": run_valid,
+            "strict_execution": strict_execution,
+            "strict_promotion": strict_promotion,
         }
 
         if validation_errors:
@@ -1489,7 +1527,7 @@ def main() -> None:
             all_rows[0]["metadata"].update(run_metadata)
 
         if not run_valid:
-            print("\nSTRICT MODE VALIDATION FAILED:")
+            print("\nSTRICT EXECUTION VALIDATION FAILED:")
             for error in validation_errors:
                 print(f"  - {error}")
             sys.exit(1)
@@ -1562,41 +1600,46 @@ def main() -> None:
         mode=mode,
     )
     
-    # Phase 5.22: Make strict benchmark failures return nonzero exit codes
-    if args.strict:
+    # P0 Fix: Final strict execution checks (variables defined at function start)
+    if strict_execution:
         # Check for any failed quality gates
         failed_gates = []
         for row in all_rows:
             if isinstance(row, dict) and row.get("gate_status") == GATE_STATUS_FAIL:
                 candidate_name = row.get("candidate_name", "unknown")
                 failed_gates.append(candidate_name)
-        
+
         if failed_gates:
-            print(f"\nSTRICT MODE: Quality gates failed for {len(failed_gates)} candidate(s):")
+            print(f"\nSTRICT EXECUTION: Quality gates failed for {len(failed_gates)} candidate(s):")
             for candidate in failed_gates:
                 print(f"  - {candidate}")
             sys.exit(1)
-        
+
         # Check for any execution errors
         execution_errors = []
         for row in all_rows:
             if isinstance(row, dict) and row.get("error"):
                 candidate_name = row.get("candidate_name", "unknown")
                 execution_errors.append(candidate_name)
-        
+
         if execution_errors:
-            print(f"\nSTRICT MODE: Execution errors in {len(execution_errors)} candidate(s):")
+            print(f"\nSTRICT EXECUTION: Execution errors in {len(execution_errors)} candidate(s):")
             for candidate in execution_errors:
                 print(f"  - {candidate}")
             sys.exit(1)
-        
-        # Fix P0 #18: Promotion policy failure should fail strict execution
+
+    # P0 Fix: Strict promotion is separate from strict execution
+    # Quick mode can pass strict-execution but will fail strict-promotion
+    if strict_promotion:
         if not promotion_allowed and promotion_blockers:
-            print(f"\nSTRICT MODE: Promotion policy failed:")
+            print(f"\nSTRICT PROMOTION: Promotion policy failed:")
             for blocker in promotion_blockers:
                 print(f"  - {blocker}")
             sys.exit(2)
-    
+        elif not promotion_allowed:
+            print(f"\nSTRICT PROMOTION: Promotion not allowed (no blockers listed)")
+            sys.exit(2)
+
     print("\nDone.")
 
 
