@@ -189,39 +189,44 @@ def _compute_file_sha256(file_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def _build_candidates(quick: bool = False, include_legacy: bool = False, bit_width_config: str = "k8v8") -> list[KVCompressionCandidate]:
-    """Instantiate all candidates. Skip unavailable ones gracefully.
+    """Instantiate all candidates using the authoritative registry.
+    
+    Fix #8: This now delegates to the one authoritative candidate_registry.
+    No longer duplicates candidate construction logic.
 
     Args:
         quick: If True, use quick-mode candidate selection.
         include_legacy: If True, include legacy/deprecated candidates.
         bit_width_config: Bit-width configuration for bit-width isolation ladder (k16v16, k8v16, k16v8, k8v8, k8v6, k8v5)
-    
+
     Phase 0 Scope Freeze: Only rfsn_direct_packed candidates are active for initial validation.
     Other candidates (RFSN K8/V5 dense reconstruction, RFSN v11, TurboQuant, Polar, QJL, Sparse) remain in source
     but are excluded from the active promotion matrix until the direct-packed path is proven correct.
     """
-    from rfsn_v11.candidates.mlx_lm_baseline import MLXLMBaseline
-    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
-
-    # Bit-width isolation ladder configuration
-    bit_configs = {
-        "k16v16": (16, 16),
-        "k8v16": (8, 16),
-        "k16v8": (16, 8),
-        "k8v8": (8, 8),
-        "k8v6": (8, 6),
-        "k8v5": (8, 5),
+    from benchmarks.candidate_registry import get_registry
+    
+    registry = get_registry()
+    
+    # Fix #8: Use the authoritative registry for baseline
+    baseline = registry.get("dense_mlx_baseline")
+    
+    # Fix #8: Use the authoritative registry for direct-packed candidates
+    # Map bit-width config to registry names
+    bit_config_to_name = {
+        "k16v16": "rfsn_direct_packed_k16v16",
+        "k8v16": "rfsn_direct_packed_k8v16",
+        "k16v8": "rfsn_direct_packed_k16v8",
+        "k8v8": "rfsn_direct_packed_k8v8",
+        "k8v6": "rfsn_direct_packed_k8v6",
+        "k8v5": "rfsn_direct_packed_k8v5",
     }
     
-    key_bits, value_bits = bit_configs.get(bit_width_config, (8, 8))
-
+    candidate_name = bit_config_to_name.get(bit_width_config, "rfsn_direct_packed_k8v8")
+    
     # Phase 0: Freeze scope to only the direct-packed candidate for correctness validation
     all_candidates: list[KVCompressionCandidate] = [
-        MLXLMBaseline(),  # Baseline for comparison
-        RFSNDirectPackedCandidate(  # Direct packed with configurable bit-width
-            key_bits=key_bits, value_bits=value_bits, group_size=64,
-            staging_capacity=64, dense_residual_window=0,  # Zero residual to force compressed execution
-        ),
+        baseline,  # From authoritative registry
+        registry.get(candidate_name),  # Direct packed from authoritative registry
     ]
 
     # Other candidates temporarily removed from active promotion matrix:

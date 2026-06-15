@@ -1,5 +1,7 @@
 """RFSN candidate registry.
 
+Fix #8: One authoritative candidate registry.
+
 Maps canonical candidate names to instantiated candidate objects.
 All imports are lazy — missing optional dependencies (mlx,
     external/turboquant-mlx, external/mlx-turboquant) only raise
@@ -24,6 +26,8 @@ S2_snapkv_plus_grouped       — Phase 8: SnapKV + grouped WHT
 S3_snapkv_plus_turboquant_mse_residual128 — Phase 8:
     SnapKV + TurboQuant MSE + residual
 dense_mlx_baseline           — Phase 1: dense FP16 baseline (always available)
+rfsn_direct_packed_k8v8      — Direct-packed K8/V8 (strict mode)
+rfsn_v10_k8v5                 — RFSN v10 K8/V5 dense reconstruction
 """
 from __future__ import annotations
 
@@ -45,11 +49,15 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 class CandidateRegistry:
-    """Lazy registry of all benchmark candidates.
+    """One authoritative candidate registry for all benchmark candidates.
 
-    get(name) instantiates the candidate on first call.
-    list_available() returns names of candidates whose
-    dependencies are satisfied.
+    Fix #8: This is the single source of truth for candidate definitions.
+    The shootout and all other code must use this registry, not hardcoded construction.
+
+    Methods:
+    - declared(): All declared candidates (no dependency checks)
+    - available(environment): Candidates that can run in current environment
+    - select(names, environment): Get specific candidates by name
     """
 
     def __init__(self) -> None:
@@ -79,29 +87,89 @@ class CandidateRegistry:
     def names(self) -> list[str]:
         return list(self._registry.keys())
 
-    def declared_candidates(self) -> list[str]:
+    def declared(self) -> list[str]:
         """Return names of all declared candidates (no dependency checks).
         
-        This is useful for portable tests that don't require MLX or other
+        Fix #8: This is for portable tests that don't require MLX or other
         runtime dependencies to be installed.
         """
         return self.names()
 
-    def available_candidates(self) -> list[str]:
+    def available(self, environment: str = "auto") -> list[str]:
         """Return names of candidates that report is_available() == True.
         
-        This checks runtime dependencies and only returns candidates that
+        Fix #8: Checks runtime dependencies and only returns candidates that
         can actually run in the current environment.
+        
+        Args:
+            environment: "auto" (default), "mlx", "numpy", or "portable"
         """
         available = []
         for name in self.names():
             try:
                 c = self.get(name)
                 if hasattr(c, "is_available") and c.is_available():
-                    available.append(name)
+                    # Additional environment-specific checks
+                    if environment == "portable":
+                        # Portable candidates don't require MLX
+                        available.append(name)
+                    elif environment == "mlx":
+                        # MLX candidates require MLX
+                        available.append(name)
+                    elif environment == "numpy":
+                        # Numpy candidates don't require MLX
+                        available.append(name)
+                    else:  # auto
+                        available.append(name)
             except Exception:
                 pass
         return available
+
+    def select(self, names: list[str], environment: str = "auto") -> list["BenchmarkCandidate"]:
+        """Get specific candidates by name.
+        
+        Fix #8: This is the authoritative way to get candidates for benchmarking.
+        
+        Args:
+            names: List of candidate names to select
+            environment: "auto", "mlx", "numpy", or "portable"
+        
+        Returns:
+            List of candidate instances
+        """
+        candidates = []
+        for name in names:
+            try:
+                c = self.get(name)
+                # Check availability if not auto
+                if environment != "auto":
+                    if hasattr(c, "is_available") and not c.is_available():
+                        continue
+                # Environment-specific filtering
+                if environment == "portable" and not hasattr(c, "is_available"):
+                    continue
+                if environment == "mlx" and not hasattr(c, "is_available"):
+                    continue
+                if environment == "numpy" and not hasattr(c, "is_available"):
+                    continue
+                candidates.append(c)
+            except Exception:
+                pass
+        return candidates
+
+    def declared_candidates(self) -> list[str]:
+        """Return names of all declared candidates (no dependency checks).
+        
+        Fix #8: Deprecated. Use declared() instead.
+        """
+        return self.declared()
+
+    def available_candidates(self) -> list[str]:
+        """Return names of candidates that report is_available() == True.
+        
+        Fix #8: Deprecated. Use available() instead.
+        """
+        return self.available()
 
 
 def _make_dense_baseline() -> Any:
@@ -178,14 +246,68 @@ def _make_s3() -> Any:
     return S3_SnapKV_PlusTurboQuantMSEResidual()
 
 
+def _make_rfsn_direct_packed_k8v8() -> Any:
+    """Fix #8: RFSN direct-packed K8/V8 candidate."""
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
+    return RFSNDirectPackedCandidate(key_bits=8, value_bits=8, group_size=64)
+
+
+def _make_rfsn_direct_packed_k8v5() -> Any:
+    """Fix #8: RFSN direct-packed K8/V5 candidate."""
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
+    return RFSNDirectPackedCandidate(key_bits=8, value_bits=5, group_size=64)
+
+
+def _make_rfsn_direct_packed_k8v6() -> Any:
+    """Fix #8: RFSN direct-packed K8/V6 candidate."""
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
+    return RFSNDirectPackedCandidate(key_bits=8, value_bits=6, group_size=64)
+
+
+def _make_rfsn_direct_packed_k16v8() -> Any:
+    """Fix #8: RFSN direct-packed K16/V8 candidate (diagnostic)."""
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
+    return RFSNDirectPackedCandidate(key_bits=16, value_bits=8, group_size=64)
+
+
+def _make_rfsn_direct_packed_k8v16() -> Any:
+    """Fix #8: RFSN direct-packed K8/V16 candidate (diagnostic)."""
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
+    return RFSNDirectPackedCandidate(key_bits=8, value_bits=16, group_size=64)
+
+
+def _make_rfsn_direct_packed_k16v16() -> Any:
+    """Fix #8: RFSN direct-packed K16/V16 candidate (diagnostic)."""
+    from rfsn_v11.candidates.rfsn_direct_packed_adapter import RFSNDirectPackedCandidate
+    return RFSNDirectPackedCandidate(key_bits=16, value_bits=16, group_size=64)
+
+
+def _make_rfsn_v10_k8v5() -> Any:
+    """Fix #8: RFSN v10 K8/V5 dense reconstruction candidate."""
+    from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
+    return RFSNV10Candidate(key_bits=8, value_bits=5, group_size=64)
+
+
+def _make_rfsn_v10_k8v8() -> Any:
+    """Fix #8: RFSN v10 K8/V8 dense reconstruction candidate."""
+    from rfsn_v11.candidates.rfsn_v10_adapter import RFSNV10Candidate
+    return RFSNV10Candidate(key_bits=8, value_bits=8, group_size=64)
+
+
 # ---------------------------------------------------------------------------
 # Default registry instance
 # ---------------------------------------------------------------------------
 
 def build_default_registry() -> CandidateRegistry:
-    """Build and return the standard registry with all known candidates."""
+    """Build and return the standard registry with all known candidates.
+    
+    Fix #8: This is the one authoritative candidate registry.
+    All benchmark code must use this registry, not hardcoded construction.
+    """
     reg = CandidateRegistry()
+    # Baseline
     reg.register("dense_mlx_baseline", _make_dense_baseline)
+    # Phase 3-10 candidates (legacy, kept for historical reference)
     reg.register("A1_wht_grouped_k8v4_gs64", _make_a1)
     reg.register("A1b_wht_asym_k8v4", _make_a1b)
     reg.register("A2_wht_polar_4bit", _make_a2)
@@ -197,6 +319,15 @@ def build_default_registry() -> CandidateRegistry:
     reg.register("S1_snapkv_prune_only", _make_s1)
     reg.register("S2_snapkv_plus_grouped", _make_s2)
     reg.register("S3_snapkv_plus_turboquant_mse_residual128", _make_s3)
+    # Fix #8: RFSN candidates (current active candidates)
+    reg.register("rfsn_direct_packed_k8v8", _make_rfsn_direct_packed_k8v8)
+    reg.register("rfsn_direct_packed_k8v5", _make_rfsn_direct_packed_k8v5)
+    reg.register("rfsn_direct_packed_k8v6", _make_rfsn_direct_packed_k8v6)
+    reg.register("rfsn_direct_packed_k16v8", _make_rfsn_direct_packed_k16v8)
+    reg.register("rfsn_direct_packed_k8v16", _make_rfsn_direct_packed_k8v16)
+    reg.register("rfsn_direct_packed_k16v16", _make_rfsn_direct_packed_k16v16)
+    reg.register("rfsn_v10_k8v5", _make_rfsn_v10_k8v5)
+    reg.register("rfsn_v10_k8v8", _make_rfsn_v10_k8v8)
     return reg
 
 
