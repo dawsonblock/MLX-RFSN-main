@@ -77,8 +77,11 @@ class CandidateResult:
     cache_bytes_read: int | None = None
 
     # Detailed runtime counters (for instrumentation and validation)
+    packed_blocks_created: int = 0
+    packed_blocks_read: int = 0
     packed_attention_calls: int = 0
     dense_fallback_calls: int = 0
+    full_history_materialization_calls: int = 0
     packed_bytes_read: int = 0
     packed_bytes_written: int = 0
     decoded_block_bytes: int = 0
