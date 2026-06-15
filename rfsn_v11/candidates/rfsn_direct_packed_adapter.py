@@ -270,6 +270,10 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 dense_residual_window=self.dense_residual_window,
             )
 
+            # Force strict mode on the adapter directly (bypass config loading)
+            if generator._adapter:
+                generator._adapter.strict = True
+
             # Suppress mlx-lm deprecated-arg print()s from internals
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(io.StringIO()):
