@@ -126,7 +126,7 @@ exclude = ["external*", "turboquant*", "mlx-turboquant*", "vmlx*"]
 [tool.setuptools_scm]
 write_to = "rfsn_v10/_version.py"
 version_scheme = "release-branch-semver"
-fallback_version = "10.2.0a84"  # Synchronized with release.toml package_version
+fallback_version = "10.2.0a84"  # Synchronized with release.toml package_version  # Synchronized with release.toml package_version
 
 [tool.pytest.ini_options]
 addopts = "-q --tb=short"

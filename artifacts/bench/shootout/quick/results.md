@@ -4,8 +4,8 @@
 
 | Candidate | Status | Speed (tps) | Memory (ratio) | Logit gate | Real cache used | Promotion |
 |-----------|--------|-------------|----------------|------------|-----------------|-----------|
-| mlx_lm_baseline | CONTROL | 48.52 | 1.000 | PASS_NO_PROMOTE | yes | no |
-| rfsn_direct_packed_k8v8_gs64 | EXPERIMENTAL | 15.46 | 0.500 | PENDING_LOGIT_GATE | yes | no |
+| dense_mlx_baseline | CONTROL | 123.38 | 1.000 | PASS_NO_PROMOTE | no | no |
+| rfsn_direct_packed_k8v8_gs64 | EXPERIMENTAL | 5.49 | 0.500 | PENDING_LOGIT_GATE | yes | no |
 
 | *Summary* | — | — | — | — | — | **No candidate is promotion eligible.** |
 

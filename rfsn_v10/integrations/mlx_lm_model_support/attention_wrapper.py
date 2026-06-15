@@ -245,6 +245,7 @@ class _PackedAttentionWrapper(nn.Module):
                     query_start_pos=layer_cache.total_token_count() - L,
                     causal=True,
                 )
+                object.__setattr__(self, "_executed_backend", "metal")
             except Exception:
                 # Fallback to reference implementation
                 output, _ = attend(
@@ -255,6 +256,7 @@ class _PackedAttentionWrapper(nn.Module):
                     query_start_pos=layer_cache.total_token_count() - L,
                     causal=True,
                 )
+                object.__setattr__(self, "_executed_backend", "packed_reference")
         else:
             output, _ = attend(
                 queries,
@@ -264,6 +266,7 @@ class _PackedAttentionWrapper(nn.Module):
                 query_start_pos=layer_cache.total_token_count() - L,
                 causal=True,
             )
+            object.__setattr__(self, "_executed_backend", "packed_reference")
 
         # Fix #2: Use typed method instead of string-based increment
         if hasattr(layer_cache, "session") and layer_cache.session is not None:
