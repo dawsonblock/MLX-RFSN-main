@@ -54,7 +54,7 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
         key_bits: int = 8,
         value_bits: int = 8,
         group_size: int = 64,
-        staging_capacity: int = 64,
+        staging_capacity: int = 8,  # Reduced from 64 to force block creation during benchmark
         dense_residual_window: int = 0,  # Set to 0 for initial validation to force compressed execution
     ) -> None:
         self.key_bits = key_bits
@@ -243,13 +243,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 RFSNConfig,
                 RuntimeConfig,
             )
-            from rfsn_v10.cache.session import GenerationCacheSession
-            from rfsn_v10.cache.cartesian_codec import CartesianCodec
-            from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
-                RfsnDirectPackedKVCache,
-                install_packed_attention,
-                packed_attention_context,
-            )
 
             # Fix #1: Pass explicit strict configuration into normal generation
             # Construct one explicit runtime configuration with strict_packed_mode=True
@@ -260,30 +253,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             explicit_config = RFSNConfig(
                 runtime=runtime_config,
             )
-
-            # Create session for direct packed path
-            session = GenerationCacheSession(
-                model_id=getattr(model, "name_or_path", "unknown"),
-                num_layers=len(model.layers),
-                key_codec=CartesianCodec(bits=self.key_bits, group_size=self.group_size),
-                value_codec=CartesianCodec(bits=self.value_bits, group_size=self.group_size),
-                staging_capacity=self.staging_capacity,
-                dense_residual_window=self.dense_residual_window,
-            )
-
-            # Create direct-packed caches
-            caches = [
-                RfsnDirectPackedKVCache(
-                    layer_id=i,
-                    key_codec=CartesianCodec(bits=self.key_bits, group_size=self.group_size),
-                    value_codec=CartesianCodec(bits=self.value_bits, group_size=self.group_size),
-                    staging_capacity=self.staging_capacity,
-                    dense_residual_window=self.dense_residual_window,
-                    strict=True,  # Strict mode for validation
-                    session=session,
-                )
-                for i in range(len(model.layers))
-            ]
 
             # Pass exact key and value bits to generator
             # The candidate's key_bits and value_bits must be used in generation,
@@ -304,11 +273,9 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             # Suppress mlx-lm deprecated-arg print()s from internals
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(io.StringIO()):
-                # Use packed_attention_context to ensure direct-packed path is used
-                with packed_attention_context(model, caches, strict=True):
-                    tokens = list(generator.generate(
-                        prompt, max_new_tokens=max_tokens, temperature=temp,
-                    ))
+                tokens = list(generator.generate(
+                    prompt, max_new_tokens=max_tokens, temperature=temp,
+                ))
             total_ms = (time.perf_counter() - t0) * 1000
             result_text = "".join(tokens)
 
@@ -397,9 +364,6 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                         packed_blocks_read=packed_blocks_read,
                         full_history_materialization_calls=full_history_materialization_calls,
                     )
-
-            # Cleanup session
-            session.destroy()
 
             return CandidateResult(
                 name=self.name,
