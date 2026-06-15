@@ -17,44 +17,49 @@ else
     DISPLAY_NAME="MLX-RFSN Fusion"
 fi
 
-# 1. Compile check
-echo "[1/9] Compile check..."
+# Fix #13: Sync version from release.toml to pyproject.toml and README.md
+echo "[1/10] Syncing version from release.toml..."
+python scripts/sync_version.py
+echo "  Version sync completed."
+
+# 2. Compile check
+echo "[2/10] Compile check..."
 python -m compileall -q rfsn_v10 rfsn_v11 tests benchmarks scripts memory
 
-# 2. Test collection (must not fail — catches import/shadowing bugs)
-echo "[2/9] Test collection..."
+# 3. Test collection (must not fail — catches import/shadowing bugs)
+echo "[3/10] Test collection..."
 PYTHONPATH=. pytest --collect-only -q tests rfsn_v11/tests
 
-# 3. CPU tests (no MLX required)
-echo "[3/9] CPU tests..."
+# 4. CPU tests (no MLX required)
+echo "[4/10] CPU tests..."
 PYTHONPATH=. RFSN_BACKEND=numpy RFSN_TELEMETRY_HMAC_KEY=test-secret \
   pytest -q tests -m "not mlx and not slow and not benchmark and not experimental and not integration and not db"
 
-# 4. rfsn_v11 unit tests (skip MLX-dependent tests on non-MLX platforms)
-echo "[4/9] rfsn_v11 tests..."
+# 5. rfsn_v11 unit tests (skip MLX-dependent tests on non-MLX platforms)
+echo "[5/10] rfsn_v11 tests..."
 PYTHONPATH=. pytest -q rfsn_v11/tests -m "not mlx"
 
-# 5. Benchmark tests
-echo "[5/9] Benchmark tests..."
+# 6. Benchmark tests
+echo "[6/10] Benchmark tests..."
 PYTHONPATH=. pytest -q tests/benchmarks
 
-# 6. Quick shootout smoke (strict — requires model for meaningful validation)
+# 7. Quick shootout smoke (strict — requires model for meaningful validation)
 # Fix #5: Use strict flags and require compressed execution in release gate
-echo "[6/9] Quick shootout smoke..."
+echo "[7/10] Quick shootout smoke..."
 PYTHONPATH=. python benchmarks/kv_shootout.py --quick --strict --require-model --require-compressed-execution
 echo "  Quick shootout completed."
 
 # Fix #12: Archive current artifacts to history before new runs
-echo "[7/9] Archiving current artifacts to history..."
+echo "[8/10] Archiving current artifacts to history..."
 python scripts/archive_artifacts.py
 echo "  Artifact archiving completed."
 
-# 8. Release integrity check
-echo "[8/9] Release integrity check..."
+# 9. Release integrity check
+echo "[9/10] Release integrity check..."
 PYTHONPATH=. python scripts/check_release_integrity.py
 
-# 9. Build check (without contaminating current environment)
-echo "[9/9] Build check..."
+# 10. Build check (without contaminating current environment)
+echo "[10/10] Build check..."
 python -m pip install --upgrade build >/dev/null 2>&1
 python -m build --wheel
 # Verify wheel can be imported without installing
@@ -65,6 +70,14 @@ if [ -n "$latest_wh" ]; then
 else
     echo "  No wheel found in dist/"
     exit 1
+fi
+
+# Fix #14: Reject 0.0.0 wheels in release gate
+if [[ "$latest_wh" == *"0.0.0"* ]]; then
+    echo "  ERROR: Wheel version is 0.0.0, rejecting for release"
+    exit 1
+else
+    echo "  Wheel version check passed"
 fi
 
 echo "=== Release Gate Passed ==="

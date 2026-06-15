@@ -1,14 +1,18 @@
 # MLX-RFSN Fusion Alpha 8.4
 
-## Status: MLX-RFSN Fusion Alpha 8.4 — Validation Integrity Repair
+## Status: MLX-RFSN Fusion Alpha 8.4 — Direct-Packed Correctness Release
 
 **Research alpha.** MLX-RFSN is a KV-cache compression research and benchmarking
 system for Apple Silicon. It is not production-ready, not a general AI server,
 and not a full vector database.
 
 **Official promoted candidate: NONE**  
-**Best practical baseline:** `rfsn_v10_k8_v5_gs64`  
+**Best practical baseline:** `rfsn_direct_packed_k8v8`  
 **Promotion allowed:** false (pending runtime-instrumented cache trace and token-sequence-hash provenance)
+
+**Release ID:** `alpha-8.4` (from release.toml)  
+**Package Version:** `10.2.0a84` (from release.toml)  
+**Artifact Schema:** `3.0` (from release.toml)
 
 To verify the current state locally:
 
