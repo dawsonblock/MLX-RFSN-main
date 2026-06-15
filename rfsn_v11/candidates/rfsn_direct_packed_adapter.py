@@ -103,6 +103,15 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 RuntimeConfig,
             )
 
+            # Fix #1: Pass explicit strict configuration into teacher-forced generation
+            # Construct one explicit runtime configuration with strict_packed_mode=True
+            runtime_config = RuntimeConfig(
+                strict_packed_mode=True,  # Explicit strict mode for direct-packed candidate
+            )
+            explicit_config = RFSNConfig(
+                runtime=runtime_config,
+            )
+
             # Configure K8/V8 quantization
             key_codec = CartesianCodec(bits=self.key_bits, group_size=self.group_size)
             value_codec = CartesianCodec(bits=self.value_bits, group_size=self.group_size)
@@ -185,6 +194,8 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                     n_layers = 0
                 self._last_runtime_counters = session.runtime_counters.to_dict()
                 self._last_runtime_counters["layers_active"] = n_layers
+                self._last_runtime_counters["requested_strict_mode"] = True
+                self._last_runtime_counters["effective_strict_mode"] = True
 
                 # Verify no dense fallback occurred using unified counters
                 if session.runtime_counters.dense_fallback_calls > 0:
@@ -228,14 +239,28 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             import io
 
             from rfsn_v10.runtime.generation import RFSNGenerator
+            from rfsn_v10.config import (
+                RFSNConfig,
+                RuntimeConfig,
+            )
 
-            # P0 #1: Pass exact key and value bits to generator
+            # Fix #1: Pass explicit strict configuration into normal generation
+            # Construct one explicit runtime configuration with strict_packed_mode=True
+            # Do not derive benchmark semantics from environment variables or defaults
+            runtime_config = RuntimeConfig(
+                strict_packed_mode=True,  # Explicit strict mode for direct-packed candidate
+            )
+            explicit_config = RFSNConfig(
+                runtime=runtime_config,
+            )
+
+            # Pass exact key and value bits to generator
             # The candidate's key_bits and value_bits must be used in generation,
             # not the generator's defaults (8, 5)
             generator = RFSNGenerator(
                 model,
                 tokenizer,
-                config=None,  # Don't use RFSNConfig, pass parameters directly
+                config=explicit_config,  # Use explicit config with strict mode
                 enable_quantized_kv=True,
                 packed_reference=True,  # Enable direct packed attention
                 key_bits=self.key_bits,  # Use candidate's key_bits
@@ -267,6 +292,7 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             compression_factor = 16.0 / self.key_bits
 
             # Check runtime counters for fallback and collect instrumentation
+            # Fix #3: Generator now outputs flattened counters, not nested runtime_counters
             packed_attention_calls = 0
             dense_fallback_calls = 0
             packed_bytes_read = 0
@@ -278,6 +304,7 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
 
             if hasattr(generator, "_last_counters"):
                 counters = generator._last_counters
+                # Counters are now flattened at top level, not nested in runtime_counters
                 packed_attention_calls = counters.get("packed_attention_calls", 0)
                 dense_fallback_calls = counters.get("dense_fallback_calls", 0)
                 packed_bytes_read = counters.get("packed_bytes_read", 0)
@@ -287,13 +314,34 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 block_seal_events = counters.get("block_seal_events", 0)
                 execution_backend = counters.get("execution_backend", "unknown")
 
-                if counters.get("dense_fallback_calls", 0) > 0:
+                # Verify strict mode was actually active
+                requested_strict = counters.get("requested_strict_mode", False)
+                effective_strict = counters.get("effective_strict_mode", False)
+                if not (requested_strict and effective_strict):
                     return CandidateResult(
                         name=self.name,
                         model_id=getattr(model, "name_or_path", "unknown"),
                         prompt=prompt,
                         gate_status="ERROR",
-                        error=f"Strict mode violation: {counters['dense_fallback_calls']} dense fallback calls",
+                        error=f"Strict mode mismatch: requested={requested_strict}, effective={effective_strict}",
+                        promotion_eligible=False,
+                        packed_attention_calls=packed_attention_calls,
+                        dense_fallback_calls=dense_fallback_calls,
+                        packed_bytes_read=packed_bytes_read,
+                        packed_bytes_written=packed_bytes_written,
+                        decoded_block_bytes=decoded_block_bytes,
+                        scratch_bytes_peak=scratch_bytes_peak,
+                        block_seal_events=block_seal_events,
+                        execution_backend=execution_backend,
+                    )
+
+                if dense_fallback_calls > 0:
+                    return CandidateResult(
+                        name=self.name,
+                        model_id=getattr(model, "name_or_path", "unknown"),
+                        prompt=prompt,
+                        gate_status="ERROR",
+                        error=f"Strict mode violation: {dense_fallback_calls} dense fallback calls",
                         promotion_eligible=False,
                         packed_attention_calls=packed_attention_calls,
                         dense_fallback_calls=dense_fallback_calls,

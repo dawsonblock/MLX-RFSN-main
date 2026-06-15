@@ -370,15 +370,16 @@ class RFSNGenerator:
                         yield from gen_iter
                     finally:
                         if caches is not None:
+                            # Fix #3: Flatten generator counter output
+                            # The candidate expects flat fields, not nested runtime_counters
+                            runtime_dict = session.runtime_counters.to_dict() if session else {}
                             self._last_counters = {
                                 "direct_packed_tokens": sum(
                                     c.layer_cache.total_token_count() for c in caches
                                 )
                                 // self._adapter.num_layers,
+                                **runtime_dict,  # Flatten runtime counters into top level
                             }
-                            # Capture runtime counters from session
-                            if session:
-                                self._last_counters["runtime_counters"] = session.runtime_counters.to_dict()
                             # Cleanup session
                             if session:
                                 session.destroy()
