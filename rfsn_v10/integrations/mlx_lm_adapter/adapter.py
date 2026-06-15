@@ -77,10 +77,7 @@ class RfsnDenseReconstructionReferenceCache:
         if self._shape_meta is None:
             self._shape_meta = (B, Hkv, D)
 
-        # Proof: tokens received
-        self.session.increment("new_tokens_received", new_T)
-
-        # Append to quantized cache
+        # Append to quantized cache (this will increment new_tokens_received)
         self.layer_cache.append(keys, values)
         self.session.increment("new_tokens_encoded", new_T)
 
