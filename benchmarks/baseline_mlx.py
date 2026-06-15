@@ -46,7 +46,7 @@ import numpy as np
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from benchmarks.schemas import CandidateResult
+from rfsn_v11.candidates.base import CandidateResult
 from rfsn_v11.candidates.json_utils import dumps_json_strict  # noqa: E402
 
 # ---------------------------------------------------------------------------
