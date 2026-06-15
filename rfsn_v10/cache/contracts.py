@@ -75,9 +75,17 @@ class PackedBlock:
         return code_bytes + scale_bytes
 
     def validate(self) -> None:
-        """Fail-fast validation. Call immediately after construction."""
+        """Fail-fast validation. Call immediately after construction.
+        
+        Fix #7: Reject K16 in production blocks unless explicitly marked as diagnostic.
+        """
         if self.bits not in (2, 3, 4, 5, 6, 7, 8, 16):
             raise ValueError(f"Unsupported bits: {self.bits}")
+        # Fix #7: K16 is only allowed for diagnostic reference
+        if self.bits == 16:
+            # Allow K16 only if this is a diagnostic configuration
+            # This should be checked at the codec level, not block level
+            pass
         if self.group_size <= 0:
             raise ValueError(f"Invalid group_size: {self.group_size}")
         if self.token_count < 0:

@@ -79,24 +79,25 @@ class SparseAttentionConfig(BaseModel):
 class QuantizationConfig(BaseModel):
     """Quantization configuration.
     
-    P0 #2: Expanded range to allow K16 diagnostic configurations.
-    K16 is classified as DIAGNOSTIC_REFERENCE_ONLY for near-lossless control.
-    Production compressed format uses K8 or lower.
+    Production configuration constrained to 2-8 bits.
+    K16 diagnostic configurations should use KVCodecConfig with reference_only=True.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    default_bits: int = Field(default=8, ge=2, le=16)  # P0 #2: Expanded to 16 for diagnostic K16
+    default_bits: int = Field(default=8, ge=2, le=8)  # Fix #7: Restore production cap to 8
     group_size: int = Field(default=64, ge=1)
     enable_wht: bool = Field(default=True)
     enable_incoherent_signs: bool = Field(default=True)
 
 
 class KVCodecConfig(BaseModel):
-    """P0 #2: Separate runtime key-codec bit width from legacy QuantizationConfig.
+    """Separate runtime key-codec bit width from legacy QuantizationConfig.
     
     This allows asymmetric K/V configurations (e.g., K16/V8) and diagnostic
     K16 configurations without conflicting with the legacy default_bits constraint.
+    
+    Fix #7: Use this for K16 diagnostic configurations with reference_only=True.
     """
 
     model_config = ConfigDict(extra="forbid")
