@@ -32,6 +32,13 @@ from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
 from rfsn_v10.compat import nn
 
+# Try to import Metal kernel
+try:
+    from rfsn_v10.kernels.metal.packed_attention_metal import attend_metal
+    HAS_METAL_KERNEL = True
+except ImportError:
+    HAS_METAL_KERNEL = False
+
 
 class RfsnDirectPackedKVCache:
     """Cache adapter for the direct packed attention path.
@@ -226,14 +233,37 @@ class _PackedAttentionWrapper(nn.Module):
 
         # Direct packed attention over the full quantized cache
         layer_cache = cache.layer_cache
-        output, _ = attend(
-            queries,
-            layer_cache,
-            scale=self._scale,
-            mask=mask,
-            query_start_pos=layer_cache.total_token_count() - L,
-            causal=True,
-        )
+        
+        # Use Metal kernel when available
+        if HAS_METAL_KERNEL:
+            try:
+                output, _ = attend_metal(
+                    queries,
+                    layer_cache,
+                    scale=self._scale,
+                    mask=mask,
+                    query_start_pos=layer_cache.total_token_count() - L,
+                    causal=True,
+                )
+            except Exception:
+                # Fallback to reference implementation
+                output, _ = attend(
+                    queries,
+                    layer_cache,
+                    scale=self._scale,
+                    mask=mask,
+                    query_start_pos=layer_cache.total_token_count() - L,
+                    causal=True,
+                )
+        else:
+            output, _ = attend(
+                queries,
+                layer_cache,
+                scale=self._scale,
+                mask=mask,
+                query_start_pos=layer_cache.total_token_count() - L,
+                causal=True,
+            )
 
         # Fix #2: Use typed method instead of string-based increment
         if hasattr(layer_cache, "session") and layer_cache.session is not None:
