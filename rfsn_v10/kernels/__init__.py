@@ -93,9 +93,16 @@ def _resolve_backend_name() -> str:
     try:
         import yaml
 
-        cfg_path = os.environ.get(
-            "RFSN_CONFIG", "configs/default_runtime.yaml"
-        )
+        # P3: prefer package-internal config so wheel behavior matches source
+        _default_cfg = "configs/default_runtime.yaml"
+        try:
+            import importlib.resources
+            _pkg_file = importlib.resources.files("rfsn_v10") / "default_runtime.yaml"
+            if _pkg_file.is_file():
+                _default_cfg = str(_pkg_file)
+        except Exception:
+            pass
+        cfg_path = os.environ.get("RFSN_CONFIG", _default_cfg)
         if os.path.exists(cfg_path):
             with open(cfg_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}

@@ -401,6 +401,13 @@ class TestRealModelPromotion:
         )
 
         if not HAS_TRUE_PACKED_KERNEL:
+            import os
+            if os.environ.get("RFSN_ENABLE_TRUE_PACKED", "") == "1":
+                pytest.fail(
+                    "RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False. "
+                    "The Metal self-test failed; this is a hard failure, not a skip.",
+                    pytrace=False,
+                )
             pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
 
         model, tokenizer = model_and_tokenizer
@@ -504,6 +511,13 @@ class TestRealModelPromotion:
         )
 
         if not HAS_TRUE_PACKED_KERNEL:
+            import os
+            if os.environ.get("RFSN_ENABLE_TRUE_PACKED", "") == "1":
+                pytest.fail(
+                    "RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False. "
+                    "The Metal self-test failed; this is a hard failure, not a skip.",
+                    pytrace=False,
+                )
             pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
 
         model, tokenizer = model_and_tokenizer
@@ -585,6 +599,13 @@ class TestRealModelPromotion:
         )
 
         if not HAS_TRUE_PACKED_KERNEL:
+            import os
+            if os.environ.get("RFSN_ENABLE_TRUE_PACKED", "") == "1":
+                pytest.fail(
+                    "RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False. "
+                    "The Metal self-test failed; this is a hard failure, not a skip.",
+                    pytrace=False,
+                )
             pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
 
         model, tokenizer = model_and_tokenizer
@@ -704,6 +725,13 @@ class TestRealModelPromotion:
         )
 
         if not HAS_TRUE_PACKED_KERNEL:
+            import os
+            if os.environ.get("RFSN_ENABLE_TRUE_PACKED", "") == "1":
+                pytest.fail(
+                    "RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False. "
+                    "The Metal self-test failed; this is a hard failure, not a skip.",
+                    pytrace=False,
+                )
             pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
 
         model, tokenizer = model_and_tokenizer
@@ -799,3 +827,191 @@ class TestRealModelPromotion:
         # The artifact itself is the proof; no further assertions needed.
         assert artifact.exists()
         assert artifact.stat().st_size > 0
+
+    def test_per_step_logit_comparison_at_block_boundary(self, model_and_tokenizer):
+        """P3: Compare dense vs packed logits at every generation step.
+
+        Uses a prompt length that crosses a 64-token staging boundary
+        during generation so we verify logits match before, at, and
+        after the seal event.
+        """
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+        from rfsn_v10.kernels.metal.packed_v4_attention import (
+            HAS_TRUE_PACKED_KERNEL,
+        )
+
+        if not HAS_TRUE_PACKED_KERNEL:
+            import os
+            if os.environ.get("RFSN_ENABLE_TRUE_PACKED", "") == "1":
+                pytest.fail(
+                    "RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False. "
+                    "The Metal self-test failed; this is a hard failure, not a skip.",
+                    pytrace=False,
+                )
+            pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
+
+        model, tokenizer = model_and_tokenizer
+        # Choose prompt so prefill is just under a 64-token boundary.
+        # Generation of ~10 tokens will then cross the boundary.
+        sentence = "The quick brown fox jumps over the lazy dog. "
+        prompt = "Summarize: " + sentence * 10  # ~220 tokens → ~55 tokens
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        prompt_len = len(prompt_ids)
+        max_tokens = 16
+
+        # Dense baseline — capture logits
+        dense_logits = []
+        dense_tokens = []
+        for token, logit in generate_step(
+            prompt_ids, model, max_tokens=max_tokens, temp=0.0
+        ):
+            dense_tokens.append(int(token))
+            dense_logits.append(logit)
+
+        # Packed path — capture logits
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=0,
+                strict=True,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        packed_logits = []
+        packed_tokens = []
+        wrap_model_attention(model, caches, strict=True)
+        try:
+            for token, logit in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed_tokens.append(int(token))
+                packed_logits.append(logit)
+        finally:
+            unwrap_model_attention(model)
+
+        # Every step must match in tokens
+        assert packed_tokens == dense_tokens
+
+        # Compute per-step cosine similarity
+        cosines = []
+        for d_logit, p_logit in zip(dense_logits, packed_logits):
+            d_f = d_logit.reshape(-1).astype(mx.float32)
+            p_f = p_logit.reshape(-1).astype(mx.float32)
+            dot = mx.sum(d_f * p_f).item()
+            nd = (mx.sum(d_f * d_f).item()) ** 0.5
+            np_ = (mx.sum(p_f * p_f).item()) ** 0.5
+            cos = dot / (nd * np_) if nd > 0 and np_ > 0 else 0.0
+            cosines.append(cos)
+
+        # Identify block-boundary step: first step where total > 64
+        boundary_step = None
+        for step, _ in enumerate(packed_tokens):
+            total_at_step = prompt_len + step + 1
+            if total_at_step > 64 and boundary_step is None:
+                boundary_step = step
+
+        # All cosines must be >= 0.99
+        for step, cos in enumerate(cosines):
+            assert cos >= 0.99, (
+                f"Step {step} logit cosine {cos} < 0.99 "
+                f"(boundary_step={boundary_step})"
+            )
+
+        # Boundary step, if it exists, must also satisfy the bound
+        if boundary_step is not None:
+            assert cosines[boundary_step] >= 0.99, (
+                f"Block boundary step {boundary_step} cosine too low"
+            )
+
+    def test_residual_window_no_double_count(self, model_and_tokenizer):
+        """P3: dense_residual_window > 0 must not double-count tokens.
+
+        With a residual window of 32, the last 32 tokens are stored
+        densely.  The attention wrapper must merge packed and residual
+        regions without counting any token twice.
+        """
+        import mlx.core as mx
+        from mlx_lm.utils import generate_step
+
+        from rfsn_v10.cache.cartesian_codec import CartesianCodec
+        from rfsn_v10.integrations.mlx_lm_model_support.attention_wrapper import (
+            RfsnDirectPackedKVCache,
+            unwrap_model_attention,
+            wrap_model_attention,
+        )
+        from rfsn_v10.kernels.metal.packed_v4_attention import (
+            HAS_TRUE_PACKED_KERNEL,
+        )
+
+        if not HAS_TRUE_PACKED_KERNEL:
+            import os
+            if os.environ.get("RFSN_ENABLE_TRUE_PACKED", "") == "1":
+                pytest.fail(
+                    "RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False. "
+                    "The Metal self-test failed; this is a hard failure, not a skip.",
+                    pytrace=False,
+                )
+            pytest.skip("RFSN_ENABLE_TRUE_PACKED=1 required for this test")
+
+        model, tokenizer = model_and_tokenizer
+        sentence = "The quick brown fox jumps over the lazy dog. "
+        prompt = "Summarize: " + sentence * 12
+        prompt_ids = mx.array(tokenizer.encode(prompt))
+        prompt_len = len(prompt_ids)
+        max_tokens = 16
+
+        # Dense baseline
+        dense_tokens = []
+        for token, _ in generate_step(
+            prompt_ids, model, max_tokens=max_tokens, temp=0.0
+        ):
+            dense_tokens.append(int(token))
+
+        # Packed path with residual window
+        k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
+        caches = [
+            RfsnDirectPackedKVCache(
+                layer_id=i,
+                key_codec=k_codec,
+                value_codec=v_codec,
+                staging_capacity=64,
+                dense_residual_window=32,
+                strict=True,
+            )
+            for i in range(len(model.layers))
+        ]
+
+        packed_tokens = []
+        wrap_model_attention(model, caches, strict=True)
+        try:
+            for token, _ in generate_step(
+                prompt_ids, model, max_tokens=max_tokens, temp=0.0, prompt_cache=caches
+            ):
+                packed_tokens.append(int(token))
+        finally:
+            unwrap_model_attention(model)
+
+        # Token-exact match proves no double-count
+        assert packed_tokens == dense_tokens, (
+            f"Residual-window divergence: dense={dense_tokens}, packed={packed_tokens}"
+        )
+
+        # Cache audit: total tokens must equal prefill + generated
+        layer0 = caches[0].layer_cache
+        assert layer0.total_token_count() == prompt_len + len(packed_tokens)
+        assert layer0.requantized_token_count == 0

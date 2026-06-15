@@ -253,8 +253,10 @@ class TestDefaultConfigFile:
     """Default config file handling."""
 
     def test_default_config_exists(self):
-        """Default config file should exist."""
-        default_path = "configs/default_runtime.yaml"
-        if os.path.exists(default_path):
-            config = load_config(default_path)
-            assert config is not None
+        """Default config file should exist in repo root or package."""
+        for default_path in ("configs/default_runtime.yaml", "rfsn_v10/default_runtime.yaml"):
+            if os.path.exists(default_path):
+                config = load_config(default_path)
+                assert config is not None
+                return
+        pytest.fail("default_runtime.yaml not found in configs/ or rfsn_v10/")

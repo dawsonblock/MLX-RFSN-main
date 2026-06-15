@@ -30,10 +30,21 @@ from rfsn_v10.kernels.metal.packed_v4_attention import (
     packed_v4_attention,
 )
 
+# P2: Hard-fail guard — if RFSN_ENABLE_TRUE_PACKED=1 is explicitly set,
+# the kernel must be available.  Skipping would make CI green on a
+# production kernel failure.
+_env_enable = __import__("os").environ.get("RFSN_ENABLE_TRUE_PACKED", "")
+if _env_enable == "1" and not HAS_TRUE_PACKED_KERNEL:
+    pytest.fail(
+        "RFSN_ENABLE_TRUE_PACKED=1 is set but HAS_TRUE_PACKED_KERNEL is False. "
+        "The Metal self-test failed; this is a hard failure, not a skip.",
+        pytrace=False,
+    )
+
 pytestmark = [
     pytest.mark.skipif(not HAS_MLX, reason="MLX not installed"),
     pytest.mark.skipif(
-        not HAS_TRUE_PACKED_KERNEL,
+        not HAS_TRUE_PACKED_KERNEL and _env_enable != "1",
         reason="RFSN_ENABLE_TRUE_PACKED=1 not set or self-test failed",
     ),
 ]
@@ -146,8 +157,10 @@ class TestPackedV4AgainstReference:
 
         abs_diff, rel_diff = self._diff(out, ref_out)
         assert rel_diff < 1e-3, f"single block mismatch: rel={rel_diff}, abs={abs_diff}"
-        assert contract.materialized_bytes == 0
-        assert contract.decoded_tokens == 0
+        assert contract.dense_kv_materialized_bytes == 0
+        assert contract.decoded_dense_tokens == 0
+        assert contract.packed_blocks_read == 1
+        assert contract.packed_bytes_read > 0
         assert contract.backend == "true_packed_metal_v4_k8"
 
     def test_multiple_blocks_exact(self):

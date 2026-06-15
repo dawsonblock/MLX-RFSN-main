@@ -114,7 +114,6 @@ def _self_test() -> bool:
                 ("SEED_VAL_V", 0),
                 ("CAUSAL", 1),
                 ("Q_PER_KV", 1),
-                ("QUERY_START", 2),
             ],
             grid=(1, 1, 1),
             threadgroup=(1, 1, 1),
@@ -151,6 +150,9 @@ class ExecutionContract:
     scratch_bytes: int = 0
     output_bytes: int = 0
     decoded_dense_tokens: int = 0
+    # P1: packed I/O counters for promotion governance
+    packed_blocks_read: int = 0
+    packed_bytes_read: int = 0
     # Legacy aliases for backward compatibility
     materialized_bytes: int = 0
     decoded_tokens: int = 0
@@ -191,7 +193,8 @@ if (q_head >= NUM_Q_HEADS || q_token >= NUM_Q_TOKENS) return;
 
 // GQA mapping
 uint kv_head = q_head / Q_PER_KV;
-uint query_global_pos = QUERY_START + q_token;
+// P4: read query_start from runtime buffer instead of compile-time constant
+uint query_global_pos = uint(query_start_arr[0]) + q_token;
 
 // Pre-transformed query offset: [NUM_Q_HEADS, NUM_Q_TOKENS, HEAD_DIM]
 uint q_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
@@ -758,7 +761,6 @@ class PackedV4AttentionKernel:
                 ("SEED_VAL_V", int(seed_v)),
                 ("CAUSAL", int(1 if causal else 0)),
                 ("Q_PER_KV", int(q_per_kv)),
-                ("QUERY_START", int(query_start_pos)),
             ],
             grid=(Hq, Lq, 1),
             threadgroup=(8, 8, 1),
@@ -822,6 +824,8 @@ class PackedV4AttentionKernel:
             scratch_bytes=scratch_bytes,
             output_bytes=output_bytes,
             decoded_dense_tokens=decoded_dense_tokens,
+            packed_blocks_read=num_blocks,
+            packed_bytes_read=packed_history_copy_bytes,
             materialized_bytes=0,
             decoded_tokens=0,
             execution_ms=execution_ms,

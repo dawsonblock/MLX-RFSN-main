@@ -516,10 +516,13 @@ class _PackedAttentionWrapper(nn.Module):
                     _sess = getattr(layer_cache, "session", None)
                     if _sess is not None:
                         _sess.runtime_counters.record_packed_attention()
-                        # Record per-block reads and bytes from contract
+                        # P1: Record per-block reads and bytes from contract
                         if contract is not None:
                             _sess.runtime_counters.record_block_read(
-                                contract.num_key_blocks
+                                contract.packed_blocks_read
+                            )
+                            _sess.runtime_counters.record_packed_read(
+                                contract.packed_bytes_read
                             )
             except Exception as exc:
                 _sess = getattr(layer_cache, "session", None)
@@ -636,6 +639,8 @@ class _PackedAttentionWrapper(nn.Module):
                 "scratch_bytes": contract.scratch_bytes,
                 "output_bytes": contract.output_bytes,
                 "decoded_dense_tokens": contract.decoded_dense_tokens,
+                "packed_blocks_read": contract.packed_blocks_read,
+                "packed_bytes_read": contract.packed_bytes_read,
                 "materialized_bytes": contract.materialized_bytes,
                 "decoded_tokens": contract.decoded_tokens,
                 "execution_ms": contract.execution_ms,

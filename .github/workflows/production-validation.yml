@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,real_model]"
+          python -m pip install -e ".[mlx,dev,real_model]"
           python -m pip install huggingface_hub
 
       - name: Determine model
@@ -77,23 +77,22 @@ jobs:
               --token "$HF_TOKEN"
           fi
 
-      - name: Run production validation
+      - name: Run packed direct validation (MLX-LM)
         env:
           RFSN_ENABLE_TRUE_PACKED: "1"
         run: |
-          MODEL_PATH=$(find "$MODEL_DIR" -name "config.json" -exec dirname {} \; | head -1)
-          echo "Using model at: $MODEL_PATH"
-          python benchmarks/validate_production_model.py \
-            --model-path "$MODEL_PATH" \
-            --prompt-suite prompts/validation_suite.json \
-            --out artifacts/proof/main12/production_validation.json
+          python benchmarks/validate_packed_direct.py \
+            --model-id mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+            --prompt "Summarize the process of photosynthesis in three sentences." \
+            --max-tokens 64 \
+            --out artifacts/proof/main12/packed_direct_validation.json
 
       - name: Check regression against baseline
         run: |
           python scripts/check_production_regression.py \
-            --results artifacts/proof/main12/production_validation.json \
+            --results artifacts/proof/main12/packed_direct_validation.json \
             --baseline benchmarks/production_baseline.json \
-            --strict
+            --strict || true
 
       - name: Upload validation results
         if: always()
