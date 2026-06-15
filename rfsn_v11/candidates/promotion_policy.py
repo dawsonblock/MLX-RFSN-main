@@ -158,20 +158,24 @@ class PromotionPolicy:
     def _check_token_provenance(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that token sequence has strict provenance.
         
-        Fix #9: Now checks provenance from candidate bundle."""
+        Fix #10: Treat missing required fields as failures."""
         provenance = candidate_bundle.get("provenance", {})
 
-        # Must have non-empty token sequence hash
+        # Must have non-empty token sequence hash (field must exist)
+        if "token_sequence_hash" not in provenance:
+            return False
         token_hash = provenance.get("token_sequence_hash", "")
         if not token_hash:
             return False
 
         # Must reference source artifact (not inherited)
+        if "token_sequence_provenance" not in provenance:
+            return False
         token_provenance = provenance.get("token_sequence_provenance")
         if not token_provenance:
             return False
 
-        # Must have artifact reference with SHA256
+        # Must have artifact reference with SHA256 (fields must exist)
         if "token_sequence_artifact" not in token_provenance:
             return False
         if "token_sequence_artifact_sha256" not in token_provenance:
@@ -182,19 +186,28 @@ class PromotionPolicy:
     def _check_runtime_trace_validation(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that runtime traces are validated.
         
-        Fix #9: Now checks runtime evidence from candidate bundle."""
+        Fix #10: Treat missing required fields as failures."""
         runtime_evidence = candidate_bundle.get("runtime_evidence", [])
 
+        if not runtime_evidence:
+            return False
+
         for evidence in runtime_evidence:
-            # Must have runtime counters
+            # Must have runtime counters (field must exist)
+            if "packed_attention_calls" not in evidence:
+                return False
             if not evidence.get("packed_attention_calls"):
                 return False
 
-            # Must have zero dense fallback in strict mode
+            # Must have zero dense fallback in strict mode (field must exist)
+            if "dense_fallback_calls" not in evidence:
+                return False
             if evidence.get("dense_fallback_calls", 0) > 0:
                 return False
 
-            # Must have execution backend recorded
+            # Must have execution backend recorded (field must exist)
+            if "execution_backend" not in evidence:
+                return False
             if not evidence.get("execution_backend"):
                 return False
 
@@ -203,11 +216,16 @@ class PromotionPolicy:
     def _check_real_cache_injection(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that real cache injection occurred.
         
-        Fix #9: Now checks runtime evidence from candidate bundle."""
+        Fix #10: Treat missing required fields as failures."""
         runtime_evidence = candidate_bundle.get("runtime_evidence", [])
 
+        if not runtime_evidence:
+            return False
+
         for evidence in runtime_evidence:
-            # Must have cache backend used
+            # Must have cache backend used (field must exist)
+            if "execution_backend" not in evidence:
+                return False
             if not evidence.get("execution_backend"):
                 return False
 
@@ -215,7 +233,9 @@ class PromotionPolicy:
             if "offline" in evidence.get("execution_backend", "").lower():
                 return False
 
-            # Must have non-zero cache bytes
+            # Must have non-zero cache bytes (field must exist)
+            if "packed_bytes_written" not in evidence:
+                return False
             if evidence.get("packed_bytes_written", 0) == 0:
                 return False
 
@@ -224,15 +244,23 @@ class PromotionPolicy:
     def _check_actual_memory_measurements(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that actual memory measurements are used.
         
-        Fix #9: Now checks memory evidence from candidate bundle."""
+        Fix #10: Treat missing required fields as failures."""
         memory_evidence = candidate_bundle.get("memory_evidence", [])
 
+        if not memory_evidence:
+            return False
+
         for evidence in memory_evidence:
-            # Must have actual KV memory
+            # Must have actual KV memory (field must exist)
+            if "actual_kv_memory_mb" not in evidence:
+                return False
             if not evidence.get("actual_kv_memory_mb"):
                 return False
 
             # Must not be estimated (check for measurement_kind field)
+            # If measurement_kind is missing, treat as failure
+            if "measurement_kind" not in evidence:
+                return False
             if evidence.get("measurement_kind") == "ESTIMATED":
                 return False
 
@@ -241,16 +269,23 @@ class PromotionPolicy:
     def _check_zero_benchmark_errors(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that benchmark completed without errors.
         
-        Fix #9: Now checks candidate results from bundle."""
+        Fix #10: Treat missing required fields as failures."""
         candidate = candidate_bundle.get("candidate", {})
         results = candidate.get("results", [])
 
+        if not results:
+            return False
+
         for result in results:
-            # Must not have ERROR status
+            # Must not have ERROR status (field must exist)
+            if "gate_status" not in result:
+                return False
             if result.get("gate_status") == "ERROR":
                 return False
 
-            # Must not have error field populated
+            # Must not have error field populated (field must exist)
+            if "error" not in result:
+                return False
             if result.get("error"):
                 return False
 
@@ -259,20 +294,27 @@ class PromotionPolicy:
     def _check_candidate_eligibility(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that candidate status is eligible for promotion.
         
-        Fix #9: Now checks candidate results from bundle."""
+        Fix #10: Treat missing required fields as failures."""
         candidate = candidate_bundle.get("candidate", {})
         results = candidate.get("results", [])
 
+        if not results:
+            return False
+
         for result in results:
-            # Must have promotion_eligible=True
+            # Must have promotion_eligible=True (field must exist)
+            if "promotion_eligible" not in result:
+                return False
             if not result.get("promotion_eligible"):
                 return False
 
-            # Must not be REFERENCE_ONLY
+            # Must not be REFERENCE_ONLY (field must exist)
+            if "candidate_status" not in result:
+                return False
             if result.get("candidate_status") == "REFERENCE_ONLY":
                 return False
 
-            # Must not be CONTROL
+            # Must not be CONTROL (field must exist)
             if result.get("candidate_status") == "CONTROL":
                 return False
 
@@ -290,15 +332,19 @@ class PromotionPolicy:
     def _check_clean_source_tree(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that source tree was clean when artifacts were generated.
         
-        Fix #9: Now checks provenance from candidate bundle."""
+        Fix #10: Treat missing required fields as failures."""
         provenance = candidate_bundle.get("provenance", {})
 
-        # Must have git state
-        git_state = provenance.get("git", {})
+        # Must have git state (field must exist)
+        if "git" not in provenance:
+            return False
+        git_state = provenance.get("git")
         if not git_state:
             return False
 
-        # Must not be dirty
+        # Must not be dirty (field must exist)
+        if "dirty" not in git_state:
+            return False
         if git_state.get("dirty", False):
             return False
 
@@ -307,10 +353,12 @@ class PromotionPolicy:
     def _check_release_id_match(self, candidate_bundle: dict[str, Any]) -> bool:
         """Check that source and artifact release IDs match.
         
-        Fix #9: Now checks provenance from candidate bundle."""
+        Fix #10: Treat missing required fields as failures."""
         provenance = candidate_bundle.get("provenance", {})
 
-        # Must have release_id in metadata
+        # Must have release_id in metadata (field must exist)
+        if "release_id" not in provenance:
+            return False
         artifact_release_id = provenance.get("release_id")
         if not artifact_release_id:
             return False
