@@ -291,14 +291,15 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
             gen_tokens = max(len(tokens), 1)
             tps = gen_tokens / (total_ms / 1000)
 
-            # P0 #8: Remove actual_ label from estimated memory
-            # This is an analytical estimate, not a runtime measurement
+            # P0 #8: Use actual measured memory from generator when available
+            actual_kv_memory_mb = None
             estimated_kv_memory_mb = estimate_kv_memory_mb(
                 model, tokenizer, prompt, gen_tokens,
                 bits=self.key_bits,  # Use key_bits for estimate
             )
             size_ratio = self.key_bits / 16.0
             compression_factor = 16.0 / self.key_bits
+            measurement_kind = "ESTIMATED"
 
             # Check runtime counters for fallback and collect instrumentation
             # Fix #3: Generator now outputs flattened counters, not nested runtime_counters
@@ -340,6 +341,14 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 packed_blocks_read = counters.get("packed_blocks_read", packed_blocks_read)
                 full_history_materialization_calls = counters.get("full_history_materialization_calls", full_history_materialization_calls)
 
+                # P0 #8: Try to get actual measured memory from generator
+                if hasattr(generator, "_last_memory_report") and generator._last_memory_report:
+                    mem_report = generator._last_memory_report
+                    payload_bytes = mem_report.get("payload_bytes", 0)
+                    if payload_bytes > 0:
+                        actual_kv_memory_mb = payload_bytes / (1024 * 1024)
+                        measurement_kind = "MEASURED"
+
                 if dense_fallback_calls > 0:
                     return CandidateResult(
                         name=self.name,
@@ -360,6 +369,14 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                         full_history_materialization_calls=full_history_materialization_calls,
                     )
 
+            # P0 #8: Use actual measured memory when available, otherwise estimate
+            kv_memory_mb = actual_kv_memory_mb if actual_kv_memory_mb is not None else estimated_kv_memory_mb
+            memory_note = (
+                "[memory measured from cache tensors]"
+                if measurement_kind == "MEASURED"
+                else "[memory is estimated, not runtime-measured]"
+            )
+
             return CandidateResult(
                 name=self.name,
                 model_id=getattr(model, "name_or_path", "unknown"),
@@ -368,14 +385,15 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 tokens_per_sec=tps,
                 generated_tokens=gen_tokens,
                 generated_text=result_text,
-                actual_kv_memory_mb=estimated_kv_memory_mb,  # P0 #8: Keep field name for compatibility, but value is estimated
-                measurement_kind="ESTIMATED",  # P0 #8: Mark as estimated
+                actual_kv_memory_mb=kv_memory_mb,
+                estimated_kv_memory_mb=estimated_kv_memory_mb,
+                measurement_kind=measurement_kind,
                 size_ratio=size_ratio,
                 compression_factor=compression_factor,
                 gate_status=GATE_STATUS_PENDING_LOGIT_GATE,
                 promotion_eligible=False,
                 cache_backend_used="rfsn_v10_direct_packed",
-                notes="Direct packed attention with K8/V8 quantization (strict mode) [memory is estimated, not runtime-measured]",
+                notes=f"Direct packed attention with K8/V8 quantization (strict mode) {memory_note}",
                 packed_attention_calls=packed_attention_calls,
                 dense_fallback_calls=dense_fallback_calls,
                 packed_bytes_read=packed_bytes_read,
