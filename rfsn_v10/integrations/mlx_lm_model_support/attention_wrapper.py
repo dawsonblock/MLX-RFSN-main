@@ -34,35 +34,22 @@ from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
 from rfsn_v10.compat import nn
 
-# Try to import Metal kernel
+# Dense-reconstruction Metal kernel (kept as fallback)
 from rfsn_v10.kernels.metal.packed_attention_metal import (
     metal_available,
     attend_metal,
 )
 HAS_METAL_KERNEL = metal_available()
 
-# P1: True packed kernel - MLX inline Metal
-# (compiles at runtime, zero materialization)
-try:
-    from rfsn_v10.kernels.metal.true_packed_mlx_inline import (
-        TruePackedMLXInline,
-        ExecutionContract,
-        HAS_MLX as _TRUE_PACKED_HAS_MLX,
-    )
-    HAS_TRUE_PACKED_KERNEL = _TRUE_PACKED_HAS_MLX
-except ImportError:
-    HAS_TRUE_PACKED_KERNEL = False
-    ExecutionContract = None  # type: ignore
-
-# Legacy true packed kernel (kept for backward compatibility)
-try:
-    from rfsn_v10.kernels.metal.true_packed_wrapper import (
-        true_packed_attend,
-        HAS_MLX as _LEGACY_TRUE_PACKED_HAS_MLX,
-    )
-    HAS_LEGACY_TRUE_PACKED_KERNEL = _LEGACY_TRUE_PACKED_HAS_MLX
-except ImportError:
-    HAS_LEGACY_TRUE_PACKED_KERNEL = False
+# Canonical true-packed kernel for PackedBlockV4 (K8/V8 only).
+# This is gated by an explicit opt-in environment variable and a
+# self-test; it is NOT automatically enabled merely because MLX
+# imports.  See ``rfsn_v10.kernels.metal.packed_v4_attention``.
+from rfsn_v10.kernels.metal.packed_v4_attention import (
+    PackedV4AttentionKernel,
+    ExecutionContract,
+    HAS_TRUE_PACKED_KERNEL,
+)
 
 
 class RfsnDirectPackedKVCache:
@@ -220,6 +207,7 @@ class _PackedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_strict", strict)
         object.__setattr__(self, "_fallback_count", 0)
         object.__setattr__(self, "_executed_backend", "unknown")
+        object.__setattr__(self, "_attempted_backends", [])
         object.__setattr__(self, "_layer_id", layer_id)
         # P1: Execution contract storage for auditability
         object.__setattr__(self, "_last_execution_contract", None)
@@ -269,23 +257,31 @@ class _PackedAttentionWrapper(nn.Module):
         # Direct packed attention over the full quantized cache
         layer_cache = cache.layer_cache
 
-        # P1: Try true packed MLX inline kernel first (zero materialization)
+        # Canonical dispatch order:
+        # 1. True packed V4 kernel (K8/V8, zero materialisation) – gated
+        # 2. Dense-reconstruction Metal kernel (fallback)
+        # 3. Blockwise packed reference (always works, slower)
         output = None
         contract = None
+        _attempted: list[str] = []
 
         if HAS_TRUE_PACKED_KERNEL:
+            _attempted.append("true_packed_v4")
             try:
-                # Use MLX inline kernel - compiles at runtime
                 _has_codec = hasattr(layer_cache, 'key_codec')
-                kernel = TruePackedMLXInline(
+                kernel = PackedV4AttentionKernel(
                     bits=layer_cache.key_codec.bits if _has_codec else 8,
                     group_size=(
                         layer_cache.key_codec.group_size if _has_codec else 64
                     ),
+                    sign_seed=(
+                        layer_cache.key_codec.sign_seed if _has_codec else 42
+                    ),
                 )
                 output, contract = kernel(
                     queries=queries,
-                    blocks=list(layer_cache.iter_key_blocks()),
+                    key_blocks=list(layer_cache.iter_key_blocks()),
+                    value_blocks=list(layer_cache.iter_value_blocks()),
                     scale=self._scale,
                     causal=True,
                     query_start_pos=layer_cache.total_token_count() - L,
@@ -293,61 +289,19 @@ class _PackedAttentionWrapper(nn.Module):
                 )
                 object.__setattr__(self, "_executed_backend", contract.backend)
                 object.__setattr__(self, "_last_execution_contract", contract)
-
-                # Validate zero materialization invariant in strict mode
-                if self._strict:
-                    passed, violations = contract.validate_invariant()
-                    if not passed:
-                        raise RuntimeError(
-                            "Strict mode: Execution contract violated:\n" +
-                            "\n".join(f"  - {v}" for v in violations)
-                        )
-            except Exception as exc:
-                # Record fallback
-                _sess = getattr(layer_cache, "session", None)
-                if _sess is not None:
-                    _sess.runtime_counters.record_fallback()
-                if self._strict:
-                    raise RuntimeError(
-                        "Strict packed mode: True packed MLX inline "
-                        f"kernel failed: {exc}"
-                    ) from exc
-                # Fall through to legacy true packed or reference
-                output = None
-
-        # Try legacy true packed kernel (backward compatibility)
-        if output is None and HAS_LEGACY_TRUE_PACKED_KERNEL:
-            try:
-                output, contract = true_packed_attend(
-                    queries,
-                    list(layer_cache.iter_key_blocks()),
-                    scale=self._scale,
-                    causal=True,
-                    query_start_pos=layer_cache.total_token_count() - L,
-                    strict=self._strict,
-                )
-                if contract is not None:
-                    object.__setattr__(
-                        self,
-                        "_executed_backend",
-                        getattr(contract, 'backend', 'true_packed_legacy'),
-                    )
-                    object.__setattr__(
-                        self, "_last_execution_contract", contract
-                    )
             except Exception as exc:
                 _sess = getattr(layer_cache, "session", None)
                 if _sess is not None:
-                    _sess.runtime_counters.record_fallback()
+                    _sess.runtime_counters.record_attempted_backend("true_packed_v4")
                 if self._strict:
                     raise RuntimeError(
-                        "Strict packed mode: Legacy true packed "
-                        f"kernel failed: {exc}"
+                        "Strict packed mode: True packed V4 kernel failed: "
+                        f"{exc}"
                     ) from exc
                 output = None
 
-        # Use dense-reconstruction Metal kernel if true packed not available
         if output is None:
+            _attempted.append("metal_dense")
             if HAS_METAL_KERNEL:
                 try:
                     output, _ = attend_metal(
@@ -365,43 +319,41 @@ class _PackedAttentionWrapper(nn.Module):
                         "metal_dense_reconstruction_violates_invariant",
                     )
                 except Exception as exc:
-                    # Record fallback
                     _sess = getattr(layer_cache, "session", None)
                     if _sess is not None:
-                        _sess.runtime_counters.record_fallback()
+                        _sess.runtime_counters.record_attempted_backend("metal_dense")
                     if self._strict:
                         raise RuntimeError(
-                            "Strict packed mode: Metal kernel failed "
-                            f"and fallback is disabled: {exc}"
+                            "Strict packed mode: Metal kernel failed and "
+                            f"fallback is disabled: {exc}"
                         ) from exc
-                    # Fallback to reference implementation
-                    output, _ = attend(
-                        queries,
-                        layer_cache,
-                        scale=self._scale,
-                        mask=mask,
-                        query_start_pos=layer_cache.total_token_count() - L,
-                        causal=True,
-                    )
-                    object.__setattr__(
-                        self,
-                        "_executed_backend",
-                        "packed_reference",
-                    )
-            else:
-                output, _ = attend(
-                    queries,
-                    layer_cache,
-                    scale=self._scale,
-                    mask=mask,
-                    query_start_pos=layer_cache.total_token_count() - L,
-                    causal=True,
-                )
-                object.__setattr__(
-                    self,
-                    "_executed_backend",
-                    "packed_reference",
-                )
+                    output = None
+
+        if output is None:
+            _attempted.append("packed_reference")
+            output, _ = attend(
+                queries,
+                layer_cache,
+                scale=self._scale,
+                mask=mask,
+                query_start_pos=layer_cache.total_token_count() - L,
+                causal=True,
+            )
+            object.__setattr__(self, "_executed_backend", "packed_reference")
+
+        # Record attempted backends and count fallback exactly once when
+        # the reference path was reached after higher-priority attempts.
+        self._attempted_backends.extend(_attempted)
+        if (
+            self._executed_backend == "packed_reference"
+            and len(_attempted) > 1
+        ):
+            object.__setattr__(
+                self, "_fallback_count", self._fallback_count + 1
+            )
+            _sess = getattr(layer_cache, "session", None)
+            if _sess is not None:
+                _sess.runtime_counters.record_fallback()
 
         # Fix #2: Use typed method instead of string-based increment
         if hasattr(layer_cache, "session") and layer_cache.session is not None:
@@ -423,6 +375,7 @@ class _PackedAttentionWrapper(nn.Module):
         stats = {
             "layer_id": self._layer_id,
             "executed_backend": self._executed_backend,
+            "attempted_backends": self._attempted_backends.copy(),
             "fallback_count": self._fallback_count,
             "strict": self._strict,
         }

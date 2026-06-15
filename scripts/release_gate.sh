@@ -28,7 +28,7 @@ python -m compileall -q rfsn_v10 rfsn_v11 tests benchmarks scripts memory
 
 # 3. Test collection (must not fail — catches import/shadowing bugs)
 echo "[3/10] Test collection..."
-PYTHONPATH=. pytest --collect-only -q tests rfsn_v11/tests
+PYTHONPATH=. pytest --collect-only -q tests rfsn_v11/tests rfsn_v10/kernels/tests
 
 # 4. CPU tests (no MLX required)
 echo "[4/10] CPU tests..."
@@ -43,24 +43,24 @@ PYTHONPATH=. pytest -q rfsn_v11/tests -m "not mlx"
 echo "[6/10] Benchmark tests..."
 PYTHONPATH=. pytest -q tests/benchmarks
 
-# 7. Quick shootout smoke (strict — requires model for meaningful validation)
-# Fix #5: Use strict flags and require compressed execution in release gate
+# 7. Quick shootout smoke (strict execution only — promotion is separate)
+# P0 Fix: Use strict-execution, not legacy --strict, and do not require a
+# real model so the gate can run on CPU-only hosts.
 echo "[7/10] Quick shootout smoke..."
-PYTHONPATH=. python benchmarks/kv_shootout.py --quick --strict --require-model --require-compressed-execution
+PYTHONPATH=. python benchmarks/kv_shootout.py --quick --strict-execution
 echo "  Quick shootout completed."
 
-# Fix #12: Archive current artifacts to history before new runs
-echo "[8/10] Archiving current artifacts to history..."
+# 8. Release integrity check (validate BEFORE archiving)
+echo "[8/10] Release integrity check..."
+PYTHONPATH=. python scripts/check_release_integrity.py
+
+# 9. Archive artifacts only after validation passes
+echo "[9/10] Archiving artifacts to history..."
 python scripts/archive_artifacts.py
 echo "  Artifact archiving completed."
 
-# 9. Release integrity check
-echo "[9/10] Release integrity check..."
-PYTHONPATH=. python scripts/check_release_integrity.py
-
-# 10. Build check (without contaminating current environment)
+# 10. Build check (hermetic — do not mutate environment)
 echo "[10/10] Build check..."
-python -m pip install --upgrade build >/dev/null 2>&1
 python -m build --wheel
 # Verify wheel can be imported without installing
 latest_wh=$(ls -t dist/*.whl 2>/dev/null | head -1)

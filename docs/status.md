@@ -31,8 +31,9 @@
 - [x] Direct-packed K8/V8 canonical BS64 configuration (smoke BS8 separated).
 - [x] Full-history materialization honestly recorded in Metal path.
 - [x] Strict Metal failures raise instead of silently falling back.
-- [x] **True packed kernel scaffold created**: `true_packed_attention.metal` and `true_packed_wrapper.py` provide the framework for zero-reconstruction GPU attention (not yet functional, falls back to reference).
-- [x] **Differential testing framework**: `test_true_packed_kernel.py` establishes testing levels for kernel validation.
+- [x] **True packed kernel implemented (K8/V8)**: ``PackedV4AttentionKernel`` in ``packed_v4_attention.py`` compiles via MLX inline Metal, reads real ``PackedBlockV4`` uint32 BHTW codes and BHTG scales, applies hash signs and WHT domain dot products, and passes differential tests against the blockwise reference. Gated by ``RFSN_ENABLE_TRUE_PACKED=1``.
+- [x] **Old prototypes quarantined**: ``TruePackedMLXInline`` and ``TruePackedAttentionMetalV2`` (mock-format prototypes) removed from production dispatch; they remain in source for reference but are no longer auto-selected.
+- [x] **Differential testing framework**: ``test_packed_v4_attention.py`` proves exact numerical match for single block, multiple blocks, GQA, causal/non-causal, and contract validation.
 - [x] **Execution contract recording**: `ExecutionContract` dataclass provides auditability with invariant validation.
 - [x] Capability-based full-logit dispatch (no hardcoded name lists).
 - [x] Runtime byte counters use actual `array.itemsize` instead of hardcoded 4.
@@ -74,7 +75,7 @@ Problem: if token N differs between baseline and candidate, all subsequent logit
 
 | Component | Status | Limitation |
 |-----------|--------|------------|
-| **Metal Kernel** | P1 Scaffold | True packed Metal kernel exists as scaffold only; actual GPU dispatch not yet functional. Falls back to CPU reference. |
+| **Metal Kernel** | P1 Implemented (K8/V8) | ``PackedV4AttentionKernel`` reads real ``PackedBlockV4`` blocks, decodes on-the-fly in WHT domain, and passes differential tests against the blockwise reference. Gated by ``RFSN_ENABLE_TRUE_PACKED=1``; not yet the default dispatch path. |
 | **Dense Reconstruction** | Violates Invariant | `metal_dense_reconstruction_violates_invariant` path explicitly flagged; reconstructs full dense KV history before attention. |
 | **Logit Capture** | Methodology Issue | Teacher-forced logit comparison is the correct methodology, but cascade divergence from independent greedy decodes remains a problem. |
 | **Promotion** | No Candidates | No candidates are currently promotion-eligible due to incomplete proof bundles and unproven quality gates. |
@@ -86,8 +87,8 @@ Problem: if token N differs between baseline and candidate, all subsequent logit
 See [roadmap_alpha9.md](roadmap_alpha9.md) for the detailed path forward.
 
 Phase A (critical): Fix the logit gate methodology → teacher-forced comparison.
-Phase B (high): Complete true packed Metal kernel implementation (vectorized QK, full decode, online softmax).
-Phase C (high): Candidate hardening once measurement is honest.
-Phase D (medium): Benchmark expansion (larger models, longer contexts).
+Phase B (high): Integrate ``PackedV4AttentionKernel`` as default dispatch path (remove opt-in gate after broader Apple-Silicon validation).
+Phase C (high): Extend kernel to V5 and sub-byte formats (2–7 bit) once K8 is fully hardened.
+Phase D (medium): Candidate hardening once measurement is honest; benchmark expansion (larger models, longer contexts).
 Phase E (low/deferred): CUDA backend, server hardening.
 Phase F (research): Sparse decode, QJL, adaptive controller — indefinite deferral.

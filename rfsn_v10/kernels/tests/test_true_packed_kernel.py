@@ -34,21 +34,16 @@ pytestmark = [
 class TestCartesianDecode:
     """Test Cartesian codec decode functions."""
 
+    @pytest.mark.skip(reason="_dequantize_uniform was removed; use PackedBlockV4 + CartesianCodec.decode_bhtd instead")
     def test_uniform_dequantize_8bit(self):
-        """Test 8-bit uniform dequantization."""
-        # P1: This will test the Metal decode function when available
-        # For now, verify Python reference implementation
-        from rfsn_v10.cache.cartesian_codec import _dequantize_uniform
+        """Test 8-bit uniform dequantization.
 
-        # Test 8-bit dequantization round-trip
-        original = np.array([0.5, -0.5, 1.0, -1.0, 0.0], dtype=np.float32)
-        quantized = _dequantize_uniform(
-            np.array([191, 64, 255, 0, 127], dtype=np.uint8),
-            8, 1.0, 0.0
-        )
-
-        # Check approximate reconstruction
-        np.testing.assert_allclose(quantized, original, rtol=0.1, atol=0.1)
+        DEPRECATED: This test referenced a helper that no longer exists.
+        The canonical decode path is ``CartesianCodec.decode_bhtd()`` on
+        a real ``PackedBlockV4`` block.  See ``test_packed_v4_attention.py``
+        for end-to-end differential tests against the blockwise reference.
+        """
+        pytest.skip("obsolete helper removed in P0 cleanup")
 
 
 class TestVectorOperations:

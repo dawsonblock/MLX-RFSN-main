@@ -339,6 +339,7 @@ class RuntimeCounters:
     packed_reference_calls: int = 0  # Alias for packed_attention_calls
     dense_fallback_calls: int = 0
     full_history_materialization_calls: int = 0
+    attempted_backend_calls: int = 0  # attempted but did not execute
 
     # Byte accounting (Phase 5.20: Real memory accounting)
     packed_bytes_written: int = 0
@@ -382,6 +383,14 @@ class RuntimeCounters:
         """Record packed bytes read."""
         self.packed_bytes_read += bytes_read
 
+    def record_attempted_backend(self, backend: str, delta: int = 1) -> None:
+        """Record an attempted backend that did not successfully execute.
+
+        This is separate from ``record_fallback`` so that promotion
+        governance can distinguish "tried and failed" from "never tried".
+        """
+        self.attempted_backend_calls += delta
+
     def record_fallback(self, delta: int = 1) -> None:
         """Record a dense fallback event."""
         self.dense_fallback_calls += delta
@@ -422,6 +431,7 @@ class RuntimeCounters:
             "packed_attention_calls": self.packed_attention_calls,
             "packed_reference_calls": self.packed_reference_calls,  # Fix #2: Include in serialization
             "dense_fallback_calls": self.dense_fallback_calls,
+            "attempted_backend_calls": self.attempted_backend_calls,
             "full_history_materialization_calls": self.full_history_materialization_calls,
             "packed_bytes_written": self.packed_bytes_written,
             "packed_bytes_read": self.packed_bytes_read,

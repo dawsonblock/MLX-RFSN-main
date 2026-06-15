@@ -596,3 +596,56 @@ pytest rfsn_v10/kernels/tests/test_true_packed_kernel_v2.py -v
 2. Zero materialization validated by execution contract
 3. Teacher-forced logit comparison passing quality gates
 4. Performance measurement showing speedup vs dense baseline
+
+---
+
+## Third Audit Response: P1 True-Packed Kernel Completed (COMPLETED)
+
+**Audit Date**: 2026-06-16
+**Scope**: Implement a canonical true-packed execution path that consumes real ``PackedBlockV4`` blocks.
+
+### What Changed
+
+1. **Production dispatch cleaned** (`attention_wrapper.py`)
+   - Removed the mock-format ``TruePackedMLXInline`` and ``TruePackedAttentionMetalV2`` from the default dispatch chain.
+   - Added ``_attempted_backends`` tracking and ``record_attempted_backend()`` to distinguish "tried and failed" from actual fallback.
+   - True-packed path now requires explicit ``RFSN_ENABLE_TRUE_PACKED=1`` and a successful self-test.
+
+2. **Canonical kernel created** (`rfsn_v10/kernels/metal/packed_v4_attention.py`)
+   - ``PackedV4AttentionKernel`` accepts real ``PackedBlockV4`` key and value blocks.
+   - Reads uint32 BHTW ``packed_codes`` and float32 BHTG ``scales`` directly.
+   - Reproduces the production Murmur32-avalanche-v1 hash signs with per-block-local indices.
+   - Uses WHT-domain dot products: Python precomputes ``WHT(Q)``, the shader decodes ``signed_decode = hash_signs(q_signed * scale)`` (which equals ``WHT(K)``), accumulates weighted values in WHT domain, and Python post-applies inverse WHT.
+   - Supports causal masking with ``logical_start`` metadata.
+   - Supports GQA via ``kv_head = q_head // q_per_kv``.
+
+3. **Differential tests added** (`rfsn_v10/kernels/tests/test_packed_v4_attention.py`)
+   - Single block exact match (rel < 1e-3)
+   - Multiple blocks exact match
+   - GQA exact match
+   - Causal and non-causal masking
+   - Contract zero-materialization validation
+   - Batch-size validation
+
+4. **Release gate repaired** (`scripts/release_gate.sh`)
+   - Uses ``--strict-execution`` instead of legacy ``--strict``.
+   - Drops ``--require-model`` so the gate can run on CPU-only hosts.
+   - Includes ``rfsn_v10/kernels/tests/`` in test collection.
+   - Archives artifacts **after** integrity checks, not before.
+   - Removes non-hermetic ``pip install --upgrade build``.
+
+### Verified Results
+
+| Test | Command | Result |
+|------|---------|--------|
+| New kernel single block | ``pytest test_packed_v4_attention.py::TestPackedV4AgainstReference::test_single_block_exact`` | PASS |
+| New kernel multi block | ``pytest test_packed_v4_attention.py::TestPackedV4AgainstReference::test_multiple_blocks_exact`` | PASS |
+| New kernel GQA | ``pytest test_packed_v4_attention.py::TestPackedV4AgainstReference::test_gqa_exact`` | PASS |
+| Full test suite | ``pytest tests/test_generation.py rfsn_v10/cache/tests/ ...`` | PASS |
+
+### Remaining Limitations
+
+- Kernel is K8/V8 only; sub-byte and V5 variants are gated out.
+- Kernel requires explicit ``RFSN_ENABLE_TRUE_PACKED=1``; not yet the default.
+- No performance benchmark or real-model logit proof bundle exists yet.
+- Teacher-forced logit comparison methodology is still the critical path blocker.
