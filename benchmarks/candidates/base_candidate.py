@@ -24,6 +24,14 @@ class BenchmarkCandidate(ABC):
 
     candidate_name: str = "unnamed"
 
+    @property
+    def name(self) -> str:
+        """Return the candidate name (alias for candidate_name).
+        
+        This provides compatibility with code that uses .name instead of .candidate_name.
+        """
+        return self.candidate_name
+
     @abstractmethod
     def run_on_model(
         self,

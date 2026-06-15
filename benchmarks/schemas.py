@@ -33,6 +33,7 @@ class CandidateResult:
     # ------------------------------------------------------------------
     # Identity
     # ------------------------------------------------------------------
+    name: str = ""  # Alias for candidate_name for compatibility
     candidate_name: str = ""
     model_id: str = ""
     prompt_id: str = ""
@@ -48,15 +49,29 @@ class CandidateResult:
     paged_cache_enabled: bool = False
     is_benchmark_only: bool = False  # True for benchmark-only candidates (e.g., A1 with MLX limitations)
 
+    def __post_init__(self) -> None:
+        """Sync name and candidate_name for backward compatibility."""
+        if not self.name and self.candidate_name:
+            self.name = self.candidate_name
+        elif not self.candidate_name and self.name:
+            self.candidate_name = self.name
+
     # ------------------------------------------------------------------
     # Quality metrics (vs dense baseline logits)
     # ------------------------------------------------------------------
     logit_cosine: Optional[float] = None
+    kl_divergence: Optional[float] = None
+    top1_match: Optional[float] = None
     top1_match_rate: Optional[float] = None
     top5_overlap: Optional[float] = None
     top10_overlap: Optional[float] = None
     perplexity_delta: Optional[float] = None          # candidate_ppl - baseline_ppl
     visible_output_drift_score: Optional[float] = None  # 0=identical, 1=completely different
+    max_logit_delta: Optional[float] = None
+    first_divergent_token: Optional[int] = None
+    text_heuristic_passed: Optional[bool] = None
+    logit_gate_passed: Optional[bool] = None
+    memory_gate_passed: Optional[bool] = None
 
     # ------------------------------------------------------------------
     # Attention metrics
@@ -81,8 +96,10 @@ class CandidateResult:
     # ------------------------------------------------------------------
     prefill_tps: Optional[float] = None               # tokens/sec during prefill
     decode_tps: Optional[float] = None                # tokens/sec during decode
+    tokens_per_sec: Optional[float] = None            # alias for decode_tps
     first_token_latency_ms: Optional[float] = None
     total_latency_ms: Optional[float] = None
+    total_ms: Optional[float] = None                  # alias for total_latency_ms
     compression_time_ms: Optional[float] = None       # time to compress KV vectors
     decompression_time_ms: Optional[float] = None     # time to decompress for attention
     attention_time_ms: Optional[float] = None         # time for attention computation
@@ -142,6 +159,8 @@ class CandidateResult:
     metal_executed: bool = False
     fallback_used: bool = False
     promotion_eligible: bool = True                 # False for smoke/benchmark-only data
+    candidate_status: str = "UNKNOWN"              # "ACTIVE" | "REFERENCE_ONLY" | "CONTROL" | "DEPRECATED"
+    gate_status: str = "UNKNOWN"                   # "PASS" | "FAIL" | "ERROR" | "PENDING_*"
     commit_hash: str = ""
     corpus_hash: str = ""
     token_sequence_hash: str = ""
@@ -154,6 +173,21 @@ class CandidateResult:
     # Proof counters (strict mode validation)
     # ------------------------------------------------------------------
     proof_counters: dict[str, Any] = field(default_factory=dict)
+    
+    # ------------------------------------------------------------------
+    # Runtime counters (Fix #4, #5, #6: actual block creation, packed calls, bytes)
+    # ------------------------------------------------------------------
+    packed_blocks_created: int = 0
+    packed_blocks_read: int = 0
+    packed_attention_calls: int = 0
+    dense_fallback_calls: int = 0
+    full_history_materialization_calls: int = 0
+    packed_bytes_written: int = 0
+    packed_bytes_read: int = 0
+    actual_kv_memory_mb: Optional[float] = None
+    working_set_memory_mb: Optional[float] = None
+    scratch_memory_mb: Optional[float] = None
+    measurement_kind: str = "UNKNOWN"  # "ACTUAL" | "ESTIMATED" | "UNKNOWN"
 
     # ------------------------------------------------------------------
     # Errors / notes
