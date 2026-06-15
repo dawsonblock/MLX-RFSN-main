@@ -32,6 +32,42 @@ class BenchmarkCandidate(ABC):
         """
         return self.candidate_name
 
+    def run(
+        self,
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        max_tokens: int = 100,
+        temp: float = 0.0,
+    ) -> "CandidateResult":
+        """Run the candidate with simplified interface for benchmark harness.
+        
+        This is a convenience wrapper around run_on_model() that provides
+        the simpler interface expected by kv_shootout.py.
+        
+        Args:
+            model: Loaded model
+            tokenizer: Tokenizer
+            prompt: Input prompt
+            max_tokens: Maximum tokens to generate
+            temp: Temperature (default 0.0 for greedy)
+        
+        Returns:
+            CandidateResult with benchmark metrics
+        """
+        model_id = getattr(model, "name_or_path", "unknown")
+        prompt_id = "benchmark_prompt"
+        
+        return self.run_on_model(
+            model=model,
+            tokenizer=tokenizer,
+            model_id=model_id,
+            prompt_id=prompt_id,
+            prompt=prompt,
+            output_tokens=max_tokens,
+            seed=42,  # Fixed seed for reproducibility
+        )
+
     @abstractmethod
     def run_on_model(
         self,
