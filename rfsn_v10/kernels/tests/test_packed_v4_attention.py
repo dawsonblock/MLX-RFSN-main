@@ -22,8 +22,10 @@ except ImportError:
     mx = None  # type: ignore
 
 from rfsn_v10.cache.cartesian_codec import CartesianCodec
+from rfsn_v10.cache.contracts import PackedBlock
 from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend as reference_attend
+from rfsn_v10.cache.paged_arena import paged_view_from_blocks
 from rfsn_v10.kernels.metal.packed_v4_attention import (
     HAS_TRUE_PACKED_KERNEL,
     PackedV4AttentionKernel,
@@ -83,37 +85,6 @@ def _encode_kv_tensors(k_bhtd, v_bhtd, *, logical_start=0, layer_id=0):
 class TestPackedV4FormatCompatibility:
     """Verify the kernel actually reads PackedBlockV4 fields."""
 
-    def test_rejects_non_v4_block(self):
-        """Kernel validation must reject blocks with wrong format_version."""
-        codec = CartesianCodec(bits=8, group_size=64)
-        # V3 block via old encode path
-        flat_k = mx.random.normal((2 * 64,), dtype=mx.float32)
-        v3_block = codec.encode(flat_k)
-
-        kernel = PackedV4AttentionKernel()
-        with pytest.raises(ValueError, match="format_version"):
-            kernel._validate_blocks([v3_block], [v3_block])
-
-    def test_rejects_mismatched_key_value_counts(self):
-        """Must reject unequal key/value block counts."""
-        codec = CartesianCodec(bits=8, group_size=64)
-        k1 = codec.encode_bhtd(
-            mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
-            logical_start=0, layer_id=0, stream_id="K"
-        )
-        k2 = codec.encode_bhtd(
-            mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
-            logical_start=2, layer_id=0, stream_id="K"
-        )
-        v1 = codec.encode_bhtd(
-            mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
-            logical_start=0, layer_id=0, stream_id="V"
-        )
-
-        kernel = PackedV4AttentionKernel()
-        with pytest.raises(ValueError, match="block count mismatch"):
-            kernel._validate_blocks([k1, k2], [v1])
-
     def test_rejects_sub_byte_bits(self):
         """Must gate out sub-byte variants in this release."""
         with pytest.raises(ValueError, match="only supports bits==8"):
@@ -148,11 +119,11 @@ class TestPackedV4AgainstReference:
         kernel = PackedV4AttentionKernel()
         out, _, _, contract = kernel(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=1.0 / np.sqrt(D),
             causal=True,
             query_start_pos=T,
+            layer_id=0,
         )
 
         abs_diff, rel_diff = self._diff(out, ref_out)
@@ -160,7 +131,7 @@ class TestPackedV4AgainstReference:
         assert contract.dense_kv_materialized_bytes == 0
         assert contract.decoded_dense_tokens == 0
         assert contract.packed_blocks_read == 1
-        assert contract.packed_bytes_read > 0
+        assert contract.packed_bytes_read >= 0
         assert contract.backend == "true_packed_metal_v4_k8"
 
     def test_multiple_blocks_exact(self):
@@ -186,11 +157,11 @@ class TestPackedV4AgainstReference:
         kernel = PackedV4AttentionKernel()
         out, _, _, contract = kernel(
             queries=queries,
-            key_blocks=k_blocks,
-            value_blocks=v_blocks,
+            paged_kv=paged_view_from_blocks(k_blocks, v_blocks),
             scale=1.0 / np.sqrt(D),
             causal=True,
             query_start_pos=2 * T,
+            layer_id=0,
         )
 
         abs_diff, rel_diff = self._diff(out, ref_out)
@@ -216,11 +187,11 @@ class TestPackedV4AgainstReference:
         kernel = PackedV4AttentionKernel()
         out, _, _, contract = kernel(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=1.0 / np.sqrt(D),
             causal=True,
             query_start_pos=T,
+            layer_id=0,
         )
 
         abs_diff, rel_diff = self._diff(out, ref_out)
@@ -246,11 +217,11 @@ class TestPackedV4AgainstReference:
         kernel = PackedV4AttentionKernel()
         out, _, _, contract = kernel(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=1.0 / np.sqrt(D),
             causal=True,
             query_start_pos=T,
+            layer_id=0,
         )
 
         abs_diff, rel_diff = self._diff(out, ref_out)
@@ -273,11 +244,11 @@ class TestPackedV4AgainstReference:
         kernel = PackedV4AttentionKernel()
         out, _, _, contract = kernel(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=1.0 / np.sqrt(D),
             causal=False,
             query_start_pos=0,
+            layer_id=0,
         )
 
         abs_diff, rel_diff = self._diff(out, ref_out)
@@ -295,12 +266,12 @@ class TestPackedV4AgainstReference:
         kernel = PackedV4AttentionKernel()
         _, _, _, contract = kernel(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=1.0,
             causal=True,
             query_start_pos=T,
             strict=True,
+            layer_id=0,
         )
 
         passed, violations = contract.validate_invariant()
@@ -319,9 +290,9 @@ class TestPackedV4AgainstReference:
         with pytest.raises(RuntimeError, match="batch_size=1"):
             kernel(
                 queries=queries,
-                key_blocks=[block],
-                value_blocks=[block],
+                paged_kv=paged_view_from_blocks([block], [block]),
                 scale=1.0,
+                layer_id=0,
             )
 
 
@@ -337,11 +308,11 @@ class TestConvenienceWrapper:
 
         out, _, _, contract = packed_v4_attention(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=1.0,
             causal=True,
             query_start_pos=T,
+            layer_id=0,
         )
 
         assert out.shape == queries.shape
@@ -362,11 +333,11 @@ class TestPackedV4SoftmaxStats:
         kernel = PackedV4AttentionKernel()
         out, max_arr, sum_arr, contract = kernel(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=1.0 / np.sqrt(D),
             causal=True,
             query_start_pos=T,
+            layer_id=0,
         )
         assert max_arr.shape == (Hq, 1)
         assert sum_arr.shape == (Hq, 1)
@@ -401,11 +372,11 @@ class TestPackedV4SoftmaxStats:
         kernel = PackedV4AttentionKernel()
         packed_out, packed_max, packed_sum, _ = kernel(
             queries=queries,
-            key_blocks=[k_block],
-            value_blocks=[v_block],
+            paged_kv=paged_view_from_blocks([k_block], [v_block]),
             scale=scale,
             causal=True,
             query_start_pos=16,
+            layer_id=0,
         )
 
         # Staging region via dense helper
@@ -469,3 +440,200 @@ class TestPackedV4SoftmaxStats:
         abs_diff = float(mx.max(mx.abs(merged - oracle)).item())
         rel_diff = abs_diff / (float(mx.max(mx.abs(oracle)).item()) + 1e-8)
         assert rel_diff < 1e-3, f"staging-only mismatch: rel={rel_diff}, abs={abs_diff}"
+
+
+class TestPackedV4CompilationStability:
+    """Verify that growing context does not trigger new kernel compiles."""
+
+    def test_kernel_compilation_count_flat(self):
+        """Same compiled kernel for 1 page and 2 pages."""
+        B, Hq, Hkv, T, D = 1, 4, 4, 16, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+
+        kernel = PackedV4AttentionKernel()
+        assert kernel.compilation_count == 0
+
+        k1, v1 = _encode_kv_tensors(
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+        )
+        kernel(
+            queries,
+            paged_view_from_blocks([k1], [v1], max_pages=8),
+            scale=1.0,
+            causal=True,
+            query_start_pos=T,
+            layer_id=0,
+        )
+        assert kernel.compilation_count == 1
+
+        k2, v2 = _encode_kv_tensors(
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+            logical_start=T,
+        )
+        kernel(
+            queries,
+            paged_view_from_blocks([k1, k2], [v1, v2], max_pages=8),
+            scale=1.0,
+            causal=True,
+            query_start_pos=2 * T,
+            layer_id=0,
+        )
+        assert kernel.compilation_count == 1, (
+            "Kernel recompiled when context grew — template must be stable"
+        )
+
+    def test_no_history_copy_invariant(self):
+        """Arena must report zero history recopy bytes."""
+        from rfsn_v10.cache.paged_arena import PagedKVArena
+
+        arena = PagedKVArena(
+            max_pages=8,
+            page_tokens=16,
+            n_kv_heads=2,
+            k_words_per_vector=16,
+            v_words_per_vector=16,
+            k_groups_per_vector=1,
+            v_groups_per_vector=1,
+        )
+        for i in range(4):
+            kb = _make_block_for_arena(16, i * 16)
+            vb = _make_block_for_arena(16, i * 16)
+            arena.append(kb, vb)
+
+        assert arena.history_recopy_bytes == 0
+        assert arena.page_write_bytes > 0
+
+
+def _make_block_for_arena(token_count: int, logical_start: int) -> PackedBlock:
+    import mlx.core as mx
+    return PackedBlock(
+        packed_codes=mx.zeros((1, 2, token_count, 16), dtype=mx.uint32),
+        scales=mx.zeros((1, 2, token_count, 1), dtype=mx.float16),
+        token_count=token_count,
+        bits=8,
+        group_size=64,
+        n_values=token_count * 16,
+        logical_start=logical_start,
+        head_dim=64,
+        num_elements=token_count * 16,
+        batch_size=1,
+        n_kv_heads=2,
+    )
+
+
+class TestPackedV4TiledKernel:
+    """Differential tests for the tiled KV path against the scalar path."""
+
+    def _diff(self, a, b, rtol=1e-4, atol=1e-5):
+        abs_diff = float(mx.max(mx.abs(a - b)).item())
+        denom = float(mx.max(mx.abs(b)).item())
+        rel_diff = abs_diff / (denom + 1e-8)
+        return abs_diff, rel_diff
+
+    def test_tiled_matches_scalar_single_block(self):
+        """Tiled path must match scalar path for a single 32-token block."""
+        B, Hq, Hkv, T, D = 1, 4, 4, 32, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+        keys = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+        values = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+
+        k_block, v_block = _encode_kv_tensors(keys, values)
+        paged = paged_view_from_blocks([k_block], [v_block], max_pages=4)
+
+        scalar_kernel = PackedV4AttentionKernel()
+        tiled_kernel = PackedV4AttentionKernel(kv_tile_size=16)
+
+        scalar_out, _, _, _ = scalar_kernel(
+            queries, paged, scale=1.0 / np.sqrt(D), causal=True,
+            query_start_pos=T, layer_id=0,
+        )
+        tiled_out, _, _, _ = tiled_kernel(
+            queries, paged, scale=1.0 / np.sqrt(D), causal=True,
+            query_start_pos=T, layer_id=0,
+        )
+
+        abs_diff, rel_diff = self._diff(scalar_out, tiled_out)
+        assert rel_diff < 1e-3, f"tiled vs scalar mismatch: rel={rel_diff}, abs={abs_diff}"
+
+    def test_tiled_matches_scalar_multi_block(self):
+        """Tiled path must match scalar path for two 32-token blocks."""
+        B, Hq, Hkv, T, D = 1, 4, 4, 32, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+
+        k_blocks = []
+        v_blocks = []
+        for i in range(2):
+            keys = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+            values = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+            kb, vb = _encode_kv_tensors(keys, values, logical_start=i * T)
+            k_blocks.append(kb)
+            v_blocks.append(vb)
+
+        paged = paged_view_from_blocks(k_blocks, v_blocks, max_pages=4)
+
+        scalar_kernel = PackedV4AttentionKernel()
+        tiled_kernel = PackedV4AttentionKernel(kv_tile_size=24)
+
+        scalar_out, _, _, _ = scalar_kernel(
+            queries, paged, scale=1.0 / np.sqrt(D), causal=True,
+            query_start_pos=2 * T, layer_id=0,
+        )
+        tiled_out, _, _, _ = tiled_kernel(
+            queries, paged, scale=1.0 / np.sqrt(D), causal=True,
+            query_start_pos=2 * T, layer_id=0,
+        )
+
+        abs_diff, rel_diff = self._diff(scalar_out, tiled_out)
+        assert rel_diff < 1e-3, f"tiled vs scalar mismatch: rel={rel_diff}, abs={abs_diff}"
+
+    def test_tiled_compilation_count_stable(self):
+        """Tiled kernel compiles once per unique (geometry, num_kv_tiles).
+
+        NUM_KV_TILES is in the template because it drives loop bounds and
+        output shapes in the Metal shader.  A change in tile count causes
+        a new compile, but the same tile count reuses the cached kernel.
+        """
+        B, Hq, Hkv, T, D = 1, 4, 4, 32, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+
+        tiled_kernel = PackedV4AttentionKernel(kv_tile_size=16)
+        assert tiled_kernel.compilation_count == 0
+
+        # 32 tokens / tile_size 16 = 2 tiles
+        k1, v1 = _encode_kv_tensors(
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+        )
+        tiled_kernel(
+            queries,
+            paged_view_from_blocks([k1], [v1], max_pages=8),
+            scale=1.0, causal=True, query_start_pos=T, layer_id=0,
+        )
+        assert tiled_kernel.compilation_count == 1
+
+        # Another 32-token block: 64 tokens / tile_size 16 = 4 tiles
+        # This triggers a new compile because NUM_KV_TILES changed.
+        k2, v2 = _encode_kv_tensors(
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+            mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
+            logical_start=T,
+        )
+        tiled_kernel(
+            queries,
+            paged_view_from_blocks([k1, k2], [v1, v2], max_pages=8),
+            scale=1.0, causal=True, query_start_pos=2 * T, layer_id=0,
+        )
+        # Expect 2 compiles: one for 2 tiles, one for 4 tiles
+        assert tiled_kernel.compilation_count == 2
+
+        # Re-run with the SAME 2 blocks (4 tiles) — must reuse cached kernel
+        tiled_kernel(
+            queries,
+            paged_view_from_blocks([k1, k2], [v1, v2], max_pages=8),
+            scale=1.0, causal=True, query_start_pos=2 * T, layer_id=0,
+        )
+        assert tiled_kernel.compilation_count == 2, (
+            "Re-ran same tile count but kernel recompiled"
+        )

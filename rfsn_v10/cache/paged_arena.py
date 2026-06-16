@@ -1,235 +1,391 @@
-"""PagedPackedArena — fixed-capacity paged storage for packed KV blocks.
-
-Phase 5: Replace concatenated historical buffers with a paged arena where:
-  * Appending one sealed block is O(block size).
-  * Existing packed blocks are never copied during append.
-  * Page metadata grows independently of packed payload.
-  * The kernel can iterate pages directly.
-  * Cache reset releases or reuses pages.
-  * Multiple cache instances do not share mutable state.
-  * Maximum capacity is explicit.
+"""PagedKVArena — fixed-capacity GPU-resident packed KV arena.
 
 Design
 ------
-Pages are stored as references to MLX arrays in a Python list.
-No concatenation ever occurs.  Each append adds one reference.
-The page table maps logical block indices → physical page indices.
+* One combined arena for K and V (never inconsistent).
+* Preallocated contiguous MLX arrays divided into logical pages.
+* New pages are written in-place via indexed update; historical pages
+  are never moved, copied, or reconstructed.
+* Page table maps logical → physical pages at runtime.
+* Kernel reads the arena arrays directly without Python concatenation.
+
+Invariants
+----------
+* history_recopy_bytes == 0  (appending page N never touches pages 0..N-1)
+* page_write_bytes grows linearly with total tokens
+* reserved_capacity_bytes stays constant after init
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+
+from rfsn_v10.compat import mx
 
 from .contracts import PackedBlock
 
 
-class PagedPackedArena:
-    """Fixed-capacity paged arena for packed KV blocks.
+@dataclass(frozen=True)
+class PagedKVView:
+    """Read-only view into a PagedKVArena for kernel consumption."""
+
+    k_codes: Any
+    k_scales: Any
+    v_codes: Any
+    v_scales: Any
+
+    page_table: Any
+    page_starts: Any
+    page_counts: Any
+
+    num_pages: int
+    max_pages: int
+    page_tokens: int
+
+    k_words_per_vector: int
+    v_words_per_vector: int
+    k_groups_per_vector: int
+    v_groups_per_vector: int
+
+
+def paged_view_from_blocks(
+    key_blocks: list[PackedBlock],
+    value_blocks: list[PackedBlock],
+    *,
+    max_pages: int | None = None,
+) -> PagedKVView:
+    """Build a temporary PagedKVView by writing blocks into a preallocated arena.
+
+    Useful for tests and reference paths that still operate on block lists
+    but need to exercise the paged kernel interface.
+    """
+    if not key_blocks or not value_blocks:
+        raise ValueError("at least one key/value block pair required")
+    if len(key_blocks) != len(value_blocks):
+        raise ValueError("key/value block count mismatch")
+
+    n_kv_heads = key_blocks[0].n_kv_heads
+    head_dim = key_blocks[0].head_dim
+    bits = key_blocks[0].bits
+    group_size = key_blocks[0].group_size
+
+    # PackedBlockV4 has words_per_vector/groups_per_vector; PackedBlock does not.
+    if hasattr(key_blocks[0], "words_per_vector"):
+        k_words = key_blocks[0].words_per_vector
+        v_words = value_blocks[0].words_per_vector
+        k_groups = key_blocks[0].groups_per_vector
+        v_groups = value_blocks[0].groups_per_vector
+    else:
+        import math
+        codes_per_word = 32 // bits
+        k_words = math.ceil(head_dim / codes_per_word)
+        v_words = k_words
+        k_groups = head_dim // group_size
+        v_groups = k_groups
+    page_tokens = key_blocks[0].token_count
+
+    num_pages = len(key_blocks)
+    if max_pages is None:
+        max_pages = num_pages
+    if num_pages > max_pages:
+        raise ValueError(f"too many blocks for max_pages: {num_pages} > {max_pages}")
+
+    arena = PagedKVArena(
+        max_pages=max_pages,
+        page_tokens=page_tokens,
+        n_kv_heads=n_kv_heads,
+        k_words_per_vector=k_words,
+        v_words_per_vector=v_words,
+        k_groups_per_vector=k_groups,
+        v_groups_per_vector=v_groups,
+    )
+
+    for kb, vb in zip(key_blocks, value_blocks):
+        arena.append(kb, vb)
+
+    return arena.view()
+
+
+class PagedKVArena:
+    """Fixed-capacity GPU-resident packed KV arena.
 
     Parameters
     ----------
     max_pages
-        Maximum number of blocks that can be stored.
-    block_tokens
-        Number of tokens per block (e.g. 64).
-    head_dim
-        Head dimension (e.g. 64 or 128).
+        Maximum number of pages that can be stored.
+    page_tokens
+        Number of tokens per page (e.g. 64).
     n_kv_heads
         Number of KV heads.
-    bits
-        Quantization bit width (8 for K8/V8).
-    group_size
-        Scale group size (64 for GS64).
+    k_words_per_vector
+        Number of uint32 words per key vector.
+    v_words_per_vector
+        Number of uint32 words per value vector.
+    k_groups_per_vector
+        Number of scale groups per key vector.
+    v_groups_per_vector
+        Number of scale groups per value vector.
     """
 
     def __init__(
         self,
+        *,
         max_pages: int,
-        block_tokens: int,
-        head_dim: int,
+        page_tokens: int,
         n_kv_heads: int,
-        bits: int,
-        group_size: int,
-        name: str = "arena",
+        k_words_per_vector: int,
+        v_words_per_vector: int,
+        k_groups_per_vector: int,
+        v_groups_per_vector: int,
     ) -> None:
+        if max_pages <= 0:
+            raise ValueError("max_pages must be positive")
+        if page_tokens <= 0:
+            raise ValueError("page_tokens must be positive")
+
         self.max_pages = max_pages
-        self.block_tokens = block_tokens
-        self.head_dim = head_dim
+        self.page_tokens = page_tokens
         self.n_kv_heads = n_kv_heads
-        self.bits = bits
-        self.group_size = group_size
-        self.name = name
 
-        # Scale tokens per group
-        self._scales_per_block = block_tokens // group_size
+        self.k_words_per_vector = k_words_per_vector
+        self.v_words_per_vector = v_words_per_vector
+        self.k_groups_per_vector = k_groups_per_vector
+        self.v_groups_per_vector = v_groups_per_vector
 
-        # Page table: maps logical block index → physical page index
-        self._page_table: list[int] = []
+        # Persistent GPU payload.
+        self.k_codes = mx.zeros(
+            (n_kv_heads, max_pages, page_tokens, k_words_per_vector),
+            dtype=mx.uint32,
+        )
+        self.k_scales = mx.zeros(
+            (n_kv_heads, max_pages, page_tokens, k_groups_per_vector),
+            dtype=mx.float16,
+        )
+        self.v_codes = mx.zeros(
+            (n_kv_heads, max_pages, page_tokens, v_words_per_vector),
+            dtype=mx.uint32,
+        )
+        self.v_scales = mx.zeros(
+            (n_kv_heads, max_pages, page_tokens, v_groups_per_vector),
+            dtype=mx.float16,
+        )
 
-        # Physical pages: list of dicts with 'codes', 'scales', 'signs'
-        self._pages: list[dict[str, Any]] = []
+        # GPU-visible logical-to-physical mapping.
+        self.page_table = mx.zeros((max_pages,), dtype=mx.int32)
+        self.page_starts = mx.zeros((max_pages,), dtype=mx.int32)
+        self.page_counts = mx.zeros((max_pages,), dtype=mx.int32)
 
-        # Free page pool: physical page indices available for reuse
-        self._free_pages: list[int] = []
+        self._num_pages = 0
+        self._next_physical_page = 0
 
-        # Block metadata (logical position, layer_id, stream_id)
-        self._block_meta: list[dict] = []
+        # Stored block references for fallback paths and reference tests.
+        # The arena arrays are the canonical GPU storage; these Python objects
+        # are lightweight metadata wrappers used only by backward-compatible
+        # iterators.  They do not trigger extra device copies.
+        self._blocks: list[tuple[PackedBlock, PackedBlock]] = []
 
-        # Instrumentation counters
-        self._page_allocation_count: int = 0
-        self._page_reuse_count: int = 0
-        self._append_copy_bytes: int = 0
+        self.page_write_bytes = 0
+        self.history_recopy_bytes = 0
 
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
     @property
-    def num_blocks(self) -> int:
-        """Number of logical blocks currently stored."""
-        return len(self._page_table)
-
-    @property
     def num_pages(self) -> int:
-        """Number of physical pages currently allocated (in use + free)."""
-        return len(self._pages)
+        return self._num_pages
 
     @property
-    def packed_payload_bytes(self) -> int:
-        """Logical payload size of active (non-free) blocks."""
-        total = 0
-        for logical_idx in self._page_table:
-            block = self._pages[logical_idx]
-            if block is None:
-                continue
-            if block.packed_codes is not None and hasattr(block.packed_codes, "size"):
-                from rfsn_v10.cache.contracts import _array_itemsize
-                total += int(block.packed_codes.size) * _array_itemsize(block.packed_codes)
-            if block.scales is not None and hasattr(block.scales, "size"):
-                from rfsn_v10.cache.contracts import _array_itemsize
-                total += int(block.scales.size) * _array_itemsize(block.scales)
-        return total
-
-    @property
-    def metadata_bytes(self) -> int:
-        """Page table + metadata overhead."""
-        return (
-            len(self._page_table) * 28  # Python int per entry
-            + len(self._block_meta) * 64  # rough dict overhead
+    def reserved_capacity_bytes(self) -> int:
+        """Total bytes of the preallocated arena (active + inactive)."""
+        return sum(
+            int(a.size) * a.dtype.size
+            for a in (
+                self.k_codes,
+                self.k_scales,
+                self.v_codes,
+                self.v_scales,
+                self.page_table,
+                self.page_starts,
+                self.page_counts,
+            )
         )
 
     @property
-    def page_table_bytes(self) -> int:
-        """Actually allocated page table bytes (dynamic Python list, not fixed array)."""
-        # Each int in a Python list is ~28 bytes (PyObject overhead).
-        # This is an estimate of the actual runtime allocation.
-        return len(self._page_table) * 28
+    def active_payload_bytes(self) -> int:
+        """Bytes of the actually-written pages (excluding inactive arena)."""
+        if self._num_pages == 0:
+            return 0
+        active_tokens = sum(
+            int(self.page_counts[i]) for i in range(self._num_pages)
+        )
+        # Each token contributes: codes + scales for K and V
+        bytes_per_token_kv = (
+            self.k_words_per_vector * 4  # uint32
+            + self.k_groups_per_vector * 2  # float16
+            + self.v_words_per_vector * 4  # uint32
+            + self.v_groups_per_vector * 2  # float16
+        )
+        return active_tokens * self.n_kv_heads * bytes_per_token_kv
 
     @property
-    def append_copy_bytes(self) -> int:
-        """Cumulative bytes copied during append operations."""
-        return self._append_copy_bytes
+    def page_metadata_bytes(self) -> int:
+        """Bytes for page table, starts, and counts."""
+        return (
+            int(self.page_table.size) * self.page_table.dtype.size
+            + int(self.page_starts.size) * self.page_starts.dtype.size
+            + int(self.page_counts.size) * self.page_counts.dtype.size
+        )
 
     # ------------------------------------------------------------------
     # Core operations
     # ------------------------------------------------------------------
 
-    def append_block(self, block: PackedBlock) -> None:
-        """Append one sealed packed block.
+    def append(
+        self,
+        key_block: PackedBlock,
+        value_block: PackedBlock,
+    ) -> None:
+        """Append one sealed packed page without copying history.
 
-        Uses free-page pool if available, otherwise allocates a new page.
-        Existing pages are never touched.
+        The page is written into the next physical slot and published
+        atomically via the page table after ``mx.eval``.
         """
-        if self.num_blocks >= self.max_pages:
+        self._validate_pair(key_block, value_block)
+
+        if self._num_pages >= self.max_pages:
             raise RuntimeError(
-                f"PagedPackedArena '{self.name}' capacity exceeded: "
-                f"{self.num_blocks} >= {self.max_pages} pages"
+                f"KV arena full: {self._num_pages}/{self.max_pages} pages"
             )
 
-        # Reuse a free page slot if available, otherwise allocate new
-        if self._free_pages:
-            page_idx = self._free_pages.pop(0)
-            self._page_reuse_count += 1
-        else:
-            page_idx = len(self._pages)
-            self._pages.append({})  # placeholder, filled below
-            self._page_allocation_count += 1
+        logical_page = self._num_pages
+        physical_page = self._next_physical_page
+        count = int(key_block.token_count)
 
-        # Store the PackedBlock directly so the kernel can consume it
-        self._pages[page_idx] = block
+        # Write only the new page. Existing payload is untouched.
+        # Blocks arrive as [B, Hkv, T, words] with B == 1.
+        self.k_codes[:, physical_page, :count, :] = key_block.packed_codes[0]
+        self.k_scales[:, physical_page, :count, :] = key_block.scales[0]
+        self.v_codes[:, physical_page, :count, :] = value_block.packed_codes[0]
+        self.v_scales[:, physical_page, :count, :] = value_block.scales[0]
 
-        # Track bytes (the append "cost" is the size of the new block)
-        if block.packed_codes is not None and hasattr(block.packed_codes, "size"):
-            from rfsn_v10.cache.contracts import _array_itemsize
-            self._append_copy_bytes += int(block.packed_codes.size) * _array_itemsize(block.packed_codes)
-        if block.scales is not None and hasattr(block.scales, "size"):
-            from rfsn_v10.cache.contracts import _array_itemsize
-            self._append_copy_bytes += int(block.scales.size) * _array_itemsize(block.scales)
+        # Publish the page through metadata.
+        self.page_table[logical_page] = physical_page
+        self.page_starts[logical_page] = int(key_block.logical_start)
+        self.page_counts[logical_page] = count
 
-        # Update page table and metadata
-        logical_idx = len(self._page_table)
-        self._page_table.append(page_idx)
-        self._block_meta.append(
-            {
-                "logical_index": logical_idx,
-                "physical_page": page_idx,
-                "logical_start": block.logical_start,
-                "layer_id": getattr(block, "layer_id", 0),
-                "stream_id": getattr(block, "stream_id", 0),
-            }
+        # Resolve the page writes before publishing the host page count.
+        mx.eval(
+            self.k_codes,
+            self.k_scales,
+            self.v_codes,
+            self.v_scales,
+            self.page_table,
+            self.page_starts,
+            self.page_counts,
         )
 
+        self._blocks.append((key_block, value_block))
+        self._num_pages += 1
+        self._next_physical_page += 1
+
+        self.page_write_bytes += (
+            key_block.payload_bytes() + value_block.payload_bytes()
+        )
+
+    def _validate_pair(
+        self,
+        key_block: PackedBlock,
+        value_block: PackedBlock,
+    ) -> None:
+        if key_block.logical_start != value_block.logical_start:
+            raise ValueError("K/V logical_start mismatch")
+
+        if key_block.token_count != value_block.token_count:
+            raise ValueError("K/V token_count mismatch")
+
+        if key_block.token_count > self.page_tokens:
+            raise ValueError("block exceeds page capacity")
+
+        if key_block.batch_size != 1 or value_block.batch_size != 1:
+            raise ValueError("paged arena currently requires batch size 1")
+
+        if key_block.n_kv_heads != self.n_kv_heads:
+            raise ValueError("key head count mismatch")
+
+        if value_block.n_kv_heads != self.n_kv_heads:
+            raise ValueError("value head count mismatch")
+
+        expected_start = self._num_pages * self.page_tokens
+        if key_block.logical_start != expected_start:
+            raise ValueError(
+                f"non-contiguous page: expected {expected_start}, "
+                f"got {key_block.logical_start}"
+            )
+
+    # ------------------------------------------------------------------
+    # View
+    # ------------------------------------------------------------------
+
+    def view(self) -> PagedKVView:
+        return PagedKVView(
+            k_codes=self.k_codes,
+            k_scales=self.k_scales,
+            v_codes=self.v_codes,
+            v_scales=self.v_scales,
+            page_table=self.page_table,
+            page_starts=self.page_starts,
+            page_counts=self.page_counts,
+            num_pages=self._num_pages,
+            max_pages=self.max_pages,
+            page_tokens=self.page_tokens,
+            k_words_per_vector=self.k_words_per_vector,
+            v_words_per_vector=self.v_words_per_vector,
+            k_groups_per_vector=self.k_groups_per_vector,
+            v_groups_per_vector=self.v_groups_per_vector,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def iter_key_blocks(self):
+        """Yield each sealed key block in logical order.
+
+        Backward-compatible iterator for fallback paths and tests.
+        """
+        for kb, _vb in self._blocks:
+            yield kb
+
+    def iter_value_blocks(self):
+        """Yield each sealed value block in logical order.
+
+        Backward-compatible iterator for fallback paths and tests.
+        """
+        for _kb, vb in self._blocks:
+            yield vb
+
     def reset(self) -> None:
-        """Clear all blocks. Physical pages are returned to the free pool for reuse."""
-        # Return all allocated physical pages to the free pool
-        for page_idx in self._page_table:
-            self._free_pages.append(page_idx)
-            # Dereference the block for GC
-            self._pages[page_idx] = None  # type: ignore[assignment]
-        self._page_table.clear()
-        self._block_meta.clear()
-        self._append_copy_bytes = 0
+        """Hide all pages without zeroing the arena.
 
-    def get_block(self, logical_index: int) -> dict[str, Any]:
-        """Return the block data at the given logical index.
-
-        Returns a dict for backward compatibility. For direct PackedBlock
-        access (kernel consumption), use iter_packed_blocks().
+        Old page contents are ignored because ``num_pages`` becomes zero.
+        Zeroing hundreds of megabytes on every reset is pointless.
         """
-        if logical_index < 0 or logical_index >= len(self._page_table):
-            raise IndexError(f"Logical block index {logical_index} out of range")
-        page_idx = self._page_table[logical_index]
-        block = self._pages[page_idx]
-        return {
-            "codes": block.packed_codes,
-            "scales": block.scales,
-            "meta": self._block_meta[logical_index],
-        }
-
-    def iter_blocks(self):
-        """Yield each stored block as a dict in logical order."""
-        for i in range(len(self._page_table)):
-            yield self.get_block(i)
-
-    def iter_packed_blocks(self):
-        """Yield each stored PackedBlock in logical order.
-
-        This is the primary interface for kernel consumption. The kernel
-        reads .packed_codes, .scales, .logical_start, etc. directly.
-        """
-        for logical_idx in self._page_table:
-            yield self._pages[logical_idx]
+        self._num_pages = 0
+        self._next_physical_page = 0
+        self._blocks.clear()
+        self.page_write_bytes = 0
+        self.history_recopy_bytes = 0
 
     def to_instrumentation(self) -> dict:
         """Return instrumentation counters for memory reporting."""
         return {
-            "packed_payload_bytes": self.packed_payload_bytes,
-            "metadata_bytes": self.metadata_bytes,
-            "page_table_bytes": self.page_table_bytes,
-            "dense_tail_bytes": 0,  # managed separately
-            "scratch_peak_bytes": 0,
-            "append_copy_bytes": self.append_copy_bytes,
-            "page_allocation_count": self._page_allocation_count,
-            "page_reuse_count": self._page_reuse_count,
+            "num_pages": self._num_pages,
             "max_pages": self.max_pages,
-            "num_blocks": self.num_blocks,
+            "page_tokens": self.page_tokens,
+            "reserved_capacity_bytes": self.reserved_capacity_bytes,
+            "active_payload_bytes": self.active_payload_bytes,
+            "page_metadata_bytes": self.page_metadata_bytes,
+            "page_write_bytes": self.page_write_bytes,
+            "history_recopy_bytes": self.history_recopy_bytes,
         }

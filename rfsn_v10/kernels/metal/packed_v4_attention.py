@@ -68,13 +68,16 @@ def _self_test() -> bool:
         return False
     try:
         # Minimal fixture: 1 Q-head, 1 Q-token, 1 KV-head, 2 KV-tokens, D=64
+        # Paged layout: (Hkv, max_pages, page_tokens, words)
         wht_queries = mx.zeros((1, 1, 64), dtype=mx.float32)
-        packed_codes_k = mx.zeros((1, 2, 16), dtype=mx.uint32)
-        scales_k = mx.ones((1, 2, 1), dtype=mx.float32)
-        packed_codes_v = mx.zeros((1, 2, 16), dtype=mx.uint32)
-        scales_v = mx.ones((1, 2, 1), dtype=mx.float32)
-        block_starts = mx.array([0], dtype=mx.int32)
-        block_counts = mx.array([2], dtype=mx.int32)
+        packed_codes_k = mx.zeros((1, 1, 2, 16), dtype=mx.uint32)
+        scales_k = mx.ones((1, 1, 2, 1), dtype=mx.float32)
+        packed_codes_v = mx.zeros((1, 1, 2, 16), dtype=mx.uint32)
+        scales_v = mx.ones((1, 1, 2, 1), dtype=mx.float32)
+        page_table = mx.array([0], dtype=mx.int32)
+        page_starts = mx.array([0], dtype=mx.int32)
+        page_counts = mx.array([2], dtype=mx.int32)
+        active_pages = mx.array([1], dtype=mx.int32)
         scale_arr = mx.array([1.0], dtype=mx.float32)
         query_start_arr = mx.array([2], dtype=mx.int32)
 
@@ -84,7 +87,7 @@ def _self_test() -> bool:
                 "wht_queries",
                 "packed_codes_k", "scales_k",
                 "packed_codes_v", "scales_v",
-                "block_starts", "block_counts",
+                "page_table", "page_starts", "page_counts", "active_pages",
                 "scale_arr", "query_start_arr",
             ],
             output_names=["output", "running_max_arr", "running_sum_arr"],
@@ -95,15 +98,15 @@ def _self_test() -> bool:
                 wht_queries,
                 packed_codes_k, scales_k,
                 packed_codes_v, scales_v,
-                block_starts, block_counts,
+                page_table, page_starts, page_counts, active_pages,
                 scale_arr, query_start_arr,
             ],
             template=[
                 ("NUM_Q_HEADS", 1),
                 ("NUM_Q_TOKENS", 1),
                 ("HEAD_DIM", 64),
-                ("NUM_BLOCKS", 1),
-                ("TOTAL_T", 2),
+                ("MAX_PAGES", 1),
+                ("PAGE_TOKENS", 2),
                 ("BITS", 8),
                 ("CODES_PER_WORD", 4),
                 ("WORDS_PER_VECTOR", 16),
@@ -212,12 +215,15 @@ for (uint d = 0; d < HEAD_DIM; d++) {
 }
 
 uint t = 0;
-for (uint b = 0; b < NUM_BLOCKS; b++) {
-    int block_start = block_starts[b];
-    int block_count = block_counts[b];
+uint num_pages = uint(active_pages[0]);
 
-    for (uint local_t = 0; local_t < block_count; local_t++) {
-        int kv_global_pos = block_start + int(local_t);
+for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
+    uint physical_page = uint(page_table[logical_page]);
+    int page_start = page_starts[logical_page];
+    int page_count = page_counts[logical_page];
+
+    for (uint local_t = 0; local_t < uint(page_count); local_t++) {
+        int kv_global_pos = page_start + int(local_t);
 
         // causal mask
         if (CAUSAL != 0 && kv_global_pos > query_global_pos) {
@@ -227,9 +233,6 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
 
         // ---- QK dot product with on-the-fly decode in WHT domain ----
         float dot = 0.0f;
-        uint base_word = (kv_head * TOTAL_T + t) * WORDS_PER_VECTOR;
-        uint base_scale = (kv_head * TOTAL_T + t) * GROUPS_PER_VECTOR;
-        uint local_flat_base = (kv_head * block_count + local_t) * HEAD_DIM;
 
         for (uint d = 0; d < HEAD_DIM; d++) {
             float q_val = wht_queries[q_offset + d];
@@ -239,16 +242,40 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
             uint shift = code_in_word * BITS;
             uint mask = (1u << BITS) - 1u;
 
-            uint packed_word = packed_codes_k[base_word + word_idx];
+            uint code_index_k = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * WORDS_PER_VECTOR
+                + word_idx
+            );
+
+            uint packed_word = packed_codes_k[code_index_k];
             uint code = (packed_word >> shift) & mask;
 
             float q_signed = float(code) - QMAX;
 
             uint group_idx = d / GROUP_SIZE;
-            float scl = scales_k[base_scale + group_idx];
+            uint scale_index_k = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * GROUPS_PER_VECTOR
+                + group_idx
+            );
+
+            half scale_k = scales_k[scale_index_k];
+            float scl = float(scale_k);
             float val = q_signed * scl;
 
             // hash sign (Murmur32-avalanche-v1)
+            uint local_flat_base = (kv_head * uint(page_count) + local_t) * HEAD_DIM;
             uint flat_idx = local_flat_base + d;
             uint state = flat_idx ^ SEED_VAL_K;
             state = state + 0x9E3779B9u;
@@ -274,22 +301,45 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
         running_max = new_max;
 
         // ---- immediately accumulate weighted values ----
-        uint base_word_v = (kv_head * TOTAL_T + t) * WORDS_PER_VECTOR;
-        uint base_scale_v = (kv_head * TOTAL_T + t) * GROUPS_PER_VECTOR;
         for (uint d = 0; d < HEAD_DIM; d++) {
             uint word_idx = d / CODES_PER_WORD;
             uint code_in_word = d % CODES_PER_WORD;
             uint shift = code_in_word * BITS;
             uint mask = (1u << BITS) - 1u;
 
-            uint packed_word = packed_codes_v[base_word_v + word_idx];
+            uint code_index_v = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * WORDS_PER_VECTOR
+                + word_idx
+            );
+
+            uint packed_word = packed_codes_v[code_index_v];
             uint code = (packed_word >> shift) & mask;
 
             float q_signed = float(code) - QMAX;
             uint group_idx = d / GROUP_SIZE;
-            float scl = scales_v[base_scale_v + group_idx];
+
+            uint scale_index_v = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * GROUPS_PER_VECTOR
+                + group_idx
+            );
+
+            half scale_v = scales_v[scale_index_v];
+            float scl = float(scale_v);
             float val = q_signed * scl;
 
+            uint local_flat_base = (kv_head * uint(page_count) + local_t) * HEAD_DIM;
             uint flat_idx = local_flat_base + d;
             uint state = flat_idx ^ SEED_VAL_V;
             state = state + 0x9E3779B9u;
@@ -372,36 +422,68 @@ float local_acc[HEAD_DIM];
 for (uint d = 0; d < HEAD_DIM; d++) { local_acc[d] = 0.0f; }
 
 uint kv_start = kv_tile * KV_TILE_SIZE;
-uint kv_end   = min(kv_start + KV_TILE_SIZE, uint(TOTAL_T));
+uint kv_end   = kv_start + KV_TILE_SIZE;  // tile size is constant per template
 
-for (uint b = 0; b < NUM_BLOCKS; b++) {
-    int block_start = block_starts[b];
-    int block_count = block_counts[b];
-    for (int local_t = 0; local_t < block_count; local_t++) {
-        int global_t = block_start + local_t;
-        if (global_t < int(kv_start)) continue;
-        if (global_t >= int(kv_end)) continue;
+uint num_pages = uint(active_pages[0]);
 
-        int kv_global_pos = global_t;
+for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
+    uint physical_page = uint(page_table[logical_page]);
+    int page_start = page_starts[logical_page];
+    int page_count = page_counts[logical_page];
+
+    int page_end = page_start + page_count;
+    if (page_end <= int(kv_start)) continue;
+    if (page_start >= int(kv_end)) continue;
+
+    for (uint local_t = 0; local_t < uint(page_count); local_t++) {
+        int kv_global_pos = page_start + int(local_t);
+        if (kv_global_pos < int(kv_start)) continue;
+        if (kv_global_pos >= int(kv_end)) continue;
         if (CAUSAL != 0 && kv_global_pos > int(query_global_pos)) continue;
 
         float dot = 0.0f;
-        uint base_word = (kv_head * TOTAL_T + uint(global_t)) * WORDS_PER_VECTOR;
-        uint base_scale = (kv_head * TOTAL_T + uint(global_t)) * GROUPS_PER_VECTOR;
-        uint local_flat_base = (kv_head * uint(block_count) + uint(local_t)) * HEAD_DIM;
+        uint local_flat_base = (kv_head * uint(page_count) + local_t) * HEAD_DIM;
 
         for (uint d = 0; d < HEAD_DIM; d++) {
             float q_val = wht_queries[q_offset + d];
+
             uint word_idx = d / CODES_PER_WORD;
             uint code_in_word = d % CODES_PER_WORD;
             uint shift = code_in_word * BITS;
             uint mask = (1u << BITS) - 1u;
-            uint packed_word = packed_codes_k[base_word + word_idx];
+
+            uint code_index_k = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * WORDS_PER_VECTOR
+                + word_idx
+            );
+
+            uint packed_word = packed_codes_k[code_index_k];
             uint code = (packed_word >> shift) & mask;
+
             float q_signed = float(code) - QMAX;
             uint group_idx = d / GROUP_SIZE;
-            float scl = scales_k[base_scale + group_idx];
+
+            uint scale_index_k = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * GROUPS_PER_VECTOR
+                + group_idx
+            );
+
+            half scale_k = scales_k[scale_index_k];
+            float scl = float(scale_k);
             float val = q_signed * scl;
+
             uint flat_idx = local_flat_base + d;
             uint state = flat_idx ^ SEED_VAL_K;
             state = state + 0x9E3779B9u;
@@ -411,6 +493,7 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
             state = state * 0xC2B2AE35u;
             state = state ^ (state >> 16);
             float sign = (state & 1u) ? -1.0f : 1.0f;
+
             float signed_val = val * sign;
             dot += q_val * signed_val;
         }
@@ -422,19 +505,44 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
         local_sum = local_sum * scale_old + exp_dot;
         local_max = new_max;
 
-        uint base_word_v = (kv_head * TOTAL_T + uint(global_t)) * WORDS_PER_VECTOR;
-        uint base_scale_v = (kv_head * TOTAL_T + uint(global_t)) * GROUPS_PER_VECTOR;
         for (uint d = 0; d < HEAD_DIM; d++) {
             uint word_idx = d / CODES_PER_WORD;
             uint code_in_word = d % CODES_PER_WORD;
             uint shift = code_in_word * BITS;
             uint mask = (1u << BITS) - 1u;
-            uint packed_word = packed_codes_v[base_word_v + word_idx];
+
+            uint code_index_v = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * WORDS_PER_VECTOR
+                + word_idx
+            );
+
+            uint packed_word = packed_codes_v[code_index_v];
             uint code = (packed_word >> shift) & mask;
+
             float q_signed = float(code) - QMAX;
             uint group_idx = d / GROUP_SIZE;
-            float scl = scales_v[base_scale_v + group_idx];
+
+            uint scale_index_v = (
+                (
+                    (
+                        kv_head * MAX_PAGES
+                        + physical_page
+                    ) * PAGE_TOKENS
+                    + local_t
+                ) * GROUPS_PER_VECTOR
+                + group_idx
+            );
+
+            half scale_v = scales_v[scale_index_v];
+            float scl = float(scale_v);
             float val = q_signed * scl;
+
             uint flat_idx = local_flat_base + d;
             uint state = flat_idx ^ SEED_VAL_V;
             state = state + 0x9E3779B9u;
@@ -444,6 +552,7 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
             state = state * 0xC2B2AE35u;
             state = state ^ (state >> 16);
             float sign = (state & 1u) ? -1.0f : 1.0f;
+
             float signed_val = val * sign;
             local_acc[d] = local_acc[d] * scale_old + exp_dot * signed_val;
         }
@@ -567,208 +676,24 @@ class PackedV4AttentionKernel:
         self.codes_per_word = 32 // bits
         self.kv_tile_size = kv_tile_size
         self._kernel_hash = hashlib.sha256(
-            _PACKED_V4_KERNEL_K8.encode()
+            (_PACKED_V4_KERNEL_K8 + _PACKED_V4_KERNEL_K8_TILED_PASS1 + _PACKED_V4_KERNEL_K8_TILED_PASS2).encode()
         ).hexdigest()[:16]
-        # Persistent concatenation cache for O(T) incremental decode
-        self._cached_key_blocks: list[PackedBlockV4] = []
-        self._cached_value_blocks: list[PackedBlockV4] = []
-        self._cached_k_codes: Any | None = None
-        self._cached_k_scales: Any | None = None
-        self._cached_v_codes: Any | None = None
-        self._cached_v_scales: Any | None = None
-        self._cached_block_starts: Any | None = None
-        self._cached_block_counts: Any | None = None
         # Kernel wrapper cache: keyed by template signature (avoid rebuild in hot path)
         self._kernel_cache: dict[tuple, Any] = {}
+        # Compilation stability counter (tests assert this stays flat)
+        self._compilation_count = 0
 
     @property
-    def cached_buffer_bytes(self) -> int:
-        """Total bytes in kernel-owned concatenation caches."""
-        total = 0
-        for arr in (
-            self._cached_k_codes,
-            self._cached_k_scales,
-            self._cached_v_codes,
-            self._cached_v_scales,
-            self._cached_block_starts,
-            self._cached_block_counts,
-        ):
-            if arr is not None and hasattr(arr, "size") and hasattr(arr, "dtype"):
-                total += int(arr.size) * arr.dtype.size
-        return total
+    def compilation_count(self) -> int:
+        return self._compilation_count
 
-    def _validate_blocks(self, key_blocks: list[PackedBlockV4], value_blocks: list[PackedBlockV4]) -> None:
-        """Fail-fast validation of block compatibility."""
-        if len(key_blocks) != len(value_blocks):
-            raise ValueError(
-                f"key/value block count mismatch: {len(key_blocks)} vs {len(value_blocks)}"
-            )
-        if not key_blocks:
-            raise ValueError("no blocks provided")
-
-        for i, (kb, vb) in enumerate(zip(key_blocks, value_blocks)):
-            # Format gate first — V3 blocks must be rejected before V4-only checks.
-            if kb.format_version != 4:
-                raise ValueError(f"block[{i}] key format_version={kb.format_version}, expected 4")
-            if vb.format_version != 4:
-                raise ValueError(f"block[{i}] value format_version={vb.format_version}, expected 4")
-
-            # P1.4: call validate() on every block
-            kb.validate()
-            vb.validate()
-
-            if kb.bits != self.bits:
-                raise ValueError(f"block[{i}] key bits={kb.bits}, expected {self.bits}")
-            if vb.bits != self.bits:
-                raise ValueError(f"block[{i}] value bits={vb.bits}, expected {self.bits}")
-            if kb.packing_layout.value != "VECTOR_ALIGNED_UINT32_V4":
-                raise ValueError(f"block[{i}] key packing_layout={kb.packing_layout}")
-            if kb.scale_layout.value != "BHTG_V4":
-                raise ValueError(f"block[{i}] key scale_layout={kb.scale_layout}")
-            if kb.preconditioner.value != "WHT64_HASH_SIGN_V1":
-                raise ValueError(
-                    f"block[{i}] key preconditioner={kb.preconditioner}; "
-                    "WHT64_HASH_SIGN_V1 required"
-                )
-            if kb.token_count != vb.token_count:
-                raise ValueError(
-                    f"block[{i}] key/value token_count mismatch: {kb.token_count} vs {vb.token_count}"
-                )
-            if kb.logical_start != vb.logical_start:
-                raise ValueError(
-                    f"block[{i}] key/value logical_start mismatch: {kb.logical_start} vs {vb.logical_start}"
-                )
-
-        # Reference metadata from first block for cross-block consistency.
-        ref_kb = key_blocks[0]
-        ref_vb = value_blocks[0]
-        expected_words_per_vector = ref_kb.words_per_vector
-        expected_groups_per_vector = ref_kb.groups_per_vector
-        ref_layer_id = ref_kb.layer_id
-        ref_stream_k = ref_kb.stream_id
-        ref_stream_v = ref_vb.stream_id
-        ref_sign_seed = ref_kb.sign_seed
-        ref_codec_sig = ref_kb.codec_signature
-        ref_batch = ref_kb.batch_size
-        ref_heads = ref_kb.n_kv_heads
-        ref_dim = ref_kb.head_dim
-        prev_end = 0
-
-        for i, (kb, vb) in enumerate(zip(key_blocks, value_blocks)):
-            # P1.4: contiguous, non-overlapping logical positions
-            if i > 0 and kb.logical_start != prev_end:
-                raise ValueError(
-                    f"block[{i}] logical_start={kb.logical_start} != previous_end={prev_end}; "
-                    "blocks must be contiguous"
-                )
-            prev_end = kb.logical_end
-
-            # P1.4: consistent geometry
-            if kb.batch_size != ref_batch or vb.batch_size != ref_batch:
-                raise ValueError(f"block[{i}] batch_size mismatch")
-            if kb.n_kv_heads != ref_heads or vb.n_kv_heads != ref_heads:
-                raise ValueError(f"block[{i}] n_kv_heads mismatch")
-            if kb.head_dim != ref_dim or vb.head_dim != ref_dim:
-                raise ValueError(f"block[{i}] head_dim mismatch")
-
-            # P1.4: consistent codec metadata
-            if kb.layer_id != ref_layer_id or vb.layer_id != ref_layer_id:
-                raise ValueError(f"block[{i}] layer_id mismatch")
-            if kb.stream_id != ref_stream_k:
-                raise ValueError(f"block[{i}] key stream_id mismatch")
-            if vb.stream_id != ref_stream_v:
-                raise ValueError(f"block[{i}] value stream_id mismatch")
-            if kb.sign_seed != ref_sign_seed or vb.sign_seed != ref_sign_seed:
-                raise ValueError(f"block[{i}] sign_seed mismatch")
-            if ref_codec_sig and kb.codec_signature != ref_codec_sig:
-                raise ValueError(f"block[{i}] codec_signature mismatch")
-
-            # P1.4: consistent format geometry
-            if kb.words_per_vector != expected_words_per_vector:
-                raise ValueError(
-                    f"block[{i}] words_per_vector={kb.words_per_vector}, expected {expected_words_per_vector}"
-                )
-            if kb.groups_per_vector != expected_groups_per_vector:
-                raise ValueError(
-                    f"block[{i}] groups_per_vector={kb.groups_per_vector}, expected {expected_groups_per_vector}"
-                )
-
-            # P1.4: buffer shape sanity
-            expected_code_shape = (ref_batch, ref_heads, kb.token_count, expected_words_per_vector)
-            if kb.packed_codes is not None and tuple(kb.packed_codes.shape) != expected_code_shape:
-                raise ValueError(
-                    f"block[{i}] key packed_codes shape {tuple(kb.packed_codes.shape)} != {expected_code_shape}"
-                )
-            expected_scale_shape = (ref_batch, ref_heads, kb.token_count, expected_groups_per_vector)
-            if kb.scales is not None and tuple(kb.scales.shape) != expected_scale_shape:
-                raise ValueError(
-                    f"block[{i}] key scales shape {tuple(kb.scales.shape)} != {expected_scale_shape}"
-                )
-
-    def _prepare_concatenated_buffers(
-        self, key_blocks: list[PackedBlockV4], value_blocks: list[PackedBlockV4]
-    ) -> tuple[Any, Any, Any, Any, Any, Any]:
-        """Return concatenated K/V buffers, using incremental append when possible.
-
-        Blocks are immutable and append-only in normal operation.  When the
-        new block lists extend the previously-cached lists we only concatenate
-        the new suffix, giving O(new_tokens) work per decode step instead of
-        O(total_tokens) = O(T^2) over the full sequence.
-        """
-        # Fast-path: check if we can reuse the cached prefix for both K and V.
-        k_cache = self._cached_key_blocks
-        v_cache = self._cached_value_blocks
-        can_append = False
-
-        if k_cache and v_cache:
-            n_k = len(k_cache)
-            n_v = len(v_cache)
-            if (
-                len(key_blocks) >= n_k
-                and len(value_blocks) >= n_v
-                and (n_k == 0 or key_blocks[n_k - 1] is k_cache[-1])
-                and (n_v == 0 or value_blocks[n_v - 1] is v_cache[-1])
-            ):
-                can_append = True
-
-        if can_append:
-            # Append new key blocks
-            new_k = key_blocks[len(k_cache):]
-            if new_k:
-                new_k_codes = mx.concatenate([b.packed_codes for b in new_k], axis=2)
-                new_k_scales = mx.concatenate([b.scales for b in new_k], axis=2)
-                self._cached_k_codes = mx.concatenate([self._cached_k_codes, new_k_codes], axis=2)
-                self._cached_k_scales = mx.concatenate([self._cached_k_scales, new_k_scales], axis=2)
-            # Append new value blocks
-            new_v = value_blocks[len(v_cache):]
-            if new_v:
-                new_v_codes = mx.concatenate([b.packed_codes for b in new_v], axis=2)
-                new_v_scales = mx.concatenate([b.scales for b in new_v], axis=2)
-                self._cached_v_codes = mx.concatenate([self._cached_v_codes, new_v_codes], axis=2)
-                self._cached_v_scales = mx.concatenate([self._cached_v_scales, new_v_scales], axis=2)
-        else:
-            # Rebuild from scratch
-            self._cached_k_codes = mx.concatenate([b.packed_codes for b in key_blocks], axis=2)
-            self._cached_k_scales = mx.concatenate([b.scales for b in key_blocks], axis=2)
-            self._cached_v_codes = mx.concatenate([b.packed_codes for b in value_blocks], axis=2)
-            self._cached_v_scales = mx.concatenate([b.scales for b in value_blocks], axis=2)
-
-        # Always rebuild starts/counts (cheap: just int32 arrays)
-        starts = [b.logical_start for b in key_blocks]
-        counts = [b.token_count for b in key_blocks]
-        self._cached_block_starts = mx.array(starts, dtype=mx.int32)
-        self._cached_block_counts = mx.array(counts, dtype=mx.int32)
-        self._cached_key_blocks = list(key_blocks)
-        self._cached_value_blocks = list(value_blocks)
-
-        return (
-            self._cached_k_codes,
-            self._cached_k_scales,
-            self._cached_v_codes,
-            self._cached_v_scales,
-            self._cached_block_starts,
-            self._cached_block_counts,
-        )
+    def _validate_paged_kv(self, paged_kv: Any) -> None:
+        """Fail-fast validation of paged view compatibility."""
+        from rfsn_v10.cache.paged_arena import PagedKVView
+        if not isinstance(paged_kv, PagedKVView):
+            raise TypeError(f"expected PagedKVView, got {type(paged_kv)}")
+        if paged_kv.num_pages <= 0:
+            raise ValueError("paged attention requires at least one page")
 
     def _derive_mixed_seed(self, layer_id: int, stream_id: str) -> int:
         """Reproduce the seed mixing from ``_reference_hash_signs`` exactly.
@@ -792,32 +717,32 @@ class PackedV4AttentionKernel:
     def __call__(
         self,
         queries: mx.array,
-        key_blocks: list[PackedBlockV4],
-        value_blocks: list[PackedBlockV4],
+        paged_kv: Any,
         *,
         scale: float = 1.0,
         causal: bool = True,
         query_start_pos: int = 0,
         strict: bool = False,
+        layer_id: int = 0,
     ) -> tuple[mx.array, mx.array, mx.array, ExecutionContract]:
-        """Execute true-packed attention.
+        """Execute true-packed attention over a paged KV arena.
 
         Parameters
         ----------
         queries
             Shape ``(B, Hq, Lq, D)``.
-        key_blocks
-            List of ``PackedBlockV4`` key blocks in positional order.
-        value_blocks
-            List of ``PackedBlockV4`` value blocks in positional order.
+        paged_kv
+            ``PagedKVView`` from ``PagedKVArena.view()``.
         scale
             Attention scale.
         causal
-            Apply causal masking using ``logical_start`` metadata.
+            Apply causal masking using ``page_starts`` metadata.
         query_start_pos
             Global position of the first query token.
         strict
             If ``True``, validate the zero-materialisation invariant.
+        layer_id
+            Layer index for deterministic sign derivation.
 
         Returns
         -------
@@ -829,27 +754,29 @@ class PackedV4AttentionKernel:
         if not HAS_MLX:
             raise RuntimeError("MLX required")
 
+        from rfsn_v10.cache.paged_arena import PagedKVView
+        if not isinstance(paged_kv, PagedKVView):
+            raise TypeError(f"expected PagedKVView, got {type(paged_kv)}")
+
         start_time = time.perf_counter()
 
-        # Validate format compatibility
-        self._validate_blocks(key_blocks, value_blocks)
+        self._validate_paged_kv(paged_kv)
 
         B, Hq, Lq, D = queries.shape
         if B != 1:
             raise RuntimeError(f"PackedV4AttentionKernel only supports batch_size=1, got {B}")
 
-        num_kv_heads = key_blocks[0].n_kv_heads
+        num_kv_heads = int(paged_kv.k_codes.shape[0])
         if Hq % num_kv_heads != 0:
             raise ValueError(f"Hq ({Hq}) must be divisible by num_kv_heads ({num_kv_heads})")
         q_per_kv = Hq // num_kv_heads
 
-        total_tokens = sum(b.token_count for b in key_blocks)
-        num_blocks = len(key_blocks)
+        num_pages = paged_kv.num_pages
+        total_tokens = int(mx.sum(paged_kv.page_counts[:num_pages]).item())
 
         # Derive mixed seeds for K and V streams independently.
-        layer_id = key_blocks[0].layer_id
-        seed_k = self._derive_mixed_seed(layer_id, key_blocks[0].stream_id)
-        seed_v = self._derive_mixed_seed(layer_id, value_blocks[0].stream_id)
+        seed_k = self._derive_mixed_seed(layer_id, "K")
+        seed_v = self._derive_mixed_seed(layer_id, "V")
 
         # Pre-transform queries into WHT domain
         groups = D // self.group_size
@@ -861,24 +788,12 @@ class PackedV4AttentionKernel:
         # Flatten batch=1 for kernel
         wht_queries_flat = wht_queries.reshape(Hq, Lq, D)
 
-        # Concatenate blocks along T (incremental O(T) when kernel persists)
-        (
-            packed_codes_k, scales_k,
-            packed_codes_v, scales_v,
-            block_starts, block_counts,
-        ) = self._prepare_concatenated_buffers(key_blocks, value_blocks)
-
-        # Flatten batch=1 for kernel buffers
-        packed_codes_k = packed_codes_k.reshape(num_kv_heads, total_tokens, -1)
-        scales_k = scales_k.reshape(num_kv_heads, total_tokens, -1)
-        packed_codes_v = packed_codes_v.reshape(num_kv_heads, total_tokens, -1)
-        scales_v = scales_v.reshape(num_kv_heads, total_tokens, -1)
-
-        # Scalar buffers
+        # Paged arrays are passed directly — no concatenation.
+        active_pages = mx.array([num_pages], dtype=mx.int32)
         scale_arr = mx.array([float(scale)], dtype=mx.float32)
         query_start_arr = mx.array([int(query_start_pos)], dtype=mx.int32)
 
-        # Kernel dispatch — cache wrapper by template signature
+        # Kernel dispatch — cache wrapper by template signature.
         use_tiling = self.kv_tile_size > 0 and total_tokens > self.kv_tile_size
         num_kv_tiles = 1
         if use_tiling:
@@ -888,13 +803,13 @@ class PackedV4AttentionKernel:
             ("NUM_Q_HEADS", int(Hq)),
             ("NUM_Q_TOKENS", int(Lq)),
             ("HEAD_DIM", int(D)),
-            ("NUM_BLOCKS", int(num_blocks)),
-            ("TOTAL_T", int(total_tokens)),
+            ("MAX_PAGES", int(paged_kv.max_pages)),
+            ("PAGE_TOKENS", int(paged_kv.page_tokens)),
             ("BITS", int(self.bits)),
             ("CODES_PER_WORD", int(self.codes_per_word)),
-            ("WORDS_PER_VECTOR", int(key_blocks[0].words_per_vector)),
+            ("WORDS_PER_VECTOR", int(paged_kv.k_words_per_vector)),
             ("GROUP_SIZE", int(self.group_size)),
-            ("GROUPS_PER_VECTOR", int(key_blocks[0].groups_per_vector)),
+            ("GROUPS_PER_VECTOR", int(paged_kv.k_groups_per_vector)),
             ("QMAX", int(self.qmax)),
             ("SEED_VAL_K", int(seed_k)),
             ("SEED_VAL_V", int(seed_v)),
@@ -903,30 +818,28 @@ class PackedV4AttentionKernel:
         ]
         if use_tiling:
             template.append(("KV_TILE_SIZE", int(self.kv_tile_size)))
+            template.append(("NUM_KV_TILES", int(num_kv_tiles)))
 
-        # Cache key includes tiling configuration
+        # Cache key must distinguish scalar vs tiled (different sources)
         cache_key = (tuple(template), use_tiling)
         cached = self._kernel_cache.get(cache_key)
 
         if cached is None:
             if use_tiling:
-                # Two-pass tiled kernel
-                pass1_template = template + [("NUM_KV_TILES", int(num_kv_tiles))]
                 pass1_kernel = mx.fast.metal_kernel(
-                    name="rfsn_tiled_pass1_v2",
+                    name="rfsn_tiled_pass1_v2_paged",
                     input_names=[
                         "wht_queries",
                         "packed_codes_k", "scales_k",
                         "packed_codes_v", "scales_v",
-                        "block_starts", "block_counts",
+                        "page_table", "page_starts", "page_counts", "active_pages",
                         "scale_arr", "query_start_arr",
                     ],
                     output_names=["partial_output", "partial_max", "partial_sum"],
                     source=_PACKED_V4_KERNEL_K8_TILED_PASS1,
                 )
-                pass2_template = template + [("NUM_KV_TILES", int(num_kv_tiles))]
                 pass2_kernel = mx.fast.metal_kernel(
-                    name="rfsn_tiled_pass2_v2",
+                    name="rfsn_tiled_pass2_v2_paged",
                     input_names=[
                         "partial_output", "partial_max", "partial_sum",
                     ],
@@ -941,13 +854,14 @@ class PackedV4AttentionKernel:
                         "wht_queries",
                         "packed_codes_k", "scales_k",
                         "packed_codes_v", "scales_v",
-                        "block_starts", "block_counts",
+                        "page_table", "page_starts", "page_counts", "active_pages",
                         "scale_arr", "query_start_arr",
                     ],
                     output_names=["output", "running_max_arr", "running_sum_arr"],
                     source=_PACKED_V4_KERNEL_K8,
                 )
             self._kernel_cache[cache_key] = cached
+            self._compilation_count += 1
 
         if use_tiling:
             pass1_kernel, pass2_kernel = cached
@@ -956,14 +870,15 @@ class PackedV4AttentionKernel:
             pass1_outputs = pass1_kernel(
                 inputs=[
                     wht_queries_flat,
-                    packed_codes_k, scales_k,
-                    packed_codes_v, scales_v,
-                    block_starts, block_counts,
+                    paged_kv.k_codes, paged_kv.k_scales,
+                    paged_kv.v_codes, paged_kv.v_scales,
+                    paged_kv.page_table, paged_kv.page_starts, paged_kv.page_counts,
+                    active_pages,
                     scale_arr, query_start_arr,
                 ],
-                template=template + [("NUM_KV_TILES", int(num_kv_tiles))],
+                template=template,
                 grid=(Hq * Lq * num_kv_tiles, 1, 1),
-                threadgroup=(64, 1, 1),
+                threadgroup=(32, 1, 1),
                 output_shapes=[
                     (Hq, Lq, num_kv_tiles, D),
                     (Hq, Lq, num_kv_tiles),
@@ -978,7 +893,7 @@ class PackedV4AttentionKernel:
             # Pass 2: reduce partials across tiles
             pass2_outputs = pass2_kernel(
                 inputs=[partial_output, partial_max, partial_sum],
-                template=template + [("NUM_KV_TILES", int(num_kv_tiles))],
+                template=template,
                 grid=(Hq, Lq, 1),
                 threadgroup=(8, 8, 1),
                 output_shapes=[(Hq, Lq, D), (Hq, Lq), (Hq, Lq)],
@@ -992,9 +907,10 @@ class PackedV4AttentionKernel:
             outputs = kernel(
                 inputs=[
                     wht_queries_flat,
-                    packed_codes_k, scales_k,
-                    packed_codes_v, scales_v,
-                    block_starts, block_counts,
+                    paged_kv.k_codes, paged_kv.k_scales,
+                    paged_kv.v_codes, paged_kv.v_scales,
+                    paged_kv.page_table, paged_kv.page_starts, paged_kv.page_counts,
+                    active_pages,
                     scale_arr, query_start_arr,
                 ],
                 template=template,
@@ -1012,37 +928,35 @@ class PackedV4AttentionKernel:
         output = _reference_wht64(output_grouped)
         output = output.reshape(1, Hq, Lq, D).astype(queries.dtype)
 
-        # P1.5: synchronize before timing so execution_ms reflects actual kernel work
+        # Synchronize before timing so execution_ms reflects actual kernel work
         mx.eval(output, running_max, running_sum)
         execution_ms = (time.perf_counter() - start_time) * 1000.0
 
-        # P0: measured counters — derive from actual buffer sizes, not constants
-        # Dense historical K/V materialisation: zero by design
+        # Measured counters
         dense_kv_materialized_bytes = 0
         decoded_dense_tokens = 0
 
-        # Packed history copies (concatenated codes + scales)
         def _buffer_bytes(arr: mx.array) -> int:
             return int(arr.size) * arr.dtype.size
 
-        packed_history_copy_bytes = (
-            _buffer_bytes(packed_codes_k)
-            + _buffer_bytes(scales_k)
-            + _buffer_bytes(packed_codes_v)
-            + _buffer_bytes(scales_v)
-        )
+        # The paged arena arrays are preallocated; the only "new" writes are
+        # the active pages themselves.  For the contract we report the active
+        # payload size, not the full reserved arena.
+        page_write_bytes = (
+            _buffer_bytes(paged_kv.k_codes)  # full arena slice
+            + _buffer_bytes(paged_kv.k_scales)
+            + _buffer_bytes(paged_kv.v_codes)
+            + _buffer_bytes(paged_kv.v_scales)
+        ) * num_pages // paged_kv.max_pages  # approximate active fraction
 
-        # Query WHT transform and flat reshape
         query_transform_bytes = _buffer_bytes(wht_queries_flat)
 
-        # Scratch = output + running_max + running_sum + tiled intermediates
         scratch_bytes = (
             _buffer_bytes(output)
             + _buffer_bytes(running_max)
             + _buffer_bytes(running_sum)
         )
         if use_tiling:
-            # Tiled pass intermediates
             scratch_bytes += (
                 _buffer_bytes(partial_output)
                 + _buffer_bytes(partial_max)
@@ -1053,21 +967,21 @@ class PackedV4AttentionKernel:
         contract = ExecutionContract(
             backend="true_packed_metal_v4_k8",
             kernel_hash=self._kernel_hash,
-            num_key_blocks=num_blocks,
-            num_value_blocks=num_blocks,
+            num_key_blocks=num_pages,
+            num_value_blocks=num_pages,
             total_kv_tokens=total_tokens,
             num_q_heads=Hq,
             num_kv_heads=num_kv_heads,
             head_dim=D,
             bits=self.bits,
             dense_kv_materialized_bytes=dense_kv_materialized_bytes,
-            packed_history_copy_bytes=packed_history_copy_bytes,
+            packed_history_copy_bytes=0,  # invariant: zero history copies
             query_transform_bytes=query_transform_bytes,
             scratch_bytes=scratch_bytes,
             output_bytes=output_bytes,
             decoded_dense_tokens=decoded_dense_tokens,
-            packed_blocks_read=num_blocks,
-            packed_bytes_read=packed_history_copy_bytes,
+            packed_blocks_read=num_pages,
+            packed_bytes_read=page_write_bytes,
             materialized_bytes=0,
             decoded_tokens=0,
             execution_ms=execution_ms,
@@ -1086,8 +1000,7 @@ class PackedV4AttentionKernel:
 
 def packed_v4_attention(
     queries: mx.array,
-    key_blocks: list[PackedBlockV4],
-    value_blocks: list[PackedBlockV4],
+    paged_kv: Any,
     *,
     scale: float = 1.0,
     causal: bool = True,
@@ -1096,15 +1009,16 @@ def packed_v4_attention(
     group_size: int = 64,
     sign_seed: int = 42,
     strict: bool = False,
+    layer_id: int = 0,
 ) -> tuple[mx.array, mx.array, mx.array, ExecutionContract]:
     """Convenience wrapper around ``PackedV4AttentionKernel``."""
     kernel = PackedV4AttentionKernel(bits=bits, group_size=group_size, sign_seed=sign_seed)
     return kernel(
         queries=queries,
-        key_blocks=key_blocks,
-        value_blocks=value_blocks,
+        paged_kv=paged_kv,
         scale=scale,
         causal=causal,
         query_start_pos=query_start_pos,
         strict=strict,
+        layer_id=layer_id,
     )

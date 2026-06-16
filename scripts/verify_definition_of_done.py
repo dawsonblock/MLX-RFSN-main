@@ -126,10 +126,10 @@ def main() -> int:
         *_check("Backend state", backend_report_ready),
     ))
 
-    # 8. PagedPackedArena with zero historical recopy
+    # 8. PagedKVArena with zero historical recopy
     arena_exists = (REPO_ROOT / "rfsn_v10" / "cache" / "paged_arena.py").exists()
     results.append((
-        "8. PagedPackedArena implemented",
+        "8. PagedKVArena implemented",
         *_check("Paged arena", arena_exists),
     ))
 

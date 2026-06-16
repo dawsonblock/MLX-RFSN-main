@@ -168,17 +168,33 @@ class GenerationCacheSession:
                 + stats.dense_residual_tokens
             )
 
-            # Payload: sealed blocks
+            # Payload: sealed blocks or paged arena
             from rfsn_v10.cache.contracts import _array_itemsize
-            for kb in lc.iter_key_blocks():
-                report.packed_key_codes_bytes += int(kb.packed_codes.size) * _array_itemsize(kb.packed_codes)
-                report.key_scales_bytes += int(kb.scales.size) * _array_itemsize(kb.scales)
-                report.block_metadata_bytes += 32  # approximate per-block header
+            paged = lc.get_paged_kv_view()
+            if paged is not None:
+                report.packed_key_codes_bytes += (
+                    int(paged.k_codes.size) * paged.k_codes.dtype.size
+                )
+                report.key_scales_bytes += (
+                    int(paged.k_scales.size) * paged.k_scales.dtype.size
+                )
+                report.packed_value_codes_bytes += (
+                    int(paged.v_codes.size) * paged.v_codes.dtype.size
+                )
+                report.value_scales_bytes += (
+                    int(paged.v_scales.size) * paged.v_scales.dtype.size
+                )
+                report.block_metadata_bytes += paged.page_metadata_bytes
+            else:
+                for kb in lc.iter_key_blocks():
+                    report.packed_key_codes_bytes += int(kb.packed_codes.size) * _array_itemsize(kb.packed_codes)
+                    report.key_scales_bytes += int(kb.scales.size) * _array_itemsize(kb.scales)
+                    report.block_metadata_bytes += 32  # approximate per-block header
 
-            for vb in lc.iter_value_blocks():
-                report.packed_value_codes_bytes += int(vb.packed_codes.size) * _array_itemsize(vb.packed_codes)
-                report.value_scales_bytes += int(vb.scales.size) * _array_itemsize(vb.scales)
-                report.block_metadata_bytes += 32
+                for vb in lc.iter_value_blocks():
+                    report.packed_value_codes_bytes += int(vb.packed_codes.size) * _array_itemsize(vb.packed_codes)
+                    report.value_scales_bytes += int(vb.scales.size) * _array_itemsize(vb.scales)
+                    report.block_metadata_bytes += 32
 
             # Staging
             sk, sv, sn = lc.get_staging()

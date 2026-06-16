@@ -29,8 +29,8 @@ from rfsn_v10.compat import mx
 from .cartesian_codec import CartesianCodec
 from .contracts import CacheStats, PackedBlock, validate_block_positions
 
-# Phase 5: optional paged arena
-from .paged_arena import PagedPackedArena
+# Phase 5: GPU-resident paged arena
+from .paged_arena import PagedKVArena, PagedKVView
 
 
 class QuantizedLayerCache:
@@ -68,14 +68,13 @@ class QuantizedLayerCache:
         self._use_paged_arena = use_paged_arena
         self._max_pages = max_pages
 
-        # Immutable sealed blocks
+        # Immutable sealed blocks (fallback when paged arena is inactive)
         self._key_blocks: list[PackedBlock] = []
         self._value_blocks: list[PackedBlock] = []
 
-        # Phase 5: optional paged arenas (lazy-initialized on first append
-        # when geometry is known)
-        self._key_arena: PagedPackedArena | None = None
-        self._value_arena: PagedPackedArena | None = None
+        # Phase 5: combined GPU-resident KV arena (lazy-initialized on first
+        # flush when packed geometry is known exactly)
+        self._kv_arena: PagedKVArena | None = None
 
         # Staging buffers (mutable) — stored as full-shaped (B, Hkv, T, D) tensors
         self._stage_keys: list[Any] = []
@@ -157,26 +156,6 @@ class QuantizedLayerCache:
                     f"head_dim {D} incompatible with value group_size {self.value_codec.group_size}"
                 )
             self._geometry = (B, Hkv, D)
-            # Phase 5: initialize paged arenas now that geometry is known
-            if self._use_paged_arena:
-                self._key_arena = PagedPackedArena(
-                    max_pages=self._max_pages,
-                    block_tokens=self.staging_capacity,
-                    head_dim=D,
-                    n_kv_heads=Hkv,
-                    bits=self.key_codec.bits,
-                    group_size=self.key_codec.group_size,
-                    name=f"L{self.layer_id}_K",
-                )
-                self._value_arena = PagedPackedArena(
-                    max_pages=self._max_pages,
-                    block_tokens=self.staging_capacity,
-                    head_dim=D,
-                    n_kv_heads=Hkv,
-                    bits=self.value_codec.bits,
-                    group_size=self.value_codec.group_size,
-                    name=f"L{self.layer_id}_V",
-                )
         else:
             expected_B, expected_Hkv, expected_D = self._geometry
             if (B, Hkv, D) != (expected_B, expected_Hkv, expected_D):
@@ -249,10 +228,10 @@ class QuantizedLayerCache:
                 stream_id="V",
             )
 
-            # Phase 5: append to paged arena (primary storage)
-            if self._use_paged_arena and self._key_arena is not None:
-                self._key_arena.append_block(key_block)
-                self._value_arena.append_block(value_block)
+            # Phase 5: append to combined paged arena (primary storage)
+            if self._use_paged_arena:
+                arena = self._ensure_kv_arena(key_block, value_block)
+                arena.append(key_block, value_block)
             else:
                 self._key_blocks.append(key_block)
                 self._value_blocks.append(value_block)
@@ -292,6 +271,24 @@ class QuantizedLayerCache:
             self._stage_keys.clear()
             self._stage_values.clear()
             self._stage_token_count = 0
+
+    def _ensure_kv_arena(
+        self,
+        key_block: PackedBlock,
+        value_block: PackedBlock,
+    ) -> PagedKVArena:
+        """Lazy-init the combined GPU arena once packed geometry is known."""
+        if self._kv_arena is None:
+            self._kv_arena = PagedKVArena(
+                max_pages=self._max_pages,
+                page_tokens=self.staging_capacity,
+                n_kv_heads=key_block.n_kv_heads,
+                k_words_per_vector=key_block.words_per_vector,
+                v_words_per_vector=value_block.words_per_vector,
+                k_groups_per_vector=key_block.groups_per_vector,
+                v_groups_per_vector=value_block.groups_per_vector,
+            )
+        return self._kv_arena
 
     def _update_dense_residual(
         self, keys: Any, values: Any
@@ -335,25 +332,24 @@ class QuantizedLayerCache:
     def iter_key_blocks(self):
         """Yield each sealed key block for blockwise attention.
 
-        Phase 5: When paged arena is active, the kernel consumes blocks
-        directly from arena storage. This eliminates duplicate storage
-        and enables true paged execution.
+        Phase 5: When the paged arena is active, delegates to the arena's
+        backward-compatible iterator.  Production code should prefer
+        ``get_paged_kv_view()``.
         """
         self._check_destroyed()
-        if self._key_arena is not None:
-            yield from self._key_arena.iter_packed_blocks()
+        if self._kv_arena is not None:
+            yield from self._kv_arena.iter_key_blocks()
         else:
             yield from self._key_blocks
 
     def iter_value_blocks(self):
         """Yield each sealed value block for blockwise attention.
 
-        Phase 5: When paged arena is active, the kernel consumes blocks
-        directly from arena storage.
+        Phase 5: Delegates to the arena when active.
         """
         self._check_destroyed()
-        if self._value_arena is not None:
-            yield from self._value_arena.iter_packed_blocks()
+        if self._kv_arena is not None:
+            yield from self._kv_arena.iter_value_blocks()
         else:
             yield from self._value_blocks
 
@@ -361,6 +357,17 @@ class QuantizedLayerCache:
         """Return the dense FP16 residual window, or (None, None)."""
         self._check_destroyed()
         return self._dense_keys, self._dense_values
+
+    def get_paged_kv_view(self) -> PagedKVView | None:
+        """Return a kernel view into the GPU paged arena, or ``None``.
+
+        Production attention should use this instead of
+        ``iter_key_blocks()`` / ``iter_value_blocks()``.
+        """
+        self._check_destroyed()
+        if self._kv_arena is None or self._kv_arena.num_pages == 0:
+            return None
+        return self._kv_arena.view()
 
     def get_staging(self) -> tuple[Any | None, Any | None, int]:
         """Return staging keys, values, and token count.
@@ -406,6 +413,8 @@ class QuantizedLayerCache:
     def payload_bytes(self) -> int:
         """Exact bytes from all sealed blocks (valid payload only)."""
         self._check_destroyed()
+        if self._kv_arena is not None:
+            return self._kv_arena.active_payload_bytes
         total = 0
         for kb, vb in zip(self.iter_key_blocks(), self.iter_value_blocks()):
             total += kb.payload_bytes()
@@ -437,8 +446,11 @@ class QuantizedLayerCache:
 
     def stats(self) -> CacheStats:
         self._check_destroyed()
-        # Count sealed blocks from arena or legacy list
-        sealed_count = sum(1 for _ in self.iter_key_blocks())
+        # Count sealed pages from arena or legacy list
+        if self._kv_arena is not None:
+            sealed_count = self._kv_arena.num_pages
+        else:
+            sealed_count = sum(1 for _ in self.iter_key_blocks())
         return CacheStats(
             tokens_encoded=self._encoded_tokens,
             tokens_requantized=self._requantized_tokens,
@@ -594,10 +606,8 @@ class QuantizedLayerCache:
         """
         self._key_blocks.clear()
         self._value_blocks.clear()
-        if self._key_arena is not None:
-            self._key_arena.reset()
-        if self._value_arena is not None:
-            self._value_arena.reset()
+        if self._kv_arena is not None:
+            self._kv_arena.reset()
         self._stage_keys.clear()
         self._stage_values.clear()
         self._stage_token_count = 0

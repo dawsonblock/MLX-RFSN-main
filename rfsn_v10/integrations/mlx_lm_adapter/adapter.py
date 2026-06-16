@@ -228,6 +228,7 @@ class RfsnMLXReferenceAdapter:
         dense_residual_window: int = 0,
         strict: bool = False,
         use_direct_packed: bool = False,
+        max_context_tokens: int = 16384,
     ) -> None:
         if not HAS_MLX:
             raise RuntimeError("MLX is not installed")
@@ -236,6 +237,7 @@ class RfsnMLXReferenceAdapter:
         self.tokenizer = tokenizer
         self.strict = strict
         self.use_direct_packed = use_direct_packed
+        self.max_context_tokens = max_context_tokens
 
         if num_layers is None:
             num_layers = len(getattr(model, "layers", []))
@@ -493,6 +495,12 @@ class RfsnMLXReferenceAdapter:
 
     def _new_session(self) -> GenerationCacheSession:
         """Create a new isolated session for this generation."""
+        import math
+
+        max_pages = math.ceil(
+            self.max_context_tokens / self.staging_capacity
+        )
+
         self._session = GenerationCacheSession(
             model_id=getattr(self.model, "model_type", "unknown"),
             num_layers=self.num_layers,
@@ -500,6 +508,8 @@ class RfsnMLXReferenceAdapter:
             value_codec=self.value_codec,
             staging_capacity=self.staging_capacity,
             dense_residual_window=self.dense_residual_window,
+            use_paged_arena=self.use_direct_packed,
+            max_pages=max_pages,
         )
         # Fix #1: Track strict mode in session runtime counters
         self._session.runtime_counters.requested_strict_mode = self.strict

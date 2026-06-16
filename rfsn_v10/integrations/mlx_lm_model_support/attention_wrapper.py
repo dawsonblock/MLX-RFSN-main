@@ -107,25 +107,36 @@ class RfsnDirectPackedKVCache:
     def state(self) -> tuple[Any, ...]:
         """Eval-able state for ``mx.eval`` during chunked prefill.
 
-        Returns every live tensor (sealed packed codes and scales, staging
-        K/V, and dense residual K/V) so that ``mx.eval`` forces computation
-        without materialising dense history.
+        Returns every live tensor (paged arena arrays or sealed blocks,
+        staging K/V, and dense residual K/V) so that ``mx.eval`` forces
+        computation without materialising dense history.
         """
         tensors: list[Any] = []
 
-        # Sealed key blocks
-        for block in self.layer_cache.iter_key_blocks():
-            if block.packed_codes is not None:
-                tensors.append(block.packed_codes)
-            if block.scales is not None:
-                tensors.append(block.scales)
-
-        # Sealed value blocks
-        for block in self.layer_cache.iter_value_blocks():
-            if block.packed_codes is not None:
-                tensors.append(block.packed_codes)
-            if block.scales is not None:
-                tensors.append(block.scales)
+        # Paged arena arrays (production path)
+        paged = self.layer_cache.get_paged_kv_view()
+        if paged is not None:
+            tensors.extend([
+                paged.k_codes,
+                paged.k_scales,
+                paged.v_codes,
+                paged.v_scales,
+                paged.page_table,
+                paged.page_starts,
+                paged.page_counts,
+            ])
+        else:
+            # Fallback path: sealed key/value blocks
+            for block in self.layer_cache.iter_key_blocks():
+                if block.packed_codes is not None:
+                    tensors.append(block.packed_codes)
+                if block.scales is not None:
+                    tensors.append(block.scales)
+            for block in self.layer_cache.iter_value_blocks():
+                if block.packed_codes is not None:
+                    tensors.append(block.packed_codes)
+                if block.scales is not None:
+                    tensors.append(block.scales)
 
         # Staging buffers
         stage_k, stage_v, stage_n = self.layer_cache.get_staging()
@@ -426,24 +437,32 @@ class _PackedAttentionWrapper(nn.Module):
                 assert kernel is not None
 
                 # Gather regions
-                key_blocks = list(layer_cache.iter_key_blocks())
-                value_blocks = list(layer_cache.iter_value_blocks())
+                paged_kv = layer_cache.get_paged_kv_view()
                 stage_k, stage_v, stage_n = layer_cache.get_staging()
                 dense_k, dense_v = layer_cache.get_dense_residual()
 
                 regions: list[tuple[Any, Any, Any]] = []
 
                 # ---- Packed region ----
-                if key_blocks:
+                # Bridge: if the cache was created without use_paged_arena,
+                # build a temporary PagedKVView from its blocks.
+                if paged_kv is None:
+                    key_blocks = list(layer_cache.iter_key_blocks())
+                    value_blocks = list(layer_cache.iter_value_blocks())
+                    if key_blocks:
+                        from rfsn_v10.cache.paged_arena import paged_view_from_blocks
+                        paged_kv = paged_view_from_blocks(key_blocks, value_blocks)
+
+                if paged_kv is not None:
                     packed_out, packed_max, packed_sum, packed_contract = (
                         kernel(
                             queries=queries,
-                            key_blocks=key_blocks,
-                            value_blocks=value_blocks,
+                            paged_kv=paged_kv,
                             scale=self._scale,
                             causal=True,
                             query_start_pos=query_start_pos,
                             strict=self._strict,
+                            layer_id=layer_cache.layer_id,
                         )
                     )
                     regions.append((packed_out, packed_max, packed_sum))
@@ -486,9 +505,10 @@ class _PackedAttentionWrapper(nn.Module):
                 if regions:
                     output = _merge_attention_regions(regions)
                 else:
-                    # Empty cache — all zeros
+                    # Empty cache — all zeros (use head_dim, not hidden_size)
+                    head_dim = D // self.n_heads
                     output = mx.zeros(
-                        (B, self.n_heads, L, D), dtype=queries.dtype
+                        (B, self.n_heads, L, head_dim), dtype=queries.dtype
                     )
 
                 # P0: truthful backend attribution based on what actually ran
