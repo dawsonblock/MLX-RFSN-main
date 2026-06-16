@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -688,6 +689,78 @@ def _measure_session_memory(
     }
 
 
+def _run_candidate_subprocess(
+    candidate_type: str,
+    model_id: str,
+    prompt_ids: list[int],
+    max_tokens: int,
+    config: RFSNRuntimeConfig,
+    forced_ids: list[int] | None = None,
+) -> dict:
+    """Run a single candidate in an isolated subprocess for clean memory measurement.
+
+    Uses JSON temp files for IPC.  The subprocess loads the model fresh,
+    runs the candidate, writes results, and exits.  This avoids model
+    caching and allocator reuse from prior candidates.
+    """
+    import subprocess
+    import tempfile
+
+    tmp_dir = Path(tempfile.gettempdir()) / "rfsn_native_gate"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    in_file = tmp_dir / f"{candidate_type}_in.json"
+    out_file = tmp_dir / f"{candidate_type}_out.json"
+
+    payload = {
+        "candidate_type": candidate_type,
+        "model_id": model_id,
+        "prompt_ids": prompt_ids,
+        "max_tokens": max_tokens,
+        "config": config.to_dict(),
+        "forced_ids": forced_ids,
+    }
+    _write_json(in_file, payload)
+
+    cmd = [
+        "python", "-m", "benchmarks.run_native_gate",
+        "--subprocess-candidate", candidate_type,
+        "--model", model_id,
+        "--output-tokens", str(max_tokens),
+        "--key-bits", str(config.key_bits),
+        "--value-bits", str(config.value_bits),
+    ]
+    env = dict(os.environ)
+    env["RFSN_SUBPROCESS_IN"] = str(in_file)
+    env["RFSN_SUBPROCESS_OUT"] = str(out_file)
+    if config.strict_backend:
+        cmd.append("--strict")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+        if result.returncode != 0:
+            return {
+                "error": f"subprocess exit {result.returncode}: {result.stderr}",
+                "candidate_type": candidate_type,
+            }
+        if not out_file.exists():
+            return {
+                "error": "subprocess did not write output file",
+                "candidate_type": candidate_type,
+            }
+        return json.loads(out_file.read_text())
+    except subprocess.TimeoutExpired:
+        return {"error": "subprocess timed out", "candidate_type": candidate_type}
+    except Exception as exc:
+        return {"error": str(exc), "candidate_type": candidate_type}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic native benchmark gate for RFSN K8/V8"
@@ -752,7 +825,51 @@ def main() -> int:
         default=8,
         help="Value quantization bits (default: 8)",
     )
+    parser.add_argument(
+        "--subprocess",
+        action="store_true",
+        help="Run each candidate in an isolated subprocess for clean memory measurement",
+    )
+    parser.add_argument(
+        "--subprocess-candidate",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+
+    # Subprocess worker mode: run a single candidate and exit
+    if args.subprocess_candidate:
+        in_path = os.environ.get("RFSN_SUBPROCESS_IN")
+        out_path = os.environ.get("RFSN_SUBPROCESS_OUT")
+        if not in_path or not out_path:
+            print("ERROR: subprocess mode requires RFSN_SUBPROCESS_IN/OUT env vars")
+            return 1
+        payload = json.loads(Path(in_path).read_text())
+        cfg = RFSNRuntimeConfig(**payload["config"])
+        prompt_ids = payload["prompt_ids"]
+        forced_ids = payload.get("forced_ids")
+        candidate_type = payload["candidate_type"]
+        model_id = payload["model_id"]
+        max_tokens = payload["max_tokens"]
+
+        if candidate_type == "dense":
+            result = _run_dense_baseline(model_id, prompt_ids, max_tokens, cfg)
+        elif candidate_type == "8bit":
+            result = _run_8bit_kv_baseline(model_id, prompt_ids, max_tokens, cfg)
+        elif candidate_type == "packed":
+            result = _run_packed_trace(
+                model_id, prompt_ids, forced_ids or [], cfg
+            )
+        else:
+            result = {"error": f"unknown candidate_type: {candidate_type}"}
+
+        # Convert numpy arrays to plain lists for JSON serialization
+        lps = result.get("per_step_logprobs")
+        if lps is not None:
+            result["per_step_logprobs"] = [lp.tolist() for lp in lps]
+        _write_json(Path(out_path), result)
+        return 0
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -854,18 +971,26 @@ def main() -> int:
             continue
 
         print(f"  Running dense baseline ...")
-        dense_delta = capture_memory_delta()
-        try:
-            dense_result = _run_dense_baseline(
-                args.model, repeated_ids, args.output_tokens, config
+        if args.subprocess:
+            dense_result = _run_candidate_subprocess(
+                "dense", args.model, repeated_ids, args.output_tokens, config
             )
-        except Exception as exc:
-            print(f"  ERROR (dense): {exc}")
-            all_ok = False
-            dense_result = {"error": str(exc)}
-        dense_delta = finalize_memory_delta(dense_delta)
-        if "memory" in dense_result:
-            dense_result["memory"]["delta"] = dense_delta.to_dict()
+            if "error" in dense_result:
+                print(f"  ERROR (dense): {dense_result['error']}")
+                all_ok = False
+        else:
+            dense_delta = capture_memory_delta()
+            try:
+                dense_result = _run_dense_baseline(
+                    args.model, repeated_ids, args.output_tokens, config
+                )
+            except Exception as exc:
+                print(f"  ERROR (dense): {exc}")
+                all_ok = False
+                dense_result = {"error": str(exc)}
+            dense_delta = finalize_memory_delta(dense_delta)
+            if "memory" in dense_result:
+                dense_result["memory"]["delta"] = dense_delta.to_dict()
 
         # Extract free-running token IDs from dense baseline for comparison
         forced_ids = dense_result.get("free_running_token_ids", [])
@@ -873,34 +998,54 @@ def main() -> int:
             print("  WARNING: no free_running_token_ids from dense baseline")
 
         print(f"  Running 8-bit KV baseline ...")
-        eight_delta = capture_memory_delta()
-        try:
-            eight_bit_result = _run_8bit_kv_baseline(
-                args.model, repeated_ids, args.output_tokens, config
+        if args.subprocess:
+            eight_bit_result = _run_candidate_subprocess(
+                "8bit", args.model, repeated_ids, args.output_tokens, config
             )
-        except Exception as exc:
-            print(f"  ERROR (8bit): {exc}")
-            eight_bit_result = {"error": str(exc), "skipped": True}
-            if args.strict:
-                print("  FAILED: 8-bit KV baseline failed in strict mode")
-                all_ok = False
-        eight_delta = finalize_memory_delta(eight_delta)
-        if "memory" in eight_bit_result:
-            eight_bit_result["memory"]["delta"] = eight_delta.to_dict()
+            if "error" in eight_bit_result:
+                print(f"  ERROR (8bit): {eight_bit_result['error']}")
+                eight_bit_result = {**eight_bit_result, "skipped": True}
+                if args.strict:
+                    print("  FAILED: 8-bit KV baseline failed in strict mode")
+                    all_ok = False
+        else:
+            eight_delta = capture_memory_delta()
+            try:
+                eight_bit_result = _run_8bit_kv_baseline(
+                    args.model, repeated_ids, args.output_tokens, config
+                )
+            except Exception as exc:
+                print(f"  ERROR (8bit): {exc}")
+                eight_bit_result = {"error": str(exc), "skipped": True}
+                if args.strict:
+                    print("  FAILED: 8-bit KV baseline failed in strict mode")
+                    all_ok = False
+            eight_delta = finalize_memory_delta(eight_delta)
+            if "memory" in eight_bit_result:
+                eight_bit_result["memory"]["delta"] = eight_delta.to_dict()
 
         print(f"  Running packed trace ...")
-        packed_delta = capture_memory_delta()
-        try:
-            packed_result = _run_packed_trace(
-                args.model, repeated_ids, forced_ids, config
+        if args.subprocess:
+            packed_result = _run_candidate_subprocess(
+                "packed", args.model, repeated_ids, args.output_tokens, config,
+                forced_ids=forced_ids,
             )
-        except Exception as exc:
-            print(f"  ERROR (packed): {exc}")
-            all_ok = False
-            packed_result = {"error": str(exc)}
-        packed_delta = finalize_memory_delta(packed_delta)
-        if "memory" in packed_result:
-            packed_result["memory"]["delta"] = packed_delta.to_dict()
+            if "error" in packed_result:
+                print(f"  ERROR (packed): {packed_result['error']}")
+                all_ok = False
+        else:
+            packed_delta = capture_memory_delta()
+            try:
+                packed_result = _run_packed_trace(
+                    args.model, repeated_ids, forced_ids, config
+                )
+            except Exception as exc:
+                print(f"  ERROR (packed): {exc}")
+                all_ok = False
+                packed_result = {"error": str(exc)}
+            packed_delta = finalize_memory_delta(packed_delta)
+            if "memory" in packed_result:
+                packed_result["memory"]["delta"] = packed_delta.to_dict()
 
         # Compare FREE-RUNNING token hashes (not forced-token hashes)
         dense_hash = dense_result.get("token_sequence_hash", "")
@@ -919,7 +1064,11 @@ def main() -> int:
         dense_lps = dense_result.get("per_step_logprobs")
         packed_lps = packed_result.get("per_step_logprobs")
         if dense_lps and packed_lps:
-            quality = _compute_logit_quality(dense_lps, packed_lps)
+            import numpy as np
+            # Convert lists back to numpy arrays (subprocess IPC serializes to list)
+            dense_arrays = [np.array(lp) for lp in dense_lps]
+            packed_arrays = [np.array(lp) for lp in packed_lps]
+            quality = _compute_logit_quality(dense_arrays, packed_arrays)
             print(
                 f"  Quality: KL={quality.get('kl_divergence', 'N/A')} "
                 f"max_delta={quality.get('max_logit_delta', 'N/A')} "
