@@ -447,6 +447,28 @@ def run_pytest(markers: str, label: str, dirs: list[str] | None = None) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+def _preflight_clean() -> None:
+    """Remove __pycache__ and bytecode left by previous runs.
+
+    pytest and import machinery write these automatically.  Cleaning
+    before the dirty-artifact check ensures idempotent gate execution.
+    """
+    import shutil
+    source_dirs = ["rfsn_v10", "rfsn_v11", "benchmarks", "tests", "scripts", "tools"]
+    cache_names = {"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
+    for src in source_dirs:
+        src_path = REPO_ROOT / src
+        if not src_path.exists():
+            continue
+        for cache_dir in src_path.rglob("*"):
+            if cache_dir.is_dir() and cache_dir.name in cache_names:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+        for pyc in src_path.rglob("*.pyc"):
+            pyc.unlink(missing_ok=True)
+        for pyo in src_path.rglob("*.pyo"):
+            pyo.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="RFSN release gate")
     parser.add_argument("--cpu-only", action="store_true", help="Run CPU-safe checks only")
@@ -454,6 +476,10 @@ def main() -> int:
     parser.add_argument("--full", action="store_true", help="All checks including benchmark smoke")
     parser.add_argument("--output", default=None, help="Write JSON report to this file")
     args = parser.parse_args()
+
+    # Pre-flight: remove bytecode cache left by any previous run so the
+    # dirty-artifact scan starts from a clean state every time.
+    _preflight_clean()
 
     checks = []
 

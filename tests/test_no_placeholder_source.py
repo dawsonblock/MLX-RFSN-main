@@ -29,6 +29,8 @@ FORBIDDEN_PATTERNS = [
 # Directories to skip (build artifacts, dependencies, etc.)
 SKIP_DIRS = {
     ".venv", "venv", "dist", "build", ".eggs", "__pycache__", "node_modules",
+    # Installed wheel test envs and third-party headers
+    "_wheel_test", "site-packages", "external",
 }
 
 
