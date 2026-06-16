@@ -1,13 +1,13 @@
 {
-  "state": "ready",
+  "state": "disabled_by_configuration",
   "backend_name": "metal_true_packed",
   "strict_mode": true,
   "kernel_source_hash": "",
-  "kernel_configuration_hash": "cb181d8ba7712c20",
+  "kernel_configuration_hash": "",
   "mlx_version": "",
-  "mlx_lm_version": "0.20.6",
-  "macos_version": "26.2",
+  "mlx_lm_version": "",
+  "macos_version": "",
   "chip_model": "",
   "memory_capacity_gb": 0.0,
-  "reason": ""
+  "reason": "RFSN_ENABLE_TRUE_PACKED=1 is not set in environment"
 }
