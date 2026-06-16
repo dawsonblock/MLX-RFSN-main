@@ -76,6 +76,16 @@ class ReleaseCriteria:
                         f"context {run['context_length']}: token mismatch"
                     )
 
+            if self.require_strict_gate:
+                if not counters.get("requested_strict_mode"):
+                    violations.append(
+                        f"context {run['context_length']}: requested_strict_mode is false"
+                    )
+                if not counters.get("effective_strict_mode"):
+                    violations.append(
+                        f"context {run['context_length']}: effective_strict_mode is false"
+                    )
+
             if self.require_zero_fallback:
                 if counters.get("dense_fallback_calls", 0) > 0:
                     violations.append(
@@ -84,6 +94,10 @@ class ReleaseCriteria:
                 if counters.get("full_history_materialization_calls", 0) > 0:
                     violations.append(
                         f"context {run['context_length']}: materialization > 0"
+                    )
+                if counters.get("packed_attention_calls", 0) == 0:
+                    violations.append(
+                        f"context {run['context_length']}: packed_attention_calls == 0"
                     )
 
         return violations

@@ -110,15 +110,16 @@ class RFSNRuntimeConfig:
             strict_mode=self.strict_backend,
         )
 
+        # MLX version via importlib.metadata (mlx module has no __version__)
         try:
-            import mlx
-            report.mlx_version = getattr(mlx, "__version__", "")
+            from importlib.metadata import version as pkg_version
+            report.mlx_version = pkg_version("mlx")
         except Exception:
             pass
 
         try:
-            import mlx_lm
-            report.mlx_lm_version = getattr(mlx_lm, "__version__", "")
+            from importlib.metadata import version as pkg_version
+            report.mlx_lm_version = pkg_version("mlx-lm")
         except Exception:
             pass
 
@@ -128,19 +129,21 @@ class RFSNRuntimeConfig:
         except Exception:
             pass
 
+        # Chip model and memory (peak_memory is allocated, not capacity)
         try:
             import mlx.core as mx
-            report.chip_model = mx.metal.get_active_device()
+            dev = mx.metal.get_active_device()
+            report.chip_model = str(dev) if dev is not None else ""
             report.memory_capacity_gb = round(
                 mx.metal.get_peak_memory() / (1024 ** 3), 2
             )
         except Exception:
             pass
 
-        # Kernel source hash
+        # Kernel source hash — use the actual shader constant name
         try:
             from rfsn_v10.kernels.metal.packed_v4_attention import (
-                _SHADER_SOURCE as _src,
+                _PACKED_V4_KERNEL_K8 as _src,
             )
             import hashlib
             report.kernel_source_hash = hashlib.sha256(

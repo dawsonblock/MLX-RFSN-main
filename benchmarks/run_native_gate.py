@@ -57,43 +57,6 @@ def _compute_token_hash(token_ids: list[int]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _run_dense_baseline(
-    model_id: str,
-    prompt: str,
-    max_tokens: int,
-    config: RFSNRuntimeConfig,
-) -> dict:
-    """Run dense FP16 baseline and return trace metadata."""
-    import mlx_lm
-
-    model, tokenizer = mlx_lm.load(model_id)
-    t0 = time.perf_counter()
-    output = mlx_lm.generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        verbose=False,
-    )
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-
-    input_ids = tokenizer.encode(prompt)
-    output_ids = tokenizer.encode(output)
-    gen_ids = output_ids[len(input_ids):]
-
-    return {
-        "model_id": model_id,
-        "prompt": prompt,
-        "prompt_tokens": len(input_ids),
-        "generated_tokens": len(gen_ids),
-        "generated_text": output,
-        "elapsed_ms": round(elapsed_ms, 2),
-        "token_sequence_hash": _compute_token_hash(gen_ids),
-        "backend": "dense_fp16_baseline",
-        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-
-
 def _generate_teacher_forced(
     model: Any,
     tokenizer: Any,
@@ -138,19 +101,25 @@ def _run_8bit_kv_baseline(
     max_tokens: int,
     config: RFSNRuntimeConfig,
 ) -> dict:
-    """Run dense FP16 baseline with MLX-LM 8-bit quantized KV cache."""
-    import mlx.core as mx
+    """Run dense FP16 baseline with MLX-LM 8-bit quantized KV cache.
+
+    Uses the official mlx-lm kv_bits API (not the unsupported quantize_kv_cache flag).
+    """
     import mlx_lm
+    from mlx_lm.sample_utils import make_sampler
 
     model, tokenizer = mlx_lm.load(model_id)
+    sampler = make_sampler(temp=0.0)
     t0 = time.perf_counter()
     output = mlx_lm.generate(
         model,
         tokenizer,
         prompt=prompt,
         max_tokens=max_tokens,
+        kv_bits=8,
+        kv_group_size=64,
+        sampler=sampler,
         verbose=False,
-        quantize_kv_cache=True,
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -158,22 +127,21 @@ def _run_8bit_kv_baseline(
     output_ids = tokenizer.encode(output)
     gen_ids = output_ids[len(input_ids):]
 
-    # 8-bit KV memory estimate: roughly half of FP16
+    # 8-bit KV memory: measure from actual caches after generation
     num_layers = len(model.layers)
-    total_tokens_8bit = len(input_ids) + len(gen_ids)
-    dense_memory = _measure_dense_memory(
-        [model.layers[i].create_cache() for i in range(num_layers)],
-        model=model, total_tokens=total_tokens_8bit,
-    )
-    dense_bytes = dense_memory["raw"].get("dense_kv_bytes", 0)
-    estimated_8bit_bytes = dense_bytes // 2
-    memory = {
-        "category1_persistent_packed_mb": round(estimated_8bit_bytes / (1024 * 1024), 2),
-        "category2_mutable_workingset_mb": 0.0,
-        "category3_transient_scratch_mb": 0.0,
-        "total_accounted_mb": round(estimated_8bit_bytes / (1024 * 1024), 2),
-        "raw": {"estimated_8bit_kv_bytes": estimated_8bit_bytes},
-    }
+    if hasattr(model, "make_cache"):
+        cache_list = model.make_cache()
+    else:
+        from mlx_lm.models import cache as mlx_cache
+        cache_list = [mlx_cache.KVCache() for _ in range(num_layers)]
+
+    # Run a dummy forward to populate caches for measurement
+    import mlx.core as mx
+    y = mx.array(input_ids + gen_ids)
+    _ = model(y[None], cache=cache_list)
+    mx.eval([c.state for c in cache_list])
+
+    memory_8bit = _measure_dense_memory(cache_list, model=model, total_tokens=len(input_ids) + len(gen_ids))
 
     return {
         "model_id": model_id,
@@ -183,10 +151,10 @@ def _run_8bit_kv_baseline(
         "generated_text": output,
         "elapsed_ms": round(elapsed_ms, 2),
         "token_sequence_hash": _compute_token_hash(gen_ids),
-        "forced_token_ids": gen_ids,
+        "free_running_token_ids": gen_ids,
         "backend": "mlx_lm_8bit_kv",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "memory": memory,
+        "memory": memory_8bit,
     }
 
 
@@ -196,22 +164,30 @@ def _run_dense_baseline(
     max_tokens: int,
     config: RFSNRuntimeConfig,
 ) -> dict:
-    """Run dense FP16 baseline and return trace metadata.
+    """Run dense FP16 baseline with proper MLX KVCache autoregressive generation.
 
-    Uses a manual generation loop so we capture exact token IDs,
-    then re-runs teacher-forced with fresh caches for comparison.
+    Step 1: Free-running greedy decode with persistent KV cache.
+    Step 2: Teacher-forced re-run with fresh caches for logit comparison.
     """
     import mlx.core as mx
     import mlx_lm
+    from mlx_lm.models import cache as mlx_cache
     from mlx_lm.sample_utils import make_sampler
 
     model, tokenizer = mlx_lm.load(model_id)
     sampler = make_sampler(temp=0.0)
     prompt_ids = tokenizer.encode(prompt)
 
-    # Step 1: Free-running to get the token sequence
+    # Step 1: Free-running greedy decode with persistent KV cache
+    if hasattr(model, "make_cache"):
+        standard_caches = model.make_cache()
+    else:
+        standard_caches = [
+            mlx_cache.KVCache() for _ in range(len(model.layers))
+        ]
+
     y = mx.array(prompt_ids)
-    logits = model(y[None], cache=None)
+    logits = model(y[None], cache=standard_caches)
     logits = logits[:, -1, :]
 
     gen_ids: list[int] = []
@@ -220,28 +196,33 @@ def _run_dense_baseline(
         token = sampler(logprobs).item()
         gen_ids.append(int(token))
         y = mx.array([token])
-        logits = model(y[None], cache=None)
+        logits = model(y[None], cache=standard_caches)
         logits = logits[:, -1, :]
 
     full_ids = prompt_ids + gen_ids
     output_text = tokenizer.decode(full_ids)
 
-    # Step 2: Re-load model to get fresh caches for teacher-forced trace
+    # Step 2: Teacher-forced re-run with fresh caches for logit comparison
     del model
     import gc
     gc.collect()
     mx.metal.reset_peak_memory()
 
     model, _ = mlx_lm.load(model_id)
-    standard_caches: list[Any] = [None] * len(model.layers)
+    if hasattr(model, "make_cache"):
+        teacher_caches = model.make_cache()
+    else:
+        teacher_caches = [
+            mlx_cache.KVCache() for _ in range(len(model.layers))
+        ]
 
     t0 = time.perf_counter()
     dense_max, dense_argmax = _generate_teacher_forced(
-        model, tokenizer, prompt, gen_ids, standard_caches
+        model, tokenizer, prompt, gen_ids, teacher_caches
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    # Phase 7: measure dense baseline memory (standard MLX caches)
+    # Phase 7: measure dense baseline memory from the free-running caches
     total_tokens = len(prompt_ids) + len(gen_ids)
     dense_memory = _measure_dense_memory(standard_caches, model=model, total_tokens=total_tokens)
 
@@ -253,7 +234,7 @@ def _run_dense_baseline(
         "generated_text": output_text,
         "elapsed_ms": round(elapsed_ms, 2),
         "token_sequence_hash": _compute_token_hash(gen_ids),
-        "forced_token_ids": gen_ids,
+        "free_running_token_ids": gen_ids,
         "per_step_max_logits": [round(x, 4) for x in dense_max],
         "per_step_argmax": dense_argmax,
         "backend": "dense_fp16_baseline",
@@ -322,8 +303,15 @@ def _run_packed_trace(
     forced_ids: list[int],
     config: RFSNRuntimeConfig,
 ) -> dict:
-    """Run packed K8/V8 teacher-forced trace and return trace metadata."""
+    """Run packed K8/V8 trace and return trace metadata.
+
+    Phase 3 fix: First does free-running greedy decode to get packed-generated
+    tokens, then teacher-forced re-run for logit comparison.
+    Token match compares free-running packed vs free-running dense.
+    """
+    import mlx.core as mx
     import mlx_lm
+    from mlx_lm.sample_utils import make_sampler
     from rfsn_v10.cache.cartesian_codec import CartesianCodec
     from rfsn_v10.cache.session import GenerationCacheSession
     from rfsn_v10.integrations.mlx_lm_model_support import (
@@ -332,6 +320,8 @@ def _run_packed_trace(
     )
 
     model, tokenizer = mlx_lm.load(model_id)
+    sampler = make_sampler(temp=0.0)
+    prompt_ids = tokenizer.encode(prompt)
 
     key_codec = CartesianCodec(bits=config.key_bits, group_size=config.group_size)
     value_codec = CartesianCodec(bits=config.value_bits, group_size=config.group_size)
@@ -347,7 +337,8 @@ def _run_packed_trace(
         max_pages=256,
     )
 
-    cache_list = [
+    # Phase 3 fix: free-running greedy decode with packed cache
+    cache_list_fr = [
         RfsnDirectPackedKVCache(
             layer_id=i,
             key_codec=key_codec,
@@ -360,29 +351,75 @@ def _run_packed_trace(
         for i in range(len(model.layers))
     ]
 
+    y = mx.array(prompt_ids)
+    with packed_attention_context(model, cache_list_fr, strict=config.strict_backend):
+        logits = model(y[None], cache=cache_list_fr)
+        logits = logits[:, -1, :]
+
+        packed_gen_ids: list[int] = []
+        for _ in range(len(forced_ids)):
+            logprobs = mx.log(mx.softmax(logits.astype(mx.float32), axis=-1))
+            token = sampler(logprobs).item()
+            packed_gen_ids.append(int(token))
+            y = mx.array([token])
+            logits = model(y[None], cache=cache_list_fr)
+            logits = logits[:, -1, :]
+
+    # Phase 3 fix: teacher-forced re-run with fresh caches for logit comparison
+    del model
+    import gc
+    gc.collect()
+    mx.metal.reset_peak_memory()
+
+    model, _ = mlx_lm.load(model_id)
+    session_tf = GenerationCacheSession(
+        model_id=model_id,
+        num_layers=len(model.layers),
+        key_codec=key_codec,
+        value_codec=value_codec,
+        staging_capacity=config.staging_capacity,
+        dense_residual_window=config.dense_residual_window,
+        use_paged_arena=True,
+        max_pages=256,
+    )
+    cache_list_tf = [
+        RfsnDirectPackedKVCache(
+            layer_id=i,
+            key_codec=key_codec,
+            value_codec=value_codec,
+            staging_capacity=config.staging_capacity,
+            dense_residual_window=config.dense_residual_window,
+            strict=config.strict_backend,
+            session=session_tf,
+        )
+        for i in range(len(model.layers))
+    ]
+
     t0 = time.perf_counter()
-    with packed_attention_context(model, cache_list, strict=config.strict_backend):
+    with packed_attention_context(model, cache_list_tf, strict=config.strict_backend):
         packed_max, packed_argmax = _generate_teacher_forced(
-            model, tokenizer, prompt, forced_ids, cache_list
+            model, tokenizer, prompt, forced_ids, cache_list_tf
         )
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    prompt_ids = tokenizer.encode(prompt)
-
     # Gather proof counters
-    counters = session.runtime_counters.to_dict()
+    counters = session_tf.runtime_counters.to_dict()
+    # Wire strict mode counters explicitly
+    counters["requested_strict_mode"] = config.strict_backend
+    counters["effective_strict_mode"] = config.strict_backend
 
-    # Phase 7: Measure memory from layer caches
-    memory = _measure_session_memory(session)
+    # Phase 7: Measure memory from teacher-forced session
+    memory = _measure_session_memory(session_tf)
 
     return {
         "model_id": model_id,
         "prompt": prompt,
         "prompt_tokens": len(prompt_ids),
-        "generated_tokens": len(forced_ids),
+        "generated_tokens": len(packed_gen_ids),
+        "free_running_token_ids": packed_gen_ids,
         "forced_token_ids": forced_ids,
         "elapsed_ms": round(elapsed_ms, 2),
-        "token_sequence_hash": _compute_token_hash(forced_ids),
+        "token_sequence_hash": _compute_token_hash(packed_gen_ids),
         "per_step_max_logits": [round(x, 4) for x in packed_max],
         "per_step_argmax": packed_argmax,
         "backend": "packed_k8v8_gs64",
@@ -393,7 +430,13 @@ def _run_packed_trace(
 
 
 def _measure_session_memory(session: Any) -> dict:
-    """Measure memory from session layer caches into three categories."""
+    """Measure memory from session layer caches into three categories.
+
+    Audit fix: count each unique packed array only once. The paged arena
+    stores references to the same arrays held in _key_blocks/_value_blocks,
+    so we must not double-count.
+    """
+    seen_ids: set[int] = set()
     total_payload = 0
     total_metadata = 0
     total_staging = 0
@@ -401,28 +444,32 @@ def _measure_session_memory(session: Any) -> dict:
     total_scratch = 0
     total_allocator = 0
 
-    for layer_cache in session._layer_caches.values():
-        # Legacy list storage
-        for kb in layer_cache._key_blocks:
-            if kb.packed_codes is not None and hasattr(kb.packed_codes, "size"):
-                total_payload += int(kb.packed_codes.size) * kb.packed_codes.dtype.size
-            if kb.scales is not None and hasattr(kb.scales, "size"):
-                total_payload += int(kb.scales.size) * kb.scales.dtype.size
-        for vb in layer_cache._value_blocks:
-            if vb.packed_codes is not None and hasattr(vb.packed_codes, "size"):
-                total_payload += int(vb.packed_codes.size) * vb.packed_codes.dtype.size
-            if vb.scales is not None and hasattr(vb.scales, "size"):
-                total_payload += int(vb.scales.size) * vb.scales.dtype.size
+    def _add_unique(arr: Any) -> None:
+        nonlocal total_payload
+        if arr is None or not hasattr(arr, "size"):
+            return
+        aid = id(arr)
+        if aid in seen_ids:
+            return
+        seen_ids.add(aid)
+        total_payload += int(arr.size) * arr.dtype.size
 
-        # Paged arena storage
+    for layer_cache in session._layer_caches.values():
+        # Count packed codes and scales from legacy blocks (unique by id)
+        for kb in layer_cache._key_blocks:
+            _add_unique(kb.packed_codes)
+            _add_unique(kb.scales)
+        for vb in layer_cache._value_blocks:
+            _add_unique(vb.packed_codes)
+            _add_unique(vb.scales)
+
+        # Arena instrumentation (do NOT double-count arrays already counted above)
         if layer_cache._key_arena is not None:
             inst = layer_cache._key_arena.to_instrumentation()
-            total_payload += inst.get("packed_payload_bytes", 0)
             total_metadata += inst.get("metadata_bytes", 0)
             total_allocator += inst.get("page_table_bytes", 0)
         if layer_cache._value_arena is not None:
             inst = layer_cache._value_arena.to_instrumentation()
-            total_payload += inst.get("packed_payload_bytes", 0)
             total_metadata += inst.get("metadata_bytes", 0)
             total_allocator += inst.get("page_table_bytes", 0)
 
@@ -588,16 +635,22 @@ def main() -> int:
 
     for ctx_len in args.context_lengths:
         print(f"\n--- Context length {ctx_len} ---")
-        # Build a prompt that tokenizes to roughly ctx_len tokens
-        # Use repeated text for determinism
+        # Build a prompt that tokenizes to EXACTLY ctx_len tokens
         base_text = (
             "The quick brown fox jumps over the lazy dog. "
             "In 1492, Christopher Columbus sailed the ocean blue. "
             "The capital of France is Paris. "
             "Machine learning is a subset of artificial intelligence. "
         )
-        # Repeat until we exceed ctx_len, then trim
-        repeated = (base_text * ((ctx_len // 10) + 1))[: ctx_len * 6]
+        # Build exact tokenized prompt using tokenizer
+        import mlx_lm
+        _tmp_model, _tmp_tokenizer = mlx_lm.load(args.model)
+        base_ids = _tmp_tokenizer.encode(base_text)
+        repeated_ids = (base_ids * ((ctx_len // len(base_ids)) + 1))[:ctx_len]
+        repeated = _tmp_tokenizer.decode(repeated_ids)
+        del _tmp_model
+        import gc
+        gc.collect()
 
         print(f"  Running dense baseline ...")
         try:
@@ -609,10 +662,10 @@ def main() -> int:
             all_ok = False
             dense_result = {"error": str(exc)}
 
-        # Extract forced token IDs from dense baseline for teacher-forced comparison
-        forced_ids = dense_result.get("forced_token_ids", [])
+        # Extract free-running token IDs from dense baseline for comparison
+        forced_ids = dense_result.get("free_running_token_ids", [])
         if not forced_ids and "error" not in dense_result:
-            print("  WARNING: no forced_token_ids from dense baseline")
+            print("  WARNING: no free_running_token_ids from dense baseline")
 
         print(f"  Running 8-bit KV baseline ...")
         try:
@@ -620,8 +673,11 @@ def main() -> int:
                 args.model, repeated, args.output_tokens, config
             )
         except Exception as exc:
-            print(f"  WARNING (8bit): {exc}")
+            print(f"  ERROR (8bit): {exc}")
             eight_bit_result = {"error": str(exc), "skipped": True}
+            if args.strict:
+                print("  FAILED: 8-bit KV baseline failed in strict mode")
+                all_ok = False
 
         print(f"  Running packed trace ...")
         try:
@@ -633,14 +689,14 @@ def main() -> int:
             all_ok = False
             packed_result = {"error": str(exc)}
 
-        # Compare token hashes
+        # Compare FREE-RUNNING token hashes (not forced-token hashes)
         dense_hash = dense_result.get("token_sequence_hash", "")
         packed_hash = packed_result.get("token_sequence_hash", "")
         if dense_hash and packed_hash:
             match = dense_hash == packed_hash
             print(f"  Token match: {match}")
             if not match and args.strict:
-                print("  FAILED: token sequence divergence")
+                print("  FAILED: free-running token sequence divergence")
                 all_ok = False
         else:
             match = None

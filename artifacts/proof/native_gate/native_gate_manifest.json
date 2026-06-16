@@ -19,9 +19,9 @@
     "state": "ready",
     "backend_name": "metal_true_packed",
     "strict_mode": true,
-    "kernel_source_hash": "",
+    "kernel_source_hash": "767b2ae889b55572",
     "kernel_configuration_hash": "cb181d8ba7712c20",
-    "mlx_version": "",
+    "mlx_version": "0.21.1",
     "mlx_lm_version": "0.20.6",
     "macos_version": "26.2",
     "chip_model": "",
@@ -33,110 +33,137 @@
       "context_length": 64,
       "dense": {
         "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick ",
-        "prompt_tokens": 83,
+        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue",
+        "prompt_tokens": 63,
         "generated_tokens": 8,
-        "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick 1eroeroeroeroeroeroero",
-        "elapsed_ms": 215.66,
-        "token_sequence_hash": "94b48cf42609b1efdf807c11b2741d2b9e3d75bf93fb117885e06fc4c3044218",
-        "forced_token_ids": [
-          16,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328
+        "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris.",
+        "elapsed_ms": 130.71,
+        "token_sequence_hash": "d0c2df820e49fcc87ef2951a05c2cfa883ed37fae38db20ea4e872bc129ab470",
+        "free_running_token_ids": [
+          13,
+          576,
+          6722,
+          315,
+          9625,
+          374,
+          12095,
+          13
         ],
         "per_step_max_logits": [
-          16.2812,
-          15.625,
-          14.7578,
-          14.7578,
-          14.7578,
-          14.7578,
-          14.7578,
-          14.7578
+          21.5,
+          17.9062,
+          17.7969,
+          24.1719,
+          21.1562,
+          23.2031,
+          21.6562,
+          22.7969
         ],
         "per_step_argmax": [
-          16,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328
+          13,
+          576,
+          6722,
+          315,
+          9625,
+          374,
+          12095,
+          13
         ],
         "backend": "dense_fp16_baseline",
-        "timestamp_utc": "2026-06-16T05:19:52Z",
+        "timestamp_utc": "2026-06-16T06:01:48Z",
         "memory": {
-          "category1_persistent_packed_mb": 1.07,
+          "category1_persistent_packed_mb": 3.83,
           "category2_mutable_workingset_mb": 0.0,
           "category3_transient_scratch_mb": 0.0,
-          "total_accounted_mb": 1.07,
+          "total_accounted_mb": 3.83,
           "raw": {
-            "dense_kv_bytes": 1118208
+            "dense_kv_bytes": 4018176
           }
         }
       },
       "eight_bit": {
-        "error": "generate_step() got an unexpected keyword argument 'quantize_kv_cache'",
-        "skipped": true
+        "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue",
+        "prompt_tokens": 63,
+        "generated_tokens": 0,
+        "generated_text": ". The capital of France is Paris.",
+        "elapsed_ms": 1033.02,
+        "token_sequence_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "free_running_token_ids": [],
+        "backend": "mlx_lm_8bit_kv",
+        "timestamp_utc": "2026-06-16T06:01:49Z",
+        "memory": {
+          "category1_persistent_packed_mb": 3.74,
+          "category2_mutable_workingset_mb": 0.0,
+          "category3_transient_scratch_mb": 0.0,
+          "total_accounted_mb": 3.74,
+          "raw": {
+            "dense_kv_bytes": 3919872
+          }
+        }
       },
       "packed": {
         "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick ",
-        "prompt_tokens": 83,
+        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue",
+        "prompt_tokens": 63,
         "generated_tokens": 8,
-        "forced_token_ids": [
-          16,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328,
-          2328
+        "free_running_token_ids": [
+          13,
+          576,
+          6722,
+          315,
+          9625,
+          374,
+          12095,
+          13
         ],
-        "elapsed_ms": 2081.36,
-        "token_sequence_hash": "94b48cf42609b1efdf807c11b2741d2b9e3d75bf93fb117885e06fc4c3044218",
+        "forced_token_ids": [
+          13,
+          576,
+          6722,
+          315,
+          9625,
+          374,
+          12095,
+          13
+        ],
+        "elapsed_ms": 777.32,
+        "token_sequence_hash": "d0c2df820e49fcc87ef2951a05c2cfa883ed37fae38db20ea4e872bc129ab470",
         "per_step_max_logits": [
-          16.2632,
-          18.4244,
-          16.6494,
-          15.1963,
-          17.2841,
-          19.1397,
-          19.1993,
-          19.1463
+          21.5156,
+          17.8594,
+          17.8051,
+          24.2087,
+          21.146,
+          23.1612,
+          21.6283,
+          22.817
         ],
         "per_step_argmax": [
-          16,
-          19,
-          13876,
+          13,
+          576,
+          6722,
+          315,
+          9625,
           374,
-          2328,
-          2328,
-          2328,
-          2328
+          12095,
+          13
         ],
         "backend": "packed_k8v8_gs64",
-        "timestamp_utc": "2026-06-16T05:19:57Z",
+        "timestamp_utc": "2026-06-16T06:01:52Z",
         "counters": {
-          "tokens_appended": 2184,
+          "tokens_appended": 1704,
           "staging_tokens_peak": 0,
           "dense_residual_tokens_peak": 0,
           "packed_blocks_created": 24,
-          "packed_blocks_read": 216,
-          "packed_attention_calls": 216,
-          "packed_reference_calls": 216,
+          "packed_blocks_read": 192,
+          "packed_attention_calls": 192,
+          "packed_reference_calls": 192,
           "dense_fallback_calls": 0,
           "attempted_backend_calls": 0,
           "full_history_materialization_calls": 0,
           "packed_bytes_written": 417792,
-          "packed_bytes_read": 3760128,
+          "packed_bytes_read": 3342336,
           "decoded_block_bytes": 0,
           "logical_payload_bytes": 0,
           "staging_bytes_peak": 0,
@@ -145,18 +172,18 @@
           "scratch_bytes_peak": 0,
           "layer_divergence_count": 0,
           "layers_processed": 0,
-          "requested_strict_mode": false,
-          "effective_strict_mode": false
+          "requested_strict_mode": true,
+          "effective_strict_mode": true
         },
         "memory": {
-          "category1_persistent_packed_mb": 0.8,
-          "category2_mutable_workingset_mb": 0.72,
+          "category1_persistent_packed_mb": 0.4,
+          "category2_mutable_workingset_mb": 0.26,
           "category3_transient_scratch_mb": 0.0,
-          "total_accounted_mb": 1.52,
+          "total_accounted_mb": 0.66,
           "raw": {
-            "payload_bytes": 835584,
+            "payload_bytes": 417792,
             "metadata_bytes": 5760,
-            "staging_bytes": 649728,
+            "staging_bytes": 168448,
             "dense_residual_bytes": 0,
             "allocator_bytes": 98304,
             "scratch_bytes": 0
@@ -166,5 +193,5 @@
       "token_match": true
     }
   ],
-  "timestamp_utc": "2026-06-16T05:19:49Z"
+  "timestamp_utc": "2026-06-16T06:01:43Z"
 }

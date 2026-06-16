@@ -434,7 +434,12 @@ def check_release_integrity() -> dict:
     }
 
 
-def run_pytest(markers: str, label: str, dirs: list[str] | None = None) -> dict:
+def run_pytest(
+    markers: str,
+    label: str,
+    dirs: list[str] | None = None,
+    extra_args: list[str] | None = None,
+) -> dict:
     """Run pytest with the given marker expression.
 
     Parameters
@@ -445,6 +450,8 @@ def run_pytest(markers: str, label: str, dirs: list[str] | None = None) -> dict:
         Human-readable label for the check name.
     dirs
         List of directories to test.  Defaults to ``tests/``.
+    extra_args
+        Additional CLI arguments (e.g. ``--rfsn-portable``).
     """
     targets = [str(REPO_ROOT / d) for d in (dirs or ["tests"])]
     cmd = [
@@ -452,6 +459,7 @@ def run_pytest(markers: str, label: str, dirs: list[str] | None = None) -> dict:
         "-q", "--tb=short",
         f"-m={markers}",
         f"--rootdir={REPO_ROOT}",
+        *(extra_args or []),
         *targets,
     ]
     t0 = time.perf_counter()
@@ -484,12 +492,6 @@ def check_release_level() -> dict:
         }
 
     manifest_path = REPO_ROOT / "artifacts" / "proof" / "native_gate" / "native_gate_manifest.json"
-    if not manifest_path.exists():
-        return {
-            "name": "release_level",
-            "passed": True,
-            "message": "No native gate manifest yet (run --full to generate)",
-        }
 
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -497,10 +499,10 @@ def check_release_level() -> dict:
         return {
             "name": "release_level",
             "passed": False,
-            "message": f"Manifest parse error: {exc}",
+            "message": f"Native gate manifest missing or unreadable: {exc}",
         }
 
-    # Determine target level from release.toml
+    # Determine target level from release.toml (top-level keys, not nested)
     try:
         import tomllib
     except ImportError:
@@ -511,7 +513,7 @@ def check_release_level() -> dict:
     if release_toml.exists():
         with release_toml.open("rb") as f:
             config = tomllib.load(f)
-        channel = config.get("release", {}).get("channel", "alpha")
+        channel = config.get("channel", "alpha")
         try:
             target_level = ReleaseLevel(channel)
         except ValueError:
@@ -590,11 +592,12 @@ def main() -> int:
         "not mlx and not slow and not benchmark"
         " and not experimental and not integration and not db",
         "cpu_safe",
+        extra_args=["--rfsn-portable"],
     ))
 
     if args.mlx or args.full:
         # P0: run marker-filtered tests from tests/
-        checks.append(run_pytest("mlx", "mlx"))
+        checks.append(run_pytest("mlx", "mlx", extra_args=["--rfsn-native-release"]))
         # P0: also run kernel, cache, and model-support suites which live
         # outside tests/ and are omitted by the marker-only path.
         # These directories use skipif guards rather than markers, so we
@@ -602,18 +605,21 @@ def main() -> int:
         checks.append(run_pytest(
             "", "mlx_kernels",
             dirs=["rfsn_v10/kernels/tests"],
+            extra_args=["--rfsn-native-release"],
         ))
         checks.append(run_pytest(
             "", "mlx_cache",
             dirs=["rfsn_v10/cache/tests"],
+            extra_args=["--rfsn-native-release"],
         ))
         checks.append(run_pytest(
             "", "mlx_model_support",
             dirs=["rfsn_v10/integrations/mlx_lm_model_support/tests"],
+            extra_args=["--rfsn-native-release"],
         ))
 
     if args.full:
-        checks.append(run_pytest("benchmark", "benchmark_smoke"))
+        checks.append(run_pytest("benchmark", "benchmark_smoke", extra_args=["--rfsn-native-release"]))
 
     # Phase 10: release level check against native gate manifest
     checks.append(check_release_level())
