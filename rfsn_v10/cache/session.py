@@ -15,6 +15,7 @@ from .cartesian_codec import CartesianCodec
 from .contracts import RuntimeCounters
 from .incremental_layer_cache import QuantizedLayerCache
 from .memory import MemoryReport, measure_process_rss
+from .paged_arena import validate_direct_packed_format
 
 
 class GenerationCacheSession:
@@ -44,6 +45,10 @@ class GenerationCacheSession:
         self.dense_residual_window = dense_residual_window
         self.use_paged_arena = use_paged_arena
         self.max_pages = max_pages
+
+        # Direct packed paging is only valid for K8/V8 GS64.
+        if use_paged_arena:
+            validate_direct_packed_format(key_codec, value_codec, label="session")
 
         # One layer cache per layer
         self._layer_caches: dict[int, QuantizedLayerCache] = {
@@ -170,21 +175,17 @@ class GenerationCacheSession:
 
             # Payload: sealed blocks or paged arena
             from rfsn_v10.cache.contracts import _array_itemsize
-            paged = lc.get_paged_kv_view()
-            if paged is not None:
-                report.packed_key_codes_bytes += (
-                    int(paged.k_codes.size) * paged.k_codes.dtype.size
+            arena_stats = lc.get_paged_arena_stats()
+            if arena_stats is not None:
+                report.packed_key_codes_bytes += arena_stats.get(
+                    "active_payload_bytes", 0
                 )
-                report.key_scales_bytes += (
-                    int(paged.k_scales.size) * paged.k_scales.dtype.size
+                report.block_metadata_bytes += arena_stats.get(
+                    "page_metadata_bytes", 0
                 )
-                report.packed_value_codes_bytes += (
-                    int(paged.v_codes.size) * paged.v_codes.dtype.size
+                report.allocator_overhead_bytes += arena_stats.get(
+                    "allocator_overhead_bytes", 0
                 )
-                report.value_scales_bytes += (
-                    int(paged.v_scales.size) * paged.v_scales.dtype.size
-                )
-                report.block_metadata_bytes += paged.page_metadata_bytes
             else:
                 for kb in lc.iter_key_blocks():
                     report.packed_key_codes_bytes += int(kb.packed_codes.size) * _array_itemsize(kb.packed_codes)

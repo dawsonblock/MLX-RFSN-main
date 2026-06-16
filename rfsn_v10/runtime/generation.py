@@ -137,6 +137,15 @@ class RFSNGenerator:
         self.enable_quantized_kv = enable_quantized_kv
         self.packed_reference = packed_reference
 
+        # Direct packed Metal currently requires K8/V8 GS64.
+        if packed_reference and (
+            key_bits != 8 or value_bits != 8 or group_size != 64
+        ):
+            raise ValueError(
+                "Direct packed generation currently requires K8/V8 GS64; "
+                f"got K{key_bits}/V{value_bits} GS{group_size}"
+            )
+
         self._adapter = None
         if MLX_LM_AVAILABLE and enable_quantized_kv:
             from ..integrations.mlx_lm_adapter.adapter import RfsnMLXReferenceAdapter

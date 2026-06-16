@@ -40,6 +40,7 @@
 8. `fix(server,kernel): tokenization guard, streaming stop sequences, CPU sign identity` — Server chat template fallback; streaming stop-sequence accumulation fix; CPU reference kernels updated to match codec sign algorithm.
 9. `fix(benchmark): make promotion gate fail-closed with valid smoke data` — `Judge(strict=True)` in `run_a1.py`; synthetic smoke data satisfies governance checks (installed-wheel, canonical format, zeroed proof counters).
 10. `fix(packaging): add missing __init__.py for integrations, kernels/tests, kernels/metal` — Fixed namespace-package shadowing that broke imports after wheel+editable cycles.
+11. `fix(paged-arena): hard-lock direct packed to K8/V8 GS64, remove duplicate source blocks, repair memory reporting, and validate masks` — Enforced K8/V8 GS64 in adapter/session/cache/kernel/candidate constructors; made `PagedKVArena` drop retained source blocks by default (`retain_source_blocks=False`); added `PagedKVFormat` descriptor; fixed paged memory-report access and split active payload / reserved capacity / allocator overhead; forced persistent paging in standalone `RfsnDirectPackedKVCache` and benchmark candidate; removed temporary arena bridge from strict path; verify supplied causal masks before ignoring them.
 
 ## Important Invariants
 - `CartesianCodec` defaults: `use_wht=True`, `sign_seed=42`, `group_size` must be a multiple of 64.
@@ -47,6 +48,15 @@
 - `validate_block_positions()` enforces monotonic, non-overlapping block positions.
 - `_reference_hash_signs` and `_numpy_hash_signs` mix `layer_id` and `stream_id` into the seed; decode must pass the same values to preserve the self-inverse identity.
 - Online softmax `running_max` is initialised to `-1e9` (finite) to avoid NaN from `-inf - (-inf)` on fully-masked first blocks.
+- Direct-packed Metal is **hard-locked to K8/V8 GS64** in this release; the `PackedV4AttentionKernel` only supports one encoding width, so any other bit width silently corrupts value decoding.
+- `PagedKVArena` no longer retains original `PackedBlock` payloads by default; use `retain_source_blocks=True` only for debugging.
+- `PagedKVFormat` is frozen on the first arena append and validated on every subsequent append and kernel dispatch.
+- Memory reports distinguish `active_payload_bytes`, `reserved_capacity_bytes`, `allocator_overhead_bytes`, `page_metadata_bytes`, and `source_block_bytes`.
+- The temporary `paged_view_from_blocks` bridge is forbidden on the strict production path; direct packed requires persistent paged storage.
+- Supplied MLX masks are verified against the expected causal additive mask before being ignored; custom masks raise `RuntimeError`.
+- `PagedKVArena` grows incrementally in 16-page slabs rather than preallocating `max_pages`; this avoids reserving the full maximum-context working set after the first page.
+- Arena append synchronisation is scoped to the written page slice and single metadata entry instead of the entire backing store.
+- The scalar packed kernel template is context-stable.  The tiled kernel still bakes `NUM_KV_TILES` into the template and must be made runtime-parametric on a target Mac before it can be promoted past experimental status.
 
 ## Packaging Notes
 - Missing `__init__.py` in package subdirectories causes setuptools to create namespace packages, which shadow editable-install paths after `pip install --force-reinstall`.

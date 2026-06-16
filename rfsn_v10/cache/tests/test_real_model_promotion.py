@@ -209,7 +209,7 @@ class TestRealModelPromotion:
 
         # Packed-reference path
         k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
-        v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
         caches = [
             RfsnDirectPackedKVCache(
                 layer_id=i,
@@ -269,7 +269,7 @@ class TestRealModelPromotion:
 
         # Packed path: wrap once, persist cache across turns
         k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
-        v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
         caches = [
             RfsnDirectPackedKVCache(
                 layer_id=i,
@@ -341,7 +341,7 @@ class TestRealModelPromotion:
 
         # Packed path
         k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
-        v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+        v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
         caches = [
             RfsnDirectPackedKVCache(
                 layer_id=i,

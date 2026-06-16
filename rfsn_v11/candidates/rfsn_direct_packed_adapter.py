@@ -60,6 +60,12 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
         staging_capacity: int = 64,  # Canonical block size
         dense_residual_window: int = 0,
     ) -> None:
+        # P0-1: Direct packed Metal currently supports only K8/V8 GS64.
+        if key_bits != 8 or value_bits != 8 or group_size != 64:
+            raise ValueError(
+                "RFSNDirectPackedCandidate currently requires K8/V8 GS64; "
+                f"got K{key_bits}/V{value_bits} GS{group_size}"
+            )
         self.key_bits = key_bits
         self.value_bits = value_bits
         self.group_size = group_size
@@ -96,6 +102,7 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
         target_text: str,
         max_tokens: int = 200,
         temp: float = 0.0,
+        max_context_tokens: int = 16384,
     ) -> Any:
         """Capture teacher-forced log-probs with direct packed attention.
 
@@ -119,7 +126,10 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 bits=self.value_bits, group_size=self.group_size
             )
 
-            # Pass staging_capacity and dense_residual_window to session
+            # P0-6: Direct packed candidate must request persistent paged storage.
+            import math
+
+            max_pages = math.ceil(max_context_tokens / self.staging_capacity)
             session = GenerationCacheSession(
                 model_id="direct_packed_teacher_forced",
                 num_layers=len(model.layers),
@@ -127,6 +137,8 @@ class RFSNDirectPackedCandidate(KVCompressionCandidate):
                 value_codec=value_codec,
                 staging_capacity=self.staging_capacity,
                 dense_residual_window=self.dense_residual_window,
+                use_paged_arena=True,
+                max_pages=max_pages,
             )
 
             # P0 Fix: Use try/finally to ensure session destruction

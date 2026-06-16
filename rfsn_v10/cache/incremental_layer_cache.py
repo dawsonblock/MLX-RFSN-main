@@ -30,7 +30,11 @@ from .cartesian_codec import CartesianCodec
 from .contracts import CacheStats, PackedBlock, validate_block_positions
 
 # Phase 5: GPU-resident paged arena
-from .paged_arena import PagedKVArena, PagedKVView
+from .paged_arena import (
+    PagedKVArena,
+    PagedKVView,
+    validate_direct_packed_format,
+)
 
 
 class QuantizedLayerCache:
@@ -67,6 +71,12 @@ class QuantizedLayerCache:
         self.session = session
         self._use_paged_arena = use_paged_arena
         self._max_pages = max_pages
+
+        # Direct packed paging is only valid for K8/V8 GS64.
+        if use_paged_arena:
+            validate_direct_packed_format(
+                key_codec, value_codec, label="QuantizedLayerCache"
+            )
 
         # Immutable sealed blocks (fallback when paged arena is inactive)
         self._key_blocks: list[PackedBlock] = []
@@ -368,6 +378,13 @@ class QuantizedLayerCache:
         if self._kv_arena is None or self._kv_arena.num_pages == 0:
             return None
         return self._kv_arena.view()
+
+    def get_paged_arena_stats(self) -> dict[str, Any] | None:
+        """Return arena instrumentation statistics, or ``None`` if not paged."""
+        self._check_destroyed()
+        if self._kv_arena is None:
+            return None
+        return self._kv_arena.to_instrumentation()
 
     def get_staging(self) -> tuple[Any | None, Any | None, int]:
         """Return staging keys, values, and token count.

@@ -21,7 +21,7 @@ def test_direct_packed_cache_interface() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
-    v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+    v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
 
     cache = RfsnDirectPackedKVCache(
         layer_id=0,
@@ -53,7 +53,7 @@ def test_direct_packed_cache_state_returns_all_live_tensors() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
-    v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+    v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
 
     cache = RfsnDirectPackedKVCache(
         layer_id=0,
@@ -63,26 +63,27 @@ def test_direct_packed_cache_state_returns_all_live_tensors() -> None:
         dense_residual_window=4,
     )
 
-    # First append: goes to staging (4 tokens)
+    # First append: with dense_residual_window=4, tokens go to the dense
+    # residual window; no sealed pages yet.
     k1 = mx.random.normal(shape=(1, 2, 4, 64)).astype(mx.float32)
     v1 = mx.random.normal(shape=(1, 2, 4, 64)).astype(mx.float32)
     cache.update_and_fetch(k1, v1)
 
-    # Staging should be present; no sealed blocks yet
     state1 = cache.state
-    assert len(state1) == 2  # stage_k, stage_v
+    assert len(state1) == 2  # dense_k, dense_v
     mx.eval(state1)
 
-    # Second append: staging flushes to sealed, new staging, dense residual
+    # Second append: 8 new tokens overflow the dense window, so 8 tokens are
+    # evicted to staging and flushed into 2 sealed paged pages.  Staging is
+    # empty after the flush, and the dense window retains the last 4 tokens.
     k2 = mx.random.normal(shape=(1, 2, 8, 64)).astype(mx.float32)
     v2 = mx.random.normal(shape=(1, 2, 8, 64)).astype(mx.float32)
     cache.update_and_fetch(k2, v2)
 
     state2 = cache.state
-    # Expect: 2 sealed blocks (K codes, K scales, V codes, V scales) +
-    #          staging K, staging V +
+    # Expect: 7 paged-arena arrays (K/V codes/scales + page metadata) +
     #          dense K, dense V
-    assert len(state2) == 10
+    assert len(state2) == 9
     mx.eval(state2)
 
 
@@ -94,7 +95,7 @@ def test_direct_packed_cache_trim_raises() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64)
-    v_codec = CartesianCodec(bits=5, group_size=64)
+    v_codec = CartesianCodec(bits=8, group_size=64)
     cache = RfsnDirectPackedKVCache(layer_id=0, key_codec=k_codec, value_codec=v_codec)
 
     with pytest.raises(NotImplementedError):
@@ -109,7 +110,7 @@ def test_direct_packed_cache_state_injection_raises() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64)
-    v_codec = CartesianCodec(bits=5, group_size=64)
+    v_codec = CartesianCodec(bits=8, group_size=64)
     cache = RfsnDirectPackedKVCache(layer_id=0, key_codec=k_codec, value_codec=v_codec)
 
     with pytest.raises(NotImplementedError):
@@ -128,7 +129,7 @@ def test_wrap_and_unwrap_model_attention() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
-    v_codec = CartesianCodec(bits=5, group_size=64, use_wht=True, sign_seed=42)
+    v_codec = CartesianCodec(bits=8, group_size=64, use_wht=True, sign_seed=42)
 
     class FakeLinear(nn.Module):
         def __init__(self):
@@ -220,7 +221,7 @@ def test_strict_mode_raises_on_missing_cache() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64)
-    v_codec = CartesianCodec(bits=5, group_size=64)
+    v_codec = CartesianCodec(bits=8, group_size=64)
 
     class FakeAttn(nn.Module):
         def __call__(self, x, mask=None, cache=None):
@@ -264,7 +265,7 @@ def test_permissive_fallback_increments_counter() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64)
-    v_codec = CartesianCodec(bits=5, group_size=64)
+    v_codec = CartesianCodec(bits=8, group_size=64)
 
     class FakeLinear(nn.Module):
         def __init__(self):
@@ -342,7 +343,7 @@ def test_wrap_preserves_parameter_and_state_parity() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64)
-    v_codec = CartesianCodec(bits=5, group_size=64)
+    v_codec = CartesianCodec(bits=8, group_size=64)
 
     class FakeAttn(nn.Module):
         def __init__(self):
@@ -405,7 +406,7 @@ def test_wrap_model_mismatched_layer_count_raises() -> None:
     )
 
     k_codec = CartesianCodec(bits=8, group_size=64)
-    v_codec = CartesianCodec(bits=5, group_size=64)
+    v_codec = CartesianCodec(bits=8, group_size=64)
 
     class FakeModel:
         def __init__(self) -> None:

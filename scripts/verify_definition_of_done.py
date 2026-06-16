@@ -147,9 +147,17 @@ def main() -> int:
         from benchmarks.candidate_registry import build_default_registry
         reg = build_default_registry()
         names = reg.names()
+        unsupported = {
+            "rfsn_direct_packed_k8v5",
+            "rfsn_direct_packed_k8v6",
+            "rfsn_direct_packed_k16v8",
+            "rfsn_direct_packed_k8v16",
+            "rfsn_direct_packed_k16v16",
+        }
         registry_frozen = (
             "rfsn_direct_packed_k8v8" in names
             and "dense_mlx_baseline" in names
+            and not any(u in names for u in unsupported)
         )
     except Exception:
         registry_frozen = False

@@ -247,6 +247,16 @@ class RfsnMLXReferenceAdapter:
         self.key_codec = CartesianCodec(bits=key_bits, group_size=group_size)
         self.value_codec = CartesianCodec(bits=value_bits, group_size=group_size)
 
+        # Direct packed Metal currently requires K8/V8 GS64.
+        if self.use_direct_packed:
+            from rfsn_v10.cache.paged_arena import validate_direct_packed_format
+
+            validate_direct_packed_format(
+                self.key_codec,
+                self.value_codec,
+                label="RfsnMLXReferenceAdapter",
+            )
+
         self.staging_capacity = staging_capacity
         self.dense_residual_window = dense_residual_window
 
@@ -343,6 +353,10 @@ class RfsnMLXReferenceAdapter:
                         self._last_counters["execution_backend"] = backends[0]
             except Exception:
                 self._last_counters["execution_backend"] = "unknown"
+            # Capture memory report before destroying session
+            if self._session:
+                self._last_memory_report = self._session.memory_report().to_dict()
+                self._last_counters = self._session.counters()
             # Destroy session
             if self._session:
                 self._session.destroy()
@@ -456,6 +470,10 @@ class RfsnMLXReferenceAdapter:
                             self._last_counters["execution_backend"] = backends[0]
                 except Exception:
                     self._last_counters["execution_backend"] = "unknown"
+                # Capture memory report before destroying session
+                if self._session:
+                    self._last_memory_report = self._session.memory_report().to_dict()
+                    self._last_counters = self._session.counters()
                 # Destroy session
                 if self._session:
                     self._session.destroy()

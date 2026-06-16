@@ -131,7 +131,7 @@ class TestPackedV4AgainstReference:
         assert contract.dense_kv_materialized_bytes == 0
         assert contract.decoded_dense_tokens == 0
         assert contract.packed_blocks_read == 1
-        assert contract.packed_bytes_read >= 0
+        assert contract.packed_bytes_read > 0
         assert contract.backend == "true_packed_metal_v4_k8"
 
     def test_multiple_blocks_exact(self):

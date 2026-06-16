@@ -34,6 +34,7 @@ import mlx.core as mx
 from rfsn_v10.cache.cartesian_codec import CartesianCodec
 from rfsn_v10.cache.incremental_layer_cache import QuantizedLayerCache
 from rfsn_v10.cache.mlx_packed_attention_reference import attend
+from rfsn_v10.cache.paged_arena import validate_direct_packed_format
 from rfsn_v10.compat import nn
 
 # Dense-reconstruction Metal kernel (kept as fallback)
@@ -72,16 +73,26 @@ class RfsnDirectPackedKVCache:
         dense_residual_window: int = 0,
         strict: bool = False,
         session: Any = None,
+        max_context_tokens: int = 16384,
     ) -> None:
         self.layer_id = layer_id
         self.strict = strict
         self.session = session
 
+        # Direct packed Metal currently requires K8/V8 GS64.
+        validate_direct_packed_format(
+            key_codec, value_codec, label="RfsnDirectPackedKVCache"
+        )
+
         # P0 #4: Make session own the actual layer cache
-        # If session is provided, use its layer cache; otherwise create one
+        # If session is provided, use its layer cache; otherwise create a
+        # standalone layer cache with persistent paging forced on.
         if session is not None:
             self.layer_cache = session.get_layer_cache(layer_id)
         else:
+            import math
+
+            max_pages = math.ceil(max_context_tokens / staging_capacity)
             self.layer_cache = QuantizedLayerCache(
                 key_codec=key_codec,
                 value_codec=value_codec,
@@ -89,6 +100,8 @@ class RfsnDirectPackedKVCache:
                 dense_residual_window=dense_residual_window,
                 layer_id=layer_id,
                 session=session,
+                use_paged_arena=True,
+                max_pages=max_pages,
             )
         self.offset: int = 0
 
@@ -277,6 +290,51 @@ def _merge_attention_regions(
     )
 
 
+def _is_expected_causal_mask(
+    mask: mx.array,
+    queries: mx.array,
+    query_start_pos: int,
+) -> bool:
+    """Return True if ``mask`` is the expected additive causal mask.
+
+    MLX-LM creates an additive mask with shape ``(Lq, total_kv_len)`` where
+    positions that a query token is not allowed to attend to are set to a
+    large negative value (``-1e9``, which may underflow to ``-inf`` in
+    float16) and allowed positions are ``0`` (or ``-0``).  The packed kernel
+    implements this logic internally, so we verify the supplied mask and
+    then ignore it.
+    """
+    B, Hq, Lq, D = queries.shape
+    total_kv_len = query_start_pos + Lq
+
+    if Lq == 0:
+        return True
+
+    if mask.shape[-2:] != (Lq, total_kv_len):
+        return False
+
+    # Work with the trailing (Lq, total_kv_len) slice.  Leading dims are
+    # broadcast, so we just need one representative slice.
+    mask_2d = mask.reshape(-1, Lq, total_kv_len)[0] if mask.ndim > 2 else mask
+
+    # Build the oracle: allowed iff kv_pos <= q_pos.
+    q_positions = mx.arange(query_start_pos, query_start_pos + Lq)[:, None]
+    kv_positions = mx.arange(total_kv_len)[None, :]
+    allowed = q_positions >= kv_positions
+
+    # Allowed positions must be numerically zero (either 0 or -0).
+    allowed_values = mx.where(allowed, mask_2d, mx.zeros_like(mask_2d))
+    if not bool(mx.all(allowed_values == 0).item()):
+        return False
+
+    # Masked positions must be strongly negative (<= -1e8 or -inf).
+    masked_values = mx.where(~allowed, mask_2d, mx.array(-1e9, dtype=mask_2d.dtype))
+    if not bool(mx.all(masked_values <= -1e8).item()):
+        return False
+
+    return True
+
+
 class _PackedAttentionWrapper(nn.Module):
     """Wrapper intercepting attention calls via packed reference.
 
@@ -367,27 +425,18 @@ class _PackedAttentionWrapper(nn.Module):
         query_start_pos = layer_cache.total_token_count() - L
 
         # ------------------------------------------------------------------
-        # P0.7: Reject unsupported masks before dispatch.
-        # The true-packed path only supports causal masking or no mask.
-        # mlx_lm passes causal mask arrays during prefill (T>1); we accept
-        # MLX arrays because our kernel implements causal logic internally.
-        # Non-causal masks (additive, sliding-window, padding) are not yet
-        # supported and will be ignored — this is a known limitation tracked
-        # in the P3 repair plan.
+        # P0.8: Verify causal masks; reject all others.
+        # The true-packed path implements causal logic internally, so an
+        # externally-provided mask is only safe if it is exactly the causal
+        # additive mask that the model would have applied.  Arbitrary MLX
+        # masks (padding, sliding-window, additive, etc.) must not be ignored.
         # ------------------------------------------------------------------
-        _mask_is_mlx_array = isinstance(mask, mx.array)
-        _mask_unsupported = False
         if mask is not None:
-            if isinstance(mask, str):
-                _mask_unsupported = mask.lower() != "causal"
-            elif not _mask_is_mlx_array:
-                _mask_unsupported = True
-
-        if _mask_unsupported and self._strict:
-            raise RuntimeError(
-                f"Strict packed mode: unsupported mask {type(mask).__name__}; "
-                "only causal=True or mask=None is supported."
-            )
+            if not _is_expected_causal_mask(mask, queries, query_start_pos):
+                raise RuntimeError(
+                    "Packed attention currently supports only the expected "
+                    "causal additive mask.  Custom masks are not supported."
+                )
 
         # ------------------------------------------------------------------
         # P0: Strict mode must fail immediately if the packed kernel is
@@ -410,7 +459,7 @@ class _PackedAttentionWrapper(nn.Module):
         _staging_dispatched = False
         _dense_residual_dispatched = False
 
-        if HAS_TRUE_PACKED_KERNEL and not _mask_unsupported:
+        if HAS_TRUE_PACKED_KERNEL:
             _attempted.append("true_packed_v4")
             try:
                 _has_codec = hasattr(layer_cache, "key_codec")
@@ -446,14 +495,14 @@ class _PackedAttentionWrapper(nn.Module):
                 regions: list[tuple[Any, Any, Any]] = []
 
                 # ---- Packed region ----
-                # Bridge: if the cache was created without use_paged_arena,
-                # build a temporary PagedKVView from its blocks.
-                if paged_kv is None:
-                    key_blocks = list(layer_cache.iter_key_blocks())
-                    value_blocks = list(layer_cache.iter_value_blocks())
-                    if key_blocks:
-                        from rfsn_v10.cache.paged_arena import paged_view_from_blocks
-                        paged_kv = paged_view_from_blocks(key_blocks, value_blocks)
+                # P0.7: In strict mode the direct-packed path requires a
+                # persistent paged arena.  Rebuilding a temporary arena from
+                # blocks on every attention call would reintroduce the O(history)
+                # copy that paged storage is meant to eliminate.
+                if paged_kv is None and self._strict:
+                    raise RuntimeError(
+                        "Direct packed attention requires persistent paged storage"
+                    )
 
                 if paged_kv is not None:
                     # Heuristic: Lq > 1 is prefill, Lq == 1 is decode

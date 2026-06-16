@@ -649,6 +649,20 @@ class PackedV4AttentionKernel:
         if paged_kv.num_pages <= 0:
             raise ValueError("paged attention requires at least one page")
 
+        # P0-1: The Metal template only supports K8/V8 GS64 in this release.
+        fmt = paged_kv.format
+        if fmt is not None:
+            if fmt.key_bits != 8 or fmt.value_bits != 8:
+                raise ValueError(
+                    f"PackedV4AttentionKernel only supports K8/V8; "
+                    f"got K{fmt.key_bits}/V{fmt.value_bits}"
+                )
+            if fmt.key_group_size != 64 or fmt.value_group_size != 64:
+                raise ValueError(
+                    f"PackedV4AttentionKernel only supports group_size==64; "
+                    f"got K GS{fmt.key_group_size}, V GS{fmt.value_group_size}"
+                )
+
     def _derive_mixed_seed(self, layer_id: int, stream_id: str) -> int:
         """Reproduce the seed mixing from ``_reference_hash_signs`` exactly.
 

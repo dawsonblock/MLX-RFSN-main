@@ -245,6 +245,31 @@ def test_history_recopy_invariant() -> None:
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+def test_incremental_slab_growth() -> None:
+    """Arena grows in slabs rather than reserving max_pages at init."""
+    arena = PagedKVArena(
+        max_pages=256,
+        page_tokens=64,
+        n_kv_heads=2,
+        k_words_per_vector=16,
+        v_words_per_vector=16,
+        k_groups_per_vector=1,
+        v_groups_per_vector=1,
+    )
+    # Initial capacity should be one slab, not the full 256 pages.
+    assert arena.k_codes.shape[1] == 16
+
+    for i in range(17):
+        kb = _make_block(logical_start=i * 64, token_count=64)
+        vb = _make_block(logical_start=i * 64, token_count=64)
+        arena.append(kb, vb)
+
+    # After crossing the first slab boundary, capacity should have grown.
+    assert arena.k_codes.shape[1] == 32
+    assert arena.num_pages == 17
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
 def test_paged_view_from_blocks_helper() -> None:
     blocks = []
     for i in range(3):
