@@ -49,6 +49,12 @@ class ReleaseCriteria:
     allow_experimental_registry: bool
     min_context_lengths: int
     max_bit_width: int
+    # Quality thresholds (None = no enforcement)
+    max_kl_divergence: float | None = None
+    min_top1_match: float | None = None
+    min_logit_cosine: float | None = None
+    max_speed_ratio: float | None = None  # packed_time / dense_time
+    min_memory_reduction_ratio: float | None = None  # dense_mb / packed_mb
 
     def check(self, manifest: dict[str, Any]) -> list[str]:
         """Return list of violations (empty if all pass)."""
@@ -100,6 +106,50 @@ class ReleaseCriteria:
                         f"context {run['context_length']}: packed_attention_calls == 0"
                     )
 
+            # Quality thresholds
+            quality = run.get("quality")
+            if quality and isinstance(quality, dict):
+                if self.max_kl_divergence is not None:
+                    kl = quality.get("kl_divergence")
+                    if kl is not None and kl > self.max_kl_divergence:
+                        violations.append(
+                            f"context {run['context_length']}: KL {kl} > {self.max_kl_divergence}"
+                        )
+                if self.min_top1_match is not None:
+                    tm = quality.get("top1_match")
+                    if tm is not None and tm < self.min_top1_match:
+                        violations.append(
+                            f"context {run['context_length']}: top1_match {tm} < {self.min_top1_match}"
+                        )
+                if self.min_logit_cosine is not None:
+                    cos = quality.get("logit_cosine")
+                    if cos is not None and cos < self.min_logit_cosine:
+                        violations.append(
+                            f"context {run['context_length']}: cosine {cos} < {self.min_logit_cosine}"
+                        )
+
+            # Speed threshold
+            if self.max_speed_ratio is not None:
+                dense_ms = run.get("dense", {}).get("elapsed_ms")
+                packed_ms = run.get("packed", {}).get("elapsed_ms")
+                if dense_ms and packed_ms and dense_ms > 0:
+                    ratio = packed_ms / dense_ms
+                    if ratio > self.max_speed_ratio:
+                        violations.append(
+                            f"context {run['context_length']}: speed ratio {ratio:.1f}x > {self.max_speed_ratio}x"
+                        )
+
+            # Memory threshold
+            if self.min_memory_reduction_ratio is not None:
+                dense_mb = run.get("dense", {}).get("memory", {}).get("total_accounted_mb")
+                packed_mb = run.get("packed", {}).get("memory", {}).get("total_accounted_mb")
+                if dense_mb and packed_mb and packed_mb > 0:
+                    ratio = dense_mb / packed_mb
+                    if ratio < self.min_memory_reduction_ratio:
+                        violations.append(
+                            f"context {run['context_length']}: memory ratio {ratio:.2f}x < {self.min_memory_reduction_ratio}x"
+                        )
+
         return violations
 
 
@@ -138,6 +188,9 @@ BETA_CRITERIA = ReleaseCriteria(
     allow_experimental_registry=True,
     min_context_lengths=3,
     max_bit_width=8,
+    max_kl_divergence=0.1,
+    min_top1_match=0.95,
+    min_logit_cosine=0.99,
 )
 
 STABLE_CRITERIA = ReleaseCriteria(
@@ -156,6 +209,11 @@ STABLE_CRITERIA = ReleaseCriteria(
     allow_experimental_registry=True,
     min_context_lengths=3,
     max_bit_width=8,
+    max_kl_divergence=0.05,
+    min_top1_match=0.99,
+    min_logit_cosine=0.995,
+    max_speed_ratio=2.0,
+    min_memory_reduction_ratio=1.25,
 )
 
 

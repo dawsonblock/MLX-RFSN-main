@@ -383,6 +383,8 @@ class PackedV4AttentionKernel:
         self._cached_v_scales: Any | None = None
         self._cached_block_starts: Any | None = None
         self._cached_block_counts: Any | None = None
+        # Kernel wrapper cache: keyed by template signature (avoid rebuild in hot path)
+        self._kernel_cache: dict[tuple, Any] = {}
 
     def _validate_blocks(self, key_blocks: list[PackedBlockV4], value_blocks: list[PackedBlockV4]) -> None:
         """Fail-fast validation of block compatibility."""
@@ -665,19 +667,40 @@ class PackedV4AttentionKernel:
         scale_arr = mx.array([float(scale)], dtype=mx.float32)
         query_start_arr = mx.array([int(query_start_pos)], dtype=mx.int32)
 
-        # Kernel dispatch
-        kernel = mx.fast.metal_kernel(
-            name="packed_v4_attention_k8",
-            input_names=[
-                "wht_queries",
-                "packed_codes_k", "scales_k",
-                "packed_codes_v", "scales_v",
-                "block_starts", "block_counts",
-                "scale_arr", "query_start_arr",
-            ],
-            output_names=["output", "running_max_arr", "running_sum_arr"],
-            source=_PACKED_V4_KERNEL_K8,
-        )
+        # Kernel dispatch — cache wrapper by template signature
+        template = [
+            ("NUM_Q_HEADS", int(Hq)),
+            ("NUM_Q_TOKENS", int(Lq)),
+            ("HEAD_DIM", int(D)),
+            ("NUM_BLOCKS", int(num_blocks)),
+            ("TOTAL_T", int(total_tokens)),
+            ("BITS", int(self.bits)),
+            ("CODES_PER_WORD", int(self.codes_per_word)),
+            ("WORDS_PER_VECTOR", int(key_blocks[0].words_per_vector)),
+            ("GROUP_SIZE", int(self.group_size)),
+            ("GROUPS_PER_VECTOR", int(key_blocks[0].groups_per_vector)),
+            ("QMAX", int(self.qmax)),
+            ("SEED_VAL_K", int(seed_k)),
+            ("SEED_VAL_V", int(seed_v)),
+            ("CAUSAL", int(1 if causal else 0)),
+            ("Q_PER_KV", int(q_per_kv)),
+        ]
+        template_key = tuple(template)
+        kernel = self._kernel_cache.get(template_key)
+        if kernel is None:
+            kernel = mx.fast.metal_kernel(
+                name="packed_v4_attention_k8",
+                input_names=[
+                    "wht_queries",
+                    "packed_codes_k", "scales_k",
+                    "packed_codes_v", "scales_v",
+                    "block_starts", "block_counts",
+                    "scale_arr", "query_start_arr",
+                ],
+                output_names=["output", "running_max_arr", "running_sum_arr"],
+                source=_PACKED_V4_KERNEL_K8,
+            )
+            self._kernel_cache[template_key] = kernel
 
         outputs = kernel(
             inputs=[
@@ -687,23 +710,7 @@ class PackedV4AttentionKernel:
                 block_starts, block_counts,
                 scale_arr, query_start_arr,
             ],
-            template=[
-                ("NUM_Q_HEADS", int(Hq)),
-                ("NUM_Q_TOKENS", int(Lq)),
-                ("HEAD_DIM", int(D)),
-                ("NUM_BLOCKS", int(num_blocks)),
-                ("TOTAL_T", int(total_tokens)),
-                ("BITS", int(self.bits)),
-                ("CODES_PER_WORD", int(self.codes_per_word)),
-                ("WORDS_PER_VECTOR", int(key_blocks[0].words_per_vector)),
-                ("GROUP_SIZE", int(self.group_size)),
-                ("GROUPS_PER_VECTOR", int(key_blocks[0].groups_per_vector)),
-                ("QMAX", int(self.qmax)),
-                ("SEED_VAL_K", int(seed_k)),
-                ("SEED_VAL_V", int(seed_v)),
-                ("CAUSAL", int(1 if causal else 0)),
-                ("Q_PER_KV", int(q_per_kv)),
-            ],
+            template=template,
             grid=(Hq, Lq, 1),
             threadgroup=(8, 8, 1),
             output_shapes=[(Hq, Lq, D), (Hq, Lq), (Hq, Lq)],

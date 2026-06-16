@@ -52,6 +52,27 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _load_model_with_retry(model_id: str, max_retries: int = 3, base_delay: float = 2.0):
+    """Load an MLX-LM model with exponential backoff on transient failures."""
+    import time
+    import mlx_lm
+
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return mlx_lm.load(model_id)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                print(f"  Model load attempt {attempt}/{max_retries} failed: {exc}")
+                print(f"  Retrying in {delay:.1f}s ...")
+                time.sleep(delay)
+    raise RuntimeError(
+        f"Failed to load model {model_id!r} after {max_retries} attempts: {last_exc}"
+    )
+
+
 def _compute_token_hash(token_ids: list[int]) -> str:
     """Deterministic hash of a token sequence."""
     payload = ",".join(str(t) for t in token_ids)
@@ -204,7 +225,7 @@ def _run_8bit_kv_baseline(
     import mlx_lm
     from mlx_lm.sample_utils import make_sampler
 
-    model, tokenizer = mlx_lm.load(model_id)
+    model, tokenizer = _load_model_with_retry(model_id)
     sampler = make_sampler(temp=0.0)
     t0 = time.perf_counter()
     output = mlx_lm.generate(
@@ -270,7 +291,7 @@ def _run_dense_baseline(
     from mlx_lm.models import cache as mlx_cache
     from mlx_lm.sample_utils import make_sampler
 
-    model, tokenizer = mlx_lm.load(model_id)
+    model, tokenizer = _load_model_with_retry(model_id)
     sampler = make_sampler(temp=0.0)
     prompt_ids = tokenizer.encode(prompt)
 
@@ -304,7 +325,7 @@ def _run_dense_baseline(
     gc.collect()
     mx.metal.reset_peak_memory()
 
-    model, _ = mlx_lm.load(model_id)
+    model, _ = _load_model_with_retry(model_id)
     if hasattr(model, "make_cache"):
         teacher_caches = model.make_cache()
     else:
@@ -468,7 +489,7 @@ def _run_packed_trace(
     gc.collect()
     mx.metal.reset_peak_memory()
 
-    model, _ = mlx_lm.load(model_id)
+    model, _ = _load_model_with_retry(model_id)
     session_tf = GenerationCacheSession(
         model_id=model_id,
         num_layers=len(model.layers),

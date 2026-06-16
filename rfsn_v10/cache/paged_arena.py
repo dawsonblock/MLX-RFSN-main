@@ -68,6 +68,9 @@ class PagedPackedArena:
         # Physical pages: list of dicts with 'codes', 'scales', 'signs'
         self._pages: list[dict[str, Any]] = []
 
+        # Free page pool: physical page indices available for reuse
+        self._free_pages: list[int] = []
+
         # Block metadata (logical position, layer_id, stream_id)
         self._block_meta: list[dict] = []
 
@@ -87,8 +90,8 @@ class PagedPackedArena:
 
     @property
     def num_pages(self) -> int:
-        """Number of physical pages currently in use."""
-        return len(self._page_table)
+        """Number of physical pages currently allocated (in use + free)."""
+        return len(self._pages)
 
     @property
     def packed_payload_bytes(self) -> int:
@@ -131,7 +134,7 @@ class PagedPackedArena:
     def append_block(self, block: PackedBlock) -> None:
         """Append one sealed packed block.
 
-        Copies only the new block's data into the next free page slot.
+        Uses free-page pool if available, otherwise allocates a new page.
         Existing pages are never touched.
         """
         if self.num_blocks >= self.max_pages:
@@ -140,8 +143,14 @@ class PagedPackedArena:
                 f"{self.num_blocks} >= {self.max_pages} pages"
             )
 
-        page_idx = len(self._pages)
-        self._page_allocation_count += 1
+        # Reuse a free page slot if available, otherwise allocate new
+        if self._free_pages:
+            page_idx = self._free_pages.pop(0)
+            self._page_reuse_count += 1
+        else:
+            page_idx = len(self._pages)
+            self._pages.append({})  # placeholder, filled below
+            self._page_allocation_count += 1
 
         # Store page data (reference, not copy — MLX arrays are immutable)
         page_data: dict[str, Any] = {
@@ -151,7 +160,7 @@ class PagedPackedArena:
         if hasattr(block, "hash_signs") and block.hash_signs is not None:
             page_data["signs"] = block.hash_signs
 
-        self._pages.append(page_data)
+        self._pages[page_idx] = page_data
 
         # Track bytes (the append "cost" is the size of the new block)
         if block.packed_codes is not None and hasattr(block.packed_codes, "size"):
@@ -169,18 +178,20 @@ class PagedPackedArena:
                 "logical_index": logical_idx,
                 "physical_page": page_idx,
                 "logical_start": block.logical_start,
-                "layer_id": block.layer_id,
-                "stream_id": block.stream_id,
+                "layer_id": getattr(block, "layer_id", 0),
+                "stream_id": getattr(block, "stream_id", 0),
             }
         )
 
     def reset(self) -> None:
-        """Clear all blocks. Pages are simply dereferenced for GC."""
+        """Clear all blocks. Physical pages are returned to the free pool for reuse."""
+        # Return all allocated physical pages to the free pool
+        for page_idx in self._page_table:
+            self._free_pages.append(page_idx)
+            # Dereference the actual data for GC
+            self._pages[page_idx] = {}
         self._page_table.clear()
         self._block_meta.clear()
-        self._pages.clear()
-        self._page_allocation_count = 0
-        self._page_reuse_count = 0
         self._append_copy_bytes = 0
 
     def get_block(self, logical_index: int) -> dict[str, Any]:
