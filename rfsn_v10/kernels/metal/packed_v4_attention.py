@@ -340,52 +340,55 @@ if (running_sum > 0.0f) {
 # Enable by passing kv_tile_size > 0 in PackedV4AttentionKernel.__call__.
 # ---------------------------------------------------------------------------
 
-_PACKED_V4_KERNEL_K8_TILED = """
-// ---- grid: (q_head, q_token, kv_tile) ----
-uint q_head      = thread_position_in_grid.x;
-uint q_token     = thread_position_in_grid.y;
-uint kv_tile     = thread_position_in_grid.z;
-uint kv_tile_id  = thread_position_in_threadgroup.z;
+# ---------------------------------------------------------------------------
+# Two-pass KV-tiled kernel
+# ---------------------------------------------------------------------------
+# Pass 1: each thread processes one KV tile and writes partial results.
+# Pass 2: one thread per (q_head, q_token) reduces all tile partials.
+#
+# This avoids the need for threadgroup-memory reduction inside a single
+# kernel dispatch, which is not well-supported by MLX's metal_kernel API.
+# ---------------------------------------------------------------------------
 
-if (q_head >= NUM_Q_HEADS || q_token >= NUM_Q_TOKENS) return;
+_PACKED_V4_KERNEL_K8_TILED_PASS1 = """
+uint tid = thread_position_in_grid.x;
+uint total_threads = NUM_Q_HEADS * NUM_Q_TOKENS * NUM_KV_TILES;
+if (tid >= total_threads) return;
+
+uint q_head = tid / (NUM_Q_TOKENS * NUM_KV_TILES);
+uint rem = tid % (NUM_Q_TOKENS * NUM_KV_TILES);
+uint q_token = rem / NUM_KV_TILES;
+uint kv_tile = rem % NUM_KV_TILES;
 
 uint kv_head = q_head / Q_PER_KV;
 uint query_global_pos = uint(query_start_arr[0]) + q_token;
 
 uint q_offset  = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
-uint out_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
 float scale_val = scale_arr[0];
 
-// ---- tile-local online softmax partials ----
 float local_max  = -INFINITY;
 float local_sum  = 0.0f;
 float local_acc[HEAD_DIM];
 for (uint d = 0; d < HEAD_DIM; d++) { local_acc[d] = 0.0f; }
 
-// Determine this thread's KV range
 uint kv_start = kv_tile * KV_TILE_SIZE;
-uint kv_end   = min(kv_start + KV_TILE_SIZE, TOTAL_T);
+uint kv_end   = min(kv_start + KV_TILE_SIZE, uint(TOTAL_T));
 
-// Iterate only over this tile's KV tokens
-uint t = kv_start;
 for (uint b = 0; b < NUM_BLOCKS; b++) {
     int block_start = block_starts[b];
     int block_count = block_counts[b];
+    for (int local_t = 0; local_t < block_count; local_t++) {
+        int global_t = block_start + local_t;
+        if (global_t < int(kv_start)) continue;
+        if (global_t >= int(kv_end)) continue;
 
-    for (uint local_t = 0; local_t < block_count; local_t++) {
-        if (t < kv_start) { t++; continue; }
-        if (t >= kv_end)   { break; }
+        int kv_global_pos = global_t;
+        if (CAUSAL != 0 && kv_global_pos > int(query_global_pos)) continue;
 
-        int kv_global_pos = block_start + int(local_t);
-        if (CAUSAL != 0 && kv_global_pos > query_global_pos) {
-            t++; continue;
-        }
-
-        // ---- QK dot product (same as base kernel) ----
         float dot = 0.0f;
-        uint base_word = (kv_head * TOTAL_T + t) * WORDS_PER_VECTOR;
-        uint base_scale = (kv_head * TOTAL_T + t) * GROUPS_PER_VECTOR;
-        uint local_flat_base = (kv_head * block_count + local_t) * HEAD_DIM;
+        uint base_word = (kv_head * TOTAL_T + uint(global_t)) * WORDS_PER_VECTOR;
+        uint base_scale = (kv_head * TOTAL_T + uint(global_t)) * GROUPS_PER_VECTOR;
+        uint local_flat_base = (kv_head * uint(block_count) + uint(local_t)) * HEAD_DIM;
 
         for (uint d = 0; d < HEAD_DIM; d++) {
             float q_val = wht_queries[q_offset + d];
@@ -413,16 +416,14 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
         }
         dot *= scale_val;
 
-        // ---- local online softmax ----
         float new_max = max(local_max, dot);
         float scale_old = (local_max == -INFINITY) ? 0.0f : exp(local_max - new_max);
         float exp_dot = exp(dot - new_max);
         local_sum = local_sum * scale_old + exp_dot;
         local_max = new_max;
 
-        // ---- accumulate weighted values ----
-        uint base_word_v = (kv_head * TOTAL_T + t) * WORDS_PER_VECTOR;
-        uint base_scale_v = (kv_head * TOTAL_T + t) * GROUPS_PER_VECTOR;
+        uint base_word_v = (kv_head * TOTAL_T + uint(global_t)) * WORDS_PER_VECTOR;
+        uint base_scale_v = (kv_head * TOTAL_T + uint(global_t)) * GROUPS_PER_VECTOR;
         for (uint d = 0; d < HEAD_DIM; d++) {
             uint word_idx = d / CODES_PER_WORD;
             uint code_in_word = d % CODES_PER_WORD;
@@ -446,26 +447,69 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
             float signed_val = val * sign;
             local_acc[d] = local_acc[d] * scale_old + exp_dot * signed_val;
         }
-        t++;
     }
-    if (t >= kv_end) break;
 }
 
-// ---- threadgroup reduction of partial online-softmax results ----
-// Each thread writes its (local_max, local_sum, local_acc) to tg memory,
-// then one thread reduces across all tiles.
-// NOTE: Threadgroup reduction requires additional Metal shared-memory
-// plumbing. The current fallback executes correctly as a single-thread
-// kernel when KV_TILE_SIZE == TOTAL_T (i.e., one tile).
+uint partial_idx = ((q_head * NUM_Q_TOKENS + q_token) * NUM_KV_TILES + kv_tile) * HEAD_DIM;
+for (uint d = 0; d < HEAD_DIM; d++) {
+    partial_output[partial_idx + d] = local_acc[d];
+}
+uint stat_idx = (q_head * NUM_Q_TOKENS + q_token) * NUM_KV_TILES + kv_tile;
+partial_max[stat_idx] = local_max;
+partial_sum[stat_idx] = local_sum;
+"""
+
+_PACKED_V4_KERNEL_K8_TILED_PASS2 = """
+// ---- grid: (q_head, q_token, 1) ----
+uint q_head  = thread_position_in_grid.x;
+uint q_token = thread_position_in_grid.y;
+
+if (q_head >= NUM_Q_HEADS || q_token >= NUM_Q_TOKENS) return;
+
+uint out_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
+
+// ---- reduce across all KV tiles ----
+// Step 1: find global max across non-empty tiles
+uint base_stat = (q_head * NUM_Q_TOKENS + q_token) * NUM_KV_TILES;
+uint base_out  = base_stat * HEAD_DIM;
+
+float global_max = -INFINITY;
+for (uint tile = 0; tile < NUM_KV_TILES; tile++) {
+    float tile_sum = partial_sum[base_stat + tile];
+    if (tile_sum > 0.0f) {
+        float tile_max = partial_max[base_stat + tile];
+        global_max = max(global_max, tile_max);
+    }
+}
+
+// Step 2: accumulate weighted partials at global_max scale
+float global_sum = 0.0f;
+float global_acc[HEAD_DIM];
+for (uint d = 0; d < HEAD_DIM; d++) { global_acc[d] = 0.0f; }
+
+for (uint tile = 0; tile < NUM_KV_TILES; tile++) {
+    float tile_sum = partial_sum[base_stat + tile];
+    if (tile_sum <= 0.0f) continue;
+
+    float tile_max = partial_max[base_stat + tile];
+    float tile_scale = exp(tile_max - global_max);
+
+    global_sum += tile_sum * tile_scale;
+
+    uint tile_out = base_out + tile * HEAD_DIM;
+    for (uint d = 0; d < HEAD_DIM; d++) {
+        global_acc[d] += partial_output[tile_out + d] * tile_scale;
+    }
+}
 
 uint stat_idx = q_head * NUM_Q_TOKENS + q_token;
-running_max_arr[stat_idx] = local_max;
-running_sum_arr[stat_idx] = local_sum;
+running_max_arr[stat_idx] = global_max;
+running_sum_arr[stat_idx] = global_sum;
 
-if (local_sum > 0.0f) {
-    float inv_sum = 1.0f / local_sum;
+if (global_sum > 0.0f) {
+    float inv_sum = 1.0f / global_sum;
     for (uint d = 0; d < HEAD_DIM; d++) {
-        output[out_offset + d] = local_acc[d] * inv_sum;
+        output[out_offset + d] = global_acc[d] * inv_sum;
     }
 } else {
     for (uint d = 0; d < HEAD_DIM; d++) {
@@ -860,45 +904,108 @@ class PackedV4AttentionKernel:
         if use_tiling:
             template.append(("KV_TILE_SIZE", int(self.kv_tile_size)))
 
-        template_key = tuple(template)
-        kernel = self._kernel_cache.get(template_key)
-        if kernel is None:
-            kernel_source = _PACKED_V4_KERNEL_K8_TILED if use_tiling else _PACKED_V4_KERNEL_K8
-            kernel = mx.fast.metal_kernel(
-                name="packed_v4_attention_k8_tiled" if use_tiling else "packed_v4_attention_k8",
-                input_names=[
-                    "wht_queries",
-                    "packed_codes_k", "scales_k",
-                    "packed_codes_v", "scales_v",
-                    "block_starts", "block_counts",
-                    "scale_arr", "query_start_arr",
+        # Cache key includes tiling configuration
+        cache_key = (tuple(template), use_tiling)
+        cached = self._kernel_cache.get(cache_key)
+
+        if cached is None:
+            if use_tiling:
+                # Two-pass tiled kernel
+                pass1_template = template + [("NUM_KV_TILES", int(num_kv_tiles))]
+                pass1_kernel = mx.fast.metal_kernel(
+                    name="rfsn_tiled_pass1_v2",
+                    input_names=[
+                        "wht_queries",
+                        "packed_codes_k", "scales_k",
+                        "packed_codes_v", "scales_v",
+                        "block_starts", "block_counts",
+                        "scale_arr", "query_start_arr",
+                    ],
+                    output_names=["partial_output", "partial_max", "partial_sum"],
+                    source=_PACKED_V4_KERNEL_K8_TILED_PASS1,
+                )
+                pass2_template = template + [("NUM_KV_TILES", int(num_kv_tiles))]
+                pass2_kernel = mx.fast.metal_kernel(
+                    name="rfsn_tiled_pass2_v2",
+                    input_names=[
+                        "partial_output", "partial_max", "partial_sum",
+                    ],
+                    output_names=["output", "running_max_arr", "running_sum_arr"],
+                    source=_PACKED_V4_KERNEL_K8_TILED_PASS2,
+                )
+                cached = (pass1_kernel, pass2_kernel)
+            else:
+                cached = mx.fast.metal_kernel(
+                    name="packed_v4_attention_k8",
+                    input_names=[
+                        "wht_queries",
+                        "packed_codes_k", "scales_k",
+                        "packed_codes_v", "scales_v",
+                        "block_starts", "block_counts",
+                        "scale_arr", "query_start_arr",
+                    ],
+                    output_names=["output", "running_max_arr", "running_sum_arr"],
+                    source=_PACKED_V4_KERNEL_K8,
+                )
+            self._kernel_cache[cache_key] = cached
+
+        if use_tiling:
+            pass1_kernel, pass2_kernel = cached
+
+            # Pass 1: per-tile partial attention
+            pass1_outputs = pass1_kernel(
+                inputs=[
+                    wht_queries_flat,
+                    packed_codes_k, scales_k,
+                    packed_codes_v, scales_v,
+                    block_starts, block_counts,
+                    scale_arr, query_start_arr,
                 ],
-                output_names=["output", "running_max_arr", "running_sum_arr"],
-                source=kernel_source,
+                template=template + [("NUM_KV_TILES", int(num_kv_tiles))],
+                grid=(Hq * Lq * num_kv_tiles, 1, 1),
+                threadgroup=(64, 1, 1),
+                output_shapes=[
+                    (Hq, Lq, num_kv_tiles, D),
+                    (Hq, Lq, num_kv_tiles),
+                    (Hq, Lq, num_kv_tiles),
+                ],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
             )
-            self._kernel_cache[template_key] = kernel
+            partial_output = pass1_outputs[0]
+            partial_max = pass1_outputs[1]
+            partial_sum = pass1_outputs[2]
 
-        grid = (Hq, Lq, num_kv_tiles) if use_tiling else (Hq, Lq, 1)
-        tg = (8, 8, num_kv_tiles) if use_tiling else (8, 8, 1)
-
-        outputs = kernel(
-            inputs=[
-                wht_queries_flat,
-                packed_codes_k, scales_k,
-                packed_codes_v, scales_v,
-                block_starts, block_counts,
-                scale_arr, query_start_arr,
-            ],
-            template=template,
-            grid=grid,
-            threadgroup=tg,
-            output_shapes=[(Hq, Lq, D), (Hq, Lq), (Hq, Lq)],
-            output_dtypes=[mx.float32, mx.float32, mx.float32],
-        )
-
-        output_wht = outputs[0]  # shape (Hq, Lq, D)
-        running_max = outputs[1]  # shape (Hq, Lq)
-        running_sum = outputs[2]  # shape (Hq, Lq)
+            # Pass 2: reduce partials across tiles
+            pass2_outputs = pass2_kernel(
+                inputs=[partial_output, partial_max, partial_sum],
+                template=template + [("NUM_KV_TILES", int(num_kv_tiles))],
+                grid=(Hq, Lq, 1),
+                threadgroup=(8, 8, 1),
+                output_shapes=[(Hq, Lq, D), (Hq, Lq), (Hq, Lq)],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+            )
+            output_wht = pass2_outputs[0]
+            running_max = pass2_outputs[1]
+            running_sum = pass2_outputs[2]
+        else:
+            kernel = cached
+            outputs = kernel(
+                inputs=[
+                    wht_queries_flat,
+                    packed_codes_k, scales_k,
+                    packed_codes_v, scales_v,
+                    block_starts, block_counts,
+                    scale_arr, query_start_arr,
+                ],
+                template=template,
+                grid=(Hq, Lq, 1),
+                threadgroup=(8, 8, 1),
+                output_shapes=[(Hq, Lq, D), (Hq, Lq), (Hq, Lq)],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+            )
+            output_wht = outputs[0]
+            running_max = outputs[1]
+            running_sum = outputs[2]
 
         # Apply inverse WHT to return to original domain
         output_grouped = output_wht.reshape(Hq, Lq, groups, self.group_size)
@@ -928,12 +1035,19 @@ class PackedV4AttentionKernel:
         # Query WHT transform and flat reshape
         query_transform_bytes = _buffer_bytes(wht_queries_flat)
 
-        # Scratch = output + running_max + running_sum
+        # Scratch = output + running_max + running_sum + tiled intermediates
         scratch_bytes = (
             _buffer_bytes(output)
             + _buffer_bytes(running_max)
             + _buffer_bytes(running_sum)
         )
+        if use_tiling:
+            # Tiled pass intermediates
+            scratch_bytes += (
+                _buffer_bytes(partial_output)
+                + _buffer_bytes(partial_max)
+                + _buffer_bytes(partial_sum)
+            )
         output_bytes = _buffer_bytes(output)
 
         contract = ExecutionContract(

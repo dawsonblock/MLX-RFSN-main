@@ -402,6 +402,8 @@ class _PackedAttentionWrapper(nn.Module):
             try:
                 _has_codec = hasattr(layer_cache, "key_codec")
                 if self._cached_kernel is None:
+                    import os as _os
+                    _kv_tile = int(_os.environ.get("RFSN_KV_TILE_SIZE", "0"))
                     object.__setattr__(
                         self,
                         "_cached_kernel",
@@ -417,6 +419,7 @@ class _PackedAttentionWrapper(nn.Module):
                                 if _has_codec
                                 else 42
                             ),
+                            kv_tile_size=_kv_tile,
                         ),
                     )
                 kernel = self._cached_kernel
