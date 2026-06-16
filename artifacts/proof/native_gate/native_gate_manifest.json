@@ -37,7 +37,7 @@
         "prompt_tokens": 83,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick 1eroeroeroeroeroeroero",
-        "elapsed_ms": 358.23,
+        "elapsed_ms": 126.06,
         "token_sequence_hash": "94b48cf42609b1efdf807c11b2741d2b9e3d75bf93fb117885e06fc4c3044218",
         "forced_token_ids": [
           16,
@@ -70,7 +70,7 @@
           2328
         ],
         "backend": "dense_fp16_baseline",
-        "timestamp_utc": "2026-06-16T02:40:42Z"
+        "timestamp_utc": "2026-06-16T02:46:30Z"
       },
       "packed": {
         "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
@@ -87,7 +87,7 @@
           2328,
           2328
         ],
-        "elapsed_ms": 1532.13,
+        "elapsed_ms": 1355.23,
         "token_sequence_hash": "94b48cf42609b1efdf807c11b2741d2b9e3d75bf93fb117885e06fc4c3044218",
         "per_step_max_logits": [
           16.1781,
@@ -110,7 +110,7 @@
           2328
         ],
         "backend": "packed_k8v8_gs64",
-        "timestamp_utc": "2026-06-16T02:40:44Z",
+        "timestamp_utc": "2026-06-16T02:46:32Z",
         "counters": {
           "tokens_appended": 2184,
           "staging_tokens_peak": 0,
@@ -139,5 +139,5 @@
       "token_match": true
     }
   ],
-  "timestamp_utc": "2026-06-16T02:40:39Z"
+  "timestamp_utc": "2026-06-16T02:46:27Z"
 }

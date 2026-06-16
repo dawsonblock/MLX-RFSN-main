@@ -32,6 +32,8 @@ class GenerationCacheSession:
         value_codec: CartesianCodec,
         staging_capacity: int = 64,
         dense_residual_window: int = 0,
+        use_paged_arena: bool = False,
+        max_pages: int = 256,
     ) -> None:
         self.session_id = str(uuid.uuid4())
         self.model_id = model_id
@@ -40,6 +42,8 @@ class GenerationCacheSession:
         self.value_codec = value_codec
         self.staging_capacity = staging_capacity
         self.dense_residual_window = dense_residual_window
+        self.use_paged_arena = use_paged_arena
+        self.max_pages = max_pages
 
         # One layer cache per layer
         self._layer_caches: dict[int, QuantizedLayerCache] = {
@@ -50,6 +54,8 @@ class GenerationCacheSession:
                 dense_residual_window=dense_residual_window,
                 layer_id=i,
                 session=self,
+                use_paged_arena=use_paged_arena,
+                max_pages=max_pages,
             )
             for i in range(num_layers)
         }

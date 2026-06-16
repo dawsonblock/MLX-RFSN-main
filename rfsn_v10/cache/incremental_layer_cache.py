@@ -29,6 +29,9 @@ from rfsn_v10.compat import mx
 from .cartesian_codec import CartesianCodec
 from .contracts import CacheStats, PackedBlock, validate_block_positions
 
+# Phase 5: optional paged arena
+from .paged_arena import PagedPackedArena
+
 
 class QuantizedLayerCache:
     """Per-layer cache that only appends, never recompresses.
@@ -53,6 +56,8 @@ class QuantizedLayerCache:
         dense_residual_window: int = 0,
         layer_id: int = 0,
         session: Any = None,
+        use_paged_arena: bool = False,
+        max_pages: int = 256,
     ) -> None:
         self.key_codec = key_codec
         self.value_codec = value_codec
@@ -60,10 +65,17 @@ class QuantizedLayerCache:
         self.dense_residual_window = dense_residual_window
         self.layer_id = layer_id
         self.session = session
+        self._use_paged_arena = use_paged_arena
+        self._max_pages = max_pages
 
         # Immutable sealed blocks
         self._key_blocks: list[PackedBlock] = []
         self._value_blocks: list[PackedBlock] = []
+
+        # Phase 5: optional paged arenas (lazy-initialized on first append
+        # when geometry is known)
+        self._key_arena: PagedPackedArena | None = None
+        self._value_arena: PagedPackedArena | None = None
 
         # Staging buffers (mutable) — stored as full-shaped (B, Hkv, T, D) tensors
         self._stage_keys: list[Any] = []
@@ -145,6 +157,26 @@ class QuantizedLayerCache:
                     f"head_dim {D} incompatible with value group_size {self.value_codec.group_size}"
                 )
             self._geometry = (B, Hkv, D)
+            # Phase 5: initialize paged arenas now that geometry is known
+            if self._use_paged_arena:
+                self._key_arena = PagedPackedArena(
+                    max_pages=self._max_pages,
+                    block_tokens=self.staging_capacity,
+                    head_dim=D,
+                    n_kv_heads=Hkv,
+                    bits=self.key_codec.bits,
+                    group_size=self.key_codec.group_size,
+                    name=f"L{self.layer_id}_K",
+                )
+                self._value_arena = PagedPackedArena(
+                    max_pages=self._max_pages,
+                    block_tokens=self.staging_capacity,
+                    head_dim=D,
+                    n_kv_heads=Hkv,
+                    bits=self.value_codec.bits,
+                    group_size=self.value_codec.group_size,
+                    name=f"L{self.layer_id}_V",
+                )
         else:
             expected_B, expected_Hkv, expected_D = self._geometry
             if (B, Hkv, D) != (expected_B, expected_Hkv, expected_D):
@@ -217,8 +249,16 @@ class QuantizedLayerCache:
                 stream_id="V",
             )
 
-            self._key_blocks.append(key_block)
-            self._value_blocks.append(value_block)
+            # Phase 5: append to paged arena or legacy list
+            if self._use_paged_arena and self._key_arena is not None:
+                self._key_arena.append_block(key_block)
+                self._value_arena.append_block(value_block)
+                # Also keep in legacy list for callers that expect PackedBlock objects
+                self._key_blocks.append(key_block)
+                self._value_blocks.append(value_block)
+            else:
+                self._key_blocks.append(key_block)
+                self._value_blocks.append(value_block)
 
             # Fix #2: Use typed methods instead of string-based increment
             # Fix #4: Record actual block creation and bytes written including scales

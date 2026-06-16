@@ -226,6 +226,8 @@ def _run_packed_trace(
         value_codec=value_codec,
         staging_capacity=config.staging_capacity,
         dense_residual_window=config.dense_residual_window,
+        use_paged_arena=True,
+        max_pages=256,
     )
 
     cache_list = [
