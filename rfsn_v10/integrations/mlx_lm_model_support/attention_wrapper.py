@@ -316,6 +316,8 @@ class _PackedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_layer_id", layer_id)
         # P1: Execution contract storage for auditability
         object.__setattr__(self, "_last_execution_contract", None)
+        # P4.6: Accumulate all contracts for prefill/decode aggregation
+        object.__setattr__(self, "_execution_contracts", [])
         object.__setattr__(self, "_cached_kernel", None)
 
     def __call__(
@@ -454,6 +456,8 @@ class _PackedAttentionWrapper(nn.Module):
                         paged_kv = paged_view_from_blocks(key_blocks, value_blocks)
 
                 if paged_kv is not None:
+                    # Heuristic: Lq > 1 is prefill, Lq == 1 is decode
+                    _is_prefill = queries.shape[2] > 1
                     packed_out, packed_max, packed_sum, packed_contract = (
                         kernel(
                             queries=queries,
@@ -463,6 +467,7 @@ class _PackedAttentionWrapper(nn.Module):
                             query_start_pos=query_start_pos,
                             strict=self._strict,
                             layer_id=layer_cache.layer_id,
+                            is_prefill=_is_prefill,
                         )
                     )
                     regions.append((packed_out, packed_max, packed_sum))
@@ -533,6 +538,7 @@ class _PackedAttentionWrapper(nn.Module):
                     object.__setattr__(
                         self, "_last_execution_contract", contract
                     )
+                    self._execution_contracts.append(contract)
 
                 # P0: record packed attention only when the kernel actually ran
                 if _packed_kernel_dispatched:
@@ -667,12 +673,27 @@ class _PackedAttentionWrapper(nn.Module):
                 "materialized_bytes": contract.materialized_bytes,
                 "decoded_tokens": contract.decoded_tokens,
                 "execution_ms": contract.execution_ms,
+                "prefill_ms": contract.prefill_ms,
+                "decode_ms": contract.decode_ms,
             }
             # Validate and report invariant status
             passed, violations = contract.validate_invariant()
             stats["invariant_passed"] = passed
             if violations:
                 stats["invariant_violations"] = violations
+
+        # P4.6: Aggregate prefill/decode across all accumulated contracts
+        total_prefill_ms = 0.0
+        total_decode_ms = 0.0
+        total_execution_ms = 0.0
+        for c in self._execution_contracts:
+            total_prefill_ms += c.prefill_ms
+            total_decode_ms += c.decode_ms
+            total_execution_ms += c.execution_ms
+        stats["aggregated_prefill_ms"] = total_prefill_ms
+        stats["aggregated_decode_ms"] = total_decode_ms
+        stats["aggregated_execution_ms"] = total_execution_ms
+        stats["num_calls"] = len(self._execution_contracts)
 
         return stats
 

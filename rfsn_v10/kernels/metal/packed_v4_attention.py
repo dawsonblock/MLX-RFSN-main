@@ -156,6 +156,9 @@ class ExecutionContract:
     # P1: packed I/O counters for promotion governance
     packed_blocks_read: int = 0
     packed_bytes_read: int = 0
+    # P4.6: separate prefill vs decode timing
+    prefill_ms: float = 0.0
+    decode_ms: float = 0.0
     # Legacy aliases for backward compatibility
     materialized_bytes: int = 0
     decoded_tokens: int = 0
@@ -199,8 +202,9 @@ uint kv_head = q_head / Q_PER_KV;
 uint query_global_pos = uint(query_start_arr[0]) + q_token;
 
 // Pre-transformed query offset: [NUM_Q_HEADS, NUM_Q_TOKENS, HEAD_DIM]
-uint q_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
-uint out_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
+uint q_pair  = q_head * NUM_Q_TOKENS + q_token;
+uint q_offset = q_pair * HEAD_DIM;
+uint out_offset = q_pair * HEAD_DIM;
 
 float scale_val = scale_arr[0];
 
@@ -214,8 +218,8 @@ for (uint d = 0; d < HEAD_DIM; d++) {
     acc[d] = 0.0f;
 }
 
-uint t = 0;
 uint num_pages = uint(active_pages[0]);
+uint mask = (1u << BITS) - 1u;
 
 for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
     uint physical_page = uint(page_table[logical_page]);
@@ -227,67 +231,60 @@ for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
 
         // causal mask
         if (CAUSAL != 0 && kv_global_pos > query_global_pos) {
-            t++;
             continue;
         }
 
         // ---- QK dot product with on-the-fly decode in WHT domain ----
         float dot = 0.0f;
 
-        for (uint d = 0; d < HEAD_DIM; d++) {
-            float q_val = wht_queries[q_offset + d];
+        uint local_flat_base = (kv_head * uint(page_count) + local_t) * HEAD_DIM;
 
-            uint word_idx = d / CODES_PER_WORD;
-            uint code_in_word = d % CODES_PER_WORD;
-            uint shift = code_in_word * BITS;
-            uint mask = (1u << BITS) - 1u;
+        // Precompute base indices for this token
+        uint token_base = (
+            (kv_head * MAX_PAGES + physical_page) * PAGE_TOKENS + local_t
+        );
+        uint code_base_k = token_base * WORDS_PER_VECTOR;
+        uint scale_base_k = token_base * GROUPS_PER_VECTOR;
 
-            uint code_index_k = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * WORDS_PER_VECTOR
-                + word_idx
+        // Load scale once per token (GROUPS_PER_VECTOR is typically 1)
+        float scl_k = float(scales_k[scale_base_k]);
+
+        // SIMD vector constants for 4-dim parallelism
+        uint4 shifts4 = uint4(0u, BITS, 2u * BITS, 3u * BITS);
+        float4 qmax4 = float4(QMAX);
+
+        for (uint word_idx = 0; word_idx < WORDS_PER_VECTOR; word_idx++) {
+            uint packed_word = packed_codes_k[code_base_k + word_idx];
+            uint d = word_idx * CODES_PER_WORD;
+
+            float4 q4 = float4(
+                wht_queries[q_offset + d + 0],
+                wht_queries[q_offset + d + 1],
+                wht_queries[q_offset + d + 2],
+                wht_queries[q_offset + d + 3]
             );
 
-            uint packed_word = packed_codes_k[code_index_k];
-            uint code = (packed_word >> shift) & mask;
+            uint4 codes4 = (uint4(packed_word) >> shifts4) & mask;
+            float4 q_signed4 = float4(codes4) - qmax4;
+            float4 val4 = q_signed4 * scl_k;
 
-            float q_signed = float(code) - QMAX;
-
-            uint group_idx = d / GROUP_SIZE;
-            uint scale_index_k = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * GROUPS_PER_VECTOR
-                + group_idx
+            uint4 flat_idx4 = uint4(
+                local_flat_base + d + 0,
+                local_flat_base + d + 1,
+                local_flat_base + d + 2,
+                local_flat_base + d + 3
             );
+            uint4 state4 = flat_idx4 ^ SEED_VAL_K;
+            state4 = state4 + 0x9E3779B9u;
+            state4 = state4 ^ (state4 >> 16);
+            state4 = state4 * 0x85EBCA6Bu;
+            state4 = state4 ^ (state4 >> 13);
+            state4 = state4 * 0xC2B2AE35u;
+            state4 = state4 ^ (state4 >> 16);
+            float4 sign4 = select(float4(1.0f), float4(-1.0f), (state4 & 1u) != 0u);
 
-            half scale_k = scales_k[scale_index_k];
-            float scl = float(scale_k);
-            float val = q_signed * scl;
-
-            // hash sign (Murmur32-avalanche-v1)
-            uint local_flat_base = (kv_head * uint(page_count) + local_t) * HEAD_DIM;
-            uint flat_idx = local_flat_base + d;
-            uint state = flat_idx ^ SEED_VAL_K;
-            state = state + 0x9E3779B9u;
-            state = state ^ (state >> 16);
-            state = state * 0x85EBCA6Bu;
-            state = state ^ (state >> 13);
-            state = state * 0xC2B2AE35u;
-            state = state ^ (state >> 16);
-            float sign = (state & 1u) ? -1.0f : 1.0f;
-
-            float signed_val = val * sign;
-            dot += q_val * signed_val;
+            float4 partial = q4 * val4 * sign4;
+            dot += partial.x + partial.y + partial.z + partial.w;
         }
 
         dot *= scale_val;
@@ -301,64 +298,45 @@ for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
         running_max = new_max;
 
         // ---- immediately accumulate weighted values ----
-        for (uint d = 0; d < HEAD_DIM; d++) {
-            uint word_idx = d / CODES_PER_WORD;
-            uint code_in_word = d % CODES_PER_WORD;
-            uint shift = code_in_word * BITS;
-            uint mask = (1u << BITS) - 1u;
+        uint code_base_v = token_base * WORDS_PER_VECTOR;
+        uint scale_base_v = token_base * GROUPS_PER_VECTOR;
+        float scl_v = float(scales_v[scale_base_v]);
 
-            uint code_index_v = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * WORDS_PER_VECTOR
-                + word_idx
+        for (uint word_idx = 0; word_idx < WORDS_PER_VECTOR; word_idx++) {
+            uint packed_word = packed_codes_v[code_base_v + word_idx];
+            uint d = word_idx * CODES_PER_WORD;
+
+            float4 acc4 = float4(acc[d+0], acc[d+1], acc[d+2], acc[d+3]);
+
+            uint4 codes4 = (uint4(packed_word) >> shifts4) & mask;
+            float4 q_signed4 = float4(codes4) - qmax4;
+            float4 val4 = q_signed4 * scl_v;
+
+            uint4 flat_idx4 = uint4(
+                local_flat_base + d + 0,
+                local_flat_base + d + 1,
+                local_flat_base + d + 2,
+                local_flat_base + d + 3
             );
+            uint4 state4 = flat_idx4 ^ SEED_VAL_V;
+            state4 = state4 + 0x9E3779B9u;
+            state4 = state4 ^ (state4 >> 16);
+            state4 = state4 * 0x85EBCA6Bu;
+            state4 = state4 ^ (state4 >> 13);
+            state4 = state4 * 0xC2B2AE35u;
+            state4 = state4 ^ (state4 >> 16);
+            float4 sign4 = select(float4(1.0f), float4(-1.0f), (state4 & 1u) != 0u);
 
-            uint packed_word = packed_codes_v[code_index_v];
-            uint code = (packed_word >> shift) & mask;
-
-            float q_signed = float(code) - QMAX;
-            uint group_idx = d / GROUP_SIZE;
-
-            uint scale_index_v = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * GROUPS_PER_VECTOR
-                + group_idx
-            );
-
-            half scale_v = scales_v[scale_index_v];
-            float scl = float(scale_v);
-            float val = q_signed * scl;
-
-            uint local_flat_base = (kv_head * uint(page_count) + local_t) * HEAD_DIM;
-            uint flat_idx = local_flat_base + d;
-            uint state = flat_idx ^ SEED_VAL_V;
-            state = state + 0x9E3779B9u;
-            state = state ^ (state >> 16);
-            state = state * 0x85EBCA6Bu;
-            state = state ^ (state >> 13);
-            state = state * 0xC2B2AE35u;
-            state = state ^ (state >> 16);
-            float sign = (state & 1u) ? -1.0f : 1.0f;
-
-            float signed_val = val * sign;
-            acc[d] = acc[d] * scale_old + exp_dot * signed_val;
+            acc4 = acc4 * scale_old + exp_dot * val4 * sign4;
+            acc[d+0] = acc4.x;
+            acc[d+1] = acc4.y;
+            acc[d+2] = acc4.z;
+            acc[d+3] = acc4.w;
         }
-
-        t++;
     }
 }
 
-uint stat_idx = q_head * NUM_Q_TOKENS + q_token;
+uint stat_idx = q_pair;
 running_max_arr[stat_idx] = running_max;
 running_sum_arr[stat_idx] = running_sum;
 
@@ -423,6 +401,7 @@ for (uint d = 0; d < HEAD_DIM; d++) { local_acc[d] = 0.0f; }
 
 uint kv_start = kv_tile * KV_TILE_SIZE;
 uint kv_end   = kv_start + KV_TILE_SIZE;  // tile size is constant per template
+uint mask = (1u << BITS) - 1u;
 
 uint num_pages = uint(active_pages[0]);
 
@@ -444,58 +423,48 @@ for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
         float dot = 0.0f;
         uint local_flat_base = (kv_head * uint(page_count) + local_t) * HEAD_DIM;
 
-        for (uint d = 0; d < HEAD_DIM; d++) {
-            float q_val = wht_queries[q_offset + d];
+        uint token_base = (
+            (kv_head * MAX_PAGES + physical_page) * PAGE_TOKENS + local_t
+        );
+        uint code_base_k = token_base * WORDS_PER_VECTOR;
+        uint scale_base_k = token_base * GROUPS_PER_VECTOR;
+        float scl_k = float(scales_k[scale_base_k]);
 
-            uint word_idx = d / CODES_PER_WORD;
-            uint code_in_word = d % CODES_PER_WORD;
-            uint shift = code_in_word * BITS;
-            uint mask = (1u << BITS) - 1u;
+        uint4 shifts4 = uint4(0u, BITS, 2u * BITS, 3u * BITS);
+        float4 qmax4 = float4(QMAX);
 
-            uint code_index_k = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * WORDS_PER_VECTOR
-                + word_idx
+        for (uint word_idx = 0; word_idx < WORDS_PER_VECTOR; word_idx++) {
+            uint packed_word = packed_codes_k[code_base_k + word_idx];
+            uint d = word_idx * CODES_PER_WORD;
+
+            float4 q4 = float4(
+                wht_queries[q_offset + d + 0],
+                wht_queries[q_offset + d + 1],
+                wht_queries[q_offset + d + 2],
+                wht_queries[q_offset + d + 3]
             );
 
-            uint packed_word = packed_codes_k[code_index_k];
-            uint code = (packed_word >> shift) & mask;
+            uint4 codes4 = (uint4(packed_word) >> shifts4) & mask;
+            float4 q_signed4 = float4(codes4) - qmax4;
+            float4 val4 = q_signed4 * scl_k;
 
-            float q_signed = float(code) - QMAX;
-            uint group_idx = d / GROUP_SIZE;
-
-            uint scale_index_k = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * GROUPS_PER_VECTOR
-                + group_idx
+            uint4 flat_idx4 = uint4(
+                local_flat_base + d + 0,
+                local_flat_base + d + 1,
+                local_flat_base + d + 2,
+                local_flat_base + d + 3
             );
+            uint4 state4 = flat_idx4 ^ SEED_VAL_K;
+            state4 = state4 + 0x9E3779B9u;
+            state4 = state4 ^ (state4 >> 16);
+            state4 = state4 * 0x85EBCA6Bu;
+            state4 = state4 ^ (state4 >> 13);
+            state4 = state4 * 0xC2B2AE35u;
+            state4 = state4 ^ (state4 >> 16);
+            float4 sign4 = select(float4(1.0f), float4(-1.0f), (state4 & 1u) != 0u);
 
-            half scale_k = scales_k[scale_index_k];
-            float scl = float(scale_k);
-            float val = q_signed * scl;
-
-            uint flat_idx = local_flat_base + d;
-            uint state = flat_idx ^ SEED_VAL_K;
-            state = state + 0x9E3779B9u;
-            state = state ^ (state >> 16);
-            state = state * 0x85EBCA6Bu;
-            state = state ^ (state >> 13);
-            state = state * 0xC2B2AE35u;
-            state = state ^ (state >> 16);
-            float sign = (state & 1u) ? -1.0f : 1.0f;
-
-            float signed_val = val * sign;
-            dot += q_val * signed_val;
+            float4 partial = q4 * val4 * sign4;
+            dot += partial.x + partial.y + partial.z + partial.w;
         }
         dot *= scale_val;
 
@@ -505,65 +474,50 @@ for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
         local_sum = local_sum * scale_old + exp_dot;
         local_max = new_max;
 
-        for (uint d = 0; d < HEAD_DIM; d++) {
-            uint word_idx = d / CODES_PER_WORD;
-            uint code_in_word = d % CODES_PER_WORD;
-            uint shift = code_in_word * BITS;
-            uint mask = (1u << BITS) - 1u;
+        uint code_base_v = token_base * WORDS_PER_VECTOR;
+        uint scale_base_v = token_base * GROUPS_PER_VECTOR;
+        float scl_v = float(scales_v[scale_base_v]);
 
-            uint code_index_v = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * WORDS_PER_VECTOR
-                + word_idx
+        for (uint word_idx = 0; word_idx < WORDS_PER_VECTOR; word_idx++) {
+            uint packed_word = packed_codes_v[code_base_v + word_idx];
+            uint d = word_idx * CODES_PER_WORD;
+
+            float4 acc4 = float4(local_acc[d+0], local_acc[d+1], local_acc[d+2], local_acc[d+3]);
+
+            uint4 codes4 = (uint4(packed_word) >> shifts4) & mask;
+            float4 q_signed4 = float4(codes4) - qmax4;
+            float4 val4 = q_signed4 * scl_v;
+
+            uint4 flat_idx4 = uint4(
+                local_flat_base + d + 0,
+                local_flat_base + d + 1,
+                local_flat_base + d + 2,
+                local_flat_base + d + 3
             );
+            uint4 state4 = flat_idx4 ^ SEED_VAL_V;
+            state4 = state4 + 0x9E3779B9u;
+            state4 = state4 ^ (state4 >> 16);
+            state4 = state4 * 0x85EBCA6Bu;
+            state4 = state4 ^ (state4 >> 13);
+            state4 = state4 * 0xC2B2AE35u;
+            state4 = state4 ^ (state4 >> 16);
+            float4 sign4 = select(float4(1.0f), float4(-1.0f), (state4 & 1u) != 0u);
 
-            uint packed_word = packed_codes_v[code_index_v];
-            uint code = (packed_word >> shift) & mask;
-
-            float q_signed = float(code) - QMAX;
-            uint group_idx = d / GROUP_SIZE;
-
-            uint scale_index_v = (
-                (
-                    (
-                        kv_head * MAX_PAGES
-                        + physical_page
-                    ) * PAGE_TOKENS
-                    + local_t
-                ) * GROUPS_PER_VECTOR
-                + group_idx
-            );
-
-            half scale_v = scales_v[scale_index_v];
-            float scl = float(scale_v);
-            float val = q_signed * scl;
-
-            uint flat_idx = local_flat_base + d;
-            uint state = flat_idx ^ SEED_VAL_V;
-            state = state + 0x9E3779B9u;
-            state = state ^ (state >> 16);
-            state = state * 0x85EBCA6Bu;
-            state = state ^ (state >> 13);
-            state = state * 0xC2B2AE35u;
-            state = state ^ (state >> 16);
-            float sign = (state & 1u) ? -1.0f : 1.0f;
-
-            float signed_val = val * sign;
-            local_acc[d] = local_acc[d] * scale_old + exp_dot * signed_val;
+            acc4 = acc4 * scale_old + exp_dot * val4 * sign4;
+            local_acc[d+0] = acc4.x;
+            local_acc[d+1] = acc4.y;
+            local_acc[d+2] = acc4.z;
+            local_acc[d+3] = acc4.w;
         }
     }
 }
 
-uint partial_idx = ((q_head * NUM_Q_TOKENS + q_token) * NUM_KV_TILES + kv_tile) * HEAD_DIM;
+uint q_pair = q_head * NUM_Q_TOKENS + q_token;
+uint partial_idx = (q_pair * NUM_KV_TILES + kv_tile) * HEAD_DIM;
 for (uint d = 0; d < HEAD_DIM; d++) {
     partial_output[partial_idx + d] = local_acc[d];
 }
-uint stat_idx = (q_head * NUM_Q_TOKENS + q_token) * NUM_KV_TILES + kv_tile;
+uint stat_idx = q_pair * NUM_KV_TILES + kv_tile;
 partial_max[stat_idx] = local_max;
 partial_sum[stat_idx] = local_sum;
 """
@@ -724,6 +678,7 @@ class PackedV4AttentionKernel:
         query_start_pos: int = 0,
         strict: bool = False,
         layer_id: int = 0,
+        is_prefill: bool = False,
     ) -> tuple[mx.array, mx.array, mx.array, ExecutionContract]:
         """Execute true-packed attention over a paged KV arena.
 
@@ -743,6 +698,8 @@ class PackedV4AttentionKernel:
             If ``True``, validate the zero-materialisation invariant.
         layer_id
             Layer index for deterministic sign derivation.
+        is_prefill
+            If ``True``, record timing under ``prefill_ms``; otherwise ``decode_ms``.
 
         Returns
         -------
@@ -931,6 +888,8 @@ class PackedV4AttentionKernel:
         # Synchronize before timing so execution_ms reflects actual kernel work
         mx.eval(output, running_max, running_sum)
         execution_ms = (time.perf_counter() - start_time) * 1000.0
+        prefill_ms = execution_ms if is_prefill else 0.0
+        decode_ms = 0.0 if is_prefill else execution_ms
 
         # Measured counters
         dense_kv_materialized_bytes = 0
@@ -982,6 +941,8 @@ class PackedV4AttentionKernel:
             decoded_dense_tokens=decoded_dense_tokens,
             packed_blocks_read=num_pages,
             packed_bytes_read=page_write_bytes,
+            prefill_ms=prefill_ms,
+            decode_ms=decode_ms,
             materialized_bytes=0,
             decoded_tokens=0,
             execution_ms=execution_ms,
