@@ -132,6 +132,64 @@ def _generate_teacher_forced(
     return per_step_max, per_step_argmax
 
 
+def _run_8bit_kv_baseline(
+    model_id: str,
+    prompt: str,
+    max_tokens: int,
+    config: RFSNRuntimeConfig,
+) -> dict:
+    """Run dense FP16 baseline with MLX-LM 8-bit quantized KV cache."""
+    import mlx.core as mx
+    import mlx_lm
+
+    model, tokenizer = mlx_lm.load(model_id)
+    t0 = time.perf_counter()
+    output = mlx_lm.generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        verbose=False,
+        quantize_kv_cache=True,
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    input_ids = tokenizer.encode(prompt)
+    output_ids = tokenizer.encode(output)
+    gen_ids = output_ids[len(input_ids):]
+
+    # 8-bit KV memory estimate: roughly half of FP16
+    num_layers = len(model.layers)
+    total_tokens_8bit = len(input_ids) + len(gen_ids)
+    dense_memory = _measure_dense_memory(
+        [model.layers[i].create_cache() for i in range(num_layers)],
+        model=model, total_tokens=total_tokens_8bit,
+    )
+    dense_bytes = dense_memory["raw"].get("dense_kv_bytes", 0)
+    estimated_8bit_bytes = dense_bytes // 2
+    memory = {
+        "category1_persistent_packed_mb": round(estimated_8bit_bytes / (1024 * 1024), 2),
+        "category2_mutable_workingset_mb": 0.0,
+        "category3_transient_scratch_mb": 0.0,
+        "total_accounted_mb": round(estimated_8bit_bytes / (1024 * 1024), 2),
+        "raw": {"estimated_8bit_kv_bytes": estimated_8bit_bytes},
+    }
+
+    return {
+        "model_id": model_id,
+        "prompt": prompt,
+        "prompt_tokens": len(input_ids),
+        "generated_tokens": len(gen_ids),
+        "generated_text": output,
+        "elapsed_ms": round(elapsed_ms, 2),
+        "token_sequence_hash": _compute_token_hash(gen_ids),
+        "forced_token_ids": gen_ids,
+        "backend": "mlx_lm_8bit_kv",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "memory": memory,
+    }
+
+
 def _run_dense_baseline(
     model_id: str,
     prompt: str,
@@ -183,6 +241,10 @@ def _run_dense_baseline(
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
+    # Phase 7: measure dense baseline memory (standard MLX caches)
+    total_tokens = len(prompt_ids) + len(gen_ids)
+    dense_memory = _measure_dense_memory(standard_caches, model=model, total_tokens=total_tokens)
+
     return {
         "model_id": model_id,
         "prompt": prompt,
@@ -196,6 +258,61 @@ def _run_dense_baseline(
         "per_step_argmax": dense_argmax,
         "backend": "dense_fp16_baseline",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "memory": dense_memory,
+    }
+
+
+def _measure_dense_memory(
+    cache_list: list[Any], model: Any | None = None, total_tokens: int = 0
+) -> dict:
+    """Measure memory of standard MLX dense caches.
+
+    If caches have no accessible state, estimates from model architecture.
+    """
+    total_kv_bytes = 0
+    for cache in cache_list:
+        if cache is None:
+            continue
+        if hasattr(cache, "k") and cache.k is not None:
+            total_kv_bytes += int(cache.k.size) * cache.k.dtype.size
+        if hasattr(cache, "v") and cache.v is not None:
+            total_kv_bytes += int(cache.v.size) * cache.v.dtype.size
+        if hasattr(cache, "keys") and cache.keys is not None:
+            total_kv_bytes += int(cache.keys.size) * cache.keys.dtype.size
+        if hasattr(cache, "values") and cache.values is not None:
+            total_kv_bytes += int(cache.values.size) * cache.values.dtype.size
+        if hasattr(cache, "state") and cache.state is not None:
+            # MLX KVCache state: tuple of (k, v)
+            try:
+                state = cache.state
+                if isinstance(state, tuple):
+                    for s in state:
+                        if s is not None and hasattr(s, "size"):
+                            total_kv_bytes += int(s.size) * s.dtype.size
+            except Exception:
+                pass
+
+    # Fallback: estimate from model architecture
+    if total_kv_bytes == 0 and model is not None and total_tokens > 0:
+        num_layers = len(getattr(model, "layers", []))
+        # Try to infer head geometry from first layer
+        try:
+            attn = model.layers[0].self_attn
+            n_kv_heads = getattr(attn, "n_kv_heads", getattr(attn, "n_heads", 1))
+            head_dim = getattr(attn, "head_dim", 64)
+        except Exception:
+            n_kv_heads = 2
+            head_dim = 64
+        # FP16: 2 bytes per element, K+V = 2 tensors
+        total_kv_bytes = num_layers * n_kv_heads * total_tokens * head_dim * 2 * 2
+
+    total_mb = round(total_kv_bytes / (1024 * 1024), 2)
+    return {
+        "category1_persistent_packed_mb": total_mb,
+        "category2_mutable_workingset_mb": 0.0,
+        "category3_transient_scratch_mb": 0.0,
+        "total_accounted_mb": total_mb,
+        "raw": {"dense_kv_bytes": total_kv_bytes},
     }
 
 
@@ -255,6 +372,9 @@ def _run_packed_trace(
     # Gather proof counters
     counters = session.runtime_counters.to_dict()
 
+    # Phase 7: Measure memory from layer caches
+    memory = _measure_session_memory(session)
+
     return {
         "model_id": model_id,
         "prompt": prompt,
@@ -268,6 +388,75 @@ def _run_packed_trace(
         "backend": "packed_k8v8_gs64",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "counters": counters,
+        "memory": memory,
+    }
+
+
+def _measure_session_memory(session: Any) -> dict:
+    """Measure memory from session layer caches into three categories."""
+    total_payload = 0
+    total_metadata = 0
+    total_staging = 0
+    total_dense_residual = 0
+    total_scratch = 0
+    total_allocator = 0
+
+    for layer_cache in session._layer_caches.values():
+        # Legacy list storage
+        for kb in layer_cache._key_blocks:
+            if kb.packed_codes is not None and hasattr(kb.packed_codes, "size"):
+                total_payload += int(kb.packed_codes.size) * kb.packed_codes.dtype.size
+            if kb.scales is not None and hasattr(kb.scales, "size"):
+                total_payload += int(kb.scales.size) * kb.scales.dtype.size
+        for vb in layer_cache._value_blocks:
+            if vb.packed_codes is not None and hasattr(vb.packed_codes, "size"):
+                total_payload += int(vb.packed_codes.size) * vb.packed_codes.dtype.size
+            if vb.scales is not None and hasattr(vb.scales, "size"):
+                total_payload += int(vb.scales.size) * vb.scales.dtype.size
+
+        # Paged arena storage
+        if layer_cache._key_arena is not None:
+            inst = layer_cache._key_arena.to_instrumentation()
+            total_payload += inst.get("packed_payload_bytes", 0)
+            total_metadata += inst.get("metadata_bytes", 0)
+            total_allocator += inst.get("page_table_bytes", 0)
+        if layer_cache._value_arena is not None:
+            inst = layer_cache._value_arena.to_instrumentation()
+            total_payload += inst.get("packed_payload_bytes", 0)
+            total_metadata += inst.get("metadata_bytes", 0)
+            total_allocator += inst.get("page_table_bytes", 0)
+
+        # Staging
+        for sk in layer_cache._stage_keys:
+            if sk is not None and hasattr(sk, "size"):
+                total_staging += int(sk.size) * sk.dtype.size
+        for sv in layer_cache._stage_values:
+            if sv is not None and hasattr(sv, "size"):
+                total_staging += int(sv.size) * sv.dtype.size
+
+        # Dense residual
+        if layer_cache._dense_keys is not None and hasattr(layer_cache._dense_keys, "size"):
+            total_dense_residual += int(layer_cache._dense_keys.size) * layer_cache._dense_keys.dtype.size
+        if layer_cache._dense_values is not None and hasattr(layer_cache._dense_values, "size"):
+            total_dense_residual += int(layer_cache._dense_values.size) * layer_cache._dense_values.dtype.size
+
+    cat1_mb = round(total_payload / (1024 * 1024), 2)
+    cat2_mb = round((total_metadata + total_staging + total_dense_residual + total_allocator) / (1024 * 1024), 2)
+    cat3_mb = round(total_scratch / (1024 * 1024), 2)
+
+    return {
+        "category1_persistent_packed_mb": cat1_mb,
+        "category2_mutable_workingset_mb": cat2_mb,
+        "category3_transient_scratch_mb": cat3_mb,
+        "total_accounted_mb": round((total_payload + total_metadata + total_staging + total_dense_residual + total_allocator + total_scratch) / (1024 * 1024), 2),
+        "raw": {
+            "payload_bytes": total_payload,
+            "metadata_bytes": total_metadata,
+            "staging_bytes": total_staging,
+            "dense_residual_bytes": total_dense_residual,
+            "allocator_bytes": total_allocator,
+            "scratch_bytes": total_scratch,
+        },
     }
 
 
@@ -413,6 +602,15 @@ def main() -> int:
         if not forced_ids and "error" not in dense_result:
             print("  WARNING: no forced_token_ids from dense baseline")
 
+        print(f"  Running 8-bit KV baseline ...")
+        try:
+            eight_bit_result = _run_8bit_kv_baseline(
+                args.model, repeated, args.output_tokens, config
+            )
+        except Exception as exc:
+            print(f"  WARNING (8bit): {exc}")
+            eight_bit_result = {"error": str(exc), "skipped": True}
+
         print(f"  Running packed trace ...")
         try:
             packed_result = _run_packed_trace(
@@ -438,6 +636,7 @@ def main() -> int:
         run_entry = {
             "context_length": ctx_len,
             "dense": dense_result,
+            "eight_bit": eight_bit_result,
             "packed": packed_result,
             "token_match": match,
         }

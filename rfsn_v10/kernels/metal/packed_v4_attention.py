@@ -181,11 +181,11 @@ class ExecutionContract:
 # ---------------------------------------------------------------------------
 
 # K8 only: 8 bits per code, 4 codes per uint32 word.
+# Phase 6: Single-pass kernel — no QK recomputation.
+# Each thread processes one (q_head, q_token) pair.
+# grid   : (num_q_heads, num_q_tokens, 1)
+# thread : one (q_head, q_token) pair
 _PACKED_V4_KERNEL_K8 = """
-// Canonical True-Packed Attention for PackedBlockV4 (K8/V8)
-// grid   : (num_q_heads, num_q_tokens, 1)
-// thread : one (q_head, q_token) pair
-
 uint q_head = thread_position_in_grid.x;
 uint q_token = thread_position_in_grid.y;
 
@@ -193,27 +193,24 @@ if (q_head >= NUM_Q_HEADS || q_token >= NUM_Q_TOKENS) return;
 
 // GQA mapping
 uint kv_head = q_head / Q_PER_KV;
-// P4: read query_start from runtime buffer instead of compile-time constant
 uint query_global_pos = uint(query_start_arr[0]) + q_token;
 
 // Pre-transformed query offset: [NUM_Q_HEADS, NUM_Q_TOKENS, HEAD_DIM]
 uint q_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
-
-// Output accumulator (written in WHT domain)
 uint out_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
-
-// Zero-initialize output buffer (MLX inline kernels do not clear output)
-for (uint d = 0; d < HEAD_DIM; d++) {
-    output[out_offset + d] = 0.0;
-}
 
 float scale_val = scale_arr[0];
 
-// ---- online softmax state ----
+// ---- single-pass online softmax + value accumulator ----
 float running_max = -INFINITY;
-float running_sum = 0.0;
+float running_sum = 0.0f;
 
-// ---- first pass: scores ----
+// Local accumulator (register) — avoid device RMW in inner loop
+float acc[HEAD_DIM];
+for (uint d = 0; d < HEAD_DIM; d++) {
+    acc[d] = 0.0f;
+}
+
 uint t = 0;
 for (uint b = 0; b < NUM_BLOCKS; b++) {
     int block_start = block_starts[b];
@@ -228,14 +225,10 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
             continue;
         }
 
-        // QK dot product with on-the-fly decode in WHT domain
-        float dot = 0.0;
-
-        // packed_codes layout: [B=0, Hkv, T, WORDS_PER_VECTOR]
+        // ---- QK dot product with on-the-fly decode in WHT domain ----
+        float dot = 0.0f;
         uint base_word = (kv_head * TOTAL_T + t) * WORDS_PER_VECTOR;
         uint base_scale = (kv_head * TOTAL_T + t) * GROUPS_PER_VECTOR;
-
-        // block-local flat index for hash signs (each block signed independently)
         uint local_flat_base = (kv_head * block_count + local_t) * HEAD_DIM;
 
         for (uint d = 0; d < HEAD_DIM; d++) {
@@ -264,7 +257,7 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
             state = state ^ (state >> 13);
             state = state * 0xC2B2AE35u;
             state = state ^ (state >> 16);
-            float sign = (state & 1u) ? -1.0 : 1.0;
+            float sign = (state & 1u) ? -1.0f : 1.0f;
 
             float signed_val = val * sign;
             dot += q_val * signed_val;
@@ -272,82 +265,15 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
 
         dot *= scale_val;
 
+        // ---- online softmax update ----
         float new_max = max(running_max, dot);
-        float old_scale = (running_max == -INFINITY) ? 0.0
+        float scale_old = (running_max == -INFINITY) ? 0.0f
                          : exp(running_max - new_max);
-        running_sum = running_sum * old_scale + exp(dot - new_max);
+        float exp_dot = exp(dot - new_max);
+        running_sum = running_sum * scale_old + exp_dot;
         running_max = new_max;
 
-        t++;
-    }
-}
-
-uint stat_idx = q_head * NUM_Q_TOKENS + q_token;
-running_max_arr[stat_idx] = running_max;
-running_sum_arr[stat_idx] = running_sum;
-
-// fully-masked row → zeros
-if (running_sum == 0.0) {
-    for (uint d = 0; d < HEAD_DIM; d++) {
-        output[out_offset + d] = 0.0;
-    }
-    return;
-}
-
-// ---- second pass: weighted accumulation in WHT domain ----
-t = 0;
-for (uint b = 0; b < NUM_BLOCKS; b++) {
-    int block_start = block_starts[b];
-    int block_count = block_counts[b];
-
-    for (uint local_t = 0; local_t < block_count; local_t++) {
-        int kv_global_pos = block_start + int(local_t);
-
-        if (CAUSAL != 0 && kv_global_pos > query_global_pos) {
-            t++;
-            continue;
-        }
-
-        // Recompute QK score to obtain weight
-        float dot = 0.0;
-        uint base_word = (kv_head * TOTAL_T + t) * WORDS_PER_VECTOR;
-        uint base_scale = (kv_head * TOTAL_T + t) * GROUPS_PER_VECTOR;
-        uint local_flat_base = (kv_head * block_count + local_t) * HEAD_DIM;
-
-        for (uint d = 0; d < HEAD_DIM; d++) {
-            float q_val = wht_queries[q_offset + d];
-
-            uint word_idx = d / CODES_PER_WORD;
-            uint code_in_word = d % CODES_PER_WORD;
-            uint shift = code_in_word * BITS;
-            uint mask = (1u << BITS) - 1u;
-
-            uint packed_word = packed_codes_k[base_word + word_idx];
-            uint code = (packed_word >> shift) & mask;
-
-            float q_signed = float(code) - QMAX;
-            uint group_idx = d / GROUP_SIZE;
-            float scl = scales_k[base_scale + group_idx];
-            float val = q_signed * scl;
-
-            uint flat_idx = local_flat_base + d;
-            uint state = flat_idx ^ SEED_VAL_K;
-            state = state + 0x9E3779B9u;
-            state = state ^ (state >> 16);
-            state = state * 0x85EBCA6Bu;
-            state = state ^ (state >> 13);
-            state = state * 0xC2B2AE35u;
-            state = state ^ (state >> 16);
-            float sign = (state & 1u) ? -1.0 : 1.0;
-
-            float signed_val = val * sign;
-            dot += q_val * signed_val;
-        }
-
-        dot *= scale_val;
-        float weight = exp(dot - running_max) / running_sum;
-
-        // Accumulate weighted values in WHT domain
+        // ---- immediately accumulate weighted values ----
         uint base_word_v = (kv_head * TOTAL_T + t) * WORDS_PER_VECTOR;
         uint base_scale_v = (kv_head * TOTAL_T + t) * GROUPS_PER_VECTOR;
         for (uint d = 0; d < HEAD_DIM; d++) {
@@ -372,13 +298,29 @@ for (uint b = 0; b < NUM_BLOCKS; b++) {
             state = state ^ (state >> 13);
             state = state * 0xC2B2AE35u;
             state = state ^ (state >> 16);
-            float sign = (state & 1u) ? -1.0 : 1.0;
+            float sign = (state & 1u) ? -1.0f : 1.0f;
 
             float signed_val = val * sign;
-            output[out_offset + d] += weight * signed_val;
+            acc[d] = acc[d] * scale_old + exp_dot * signed_val;
         }
 
         t++;
+    }
+}
+
+uint stat_idx = q_head * NUM_Q_TOKENS + q_token;
+running_max_arr[stat_idx] = running_max;
+running_sum_arr[stat_idx] = running_sum;
+
+// Normalize and write to output
+if (running_sum > 0.0f) {
+    float inv_sum = 1.0f / running_sum;
+    for (uint d = 0; d < HEAD_DIM; d++) {
+        output[out_offset + d] = acc[d] * inv_sum;
+    }
+} else {
+    for (uint d = 0; d < HEAD_DIM; d++) {
+        output[out_offset + d] = 0.0f;
     }
 }
 """

@@ -67,7 +67,11 @@ class MemoryReport:
     group_size: int = 0
     num_layers: int = 0
 
-    # Computed properties
+    # Phase 7: Three-category memory breakdown
+    # Category 1: Persistent packed payload (immutable, never copied)
+    # Category 2: Mutable working-set (staging, dense residual, metadata)
+    # Category 3: Transient scratch (temporary, per-call)
+
     @property
     def payload_bytes(self) -> int:
         """Actual stored quantized data (codes + scales)."""
@@ -102,6 +106,26 @@ class MemoryReport:
             + self.scratch_bytes
             + self.allocator_overhead_bytes
         )
+
+    # Phase 7: Three canonical categories
+    @property
+    def category1_persistent_packed_mb(self) -> float:
+        """Immutable packed payload: codes + scales."""
+        return round(self.payload_bytes / (1024 * 1024), 2)
+
+    @property
+    def category2_mutable_workingset_mb(self) -> float:
+        """Mutable buffers: staging + dense residual + metadata + overhead."""
+        return round(
+            (self.staging_bytes + self.dense_residual_bytes
+             + self.block_metadata_bytes + self.allocator_overhead_bytes)
+            / (1024 * 1024), 2
+        )
+
+    @property
+    def category3_transient_scratch_mb(self) -> float:
+        """Temporary per-call buffers: attention scratch + shadow."""
+        return round(self.scratch_bytes / (1024 * 1024), 2)
 
     @property
     def compression_ratio(self) -> float:
@@ -138,6 +162,10 @@ class MemoryReport:
             "scratch_bytes": self.scratch_bytes,
             "total_accounted_bytes": self.total_accounted_bytes,
             "compression_ratio": self.compression_ratio,
+            # Phase 7: three canonical categories
+            "category1_persistent_packed_mb": self.category1_persistent_packed_mb,
+            "category2_mutable_workingset_mb": self.category2_mutable_workingset_mb,
+            "category3_transient_scratch_mb": self.category3_transient_scratch_mb,
         }
 
 
