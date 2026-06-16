@@ -274,7 +274,12 @@ def _merge_attention_regions(
     acc_total = None
     sum_total = 0
     for output_i, max_i, sum_i in regions:
-        scale = mx.exp(max_i - global_max)
+        # When global_max is -inf (all regions empty / fully masked),
+        # exp(max_i - global_max) produces NaN.  Guard so that a
+        # zero-sum region contributes nothing rather than poisoning
+        # the total with NaN.
+        raw_scale = mx.exp(max_i - global_max)
+        scale = mx.where(mx.isfinite(raw_scale), raw_scale, mx.ones_like(raw_scale))
         weighted_acc = output_i * sum_i[..., None] * scale[..., None]
         if acc_total is None:
             acc_total = weighted_acc
@@ -282,7 +287,11 @@ def _merge_attention_regions(
             acc_total = acc_total + weighted_acc
         sum_total = sum_total + sum_i * scale
 
-    safe_sum = mx.where(sum_total == 0, mx.ones_like(sum_total), sum_total)
+    safe_sum = mx.where(
+        mx.logical_or(sum_total == 0, mx.isnan(sum_total)),
+        mx.ones_like(sum_total),
+        sum_total,
+    )
     return mx.where(
         sum_total[..., None] > 0,
         acc_total / safe_sum[..., None],

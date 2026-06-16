@@ -50,7 +50,6 @@ except ImportError:  # pragma: no cover
     np = None  # type: ignore
 
 from rfsn_v10.cache.cartesian_codec import _reference_wht64
-from rfsn_v10.cache.contracts import PackedBlockV4
 
 # ---------------------------------------------------------------------------
 # Feature gate – do not claim availability merely because MLX imports.
@@ -364,6 +363,13 @@ if (running_sum > 0.0f) {
 # This addresses the audit finding that the original kernel is "serial over
 # context and under-parallelized".
 #
+# Runtime-parametric tiling
+# -------------------------
+# MAX_KV_TILES is baked into the template (drives buffer strides and loop
+# bounds).  active_kv_tiles is passed at runtime (limits the actual work).
+# This means the same compiled kernel serves any context length up to the
+# pre-configured maximum, eliminating per-context-length recompilation.
+#
 # Status: ARCHITECTURE READY — tiled source defined but not yet the default.
 # Enable by passing kv_tile_size > 0 in PackedV4AttentionKernel.__call__.
 # ---------------------------------------------------------------------------
@@ -380,13 +386,14 @@ if (running_sum > 0.0f) {
 
 _PACKED_V4_KERNEL_K8_TILED_PASS1 = """
 uint tid = thread_position_in_grid.x;
-uint total_threads = NUM_Q_HEADS * NUM_Q_TOKENS * NUM_KV_TILES;
+uint n_active_kv_tiles = uint(active_kv_tiles[0]);
+uint total_threads = NUM_Q_HEADS * NUM_Q_TOKENS * n_active_kv_tiles;
 if (tid >= total_threads) return;
 
-uint q_head = tid / (NUM_Q_TOKENS * NUM_KV_TILES);
-uint rem = tid % (NUM_Q_TOKENS * NUM_KV_TILES);
-uint q_token = rem / NUM_KV_TILES;
-uint kv_tile = rem % NUM_KV_TILES;
+uint q_head = tid / (NUM_Q_TOKENS * n_active_kv_tiles);
+uint rem = tid % (NUM_Q_TOKENS * n_active_kv_tiles);
+uint q_token = rem / n_active_kv_tiles;
+uint kv_tile = rem % n_active_kv_tiles;
 
 uint kv_head = q_head / Q_PER_KV;
 uint query_global_pos = uint(query_start_arr[0]) + q_token;
@@ -513,11 +520,11 @@ for (uint logical_page = 0; logical_page < num_pages; logical_page++) {
 }
 
 uint q_pair = q_head * NUM_Q_TOKENS + q_token;
-uint partial_idx = (q_pair * NUM_KV_TILES + kv_tile) * HEAD_DIM;
+uint partial_idx = (q_pair * MAX_KV_TILES + kv_tile) * HEAD_DIM;
 for (uint d = 0; d < HEAD_DIM; d++) {
     partial_output[partial_idx + d] = local_acc[d];
 }
-uint stat_idx = q_pair * NUM_KV_TILES + kv_tile;
+uint stat_idx = q_pair * MAX_KV_TILES + kv_tile;
 partial_max[stat_idx] = local_max;
 partial_sum[stat_idx] = local_sum;
 """
@@ -533,11 +540,12 @@ uint out_offset = (q_head * NUM_Q_TOKENS + q_token) * HEAD_DIM;
 
 // ---- reduce across all KV tiles ----
 // Step 1: find global max across non-empty tiles
-uint base_stat = (q_head * NUM_Q_TOKENS + q_token) * NUM_KV_TILES;
+uint n_active_kv_tiles = uint(active_kv_tiles[0]);
+uint base_stat = (q_head * NUM_Q_TOKENS + q_token) * MAX_KV_TILES;
 uint base_out  = base_stat * HEAD_DIM;
 
 float global_max = -INFINITY;
-for (uint tile = 0; tile < NUM_KV_TILES; tile++) {
+for (uint tile = 0; tile < n_active_kv_tiles; tile++) {
     float tile_sum = partial_sum[base_stat + tile];
     if (tile_sum > 0.0f) {
         float tile_max = partial_max[base_stat + tile];
@@ -550,7 +558,7 @@ float global_sum = 0.0f;
 float global_acc[HEAD_DIM];
 for (uint d = 0; d < HEAD_DIM; d++) { global_acc[d] = 0.0f; }
 
-for (uint tile = 0; tile < NUM_KV_TILES; tile++) {
+for (uint tile = 0; tile < n_active_kv_tiles; tile++) {
     float tile_sum = partial_sum[base_stat + tile];
     if (tile_sum <= 0.0f) continue;
 
@@ -629,6 +637,9 @@ class PackedV4AttentionKernel:
         self.qmax = (1 << (bits - 1)) - 1
         self.codes_per_word = 32 // bits
         self.kv_tile_size = kv_tile_size
+        # Runtime-parametric tiling: MAX_KV_TILES is derived from arena capacity
+        # on the first tiled call and cached.  Only grows; never shrinks.
+        self._max_kv_tiles: int | None = None
         self._kernel_hash = hashlib.sha256(
             (_PACKED_V4_KERNEL_K8 + _PACKED_V4_KERNEL_K8_TILED_PASS1 + _PACKED_V4_KERNEL_K8_TILED_PASS2).encode()
         ).hexdigest()[:16]
@@ -767,8 +778,20 @@ class PackedV4AttentionKernel:
         # Kernel dispatch — cache wrapper by template signature.
         use_tiling = self.kv_tile_size > 0 and total_tokens > self.kv_tile_size
         num_kv_tiles = 1
+        max_kv_tiles = 1
+        active_kv_tiles_arr = mx.array([1], dtype=mx.int32)
         if use_tiling:
             num_kv_tiles = (total_tokens + self.kv_tile_size - 1) // self.kv_tile_size
+            # Derive MAX_KV_TILES from arena capacity so the same kernel serves
+            # any context up to the pre-allocated limit.
+            arena_max_tokens = paged_kv.max_pages * paged_kv.page_tokens
+            required_max_kv_tiles = (
+                arena_max_tokens + self.kv_tile_size - 1
+            ) // self.kv_tile_size
+            if self._max_kv_tiles is None or required_max_kv_tiles > self._max_kv_tiles:
+                self._max_kv_tiles = required_max_kv_tiles
+            max_kv_tiles = self._max_kv_tiles
+            active_kv_tiles_arr = mx.array([num_kv_tiles], dtype=mx.int32)
 
         template = [
             ("NUM_Q_HEADS", int(Hq)),
@@ -789,7 +812,7 @@ class PackedV4AttentionKernel:
         ]
         if use_tiling:
             template.append(("KV_TILE_SIZE", int(self.kv_tile_size)))
-            template.append(("NUM_KV_TILES", int(num_kv_tiles)))
+            template.append(("MAX_KV_TILES", int(max_kv_tiles)))
 
         # Cache key must distinguish scalar vs tiled (different sources)
         cache_key = (tuple(template), use_tiling)
@@ -804,7 +827,7 @@ class PackedV4AttentionKernel:
                         "packed_codes_k", "scales_k",
                         "packed_codes_v", "scales_v",
                         "page_table", "page_starts", "page_counts", "active_pages",
-                        "scale_arr", "query_start_arr",
+                        "scale_arr", "query_start_arr", "active_kv_tiles",
                     ],
                     output_names=["partial_output", "partial_max", "partial_sum"],
                     source=_PACKED_V4_KERNEL_K8_TILED_PASS1,
@@ -813,6 +836,7 @@ class PackedV4AttentionKernel:
                     name="rfsn_tiled_pass2_v2_paged",
                     input_names=[
                         "partial_output", "partial_max", "partial_sum",
+                        "active_kv_tiles",
                     ],
                     output_names=["output", "running_max_arr", "running_sum_arr"],
                     source=_PACKED_V4_KERNEL_K8_TILED_PASS2,
@@ -846,14 +870,15 @@ class PackedV4AttentionKernel:
                     paged_kv.page_table, paged_kv.page_starts, paged_kv.page_counts,
                     active_pages,
                     scale_arr, query_start_arr,
+                    active_kv_tiles_arr,
                 ],
                 template=template,
                 grid=(Hq * Lq * num_kv_tiles, 1, 1),
                 threadgroup=(32, 1, 1),
                 output_shapes=[
-                    (Hq, Lq, num_kv_tiles, D),
-                    (Hq, Lq, num_kv_tiles),
-                    (Hq, Lq, num_kv_tiles),
+                    (Hq, Lq, max_kv_tiles, D),
+                    (Hq, Lq, max_kv_tiles),
+                    (Hq, Lq, max_kv_tiles),
                 ],
                 output_dtypes=[mx.float32, mx.float32, mx.float32],
             )
@@ -863,7 +888,10 @@ class PackedV4AttentionKernel:
 
             # Pass 2: reduce partials across tiles
             pass2_outputs = pass2_kernel(
-                inputs=[partial_output, partial_max, partial_sum],
+                inputs=[
+                    partial_output, partial_max, partial_sum,
+                    active_kv_tiles_arr,
+                ],
                 template=template,
                 grid=(Hq, Lq, 1),
                 threadgroup=(8, 8, 1),

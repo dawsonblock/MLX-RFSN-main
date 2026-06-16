@@ -599,6 +599,12 @@ class PagedKVArena:
     # ------------------------------------------------------------------
 
     def view(self) -> PagedKVView:
+        # MAX_PAGES in the Metal kernel is used as a stride for per-head
+        # indexing.  It MUST match the actual backing array capacity, not the
+        # logical maximum, or the kernel reads from the wrong offsets for
+        # kv_head >= 1.  When the arena grows via slab allocation, a new
+        # PagedKVView is created with the updated capacity, and the kernel
+        # cache naturally recompiles with the new stride.
         return PagedKVView(
             k_codes=self.k_codes,
             k_scales=self.k_scales,
@@ -608,7 +614,7 @@ class PagedKVArena:
             page_starts=self.page_starts,
             page_counts=self.page_counts,
             num_pages=self._num_pages,
-            max_pages=self.max_pages,
+            max_pages=self._current_capacity,
             page_tokens=self.page_tokens,
             k_words_per_vector=self.k_words_per_vector,
             v_words_per_vector=self.v_words_per_vector,

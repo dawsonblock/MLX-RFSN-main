@@ -557,6 +557,37 @@ class TestPackedV4TiledKernel:
         abs_diff, rel_diff = self._diff(scalar_out, tiled_out)
         assert rel_diff < 1e-3, f"tiled vs scalar mismatch: rel={rel_diff}, abs={abs_diff}"
 
+    def test_tiled_matches_scalar_gqa(self):
+        """Tiled path must match scalar path under GQA (Hq > Hkv)."""
+        B, Hq, Hkv, T, D = 1, 8, 2, 32, 64
+        queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
+
+        k_blocks = []
+        v_blocks = []
+        for i in range(2):
+            keys = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+            values = mx.random.normal((B, Hkv, T, D), dtype=mx.float32)
+            kb, vb = _encode_kv_tensors(keys, values, logical_start=i * T)
+            k_blocks.append(kb)
+            v_blocks.append(vb)
+
+        paged = paged_view_from_blocks(k_blocks, v_blocks, max_pages=4)
+
+        scalar_kernel = PackedV4AttentionKernel()
+        tiled_kernel = PackedV4AttentionKernel(kv_tile_size=16)
+
+        scalar_out, _, _, _ = scalar_kernel(
+            queries, paged, scale=1.0 / np.sqrt(D), causal=True,
+            query_start_pos=2 * T, layer_id=0,
+        )
+        tiled_out, _, _, _ = tiled_kernel(
+            queries, paged, scale=1.0 / np.sqrt(D), causal=True,
+            query_start_pos=2 * T, layer_id=0,
+        )
+
+        abs_diff, rel_diff = self._diff(scalar_out, tiled_out)
+        assert rel_diff < 1e-3, f"tiled GQA mismatch: rel={rel_diff}, abs={abs_diff}"
+
     def test_tiled_matches_scalar_multi_block(self):
         """Tiled path must match scalar path for two 32-token blocks."""
         B, Hq, Hkv, T, D = 1, 4, 4, 32, 64
@@ -589,11 +620,12 @@ class TestPackedV4TiledKernel:
         assert rel_diff < 1e-3, f"tiled vs scalar mismatch: rel={rel_diff}, abs={abs_diff}"
 
     def test_tiled_compilation_count_stable(self):
-        """Tiled kernel compiles once per unique (geometry, num_kv_tiles).
+        """Tiled kernel compiles once per unique (geometry, MAX_KV_TILES).
 
-        NUM_KV_TILES is in the template because it drives loop bounds and
-        output shapes in the Metal shader.  A change in tile count causes
-        a new compile, but the same tile count reuses the cached kernel.
+        MAX_KV_TILES is derived from arena capacity (max_pages * page_tokens)
+        and baked into the template.  active_kv_tiles is passed at runtime.
+        Changing the active tile count without exceeding the cached max does
+        NOT recompile; only a larger arena capacity triggers a new compile.
         """
         B, Hq, Hkv, T, D = 1, 4, 4, 32, 64
         queries = mx.random.normal((B, Hq, 1, D), dtype=mx.float32)
@@ -601,7 +633,8 @@ class TestPackedV4TiledKernel:
         tiled_kernel = PackedV4AttentionKernel(kv_tile_size=16)
         assert tiled_kernel.compilation_count == 0
 
-        # 32 tokens / tile_size 16 = 2 tiles
+        # 32 tokens / tile_size 16 = 2 active tiles.
+        # Arena: max_pages=8, page_tokens=32 → capacity 256 tokens → MAX_KV_TILES=16.
         k1, v1 = _encode_kv_tensors(
             mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
             mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
@@ -613,8 +646,8 @@ class TestPackedV4TiledKernel:
         )
         assert tiled_kernel.compilation_count == 1
 
-        # Another 32-token block: 64 tokens / tile_size 16 = 4 tiles
-        # This triggers a new compile because NUM_KV_TILES changed.
+        # Another 32-token block: 64 tokens / tile_size 16 = 4 active tiles.
+        # Same arena capacity → MAX_KV_TILES still 16 → reuse cached kernel.
         k2, v2 = _encode_kv_tensors(
             mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
             mx.random.normal((B, Hkv, T, D), dtype=mx.float32),
@@ -625,15 +658,26 @@ class TestPackedV4TiledKernel:
             paged_view_from_blocks([k1, k2], [v1, v2], max_pages=8),
             scale=1.0, causal=True, query_start_pos=2 * T, layer_id=0,
         )
-        # Expect 2 compiles: one for 2 tiles, one for 4 tiles
-        assert tiled_kernel.compilation_count == 2
+        # Only 1 compile because MAX_KV_TILES (16) already covers 4 active tiles.
+        assert tiled_kernel.compilation_count == 1
 
-        # Re-run with the SAME 2 blocks (4 tiles) — must reuse cached kernel
+        # Re-run with the SAME 2 blocks (4 active tiles) — must reuse kernel
         tiled_kernel(
             queries,
             paged_view_from_blocks([k1, k2], [v1, v2], max_pages=8),
             scale=1.0, causal=True, query_start_pos=2 * T, layer_id=0,
         )
-        assert tiled_kernel.compilation_count == 2, (
+        assert tiled_kernel.compilation_count == 1, (
             "Re-ran same tile count but kernel recompiled"
+        )
+
+        # Larger arena capacity forces MAX_KV_TILES to grow → new compile.
+        # max_pages=16, page_tokens=32 → capacity 512 tokens → MAX_KV_TILES=32.
+        tiled_kernel(
+            queries,
+            paged_view_from_blocks([k1, k2], [v1, v2], max_pages=16),
+            scale=1.0, causal=True, query_start_pos=2 * T, layer_id=0,
+        )
+        assert tiled_kernel.compilation_count == 2, (
+            "Larger arena should trigger recompile with bigger MAX_KV_TILES"
         )
