@@ -236,13 +236,12 @@ def _run_8bit_kv_baseline(
     num_layers = len(model.layers)
     cache_list = [QuantizedKVCache(group_size=64, bits=8) for _ in range(num_layers)]
 
-    # Prefill
-    t0 = time.perf_counter()
+    # Prefill + free-running greedy decode (timed together)
+    t0_fr = time.perf_counter()
     y = mx.array(prompt_ids)
     logits = model(y[None], cache=cache_list)
     logits = logits[:, -1, :]
 
-    # Free-running greedy decode
     gen_ids: list[int] = []
     for _ in range(max_tokens):
         logprobs = mx.log(mx.softmax(logits.astype(mx.float32), axis=-1))
@@ -252,7 +251,7 @@ def _run_8bit_kv_baseline(
         logits = model(y[None], cache=cache_list)
         logits = logits[:, -1, :]
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    free_running_ms = (time.perf_counter() - t0_fr) * 1000
 
     full_ids = prompt_ids + gen_ids
     output_text = tokenizer.decode(full_ids)
@@ -269,7 +268,9 @@ def _run_8bit_kv_baseline(
         "prompt_tokens": len(prompt_ids),
         "generated_tokens": len(gen_ids),
         "generated_text": output_text,
-        "elapsed_ms": round(elapsed_ms, 2),
+        "free_running_elapsed_ms": round(free_running_ms, 2),
+        "teacher_forced_elapsed_ms": None,
+        "decode_ms_per_token": round(free_running_ms / max(max_tokens, 1), 4),
         "token_sequence_hash": _compute_token_hash(gen_ids),
         "free_running_token_ids": gen_ids,
         "backend": "mlx_lm_8bit_kv",
@@ -341,6 +342,7 @@ def _run_dense_baseline(
     logits = model(y[None], cache=standard_caches)
     logits = logits[:, -1, :]
 
+    t0_fr = time.perf_counter()
     gen_ids: list[int] = []
     for _ in range(max_tokens):
         logprobs = mx.log(mx.softmax(logits.astype(mx.float32), axis=-1))
@@ -349,6 +351,7 @@ def _run_dense_baseline(
         y = mx.array([token])
         logits = model(y[None], cache=standard_caches)
         logits = logits[:, -1, :]
+    free_running_ms = (time.perf_counter() - t0_fr) * 1000
 
     full_ids = prompt_ids + gen_ids
     output_text = tokenizer.decode(full_ids)
@@ -369,11 +372,11 @@ def _run_dense_baseline(
             mlx_cache.KVCache() for _ in range(len(model.layers))
         ]
 
-    t0 = time.perf_counter()
+    t0_tf = time.perf_counter()
     dense_tf = _generate_teacher_forced(
         model, tokenizer, prompt_ids, gen_ids, teacher_caches
     )
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    teacher_forced_ms = (time.perf_counter() - t0_tf) * 1000
 
     # Phase 7: measure dense baseline memory from the free-running caches
     total_tokens = len(prompt_ids) + len(gen_ids)
@@ -385,7 +388,9 @@ def _run_dense_baseline(
         "prompt_tokens": len(prompt_ids),
         "generated_tokens": len(gen_ids),
         "generated_text": output_text,
-        "elapsed_ms": round(elapsed_ms, 2),
+        "free_running_elapsed_ms": round(free_running_ms, 2),
+        "teacher_forced_elapsed_ms": round(teacher_forced_ms, 2),
+        "decode_ms_per_token": round(free_running_ms / max(max_tokens, 1), 4),
         "token_sequence_hash": _compute_token_hash(gen_ids),
         "free_running_token_ids": gen_ids,
         "per_step_max_logits": [round(x, 4) for x in dense_tf["per_step_max_logits"]],
@@ -505,6 +510,7 @@ def _run_packed_trace(
     ]
 
     y = mx.array(prompt_ids)
+    t0_fr = time.perf_counter()
     with packed_attention_context(model, cache_list_fr, strict=config.strict_backend):
         logits = model(y[None], cache=cache_list_fr)
         logits = logits[:, -1, :]
@@ -517,6 +523,7 @@ def _run_packed_trace(
             y = mx.array([token])
             logits = model(y[None], cache=cache_list_fr)
             logits = logits[:, -1, :]
+    free_running_ms = (time.perf_counter() - t0_fr) * 1000
 
     # Phase 3 fix: teacher-forced re-run with fresh caches for logit comparison
     del model
@@ -547,12 +554,12 @@ def _run_packed_trace(
         for i in range(len(model.layers))
     ]
 
-    t0 = time.perf_counter()
+    t0_tf = time.perf_counter()
     with packed_attention_context(model, cache_list_tf, strict=config.strict_backend):
         packed_tf = _generate_teacher_forced(
             model, tokenizer, prompt_ids, forced_ids, cache_list_tf
         )
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    teacher_forced_ms = (time.perf_counter() - t0_tf) * 1000
 
     # Gather proof counters
     counters = session_tf.runtime_counters.to_dict()
@@ -592,7 +599,9 @@ def _run_packed_trace(
         "generated_tokens": len(packed_gen_ids),
         "free_running_token_ids": packed_gen_ids,
         "forced_token_ids": forced_ids,
-        "elapsed_ms": round(elapsed_ms, 2),
+        "free_running_elapsed_ms": round(free_running_ms, 2),
+        "teacher_forced_elapsed_ms": round(teacher_forced_ms, 2),
+        "decode_ms_per_token": round(free_running_ms / max(len(forced_ids), 1), 4),
         "token_sequence_hash": _compute_token_hash(packed_gen_ids),
         "per_step_max_logits": [round(x, 4) for x in packed_tf["per_step_max_logits"]],
         "per_step_argmax": packed_tf["per_step_argmax"],

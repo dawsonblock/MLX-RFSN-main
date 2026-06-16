@@ -128,10 +128,10 @@ class ReleaseCriteria:
                             f"context {run['context_length']}: cosine {cos} < {self.min_logit_cosine}"
                         )
 
-            # Speed threshold
+            # Speed threshold — compare free-running times (comparable across candidates)
             if self.max_speed_ratio is not None:
-                dense_ms = run.get("dense", {}).get("elapsed_ms")
-                packed_ms = run.get("packed", {}).get("elapsed_ms")
+                dense_ms = run.get("dense", {}).get("free_running_elapsed_ms")
+                packed_ms = run.get("packed", {}).get("free_running_elapsed_ms")
                 if dense_ms and packed_ms and dense_ms > 0:
                     ratio = packed_ms / dense_ms
                     if ratio > self.max_speed_ratio:

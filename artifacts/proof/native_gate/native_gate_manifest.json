@@ -8,8 +8,7 @@
     "context_lengths": [
       64,
       128,
-      512,
-      2048
+      512
     ],
     "output_tokens": 8,
     "key_bits": 8,
@@ -30,13 +29,13 @@
     "chip_model": "",
     "memory_capacity_gb": 0.0,
     "reason": "",
-    "git_commit": "9a0f337c7dc43cc9b7732c0ff3ad55febd0aaaa8",
+    "git_commit": "a1f98eb89187a623871cb7dd73522bedfc975dfd",
     "benchmark_source_hash": "",
     "prompt_token_hash": "",
     "python_version": "3.12.8",
     "platform_machine": "arm64"
   },
-  "benchmark_source_hash": "b8492224e483bed7",
+  "benchmark_source_hash": "f7771f2cfe4d3178",
   "runs": [
     {
       "context_length": 64,
@@ -48,7 +47,9 @@
         "prompt_tokens": 64,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris.",
-        "elapsed_ms": 370.83,
+        "free_running_elapsed_ms": 256.3,
+        "teacher_forced_elapsed_ms": 302.72,
+        "decode_ms_per_token": 32.0371,
         "token_sequence_hash": "d0c2df820e49fcc87ef2951a05c2cfa883ed37fae38db20ea4e872bc129ab470",
         "free_running_token_ids": [
           13,
@@ -81,7 +82,7 @@
           13
         ],
         "backend": "dense_fp16_baseline",
-        "timestamp_utc": "2026-06-16T07:35:12Z",
+        "timestamp_utc": "2026-06-16T07:47:39Z",
         "memory": {
           "category1_persistent_packed_mb": 3.84,
           "category2_mutable_workingset_mb": 0.0,
@@ -91,9 +92,9 @@
             "dense_kv_bytes": 4030464
           },
           "delta": {
-            "rss_before_mb": 181.12,
-            "rss_after_mb": 112.31,
-            "rss_delta_mb": -68.81,
+            "rss_before_mb": 238.94,
+            "rss_after_mb": 126.67,
+            "rss_delta_mb": -112.27,
             "metal_peak_before_mb": 268.14,
             "metal_peak_after_mb": 567.86,
             "metal_peak_delta_mb": 299.72
@@ -106,7 +107,9 @@
         "prompt_tokens": 64,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris.",
-        "elapsed_ms": 1436.44,
+        "free_running_elapsed_ms": 202.7,
+        "teacher_forced_elapsed_ms": null,
+        "decode_ms_per_token": 25.3371,
         "token_sequence_hash": "d0c2df820e49fcc87ef2951a05c2cfa883ed37fae38db20ea4e872bc129ab470",
         "free_running_token_ids": [
           13,
@@ -119,7 +122,7 @@
           13
         ],
         "backend": "mlx_lm_8bit_kv",
-        "timestamp_utc": "2026-06-16T07:35:16Z",
+        "timestamp_utc": "2026-06-16T07:47:40Z",
         "memory": {
           "category1_persistent_packed_mb": 0.45,
           "category2_mutable_workingset_mb": 0.0,
@@ -130,9 +133,9 @@
             "total_tokens": 72
           },
           "delta": {
-            "rss_before_mb": 112.62,
-            "rss_after_mb": 76.23,
-            "rss_delta_mb": -36.39,
+            "rss_before_mb": 126.97,
+            "rss_after_mb": 460.88,
+            "rss_delta_mb": 333.91,
             "metal_peak_before_mb": 567.86,
             "metal_peak_after_mb": 567.86,
             "metal_peak_delta_mb": 0.0
@@ -164,7 +167,9 @@
           12095,
           13
         ],
-        "elapsed_ms": 2011.35,
+        "free_running_elapsed_ms": 1450.86,
+        "teacher_forced_elapsed_ms": 955.31,
+        "decode_ms_per_token": 181.3569,
         "token_sequence_hash": "d0c2df820e49fcc87ef2951a05c2cfa883ed37fae38db20ea4e872bc129ab470",
         "per_step_max_logits": [
           21.1562,
@@ -187,7 +192,7 @@
           13
         ],
         "backend": "packed_k8v8_gs64",
-        "timestamp_utc": "2026-06-16T07:35:28Z",
+        "timestamp_utc": "2026-06-16T07:47:44Z",
         "counters": {
           "tokens_appended": 1728,
           "staging_tokens_peak": 0,
@@ -227,9 +232,9 @@
             "scratch_bytes": 3696
           },
           "delta": {
-            "rss_before_mb": 76.66,
-            "rss_after_mb": 132.55,
-            "rss_delta_mb": 55.89,
+            "rss_before_mb": 460.89,
+            "rss_after_mb": 559.97,
+            "rss_delta_mb": 99.08,
             "metal_peak_before_mb": 567.86,
             "metal_peak_after_mb": 567.86,
             "metal_peak_delta_mb": 0.0
@@ -259,7 +264,9 @@
         "prompt_tokens": 128,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1",
-        "elapsed_ms": 367.1,
+        "free_running_elapsed_ms": 132.31,
+        "teacher_forced_elapsed_ms": 209.65,
+        "decode_ms_per_token": 16.5393,
         "token_sequence_hash": "0360bed7afe18ad939bfd5fb8133f6e38f0286494f7f6b136bb1bfe91d6a774f",
         "free_running_token_ids": [
           916,
@@ -292,7 +299,7 @@
           16
         ],
         "backend": "dense_fp16_baseline",
-        "timestamp_utc": "2026-06-16T07:35:33Z",
+        "timestamp_utc": "2026-06-16T07:47:46Z",
         "memory": {
           "category1_persistent_packed_mb": 4.59,
           "category2_mutable_workingset_mb": 0.0,
@@ -302,9 +309,9 @@
             "dense_kv_bytes": 4816896
           },
           "delta": {
-            "rss_before_mb": 147.34,
-            "rss_after_mb": 192.27,
-            "rss_delta_mb": 44.92,
+            "rss_before_mb": 577.67,
+            "rss_after_mb": 717.58,
+            "rss_delta_mb": 139.91,
             "metal_peak_before_mb": 567.86,
             "metal_peak_after_mb": 593.43,
             "metal_peak_delta_mb": 25.57
@@ -317,7 +324,9 @@
         "prompt_tokens": 128,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1",
-        "elapsed_ms": 504.99,
+        "free_running_elapsed_ms": 126.98,
+        "teacher_forced_elapsed_ms": null,
+        "decode_ms_per_token": 15.8728,
         "token_sequence_hash": "0360bed7afe18ad939bfd5fb8133f6e38f0286494f7f6b136bb1bfe91d6a774f",
         "free_running_token_ids": [
           916,
@@ -330,7 +339,7 @@
           16
         ],
         "backend": "mlx_lm_8bit_kv",
-        "timestamp_utc": "2026-06-16T07:35:35Z",
+        "timestamp_utc": "2026-06-16T07:47:47Z",
         "memory": {
           "category1_persistent_packed_mb": 0.85,
           "category2_mutable_workingset_mb": 0.0,
@@ -341,9 +350,9 @@
             "total_tokens": 136
           },
           "delta": {
-            "rss_before_mb": 192.58,
-            "rss_after_mb": 323.78,
-            "rss_delta_mb": 131.2,
+            "rss_before_mb": 717.66,
+            "rss_after_mb": 700.28,
+            "rss_delta_mb": -17.38,
             "metal_peak_before_mb": 593.43,
             "metal_peak_after_mb": 593.43,
             "metal_peak_delta_mb": 0.0
@@ -375,7 +384,9 @@
           220,
           16
         ],
-        "elapsed_ms": 1908.06,
+        "free_running_elapsed_ms": 1681.99,
+        "teacher_forced_elapsed_ms": 1575.45,
+        "decode_ms_per_token": 210.2493,
         "token_sequence_hash": "0360bed7afe18ad939bfd5fb8133f6e38f0286494f7f6b136bb1bfe91d6a774f",
         "per_step_max_logits": [
           23.6875,
@@ -398,7 +409,7 @@
           16
         ],
         "backend": "packed_k8v8_gs64",
-        "timestamp_utc": "2026-06-16T07:35:41Z",
+        "timestamp_utc": "2026-06-16T07:47:52Z",
         "counters": {
           "tokens_appended": 3264,
           "staging_tokens_peak": 0,
@@ -438,9 +449,9 @@
             "scratch_bytes": 3696
           },
           "delta": {
-            "rss_before_mb": 323.98,
-            "rss_after_mb": 230.38,
-            "rss_delta_mb": -93.61,
+            "rss_before_mb": 700.28,
+            "rss_after_mb": 261.69,
+            "rss_delta_mb": -438.59,
             "metal_peak_before_mb": 593.43,
             "metal_peak_after_mb": 593.43,
             "metal_peak_delta_mb": 0.0
@@ -470,7 +481,9 @@
         "prompt_tokens": 512,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France",
-        "elapsed_ms": 449.12,
+        "free_running_elapsed_ms": 251.2,
+        "teacher_forced_elapsed_ms": 241.99,
+        "decode_ms_per_token": 31.4004,
         "token_sequence_hash": "a0443b3275884b0ed70c8ecd3a46ed8ae56ef99e7a9904fe547c050c3abc4661",
         "free_running_token_ids": [
           279,
@@ -503,7 +516,7 @@
           9625
         ],
         "backend": "dense_fp16_baseline",
-        "timestamp_utc": "2026-06-16T07:35:45Z",
+        "timestamp_utc": "2026-06-16T07:47:54Z",
         "memory": {
           "category1_persistent_packed_mb": 15.09,
           "category2_mutable_workingset_mb": 0.0,
@@ -513,9 +526,9 @@
             "dense_kv_bytes": 15826944
           },
           "delta": {
-            "rss_before_mb": 253.28,
-            "rss_after_mb": 204.25,
-            "rss_delta_mb": -49.03,
+            "rss_before_mb": 277.08,
+            "rss_after_mb": 720.75,
+            "rss_delta_mb": 443.67,
             "metal_peak_before_mb": 593.43,
             "metal_peak_after_mb": 761.59,
             "metal_peak_delta_mb": 168.16
@@ -528,7 +541,9 @@
         "prompt_tokens": 512,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France",
-        "elapsed_ms": 257.65,
+        "free_running_elapsed_ms": 1260.43,
+        "teacher_forced_elapsed_ms": null,
+        "decode_ms_per_token": 157.5539,
         "token_sequence_hash": "a0443b3275884b0ed70c8ecd3a46ed8ae56ef99e7a9904fe547c050c3abc4661",
         "free_running_token_ids": [
           279,
@@ -541,7 +556,7 @@
           9625
         ],
         "backend": "mlx_lm_8bit_kv",
-        "timestamp_utc": "2026-06-16T07:35:46Z",
+        "timestamp_utc": "2026-06-16T07:47:57Z",
         "memory": {
           "category1_persistent_packed_mb": 3.24,
           "category2_mutable_workingset_mb": 0.0,
@@ -552,9 +567,9 @@
             "total_tokens": 520
           },
           "delta": {
-            "rss_before_mb": 204.47,
-            "rss_after_mb": 452.09,
-            "rss_delta_mb": 247.62,
+            "rss_before_mb": 720.94,
+            "rss_after_mb": 103.88,
+            "rss_delta_mb": -617.06,
             "metal_peak_before_mb": 761.59,
             "metal_peak_after_mb": 761.59,
             "metal_peak_delta_mb": 0.0
@@ -586,7 +601,9 @@
           315,
           9625
         ],
-        "elapsed_ms": 4284.34,
+        "free_running_elapsed_ms": 8425.56,
+        "teacher_forced_elapsed_ms": 7155.03,
+        "decode_ms_per_token": 1053.1948,
         "token_sequence_hash": "a0443b3275884b0ed70c8ecd3a46ed8ae56ef99e7a9904fe547c050c3abc4661",
         "per_step_max_logits": [
           25.0938,
@@ -609,7 +626,7 @@
           9625
         ],
         "backend": "packed_k8v8_gs64",
-        "timestamp_utc": "2026-06-16T07:35:58Z",
+        "timestamp_utc": "2026-06-16T07:48:20Z",
         "counters": {
           "tokens_appended": 12480,
           "staging_tokens_peak": 0,
@@ -649,9 +666,9 @@
             "scratch_bytes": 3696
           },
           "delta": {
-            "rss_before_mb": 452.3,
-            "rss_after_mb": 143.2,
-            "rss_delta_mb": -309.09,
+            "rss_before_mb": 104.22,
+            "rss_after_mb": 132.66,
+            "rss_delta_mb": 28.44,
             "metal_peak_before_mb": 761.59,
             "metal_peak_after_mb": 761.59,
             "metal_peak_delta_mb": 0.0
@@ -670,222 +687,11 @@
         "first_divergent_token": null,
         "steps_compared": 8
       }
-    },
-    {
-      "context_length": 2048,
-      "prompt_token_hash": "d1a52e81d1a2f253674e01416ec0d4ba1c66e27d694cf380f3db404abf31e625",
-      "prompt_tokens_actual": 2048,
-      "dense": {
-        "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence",
-        "prompt_tokens": 2048,
-        "generated_tokens": 8,
-        "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence.  The quick brown fox jumps over",
-        "elapsed_ms": 1920.02,
-        "token_sequence_hash": "d87ed012db7e54430986a53c2510ba07afba3133617d27a3e455b1da16faef9a",
-        "free_running_token_ids": [
-          13,
-          220,
-          576,
-          3974,
-          13876,
-          38835,
-          34208,
-          916
-        ],
-        "per_step_max_logits": [
-          21.5312,
-          20.2812,
-          20.8594,
-          19.6875,
-          25.9844,
-          25.2031,
-          23.8594,
-          24.0312
-        ],
-        "per_step_argmax": [
-          13,
-          220,
-          576,
-          3974,
-          13876,
-          38835,
-          34208,
-          916
-        ],
-        "backend": "dense_fp16_baseline",
-        "timestamp_utc": "2026-06-16T07:36:08Z",
-        "memory": {
-          "category1_persistent_packed_mb": 51.09,
-          "category2_mutable_workingset_mb": 0.0,
-          "category3_transient_scratch_mb": 0.0,
-          "total_accounted_mb": 51.09,
-          "raw": {
-            "dense_kv_bytes": 53575680
-          },
-          "delta": {
-            "rss_before_mb": 172.72,
-            "rss_after_mb": 151.88,
-            "rss_delta_mb": -20.84,
-            "metal_peak_before_mb": 761.59,
-            "metal_peak_after_mb": 1598.97,
-            "metal_peak_delta_mb": 837.38
-          }
-        }
-      },
-      "eight_bit": {
-        "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence",
-        "prompt_tokens": 2048,
-        "generated_tokens": 8,
-        "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence.  The quick brown fox jumps over",
-        "elapsed_ms": 1699.82,
-        "token_sequence_hash": "d87ed012db7e54430986a53c2510ba07afba3133617d27a3e455b1da16faef9a",
-        "free_running_token_ids": [
-          13,
-          220,
-          576,
-          3974,
-          13876,
-          38835,
-          34208,
-          916
-        ],
-        "backend": "mlx_lm_8bit_kv",
-        "timestamp_utc": "2026-06-16T07:36:11Z",
-        "memory": {
-          "category1_persistent_packed_mb": 12.8,
-          "category2_mutable_workingset_mb": 0.0,
-          "category3_transient_scratch_mb": 0.0,
-          "total_accounted_mb": 12.8,
-          "raw": {
-            "quantized_kv_bytes": 13421568,
-            "total_tokens": 2056
-          },
-          "delta": {
-            "rss_before_mb": 152.2,
-            "rss_after_mb": 114.34,
-            "rss_delta_mb": -37.86,
-            "metal_peak_before_mb": 1598.97,
-            "metal_peak_after_mb": 1598.97,
-            "metal_peak_delta_mb": 0.0
-          }
-        }
-      },
-      "packed": {
-        "model_id": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
-        "prompt": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence",
-        "prompt_tokens": 2048,
-        "generated_tokens": 8,
-        "free_running_token_ids": [
-          13,
-          220,
-          576,
-          3974,
-          13876,
-          38835,
-          34208,
-          916
-        ],
-        "forced_token_ids": [
-          13,
-          220,
-          576,
-          3974,
-          13876,
-          38835,
-          34208,
-          916
-        ],
-        "elapsed_ms": 10033.45,
-        "token_sequence_hash": "d87ed012db7e54430986a53c2510ba07afba3133617d27a3e455b1da16faef9a",
-        "per_step_max_logits": [
-          21.2969,
-          20.0834,
-          20.4822,
-          20.7347,
-          26.0275,
-          25.5343,
-          24.3125,
-          24.1693
-        ],
-        "per_step_argmax": [
-          13,
-          220,
-          576,
-          3974,
-          13876,
-          38835,
-          34208,
-          916
-        ],
-        "backend": "packed_k8v8_gs64",
-        "timestamp_utc": "2026-06-16T07:36:42Z",
-        "counters": {
-          "tokens_appended": 49344,
-          "staging_tokens_peak": 0,
-          "dense_residual_tokens_peak": 0,
-          "packed_blocks_created": 768,
-          "packed_blocks_read": 6912,
-          "packed_attention_calls": 216,
-          "packed_reference_calls": 216,
-          "dense_fallback_calls": 0,
-          "attempted_backend_calls": 0,
-          "full_history_materialization_calls": 0,
-          "packed_bytes_written": 13369344,
-          "packed_bytes_read": 120324096,
-          "decoded_block_bytes": 0,
-          "logical_payload_bytes": 0,
-          "staging_bytes_peak": 0,
-          "dense_residual_bytes_peak": 0,
-          "scratch_bytes_current": 0,
-          "scratch_bytes_peak": 0,
-          "layer_divergence_count": 0,
-          "layers_processed": 0,
-          "requested_strict_mode": true,
-          "effective_strict_mode": true
-        },
-        "memory": {
-          "category1_persistent_packed_mb": 0.0,
-          "category2_mutable_workingset_mb": 0.36,
-          "category3_transient_scratch_mb": 0.0,
-          "total_accounted_mb": 0.36,
-          "raw": {
-            "payload_bytes": 0,
-            "metadata_bytes": 141312,
-            "staging_bytes": 192512,
-            "dense_residual_bytes": 0,
-            "allocator_bytes": 43008,
-            "kernel_buffer_bytes": 0,
-            "scratch_bytes": 3696
-          },
-          "delta": {
-            "rss_before_mb": 114.61,
-            "rss_after_mb": 171.98,
-            "rss_delta_mb": 57.38,
-            "metal_peak_before_mb": 1598.97,
-            "metal_peak_after_mb": 1598.97,
-            "metal_peak_delta_mb": 0.0
-          }
-        }
-      },
-      "token_match": true,
-      "quality": {
-        "kl_divergence": 0.009602,
-        "max_logit_delta": 2.8029,
-        "mean_logit_delta": 1.6356,
-        "top1_match": 1.0,
-        "top5_overlap": 0.9,
-        "top10_overlap": 0.925,
-        "logit_cosine": 0.9999,
-        "first_divergent_token": null,
-        "steps_compared": 8
-      }
     }
   ],
-  "timestamp_utc": "2026-06-16T07:35:04Z",
+  "timestamp_utc": "2026-06-16T07:47:33Z",
   "status": "passed",
   "exit_code": 0,
   "violations": [],
-  "validation_timestamp_utc": "2026-06-16T07:36:42Z"
+  "validation_timestamp_utc": "2026-06-16T07:48:22Z"
 }

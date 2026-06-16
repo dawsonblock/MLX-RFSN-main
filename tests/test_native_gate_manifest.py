@@ -256,6 +256,66 @@ def test_backend_report_has_provenance(manifest: dict) -> None:
     assert br.get("platform_machine"), "Missing platform_machine"
 
 
+def test_free_running_timing_present(manifest: dict) -> None:
+    """Every candidate must report free-running generation time."""
+    for run in manifest["runs"]:
+        for candidate in ("dense", "eight_bit", "packed"):
+            result = run.get(candidate, {})
+            fr = result.get("free_running_elapsed_ms")
+            assert fr is not None, (
+                f"Run context={run['context_length']}: {candidate} missing "
+                "free_running_elapsed_ms"
+            )
+            assert isinstance(fr, (int, float)), (
+                f"Run context={run['context_length']}: {candidate} "
+                f"free_running_elapsed_ms={fr!r} is not numeric"
+            )
+            assert fr >= 0, (
+                f"Run context={run['context_length']}: {candidate} "
+                f"free_running_elapsed_ms={fr} < 0"
+            )
+
+
+def test_teacher_forced_timing_present_for_dense_and_packed(manifest: dict) -> None:
+    """Dense and packed must report teacher-forced re-run time."""
+    for run in manifest["runs"]:
+        for candidate in ("dense", "packed"):
+            result = run.get(candidate, {})
+            tf = result.get("teacher_forced_elapsed_ms")
+            assert tf is not None, (
+                f"Run context={run['context_length']}: {candidate} missing "
+                "teacher_forced_elapsed_ms"
+            )
+            assert isinstance(tf, (int, float)), (
+                f"Run context={run['context_length']}: {candidate} "
+                f"teacher_forced_elapsed_ms={tf!r} is not numeric"
+            )
+            assert tf >= 0, (
+                f"Run context={run['context_length']}: {candidate} "
+                f"teacher_forced_elapsed_ms={tf} < 0"
+            )
+
+
+def test_decode_ms_per_token_present(manifest: dict) -> None:
+    """Every candidate must report per-token decode time."""
+    for run in manifest["runs"]:
+        for candidate in ("dense", "eight_bit", "packed"):
+            result = run.get(candidate, {})
+            dpt = result.get("decode_ms_per_token")
+            assert dpt is not None, (
+                f"Run context={run['context_length']}: {candidate} missing "
+                "decode_ms_per_token"
+            )
+            assert isinstance(dpt, (int, float)), (
+                f"Run context={run['context_length']}: {candidate} "
+                f"decode_ms_per_token={dpt!r} is not numeric"
+            )
+            assert dpt >= 0, (
+                f"Run context={run['context_length']}: {candidate} "
+                f"decode_ms_per_token={dpt} < 0"
+            )
+
+
 def test_multi_context_runs_present(manifest: dict) -> None:
     """At least 3 context lengths should be tested for coverage."""
     contexts = [r["context_length"] for r in manifest["runs"]]
