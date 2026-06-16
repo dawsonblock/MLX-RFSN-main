@@ -95,26 +95,26 @@ class PagedPackedArena:
 
     @property
     def packed_payload_bytes(self) -> int:
-        """Logical payload size of stored blocks."""
+        """Logical payload size of active (non-free) blocks."""
         total = 0
-        for page in self._pages:
-            codes = page.get("codes")
-            if codes is not None and hasattr(codes, "size"):
+        for logical_idx in self._page_table:
+            block = self._pages[logical_idx]
+            if block is None:
+                continue
+            if block.packed_codes is not None and hasattr(block.packed_codes, "size"):
                 from rfsn_v10.cache.contracts import _array_itemsize
-                total += int(codes.size) * _array_itemsize(codes)
-            scales = page.get("scales")
-            if scales is not None and hasattr(scales, "size"):
+                total += int(block.packed_codes.size) * _array_itemsize(block.packed_codes)
+            if block.scales is not None and hasattr(block.scales, "size"):
                 from rfsn_v10.cache.contracts import _array_itemsize
-                total += int(scales.size) * _array_itemsize(scales)
+                total += int(block.scales.size) * _array_itemsize(block.scales)
         return total
 
     @property
     def metadata_bytes(self) -> int:
         """Page table + metadata overhead."""
         return (
-            len(self._page_table) * 8  # int64 per entry
+            len(self._page_table) * 28  # Python int per entry
             + len(self._block_meta) * 64  # rough dict overhead
-            + len(self._pages) * 48  # page dict overhead
         )
 
     @property
@@ -154,15 +154,8 @@ class PagedPackedArena:
             self._pages.append({})  # placeholder, filled below
             self._page_allocation_count += 1
 
-        # Store page data (reference, not copy — MLX arrays are immutable)
-        page_data: dict[str, Any] = {
-            "codes": block.packed_codes,
-            "scales": block.scales,
-        }
-        if hasattr(block, "hash_signs") and block.hash_signs is not None:
-            page_data["signs"] = block.hash_signs
-
-        self._pages[page_idx] = page_data
+        # Store the PackedBlock directly so the kernel can consume it
+        self._pages[page_idx] = block
 
         # Track bytes (the append "cost" is the size of the new block)
         if block.packed_codes is not None and hasattr(block.packed_codes, "size"):
@@ -190,26 +183,41 @@ class PagedPackedArena:
         # Return all allocated physical pages to the free pool
         for page_idx in self._page_table:
             self._free_pages.append(page_idx)
-            # Dereference the actual data for GC
-            self._pages[page_idx] = {}
+            # Dereference the block for GC
+            self._pages[page_idx] = None  # type: ignore[assignment]
         self._page_table.clear()
         self._block_meta.clear()
         self._append_copy_bytes = 0
 
     def get_block(self, logical_index: int) -> dict[str, Any]:
-        """Return the block data at the given logical index."""
+        """Return the block data at the given logical index.
+
+        Returns a dict for backward compatibility. For direct PackedBlock
+        access (kernel consumption), use iter_packed_blocks().
+        """
         if logical_index < 0 or logical_index >= len(self._page_table):
             raise IndexError(f"Logical block index {logical_index} out of range")
         page_idx = self._page_table[logical_index]
+        block = self._pages[page_idx]
         return {
-            **self._pages[page_idx],
+            "codes": block.packed_codes,
+            "scales": block.scales,
             "meta": self._block_meta[logical_index],
         }
 
     def iter_blocks(self):
-        """Yield each stored block in logical order."""
+        """Yield each stored block as a dict in logical order."""
         for i in range(len(self._page_table)):
             yield self.get_block(i)
+
+    def iter_packed_blocks(self):
+        """Yield each stored PackedBlock in logical order.
+
+        This is the primary interface for kernel consumption. The kernel
+        reads .packed_codes, .scales, .logical_start, etc. directly.
+        """
+        for logical_idx in self._page_table:
+            yield self._pages[logical_idx]
 
     def to_instrumentation(self) -> dict:
         """Return instrumentation counters for memory reporting."""

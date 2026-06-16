@@ -249,13 +249,10 @@ class QuantizedLayerCache:
                 stream_id="V",
             )
 
-            # Phase 5: append to paged arena or legacy list
+            # Phase 5: append to paged arena (primary storage)
             if self._use_paged_arena and self._key_arena is not None:
                 self._key_arena.append_block(key_block)
                 self._value_arena.append_block(value_block)
-                # Also keep in legacy list for callers that expect PackedBlock objects
-                self._key_blocks.append(key_block)
-                self._value_blocks.append(value_block)
             else:
                 self._key_blocks.append(key_block)
                 self._value_blocks.append(value_block)
@@ -278,10 +275,12 @@ class QuantizedLayerCache:
         self._encoded_tokens += n_full_blocks * block_size
 
         # Validate sealed block positions after flush
-        if self._key_blocks:
-            validate_block_positions(self._key_blocks)
-        if self._value_blocks:
-            validate_block_positions(self._value_blocks)
+        key_blocks_list = list(self.iter_key_blocks())
+        if key_blocks_list:
+            validate_block_positions(key_blocks_list)
+        value_blocks_list = list(self.iter_value_blocks())
+        if value_blocks_list:
+            validate_block_positions(value_blocks_list)
 
         # Keep remainder in staging
         if remainder > 0:
@@ -334,14 +333,29 @@ class QuantizedLayerCache:
     # ------------------------------------------------------------------
 
     def iter_key_blocks(self):
-        """Yield each sealed key block for blockwise attention."""
+        """Yield each sealed key block for blockwise attention.
+
+        Phase 5: When paged arena is active, the kernel consumes blocks
+        directly from arena storage. This eliminates duplicate storage
+        and enables true paged execution.
+        """
         self._check_destroyed()
-        yield from self._key_blocks
+        if self._key_arena is not None:
+            yield from self._key_arena.iter_packed_blocks()
+        else:
+            yield from self._key_blocks
 
     def iter_value_blocks(self):
-        """Yield each sealed value block for blockwise attention."""
+        """Yield each sealed value block for blockwise attention.
+
+        Phase 5: When paged arena is active, the kernel consumes blocks
+        directly from arena storage.
+        """
         self._check_destroyed()
-        yield from self._value_blocks
+        if self._value_arena is not None:
+            yield from self._value_arena.iter_packed_blocks()
+        else:
+            yield from self._value_blocks
 
     def get_dense_residual(self) -> tuple[Any | None, Any | None]:
         """Return the dense FP16 residual window, or (None, None)."""
@@ -393,7 +407,7 @@ class QuantizedLayerCache:
         """Exact bytes from all sealed blocks (valid payload only)."""
         self._check_destroyed()
         total = 0
-        for kb, vb in zip(self._key_blocks, self._value_blocks):
+        for kb, vb in zip(self.iter_key_blocks(), self.iter_value_blocks()):
             total += kb.payload_bytes()
             total += vb.payload_bytes()
         return total
@@ -423,10 +437,12 @@ class QuantizedLayerCache:
 
     def stats(self) -> CacheStats:
         self._check_destroyed()
+        # Count sealed blocks from arena or legacy list
+        sealed_count = sum(1 for _ in self.iter_key_blocks())
         return CacheStats(
             tokens_encoded=self._encoded_tokens,
             tokens_requantized=self._requantized_tokens,
-            sealed_blocks=len(self._key_blocks),
+            sealed_blocks=sealed_count,
             staged_tokens=self._stage_token_count,
             dense_residual_tokens=self._dense_token_count,
             payload_bytes=self.payload_bytes(),
@@ -538,7 +554,7 @@ class QuantizedLayerCache:
             has_mass = mx.logical_or(has_mass, mx.any(mx.isfinite(scores), axis=-1, keepdims=True))
 
         token_offset = 0
-        for kb, vb in zip(self._key_blocks, self._value_blocks):
+        for kb, vb in zip(self.iter_key_blocks(), self.iter_value_blocks()):
             k_block = self.key_codec.decode_bhtd(kb)
             v_block = self.value_codec.decode_bhtd(vb)
             block_T = kb.token_count
@@ -578,6 +594,10 @@ class QuantizedLayerCache:
         """
         self._key_blocks.clear()
         self._value_blocks.clear()
+        if self._key_arena is not None:
+            self._key_arena.reset()
+        if self._value_arena is not None:
+            self._value_arena.reset()
         self._stage_keys.clear()
         self._stage_values.clear()
         self._stage_token_count = 0

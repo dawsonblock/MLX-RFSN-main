@@ -254,3 +254,63 @@ def test_backend_report_has_provenance(manifest: dict) -> None:
     assert br.get("git_commit"), "Missing git_commit"
     assert br.get("python_version"), "Missing python_version"
     assert br.get("platform_machine"), "Missing platform_machine"
+
+
+def test_multi_context_runs_present(manifest: dict) -> None:
+    """At least 3 context lengths should be tested for coverage."""
+    contexts = [r["context_length"] for r in manifest["runs"]]
+    assert len(contexts) >= 3, f"Only {len(contexts)} context lengths tested"
+
+
+def test_multi_block_contexts_have_multiple_blocks(manifest: dict) -> None:
+    """Contexts >= 128 tokens should create multiple packed blocks."""
+    for run in manifest["runs"]:
+        ctx = run["context_length"]
+        if ctx >= 128:
+            counters = run.get("packed", {}).get("counters", {})
+            blocks = counters.get("packed_blocks_created", 0)
+            assert blocks > 1, (
+                f"Run context={ctx}: expected multiple blocks, got {blocks}"
+            )
+
+
+def test_all_contexts_zero_fallback(manifest: dict) -> None:
+    """Every run must have zero dense fallback."""
+    for run in manifest["runs"]:
+        counters = run.get("packed", {}).get("counters", {})
+        fb = counters.get("dense_fallback_calls", 0)
+        assert fb == 0, f"Run context={run['context_length']}: fallback={fb}"
+
+
+def test_all_contexts_zero_materialization(manifest: dict) -> None:
+    """Every run must have zero full-history materialization."""
+    for run in manifest["runs"]:
+        counters = run.get("packed", {}).get("counters", {})
+        mat = counters.get("full_history_materialization_calls", 0)
+        assert mat == 0, f"Run context={run['context_length']}: materialization={mat}"
+
+
+def test_attention_calls_scale_with_context(manifest: dict) -> None:
+    """Packed attention calls should increase with context length."""
+    contexts = []
+    calls = []
+    for run in manifest["runs"]:
+        ctx = run["context_length"]
+        c = run.get("packed", {}).get("counters", {}).get("packed_attention_calls", 0)
+        contexts.append(ctx)
+        calls.append(c)
+    # At minimum, longer contexts should not have fewer calls than shorter ones
+    for i in range(1, len(contexts)):
+        if contexts[i] > contexts[i - 1]:
+            assert calls[i] >= calls[i - 1], (
+                f"Context {contexts[i]} has {calls[i]} calls but "
+                f"context {contexts[i-1]} has {calls[i-1]} calls"
+            )
+
+
+def test_long_context_token_match(manifest: dict) -> None:
+    """Token match must hold even for the longest tested context."""
+    longest = max(manifest["runs"], key=lambda r: r["context_length"])
+    assert longest.get("token_match") is True, (
+        f"Token match failed at longest context={longest['context_length']}"
+    )

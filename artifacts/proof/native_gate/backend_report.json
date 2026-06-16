@@ -10,7 +10,7 @@
   "chip_model": "",
   "memory_capacity_gb": 0.0,
   "reason": "",
-  "git_commit": "a63a31fdbb498cf53d0b71de351288f28e56a5ca",
+  "git_commit": "9a0f337c7dc43cc9b7732c0ff3ad55febd0aaaa8",
   "benchmark_source_hash": "",
   "prompt_token_hash": "",
   "python_version": "3.12.8",
