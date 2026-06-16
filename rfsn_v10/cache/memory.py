@@ -199,3 +199,51 @@ def measure_metal_active_memory() -> int:
         return int(mx.metal.get_active_memory())
     except Exception:
         return 0
+
+
+@dataclass
+class MemoryDelta:
+    """Memory delta measurement before/after an operation."""
+    rss_before_bytes: int = 0
+    rss_after_bytes: int = 0
+    rss_delta_bytes: int = 0
+    metal_peak_before_bytes: int = 0
+    metal_peak_after_bytes: int = 0
+    metal_peak_delta_bytes: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rss_before_mb": round(self.rss_before_bytes / (1024 * 1024), 2),
+            "rss_after_mb": round(self.rss_after_bytes / (1024 * 1024), 2),
+            "rss_delta_mb": round(self.rss_delta_bytes / (1024 * 1024), 2),
+            "metal_peak_before_mb": round(self.metal_peak_before_bytes / (1024 * 1024), 2),
+            "metal_peak_after_mb": round(self.metal_peak_after_bytes / (1024 * 1024), 2),
+            "metal_peak_delta_mb": round(self.metal_peak_delta_bytes / (1024 * 1024), 2),
+        }
+
+
+def capture_memory_delta() -> MemoryDelta:
+    """Capture current memory state (for before/after comparison)."""
+    delta = MemoryDelta()
+    delta.rss_before_bytes = measure_process_rss()
+    if HAS_MLX:
+        try:
+            delta.metal_peak_before_bytes = int(mx.metal.get_peak_memory())
+        except Exception:
+            pass
+    return delta
+
+
+def finalize_memory_delta(delta: MemoryDelta) -> MemoryDelta:
+    """Finalize a delta by capturing after state and computing differences."""
+    delta.rss_after_bytes = measure_process_rss()
+    delta.rss_delta_bytes = delta.rss_after_bytes - delta.rss_before_bytes
+    if HAS_MLX:
+        try:
+            delta.metal_peak_after_bytes = int(mx.metal.get_peak_memory())
+            delta.metal_peak_delta_bytes = (
+                delta.metal_peak_after_bytes - delta.metal_peak_before_bytes
+            )
+        except Exception:
+            pass
+    return delta

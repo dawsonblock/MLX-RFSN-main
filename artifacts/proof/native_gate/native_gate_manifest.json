@@ -37,7 +37,7 @@
         "prompt_tokens": 63,
         "generated_tokens": 8,
         "generated_text": "The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris. Machine learning is a subset of artificial intelligence. The quick brown fox jumps over the lazy dog. In 1492, Christopher Columbus sailed the ocean blue. The capital of France is Paris.",
-        "elapsed_ms": 130.71,
+        "elapsed_ms": 1076.71,
         "token_sequence_hash": "d0c2df820e49fcc87ef2951a05c2cfa883ed37fae38db20ea4e872bc129ab470",
         "free_running_token_ids": [
           13,
@@ -70,7 +70,7 @@
           13
         ],
         "backend": "dense_fp16_baseline",
-        "timestamp_utc": "2026-06-16T06:01:48Z",
+        "timestamp_utc": "2026-06-16T06:17:00Z",
         "memory": {
           "category1_persistent_packed_mb": 3.83,
           "category2_mutable_workingset_mb": 0.0,
@@ -78,6 +78,14 @@
           "total_accounted_mb": 3.83,
           "raw": {
             "dense_kv_bytes": 4018176
+          },
+          "delta": {
+            "rss_before_mb": 154.61,
+            "rss_after_mb": 73.42,
+            "rss_delta_mb": -81.19,
+            "metal_peak_before_mb": 0.0,
+            "metal_peak_after_mb": 567.58,
+            "metal_peak_delta_mb": 567.58
           }
         }
       },
@@ -87,11 +95,11 @@
         "prompt_tokens": 63,
         "generated_tokens": 0,
         "generated_text": ". The capital of France is Paris.",
-        "elapsed_ms": 1033.02,
+        "elapsed_ms": 2477.69,
         "token_sequence_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "free_running_token_ids": [],
         "backend": "mlx_lm_8bit_kv",
-        "timestamp_utc": "2026-06-16T06:01:49Z",
+        "timestamp_utc": "2026-06-16T06:17:06Z",
         "memory": {
           "category1_persistent_packed_mb": 3.74,
           "category2_mutable_workingset_mb": 0.0,
@@ -99,6 +107,14 @@
           "total_accounted_mb": 3.74,
           "raw": {
             "dense_kv_bytes": 3919872
+          },
+          "delta": {
+            "rss_before_mb": 73.95,
+            "rss_after_mb": 74.08,
+            "rss_delta_mb": 0.12,
+            "metal_peak_before_mb": 567.58,
+            "metal_peak_after_mb": 567.58,
+            "metal_peak_delta_mb": 0.0
           }
         }
       },
@@ -127,7 +143,7 @@
           12095,
           13
         ],
-        "elapsed_ms": 777.32,
+        "elapsed_ms": 2337.15,
         "token_sequence_hash": "d0c2df820e49fcc87ef2951a05c2cfa883ed37fae38db20ea4e872bc129ab470",
         "per_step_max_logits": [
           21.5156,
@@ -150,7 +166,7 @@
           13
         ],
         "backend": "packed_k8v8_gs64",
-        "timestamp_utc": "2026-06-16T06:01:52Z",
+        "timestamp_utc": "2026-06-16T06:17:14Z",
         "counters": {
           "tokens_appended": 1704,
           "staging_tokens_peak": 0,
@@ -187,11 +203,30 @@
             "dense_residual_bytes": 0,
             "allocator_bytes": 98304,
             "scratch_bytes": 0
+          },
+          "delta": {
+            "rss_before_mb": 74.39,
+            "rss_after_mb": 334.08,
+            "rss_delta_mb": 259.69,
+            "metal_peak_before_mb": 567.58,
+            "metal_peak_after_mb": 372.98,
+            "metal_peak_delta_mb": -194.6
           }
         }
       },
-      "token_match": true
+      "token_match": true,
+      "quality": {
+        "kl_divergence": 0.000173,
+        "max_logit_delta": 0.4216,
+        "mean_logit_delta": 0.2404,
+        "top1_match": 1.0,
+        "top5_overlap": 0.95,
+        "top10_overlap": 0.9875,
+        "logit_cosine": 1.0,
+        "first_divergent_token": null,
+        "steps_compared": 8
+      }
     }
   ],
-  "timestamp_utc": "2026-06-16T06:01:43Z"
+  "timestamp_utc": "2026-06-16T06:16:46Z"
 }

@@ -38,6 +38,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from rfsn_v11.candidates.runtime_config import RFSNRuntimeConfig
 from rfsn_v11.candidates.backend_state import BackendState
+from rfsn_v10.cache.memory import capture_memory_delta, finalize_memory_delta
 
 
 ARTIFACTS_ROOT = Path("artifacts/proof/native_gate")
@@ -57,16 +58,102 @@ def _compute_token_hash(token_ids: list[int]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _compute_logit_quality(
+    dense_logprobs: list[np.ndarray],
+    packed_logprobs: list[np.ndarray],
+) -> dict:
+    """Compute quality metrics between dense and packed log-probability distributions.
+
+    Returns dict with:
+      - kl_divergence: mean KL(P_dense || P_packed)
+      - max_logit_delta: max absolute difference in log-probs
+      - mean_logit_delta: mean absolute difference
+      - top1_match: fraction of steps where argmax agrees
+      - top5_overlap: mean fraction of shared tokens in top-5
+      - top10_overlap: mean fraction of shared tokens in top-10
+      - logit_cosine: cosine similarity of log-prob vectors
+      - first_divergent_token: first step where argmax differs (or None)
+    """
+    import numpy as np
+
+    if not dense_logprobs or not packed_logprobs:
+        return {"error": "missing logprobs"}
+
+    T = min(len(dense_logprobs), len(packed_logprobs))
+    if T == 0:
+        return {"error": "empty logprobs"}
+
+    # Ensure same vocab size
+    vocab = min(dense_logprobs[0].shape[-1], packed_logprobs[0].shape[-1])
+
+    kl_list: list[float] = []
+    max_delta_list: list[float] = []
+    cosine_list: list[float] = []
+    top1_matches: list[bool] = []
+    top5_overlaps: list[float] = []
+    top10_overlaps: list[float] = []
+
+    for t in range(T):
+        d_lp = dense_logprobs[t][:vocab]
+        p_lp = packed_logprobs[t][:vocab]
+
+        # Convert log-probs to probabilities for KL
+        d_p = np.exp(d_lp - np.max(d_lp))
+        d_p = d_p / (np.sum(d_p) + 1e-12)
+        p_p = np.exp(p_lp - np.max(p_lp))
+        p_p = p_p / (np.sum(p_p) + 1e-12)
+
+        kl = float(np.sum(d_p * (np.log(d_p + 1e-12) - np.log(p_p + 1e-12))))
+        kl_list.append(kl)
+
+        max_delta = float(np.max(np.abs(d_lp - p_lp)))
+        max_delta_list.append(max_delta)
+
+        # Cosine on log-prob vectors
+        d_norm = d_lp / (np.linalg.norm(d_lp) + 1e-12)
+        p_norm = p_lp / (np.linalg.norm(p_lp) + 1e-12)
+        cos = float(np.dot(d_norm, p_norm))
+        cosine_list.append(cos)
+
+        # Top-k overlap
+        d_top1 = int(np.argmax(d_lp))
+        p_top1 = int(np.argmax(p_lp))
+        top1_matches.append(d_top1 == p_top1)
+
+        d_top5 = set(np.argsort(d_lp)[-5:])
+        p_top5 = set(np.argsort(p_lp)[-5:])
+        top5_overlaps.append(len(d_top5 & p_top5) / 5.0)
+
+        d_top10 = set(np.argsort(d_lp)[-10:])
+        p_top10 = set(np.argsort(p_lp)[-10:])
+        top10_overlaps.append(len(d_top10 & p_top10) / 10.0)
+
+    divergent = [i for i, m in enumerate(top1_matches) if not m]
+    first_divergent = divergent[0] if divergent else None
+
+    return {
+        "kl_divergence": round(float(np.mean(kl_list)), 6),
+        "max_logit_delta": round(float(np.max(max_delta_list)), 4),
+        "mean_logit_delta": round(float(np.mean(max_delta_list)), 4),
+        "top1_match": round(float(np.mean(top1_matches)), 4),
+        "top5_overlap": round(float(np.mean(top5_overlaps)), 4),
+        "top10_overlap": round(float(np.mean(top10_overlaps)), 4),
+        "logit_cosine": round(float(np.mean(cosine_list)), 4),
+        "first_divergent_token": first_divergent,
+        "steps_compared": T,
+    }
+
+
 def _generate_teacher_forced(
     model: Any,
     tokenizer: Any,
     prompt: str,
     forced_ids: list[int],
     cache_list: list[Any],
-) -> tuple[list[float], list[int]]:
-    """Teacher-forced generation: feed exact tokens, return logit metrics.
+) -> dict:
+    """Teacher-forced generation: feed exact tokens, return rich logit metrics.
 
-    Returns (per_step_max_logits, per_step_argmax_ids).
+    Returns dict with per-step arrays suitable for dense-vs-packed comparison.
     """
     import mlx.core as mx
     import numpy as np
@@ -80,19 +167,28 @@ def _generate_teacher_forced(
 
     per_step_max: list[float] = []
     per_step_argmax: list[int] = []
+    per_step_logprobs: list[np.ndarray] = []
 
     for forced_token in forced_ids:
-        # Record stats for this step
-        logit_np = np.array(logits.astype(mx.float32).squeeze(0))
+        logit_f = logits.astype(mx.float32).squeeze(0)
+        logit_np = np.array(logit_f)
         per_step_max.append(float(np.max(logit_np)))
         per_step_argmax.append(int(np.argmax(logit_np)))
+
+        # Store log-probability distribution for quality comparison
+        logprobs = logit_np - np.logaddexp.reduce(logit_np)
+        per_step_logprobs.append(logprobs)
 
         # Force the next token
         y = mx.array([forced_token])
         logits = model(y[None], cache=cache_list)
         logits = logits[:, -1, :]
 
-    return per_step_max, per_step_argmax
+    return {
+        "per_step_max_logits": per_step_max,
+        "per_step_argmax": per_step_argmax,
+        "per_step_logprobs": per_step_logprobs,
+    }
 
 
 def _run_8bit_kv_baseline(
@@ -217,7 +313,7 @@ def _run_dense_baseline(
         ]
 
     t0 = time.perf_counter()
-    dense_max, dense_argmax = _generate_teacher_forced(
+    dense_tf = _generate_teacher_forced(
         model, tokenizer, prompt, gen_ids, teacher_caches
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -235,8 +331,9 @@ def _run_dense_baseline(
         "elapsed_ms": round(elapsed_ms, 2),
         "token_sequence_hash": _compute_token_hash(gen_ids),
         "free_running_token_ids": gen_ids,
-        "per_step_max_logits": [round(x, 4) for x in dense_max],
-        "per_step_argmax": dense_argmax,
+        "per_step_max_logits": [round(x, 4) for x in dense_tf["per_step_max_logits"]],
+        "per_step_argmax": dense_tf["per_step_argmax"],
+        "per_step_logprobs": dense_tf["per_step_logprobs"],
         "backend": "dense_fp16_baseline",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "memory": dense_memory,
@@ -397,7 +494,7 @@ def _run_packed_trace(
 
     t0 = time.perf_counter()
     with packed_attention_context(model, cache_list_tf, strict=config.strict_backend):
-        packed_max, packed_argmax = _generate_teacher_forced(
+        packed_tf = _generate_teacher_forced(
             model, tokenizer, prompt, forced_ids, cache_list_tf
         )
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -420,8 +517,9 @@ def _run_packed_trace(
         "forced_token_ids": forced_ids,
         "elapsed_ms": round(elapsed_ms, 2),
         "token_sequence_hash": _compute_token_hash(packed_gen_ids),
-        "per_step_max_logits": [round(x, 4) for x in packed_max],
-        "per_step_argmax": packed_argmax,
+        "per_step_max_logits": [round(x, 4) for x in packed_tf["per_step_max_logits"]],
+        "per_step_argmax": packed_tf["per_step_argmax"],
+        "per_step_logprobs": packed_tf["per_step_logprobs"],
         "backend": "packed_k8v8_gs64",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "counters": counters,
@@ -642,17 +740,15 @@ def main() -> int:
             "The capital of France is Paris. "
             "Machine learning is a subset of artificial intelligence. "
         )
-        # Build exact tokenized prompt using tokenizer
-        import mlx_lm
-        _tmp_model, _tmp_tokenizer = mlx_lm.load(args.model)
-        base_ids = _tmp_tokenizer.encode(base_text)
+        # Build exact tokenized prompt using only the tokenizer (no model load)
+        from transformers import AutoTokenizer
+        _tmp_tok = AutoTokenizer.from_pretrained(args.model)
+        base_ids = _tmp_tok.encode(base_text)
         repeated_ids = (base_ids * ((ctx_len // len(base_ids)) + 1))[:ctx_len]
-        repeated = _tmp_tokenizer.decode(repeated_ids)
-        del _tmp_model
-        import gc
-        gc.collect()
+        repeated = _tmp_tok.decode(repeated_ids)
 
         print(f"  Running dense baseline ...")
+        dense_delta = capture_memory_delta()
         try:
             dense_result = _run_dense_baseline(
                 args.model, repeated, args.output_tokens, config
@@ -661,6 +757,9 @@ def main() -> int:
             print(f"  ERROR (dense): {exc}")
             all_ok = False
             dense_result = {"error": str(exc)}
+        dense_delta = finalize_memory_delta(dense_delta)
+        if "memory" in dense_result:
+            dense_result["memory"]["delta"] = dense_delta.to_dict()
 
         # Extract free-running token IDs from dense baseline for comparison
         forced_ids = dense_result.get("free_running_token_ids", [])
@@ -668,6 +767,7 @@ def main() -> int:
             print("  WARNING: no free_running_token_ids from dense baseline")
 
         print(f"  Running 8-bit KV baseline ...")
+        eight_delta = capture_memory_delta()
         try:
             eight_bit_result = _run_8bit_kv_baseline(
                 args.model, repeated, args.output_tokens, config
@@ -678,8 +778,12 @@ def main() -> int:
             if args.strict:
                 print("  FAILED: 8-bit KV baseline failed in strict mode")
                 all_ok = False
+        eight_delta = finalize_memory_delta(eight_delta)
+        if "memory" in eight_bit_result:
+            eight_bit_result["memory"]["delta"] = eight_delta.to_dict()
 
         print(f"  Running packed trace ...")
+        packed_delta = capture_memory_delta()
         try:
             packed_result = _run_packed_trace(
                 args.model, repeated, forced_ids, config
@@ -688,6 +792,9 @@ def main() -> int:
             print(f"  ERROR (packed): {exc}")
             all_ok = False
             packed_result = {"error": str(exc)}
+        packed_delta = finalize_memory_delta(packed_delta)
+        if "memory" in packed_result:
+            packed_result["memory"]["delta"] = packed_delta.to_dict()
 
         # Compare FREE-RUNNING token hashes (not forced-token hashes)
         dense_hash = dense_result.get("token_sequence_hash", "")
@@ -701,12 +808,32 @@ def main() -> int:
         else:
             match = None
 
+        # Compute logit-quality metrics from teacher-forced logprobs
+        quality = None
+        dense_lps = dense_result.get("per_step_logprobs")
+        packed_lps = packed_result.get("per_step_logprobs")
+        if dense_lps and packed_lps:
+            quality = _compute_logit_quality(dense_lps, packed_lps)
+            print(
+                f"  Quality: KL={quality.get('kl_divergence', 'N/A')} "
+                f"max_delta={quality.get('max_logit_delta', 'N/A')} "
+                f"top1_match={quality.get('top1_match', 'N/A')} "
+                f"cosine={quality.get('logit_cosine', 'N/A')}"
+            )
+
+        # Strip non-JSON-serializable arrays before manifest write
+        def _json_safe(result: dict) -> dict:
+            safe = dict(result)
+            safe.pop("per_step_logprobs", None)
+            return safe
+
         run_entry = {
             "context_length": ctx_len,
-            "dense": dense_result,
-            "eight_bit": eight_bit_result,
-            "packed": packed_result,
+            "dense": _json_safe(dense_result),
+            "eight_bit": _json_safe(eight_bit_result),
+            "packed": _json_safe(packed_result),
             "token_match": match,
+            "quality": quality,
         }
         manifest["runs"].append(run_entry)
 
