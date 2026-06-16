@@ -939,6 +939,21 @@ def check() -> list[str]:
         except (OSError, json.JSONDecodeError):
             pass
 
+    # --- Vendored repo check (Phase 10) ---
+    vendored_dir = root / "external"
+    if vendored_dir.exists():
+        vendored_repos = [
+            d.name for d in vendored_dir.iterdir()
+            if d.is_dir() and d.name not in {".git", "__pycache__"}
+        ]
+        if vendored_repos:
+            # Phase 10: alpha allows vendored repos; beta+ warns
+            if release_config.get("channel") != "alpha":
+                errors.append(
+                    f"vendored repos present: {vendored_repos}; "
+                    f"remove before beta promotion"
+                )
+
     return errors
 
 

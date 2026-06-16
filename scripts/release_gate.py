@@ -470,6 +470,69 @@ def run_pytest(markers: str, label: str, dirs: list[str] | None = None) -> dict:
     }
 
 
+def check_release_level() -> dict:
+    """Check native gate manifest against release level criteria."""
+    try:
+        from rfsn_v11.candidates.release_levels import (
+            ReleaseLevel, get_criteria,
+        )
+    except Exception as exc:
+        return {
+            "name": "release_level",
+            "passed": False,
+            "message": f"Failed to import release_levels: {exc}",
+        }
+
+    manifest_path = REPO_ROOT / "artifacts" / "proof" / "native_gate" / "native_gate_manifest.json"
+    if not manifest_path.exists():
+        return {
+            "name": "release_level",
+            "passed": True,
+            "message": "No native gate manifest yet (run --full to generate)",
+        }
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "name": "release_level",
+            "passed": False,
+            "message": f"Manifest parse error: {exc}",
+        }
+
+    # Determine target level from release.toml
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
+    release_toml = REPO_ROOT / "release.toml"
+    target_level = ReleaseLevel.ALPHA
+    if release_toml.exists():
+        with release_toml.open("rb") as f:
+            config = tomllib.load(f)
+        channel = config.get("release", {}).get("channel", "alpha")
+        try:
+            target_level = ReleaseLevel(channel)
+        except ValueError:
+            target_level = ReleaseLevel.ALPHA
+
+    criteria = get_criteria(target_level)
+    violations = criteria.check(manifest)
+
+    if violations:
+        return {
+            "name": "release_level",
+            "passed": False,
+            "message": f"{target_level.value}: {len(violations)} violation(s): " + "; ".join(violations),
+        }
+    return {
+        "name": "release_level",
+        "passed": True,
+        "message": f"{target_level.value} criteria satisfied",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -551,6 +614,9 @@ def main() -> int:
 
     if args.full:
         checks.append(run_pytest("benchmark", "benchmark_smoke"))
+
+    # Phase 10: release level check against native gate manifest
+    checks.append(check_release_level())
 
     # Summarise
     n_passed = sum(1 for c in checks if c["passed"])
