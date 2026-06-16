@@ -119,8 +119,10 @@ class PagedPackedArena:
 
     @property
     def page_table_bytes(self) -> int:
-        """Page table array bytes."""
-        return self.max_pages * 8
+        """Actually allocated page table bytes (dynamic Python list, not fixed array)."""
+        # Each int in a Python list is ~28 bytes (PyObject overhead).
+        # This is an estimate of the actual runtime allocation.
+        return len(self._page_table) * 28
 
     @property
     def append_copy_bytes(self) -> int:

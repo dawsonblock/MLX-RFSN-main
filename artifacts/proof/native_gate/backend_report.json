@@ -9,5 +9,10 @@
   "macos_version": "26.2",
   "chip_model": "",
   "memory_capacity_gb": 0.0,
-  "reason": ""
+  "reason": "",
+  "git_commit": "28317e9e33288f309216c720a02f6d7ec55fc168",
+  "benchmark_source_hash": "",
+  "prompt_token_hash": "",
+  "python_version": "3.12.8",
+  "platform_machine": "arm64"
 }

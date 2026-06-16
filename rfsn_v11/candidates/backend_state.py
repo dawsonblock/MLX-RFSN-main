@@ -46,6 +46,12 @@ class BackendReport:
     chip_model: str = ""
     memory_capacity_gb: float = 0.0
     reason: str = ""  # Human-readable detail when not READY
+    # Provenance (audit fix: reproducibility)
+    git_commit: str = ""
+    benchmark_source_hash: str = ""
+    prompt_token_hash: str = ""
+    python_version: str = ""
+    platform_machine: str = ""
 
     def is_ready(self) -> bool:
         return self.state == BackendState.READY
@@ -63,4 +69,9 @@ class BackendReport:
             "chip_model": self.chip_model,
             "memory_capacity_gb": self.memory_capacity_gb,
             "reason": self.reason,
+            "git_commit": self.git_commit,
+            "benchmark_source_hash": self.benchmark_source_hash,
+            "prompt_token_hash": self.prompt_token_hash,
+            "python_version": self.python_version,
+            "platform_machine": self.platform_machine,
         }

@@ -386,6 +386,22 @@ class PackedV4AttentionKernel:
         # Kernel wrapper cache: keyed by template signature (avoid rebuild in hot path)
         self._kernel_cache: dict[tuple, Any] = {}
 
+    @property
+    def cached_buffer_bytes(self) -> int:
+        """Total bytes in kernel-owned concatenation caches."""
+        total = 0
+        for arr in (
+            self._cached_k_codes,
+            self._cached_k_scales,
+            self._cached_v_codes,
+            self._cached_v_scales,
+            self._cached_block_starts,
+            self._cached_block_counts,
+        ):
+            if arr is not None and hasattr(arr, "size") and hasattr(arr, "dtype"):
+                total += int(arr.size) * arr.dtype.size
+        return total
+
     def _validate_blocks(self, key_blocks: list[PackedBlockV4], value_blocks: list[PackedBlockV4]) -> None:
         """Fail-fast validation of block compatibility."""
         if len(key_blocks) != len(value_blocks):

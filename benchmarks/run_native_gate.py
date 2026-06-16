@@ -168,7 +168,7 @@ def _compute_logit_quality(
 def _generate_teacher_forced(
     model: Any,
     tokenizer: Any,
-    prompt: str,
+    prompt_ids: list[int],
     forced_ids: list[int],
     cache_list: list[Any],
 ) -> dict:
@@ -179,7 +179,6 @@ def _generate_teacher_forced(
     import mlx.core as mx
     import numpy as np
 
-    prompt_ids = tokenizer.encode(prompt)
     y = mx.array(prompt_ids)
 
     # Prefill
@@ -214,58 +213,61 @@ def _generate_teacher_forced(
 
 def _run_8bit_kv_baseline(
     model_id: str,
-    prompt: str,
+    prompt_ids: list[int],
     max_tokens: int,
     config: RFSNRuntimeConfig,
 ) -> dict:
-    """Run dense FP16 baseline with MLX-LM 8-bit quantized KV cache.
+    """Run free-running greedy decode with MLX-LM 8-bit quantized KV cache.
 
-    Uses the official mlx-lm kv_bits API (not the unsupported quantize_kv_cache flag).
+    Uses QuantizedKVCache directly so the benchmark owns and can inspect
+    the actual quantized cache.  Token IDs are captured exactly during
+    generation, not reconstructed by re-encoding text.
     """
+    import mlx.core as mx
     import mlx_lm
+    from mlx_lm.models.cache import QuantizedKVCache
     from mlx_lm.sample_utils import make_sampler
 
     model, tokenizer = _load_model_with_retry(model_id)
     sampler = make_sampler(temp=0.0)
+
+    # Build per-layer QuantizedKVCache — this IS the 8-bit cache
+    num_layers = len(model.layers)
+    cache_list = [QuantizedKVCache(group_size=64, bits=8) for _ in range(num_layers)]
+
+    # Prefill
     t0 = time.perf_counter()
-    output = mlx_lm.generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        kv_bits=8,
-        kv_group_size=64,
-        sampler=sampler,
-        verbose=False,
-    )
+    y = mx.array(prompt_ids)
+    logits = model(y[None], cache=cache_list)
+    logits = logits[:, -1, :]
+
+    # Free-running greedy decode
+    gen_ids: list[int] = []
+    for _ in range(max_tokens):
+        logprobs = mx.log(mx.softmax(logits.astype(mx.float32), axis=-1))
+        token = sampler(logprobs).item()
+        gen_ids.append(int(token))
+        y = mx.array([token])
+        logits = model(y[None], cache=cache_list)
+        logits = logits[:, -1, :]
+
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    input_ids = tokenizer.encode(prompt)
-    output_ids = tokenizer.encode(output)
-    gen_ids = output_ids[len(input_ids):]
+    full_ids = prompt_ids + gen_ids
+    output_text = tokenizer.decode(full_ids)
 
-    # 8-bit KV memory: measure from actual caches after generation
-    num_layers = len(model.layers)
-    if hasattr(model, "make_cache"):
-        cache_list = model.make_cache()
-    else:
-        from mlx_lm.models import cache as mlx_cache
-        cache_list = [mlx_cache.KVCache() for _ in range(num_layers)]
-
-    # Run a dummy forward to populate caches for measurement
-    import mlx.core as mx
-    y = mx.array(input_ids + gen_ids)
-    _ = model(y[None], cache=cache_list)
+    # Measure the ACTUAL 8-bit quantized cache
     mx.eval([c.state for c in cache_list])
+    memory_8bit = _measure_quantized_memory(cache_list, total_tokens=len(prompt_ids) + len(gen_ids))
 
-    memory_8bit = _measure_dense_memory(cache_list, model=model, total_tokens=len(input_ids) + len(gen_ids))
+    prompt_text = tokenizer.decode(prompt_ids)
 
     return {
         "model_id": model_id,
-        "prompt": prompt,
-        "prompt_tokens": len(input_ids),
+        "prompt": prompt_text,
+        "prompt_tokens": len(prompt_ids),
         "generated_tokens": len(gen_ids),
-        "generated_text": output,
+        "generated_text": output_text,
         "elapsed_ms": round(elapsed_ms, 2),
         "token_sequence_hash": _compute_token_hash(gen_ids),
         "free_running_token_ids": gen_ids,
@@ -275,9 +277,41 @@ def _run_8bit_kv_baseline(
     }
 
 
+def _measure_quantized_memory(cache_list: list[Any], total_tokens: int = 0) -> dict:
+    """Measure memory of QuantizedKVCache instances.
+
+    QuantizedKVCache stores (codes, scales, biases) tuples.
+    We sum the sizes of all arrays in the state.
+    """
+    total_bytes = 0
+    for cache in cache_list:
+        if cache is None:
+            continue
+        state = getattr(cache, "state", None)
+        if state is None:
+            continue
+        # state is a tuple of (keys_tuple, values_tuple)
+        # each tuple contains (codes, scales, biases)
+        for tensor_group in state:
+            if not isinstance(tensor_group, tuple):
+                continue
+            for arr in tensor_group:
+                if arr is not None and hasattr(arr, "size") and hasattr(arr, "dtype"):
+                    total_bytes += int(arr.size) * arr.dtype.size
+
+    total_mb = round(total_bytes / (1024 * 1024), 2)
+    return {
+        "category1_persistent_packed_mb": total_mb,
+        "category2_mutable_workingset_mb": 0.0,
+        "category3_transient_scratch_mb": 0.0,
+        "total_accounted_mb": total_mb,
+        "raw": {"quantized_kv_bytes": total_bytes, "total_tokens": total_tokens},
+    }
+
+
 def _run_dense_baseline(
     model_id: str,
-    prompt: str,
+    prompt_ids: list[int],
     max_tokens: int,
     config: RFSNRuntimeConfig,
 ) -> dict:
@@ -293,7 +327,6 @@ def _run_dense_baseline(
 
     model, tokenizer = _load_model_with_retry(model_id)
     sampler = make_sampler(temp=0.0)
-    prompt_ids = tokenizer.encode(prompt)
 
     # Step 1: Free-running greedy decode with persistent KV cache
     if hasattr(model, "make_cache"):
@@ -319,11 +352,13 @@ def _run_dense_baseline(
     full_ids = prompt_ids + gen_ids
     output_text = tokenizer.decode(full_ids)
 
+    # Also decode the prompt for display/logging
+    prompt_text = tokenizer.decode(prompt_ids)
+
     # Step 2: Teacher-forced re-run with fresh caches for logit comparison
     del model
     import gc
     gc.collect()
-    mx.metal.reset_peak_memory()
 
     model, _ = _load_model_with_retry(model_id)
     if hasattr(model, "make_cache"):
@@ -335,7 +370,7 @@ def _run_dense_baseline(
 
     t0 = time.perf_counter()
     dense_tf = _generate_teacher_forced(
-        model, tokenizer, prompt, gen_ids, teacher_caches
+        model, tokenizer, prompt_ids, gen_ids, teacher_caches
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -345,7 +380,7 @@ def _run_dense_baseline(
 
     return {
         "model_id": model_id,
-        "prompt": prompt,
+        "prompt": prompt_text,
         "prompt_tokens": len(prompt_ids),
         "generated_tokens": len(gen_ids),
         "generated_text": output_text,
@@ -417,7 +452,7 @@ def _measure_dense_memory(
 
 def _run_packed_trace(
     model_id: str,
-    prompt: str,
+    prompt_ids: list[int],
     forced_ids: list[int],
     config: RFSNRuntimeConfig,
 ) -> dict:
@@ -437,9 +472,8 @@ def _run_packed_trace(
         packed_attention_context,
     )
 
-    model, tokenizer = mlx_lm.load(model_id)
+    model, tokenizer = _load_model_with_retry(model_id)
     sampler = make_sampler(temp=0.0)
-    prompt_ids = tokenizer.encode(prompt)
 
     key_codec = CartesianCodec(bits=config.key_bits, group_size=config.group_size)
     value_codec = CartesianCodec(bits=config.value_bits, group_size=config.group_size)
@@ -487,7 +521,6 @@ def _run_packed_trace(
     del model
     import gc
     gc.collect()
-    mx.metal.reset_peak_memory()
 
     model, _ = _load_model_with_retry(model_id)
     session_tf = GenerationCacheSession(
@@ -516,7 +549,7 @@ def _run_packed_trace(
     t0 = time.perf_counter()
     with packed_attention_context(model, cache_list_tf, strict=config.strict_backend):
         packed_tf = _generate_teacher_forced(
-            model, tokenizer, prompt, forced_ids, cache_list_tf
+            model, tokenizer, prompt_ids, forced_ids, cache_list_tf
         )
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
@@ -527,11 +560,33 @@ def _run_packed_trace(
     counters["effective_strict_mode"] = config.strict_backend
 
     # Phase 7: Measure memory from teacher-forced session
-    memory = _measure_session_memory(session_tf)
+    # Audit fix: count kernel-owned concatenation buffers
+    kernel_buffer_bytes = 0
+    for wrapper in cache_list_tf:
+        kernel = getattr(wrapper, "_cached_kernel", None)
+        if kernel is not None:
+            kernel_buffer_bytes += kernel.cached_buffer_bytes
+
+    # Estimate scratch: query transform + output + softmax temporaries
+    # For one decode step with Hq heads, Lq=1, D=head_dim:
+    #   wht_queries: Hq * 1 * D * 4 bytes (float32)
+    #   output: Hq * 1 * D * 4 bytes
+    #   running_max + running_sum: Hq * 1 * 4 bytes each
+    num_heads = getattr(model.layers[0].self_attn, "n_heads", 16)
+    head_dim = getattr(model.layers[0].self_attn, "head_dim", 64)
+    scratch_bytes = num_heads * (head_dim * 4 + 4 * 2)  # one step estimate
+
+    memory = _measure_session_memory(
+        session_tf,
+        kernel_buffer_bytes=kernel_buffer_bytes,
+        scratch_bytes=scratch_bytes,
+    )
+
+    prompt_text = tokenizer.decode(prompt_ids)
 
     return {
         "model_id": model_id,
-        "prompt": prompt,
+        "prompt": prompt_text,
         "prompt_tokens": len(prompt_ids),
         "generated_tokens": len(packed_gen_ids),
         "free_running_token_ids": packed_gen_ids,
@@ -548,7 +603,11 @@ def _run_packed_trace(
     }
 
 
-def _measure_session_memory(session: Any) -> dict:
+def _measure_session_memory(
+    session: Any,
+    kernel_buffer_bytes: int = 0,
+    scratch_bytes: int = 0,
+) -> dict:
     """Measure memory from session layer caches into three categories.
 
     Audit fix: count each unique packed array only once. The paged arena
@@ -560,7 +619,6 @@ def _measure_session_memory(session: Any) -> dict:
     total_metadata = 0
     total_staging = 0
     total_dense_residual = 0
-    total_scratch = 0
     total_allocator = 0
 
     def _add_unique(arr: Any) -> None:
@@ -606,22 +664,26 @@ def _measure_session_memory(session: Any) -> dict:
         if layer_cache._dense_values is not None and hasattr(layer_cache._dense_values, "size"):
             total_dense_residual += int(layer_cache._dense_values.size) * layer_cache._dense_values.dtype.size
 
+    # Kernel concatenation buffers are session-external but real allocations
+    total_kernel = kernel_buffer_bytes
+
     cat1_mb = round(total_payload / (1024 * 1024), 2)
-    cat2_mb = round((total_metadata + total_staging + total_dense_residual + total_allocator) / (1024 * 1024), 2)
-    cat3_mb = round(total_scratch / (1024 * 1024), 2)
+    cat2_mb = round((total_metadata + total_staging + total_dense_residual + total_allocator + total_kernel) / (1024 * 1024), 2)
+    cat3_mb = round(scratch_bytes / (1024 * 1024), 2)
 
     return {
         "category1_persistent_packed_mb": cat1_mb,
         "category2_mutable_workingset_mb": cat2_mb,
         "category3_transient_scratch_mb": cat3_mb,
-        "total_accounted_mb": round((total_payload + total_metadata + total_staging + total_dense_residual + total_allocator + total_scratch) / (1024 * 1024), 2),
+        "total_accounted_mb": round((total_payload + total_metadata + total_staging + total_dense_residual + total_allocator + total_kernel + scratch_bytes) / (1024 * 1024), 2),
         "raw": {
             "payload_bytes": total_payload,
             "metadata_bytes": total_metadata,
             "staging_bytes": total_staging,
             "dense_residual_bytes": total_dense_residual,
             "allocator_bytes": total_allocator,
-            "scratch_bytes": total_scratch,
+            "kernel_buffer_bytes": total_kernel,
+            "scratch_bytes": scratch_bytes,
         },
     }
 
@@ -743,36 +805,59 @@ def main() -> int:
     # 2. Run traces at each context length
     # ------------------------------------------------------------------
     all_ok = True
+
+    # Benchmark source hash for reproducibility
+    _bench_hash = ""
+    try:
+        import hashlib
+        _bench_path = Path(__file__).resolve()
+        _bench_hash = hashlib.sha256(_bench_path.read_bytes()).hexdigest()[:16]
+    except Exception:
+        pass
+
     manifest = {
         "candidate": args.candidate,
         "model_id": args.model,
         "config": config.to_dict(),
         "backend_report": report.to_dict(),
+        "benchmark_source_hash": _bench_hash,
         "runs": [],
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
+    # Load model + tokenizer once to build exact prompts with the
+    # SAME tokenizer used by all candidates (avoids cross-tokenizer drift).
+    print("\nLoading model for prompt construction ...")
+    _probe_model, _probe_tok = _load_model_with_retry(args.model)
+    _base_text = (
+        "The quick brown fox jumps over the lazy dog. "
+        "In 1492, Christopher Columbus sailed the ocean blue. "
+        "The capital of France is Paris. "
+        "Machine learning is a subset of artificial intelligence. "
+    )
+    _base_ids = _probe_tok.encode(_base_text)
+    del _probe_model
+    import gc
+    gc.collect()
+
     for ctx_len in args.context_lengths:
         print(f"\n--- Context length {ctx_len} ---")
-        # Build a prompt that tokenizes to EXACTLY ctx_len tokens
-        base_text = (
-            "The quick brown fox jumps over the lazy dog. "
-            "In 1492, Christopher Columbus sailed the ocean blue. "
-            "The capital of France is Paris. "
-            "Machine learning is a subset of artificial intelligence. "
-        )
-        # Build exact tokenized prompt using only the tokenizer (no model load)
-        from transformers import AutoTokenizer
-        _tmp_tok = AutoTokenizer.from_pretrained(args.model)
-        base_ids = _tmp_tok.encode(base_text)
-        repeated_ids = (base_ids * ((ctx_len // len(base_ids)) + 1))[:ctx_len]
-        repeated = _tmp_tok.decode(repeated_ids)
+        # Build exact prompt token IDs
+        repeated_ids = (_base_ids * ((ctx_len // len(_base_ids)) + 1))[:ctx_len]
+        # CRITICAL: verify the prompt actually has the requested length
+        if len(repeated_ids) != ctx_len:
+            print(
+                f"  FATAL: prompt length mismatch: requested {ctx_len}, "
+                f"actual {len(repeated_ids)}"
+            )
+            all_ok = False
+            continue
 
         print(f"  Running dense baseline ...")
         dense_delta = capture_memory_delta()
         try:
             dense_result = _run_dense_baseline(
-                args.model, repeated, args.output_tokens, config
+                args.model, repeated_ids, args.output_tokens, config
             )
         except Exception as exc:
             print(f"  ERROR (dense): {exc}")
@@ -791,7 +876,7 @@ def main() -> int:
         eight_delta = capture_memory_delta()
         try:
             eight_bit_result = _run_8bit_kv_baseline(
-                args.model, repeated, args.output_tokens, config
+                args.model, repeated_ids, args.output_tokens, config
             )
         except Exception as exc:
             print(f"  ERROR (8bit): {exc}")
@@ -807,7 +892,7 @@ def main() -> int:
         packed_delta = capture_memory_delta()
         try:
             packed_result = _run_packed_trace(
-                args.model, repeated, forced_ids, config
+                args.model, repeated_ids, forced_ids, config
             )
         except Exception as exc:
             print(f"  ERROR (packed): {exc}")
@@ -842,6 +927,9 @@ def main() -> int:
                 f"cosine={quality.get('logit_cosine', 'N/A')}"
             )
 
+        # Prompt token hash for reproducibility
+        _prompt_hash = _compute_token_hash(repeated_ids)
+
         # Strip non-JSON-serializable arrays before manifest write
         def _json_safe(result: dict) -> dict:
             safe = dict(result)
@@ -850,6 +938,8 @@ def main() -> int:
 
         run_entry = {
             "context_length": ctx_len,
+            "prompt_token_hash": _prompt_hash,
+            "prompt_tokens_actual": len(repeated_ids),
             "dense": _json_safe(dense_result),
             "eight_bit": _json_safe(eight_bit_result),
             "packed": _json_safe(packed_result),
@@ -859,11 +949,9 @@ def main() -> int:
         manifest["runs"].append(run_entry)
 
     # ------------------------------------------------------------------
-    # 3. Write manifest and validate
+    # 3. Validate and write manifest atomically after validation
     # ------------------------------------------------------------------
-    manifest_path = out_dir / "native_gate_manifest.json"
-    _write_json(manifest_path, manifest)
-    print(f"\nWrote manifest: {manifest_path}")
+    violations: list[str] = []
 
     # Check for zero fallback (only in strict mode)
     if args.strict:
@@ -871,17 +959,75 @@ def main() -> int:
             packed = run.get("packed", {})
             counters = packed.get("counters", {})
             if counters.get("dense_fallback_calls", 0) > 0:
-                print(
-                    f"  FAILED: dense_fallback_calls > 0 "
-                    f"at context {run['context_length']}"
-                )
+                v = f"dense_fallback_calls > 0 at context {run['context_length']}"
+                violations.append(v)
+                print(f"  FAILED: {v}")
                 all_ok = False
             if counters.get("full_history_materialization_calls", 0) > 0:
-                print(
-                    f"  FAILED: full_history_materialization_calls > 0 "
-                    f"at context {run['context_length']}"
-                )
+                v = f"full_history_materialization_calls > 0 at context {run['context_length']}"
+                violations.append(v)
+                print(f"  FAILED: {v}")
                 all_ok = False
+            if not counters.get("requested_strict_mode", False):
+                v = f"requested_strict_mode is false at context {run['context_length']}"
+                violations.append(v)
+                all_ok = False
+            if not counters.get("effective_strict_mode", False):
+                v = f"effective_strict_mode is false at context {run['context_length']}"
+                violations.append(v)
+                all_ok = False
+            if counters.get("packed_attention_calls", 0) == 0:
+                v = f"packed_attention_calls == 0 at context {run['context_length']}"
+                violations.append(v)
+                all_ok = False
+
+    # Prompt length validation
+    for run in manifest["runs"]:
+        ctx = run.get("context_length", 0)
+        dense_pt = run.get("dense", {}).get("prompt_tokens", 0)
+        packed_pt = run.get("packed", {}).get("prompt_tokens", 0)
+        if dense_pt != ctx:
+            v = f"dense prompt_tokens {dense_pt} != requested {ctx}"
+            violations.append(v)
+            all_ok = False
+        if packed_pt != ctx:
+            v = f"packed prompt_tokens {packed_pt} != requested {ctx}"
+            violations.append(v)
+            all_ok = False
+
+    # Token match validation
+    for run in manifest["runs"]:
+        if run.get("token_match") is False:
+            v = f"token_match False at context {run['context_length']}"
+            violations.append(v)
+            all_ok = False
+
+    # Quality threshold validation (fail-closed)
+    for run in manifest["runs"]:
+        quality = run.get("quality")
+        if quality:
+            kl = quality.get("kl_divergence")
+            if kl is not None and kl > 0.01:
+                v = f"KL {kl} > 0.01 at context {run['context_length']}"
+                violations.append(v)
+                all_ok = False
+            top1 = quality.get("top1_match")
+            if top1 is not None and top1 < 1.0:
+                v = f"top1_match {top1} < 1.0 at context {run['context_length']}"
+                violations.append(v)
+                all_ok = False
+
+    # Finalize manifest with validation results
+    manifest["status"] = "passed" if all_ok else "failed"
+    manifest["exit_code"] = 0 if all_ok else 1
+    manifest["violations"] = violations
+    manifest["validation_timestamp_utc"] = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+    )
+
+    manifest_path = out_dir / "native_gate_manifest.json"
+    _write_json(manifest_path, manifest)
+    print(f"\nWrote manifest: {manifest_path}")
 
     if all_ok:
         print("\n=== Native Gate Passed ===")

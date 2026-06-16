@@ -163,6 +163,26 @@ class RFSNRuntimeConfig:
             config_str.encode("utf-8")
         ).hexdigest()[:16]
 
+        # Provenance
+        try:
+            import subprocess
+            report.git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=os.getcwd(), text=True
+            ).strip()
+        except Exception:
+            pass
+
+        try:
+            report.python_version = os.sys.version.split()[0]
+        except Exception:
+            pass
+
+        try:
+            import platform
+            report.platform_machine = platform.machine()
+        except Exception:
+            pass
+
         return report
 
     def to_dict(self) -> dict[str, Any]:
