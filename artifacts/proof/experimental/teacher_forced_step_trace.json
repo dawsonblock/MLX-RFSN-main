@@ -1,6 +1,7 @@
 {
-  "status": "no_native_run_completed",
-  "description": "Teacher-forced step trace requires Apple Silicon with MLX and a real model. Run: python tools/run_teacher_forced_trace.py to generate.",
+  "status": "execution_failed",
+  "description": "Teacher-forced step trace requires Apple Silicon with MLX and a real model. Run: python benchmarks/benchmark_teacher_forced_step_trace.py to generate.",
+  "entry_point": "benchmarks/benchmark_teacher_forced_step_trace.py",
   "traces": [
     {
       "error": "no_native_run: Apple Silicon with MLX required to generate teacher-forced step traces",

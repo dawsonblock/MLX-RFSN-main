@@ -1,33 +1,23 @@
 """RFSN candidate registry.
 
 Fix #8: One authoritative candidate registry.
+Phase 0 Scope Freeze (2026-06-15): The default registry contains ONLY
+three canonical candidates required for K8/V8 GS64 validation:
+
+  1. dense_mlx_baseline              — FP16 dense control
+  2. mlx_lm_8bit_kv                  — MLX-LM built-in 8-bit KV control
+  3. rfsn_direct_packed_k8v8_gs64    — RFSN direct-packed K8/V8 GS64
+
+All other candidates (Polar, TurboQuant, QJL, K8/V5, K8/V6, K16/V8,
+K8/V16, K16/V16, SnapKV, SparseJL, etc.) remain in the repository as
+archived experiments but are EXCLUDED from the default registry.
+
+They can be accessed via build_experimental_registry() or
+get_experimental_registry() for explicit research work.
 
 Maps canonical candidate names to instantiated candidate objects.
-All imports are lazy — missing optional dependencies (mlx,
-    external/turboquant-mlx, external/mlx-turboquant) only raise
-    when the specific candidate is requested.
-
-Canonical name conventions
----------------------------
-A1_wht_grouped_k8v4_gs64  — Phase 3: grouped WHT, keys 8-bit,
-    values 4-bit, group 64
-A1b_wht_asym_k8v4            — Phase 4: asymmetric bit sweep
-A2_wht_polar_4bit            — Phase 6: PolarQuant
-A3_wht_turboquant_mse_4bit   — Phase 5: TurboQuant MSE-only
-A4_wht_turboquant_qjl_4bit   — Phase 10: TurboQuant + QJL
-B1_sparsejl_grouped_k8v4_gs64 — Phase 9:
-    Sparse JL ablation
-R1_wht_grouped_residual128 — Phase 7: grouped WHT +
-    FP16 residual window R=128
-R2_turboquant_mse_residual128 — Phase 7:
-    TurboQuant MSE + FP16 residual window R=128
-S1_snapkv_prune_only         — Phase 8: SnapKV pruning only
-S2_snapkv_plus_grouped       — Phase 8: SnapKV + grouped WHT
-S3_snapkv_plus_turboquant_mse_residual128 — Phase 8:
-    SnapKV + TurboQuant MSE + residual
-dense_mlx_baseline           — Phase 1: dense FP16 baseline (always available)
-rfsn_direct_packed_k8v8      — Direct-packed K8/V8 (strict mode)
-rfsn_v10_k8v5                 — RFSN v10 K8/V5 dense reconstruction
+All imports are lazy — missing optional dependencies only raise
+when the specific candidate is requested.
 """
 from __future__ import annotations
 
@@ -177,6 +167,12 @@ def _make_dense_baseline() -> Any:
     return DenseMlxBaseline()
 
 
+def _make_mlx_lm_8bit_kv() -> Any:
+    """MLX-LM built-in 8-bit KV cache (primary control for comparison)."""
+    from rfsn_v11.candidates.mlx_lm_quantized import MLXLMQuantizedKV
+    return MLXLMQuantizedKV(kv_bits=8)
+
+
 def _make_a1() -> Any:
     from benchmarks.candidates.a1_wht_grouped_k8v4_gs64 import A1_WHT_Grouped
     return A1_WHT_Grouped()
@@ -301,19 +297,46 @@ def _make_rfsn_v10_k8v8() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Default registry instance
+# Registry builders
 # ---------------------------------------------------------------------------
 
+# Phase 0 canonical candidates — the only ones active for validation
+_CANONICAL_CANDIDATES = [
+    "dense_mlx_baseline",
+    "mlx_lm_8bit_kv",
+    "rfsn_direct_packed_k8v8",
+]
+
+
 def build_default_registry() -> CandidateRegistry:
-    """Build and return the standard registry with all known candidates.
-    
-    Fix #8: This is the one authoritative candidate registry.
-    All benchmark code must use this registry, not hardcoded construction.
+    """Build and return the FROZEN default registry.
+
+    Phase 0 Scope Freeze: Contains exactly three canonical candidates:
+      1. dense_mlx_baseline
+      2. mlx_lm_8bit_kv
+      3. rfsn_direct_packed_k8v8
+
+    All other candidates are accessible via build_experimental_registry().
     """
     reg = CandidateRegistry()
-    # Baseline
     reg.register("dense_mlx_baseline", _make_dense_baseline)
-    # Phase 3-10 candidates (legacy, kept for historical reference)
+    reg.register("mlx_lm_8bit_kv", _make_mlx_lm_8bit_kv)
+    reg.register("rfsn_direct_packed_k8v8", _make_rfsn_direct_packed_k8v8)
+    return reg
+
+
+def build_experimental_registry() -> CandidateRegistry:
+    """Build and return the EXPERIMENTAL registry with all known candidates.
+
+    Includes legacy research candidates (Polar, TurboQuant, QJL, SnapKV,
+    SparseJL, additional bit-widths, etc.) that are excluded from the
+    default registry.  Use this only for explicit research work.
+    """
+    reg = CandidateRegistry()
+    # Baselines and controls
+    reg.register("dense_mlx_baseline", _make_dense_baseline)
+    reg.register("mlx_lm_8bit_kv", _make_mlx_lm_8bit_kv)
+    # Phase 3-10 legacy candidates (archived, not actively benchmarked)
     reg.register("A1_wht_grouped_k8v4_gs64", _make_a1)
     reg.register("A1b_wht_asym_k8v4", _make_a1b)
     reg.register("A2_wht_polar_4bit", _make_a2)
@@ -325,7 +348,7 @@ def build_default_registry() -> CandidateRegistry:
     reg.register("S1_snapkv_prune_only", _make_s1)
     reg.register("S2_snapkv_plus_grouped", _make_s2)
     reg.register("S3_snapkv_plus_turboquant_mse_residual128", _make_s3)
-    # Fix #8: RFSN candidates (current active candidates)
+    # RFSN direct-packed variants (all bit-widths)
     reg.register("rfsn_direct_packed_k8v8", _make_rfsn_direct_packed_k8v8)
     reg.register("rfsn_direct_packed_k8v8_smoke", _make_rfsn_direct_packed_k8v8_smoke)
     reg.register("rfsn_direct_packed_k8v5", _make_rfsn_direct_packed_k8v5)
@@ -333,6 +356,7 @@ def build_default_registry() -> CandidateRegistry:
     reg.register("rfsn_direct_packed_k16v8", _make_rfsn_direct_packed_k16v8)
     reg.register("rfsn_direct_packed_k8v16", _make_rfsn_direct_packed_k8v16)
     reg.register("rfsn_direct_packed_k16v16", _make_rfsn_direct_packed_k16v16)
+    # RFSN v10 dense-reconstruction candidates
     reg.register("rfsn_v10_k8v5", _make_rfsn_v10_k8v5)
     reg.register("rfsn_v10_k8v8", _make_rfsn_v10_k8v8)
     return reg
@@ -340,11 +364,20 @@ def build_default_registry() -> CandidateRegistry:
 
 # Module-level default
 _default_registry: CandidateRegistry | None = None
+_experimental_registry: CandidateRegistry | None = None
 
 
 def get_registry() -> CandidateRegistry:
-    """Return the module-level default registry (created on first call)."""
+    """Return the module-level default (frozen) registry."""
     global _default_registry
     if _default_registry is None:
         _default_registry = build_default_registry()
     return _default_registry
+
+
+def get_experimental_registry() -> CandidateRegistry:
+    """Return the module-level experimental registry."""
+    global _experimental_registry
+    if _experimental_registry is None:
+        _experimental_registry = build_experimental_registry()
+    return _experimental_registry

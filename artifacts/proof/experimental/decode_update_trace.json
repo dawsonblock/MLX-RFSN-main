@@ -1,6 +1,7 @@
 {
-  "status": "no_native_run_completed",
-  "description": "Decode-update trace requires Apple Silicon with MLX. Run: python tools/run_decode_trace.py to generate.",
+  "status": "execution_failed",
+  "description": "Decode-update trace requires Apple Silicon with MLX. Run: python benchmarks/debug_decode_update_path.py to generate.",
+  "entry_point": "benchmarks/debug_decode_update_path.py",
   "traces": [
     {
       "error": "no_native_run: Apple Silicon with MLX required to generate decode-update traces",

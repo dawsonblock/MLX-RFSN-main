@@ -190,68 +190,86 @@ def _build_candidates(
     bit_width_config: str = "k8v8",
     check_available: bool = True,
     canonical: bool = False,
+    experimental: bool = False,
 ) -> list[KVCompressionCandidate]:
-    """Instantiate all candidates using the authoritative registry.
+    """Instantiate candidates using the authoritative registry.
 
-    Fix #8: This now delegates to the one authoritative candidate_registry.
-    No longer duplicates candidate construction logic.
+    Fix #8: Delegates to candidate_registry.  Phase 0: default returns exactly
+    three canonical candidates.  experimental=True unlocks the full registry.
 
     Args:
-        quick: If True, use quick-mode candidate selection.
-        include_legacy: If True, include legacy/deprecated candidates.
-        bit_width_config: Bit-width configuration for bit-width isolation ladder (k16v16, k8v16, k16v8, k8v8, k8v6, k8v5)
-        check_available: If True, filter candidates by is_available(). If False, return all declared candidates.
-            P0 Fix: Set to False for portable tests that verify registry structure without requiring MLX.
-        canonical: P0 Fix: If True, force canonical BS64 configuration regardless of quick mode.
-
-    Phase 0 Scope Freeze: Only rfsn_direct_packed candidates are active for initial validation.
-    Other candidates (RFSN K8/V5 dense reconstruction, RFSN v11, TurboQuant, Polar, QJL, Sparse) remain in source
-    but are excluded from the active promotion matrix until the direct-packed path is proven correct.
+        quick: If True, use quick-mode candidate selection (smoke BS8).
+        include_legacy: Legacy flag; ignored in default (frozen) mode.
+        bit_width_config: Bit-width for experimental ladder (ignored in default mode).
+        check_available: If True, filter by is_available(). If False, return declared.
+        canonical: If True, force canonical BS64 (overrides quick mode).
+        experimental: Phase 0: If True, use experimental registry with all candidates.
     """
-    from benchmarks.candidate_registry import get_registry
+    from benchmarks.candidate_registry import (
+        get_experimental_registry,
+        get_registry,
+    )
 
-    registry = get_registry()
+    if experimental:
+        registry = get_experimental_registry()
+        # Experimental mode: baseline + MLX-LM 8-bit + selected bit-width + legacy
+        baseline = registry.get("dense_mlx_baseline")
+        bit_config_to_name = {
+            "k16v16": "rfsn_direct_packed_k16v16",
+            "k8v16": "rfsn_direct_packed_k8v16",
+            "k16v8": "rfsn_direct_packed_k16v8",
+            "k8v8": "rfsn_direct_packed_k8v8",
+            "k8v6": "rfsn_direct_packed_k8v6",
+            "k8v5": "rfsn_direct_packed_k8v5",
+        }
+        if quick and not canonical:
+            bit_config_to_name["k8v8"] = "rfsn_direct_packed_k8v8_smoke"
+        candidate_name = bit_config_to_name.get(bit_width_config, "rfsn_direct_packed_k8v8")
+        all_candidates: list[KVCompressionCandidate] = [
+            baseline,
+            registry.get("mlx_lm_8bit_kv"),
+            registry.get(candidate_name),
+        ]
+        if include_legacy:
+            legacy_names = [
+                "A1_wht_grouped_k8v4_gs64",
+                "A1b_wht_asym_k8v4",
+                "A2_wht_polar_4bit",
+                "A3_wht_turboquant_mse_4bit",
+                "A4_wht_turboquant_qjl_4bit",
+                "B1_sparsejl_grouped_k8v4_gs64",
+                "R1_wht_grouped_residual128",
+                "R2_turboquant_mse_residual128",
+                "S1_snapkv_prune_only",
+                "S2_snapkv_plus_grouped",
+                "S3_snapkv_plus_turboquant_mse_residual128",
+                "rfsn_v10_k8v5",
+                "rfsn_v10_k8v8",
+            ]
+            for name in legacy_names:
+                try:
+                    all_candidates.append(registry.get(name))
+                except KeyError:
+                    pass
+    else:
+        # Phase 0 default: exactly three canonical candidates
+        registry = get_registry()
+        # Map quick mode to smoke variant inside the canonical candidate
+        if quick and not canonical:
+            # Smoke variant: use the smoke factory directly from experimental registry
+            # but default registry only has canonical.  We temporarily fetch smoke.
+            from benchmarks.candidate_registry import get_experimental_registry
+            exp_reg = get_experimental_registry()
+            direct_packed = exp_reg.get("rfsn_direct_packed_k8v8_smoke")
+        else:
+            direct_packed = registry.get("rfsn_direct_packed_k8v8")
+        all_candidates = [
+            registry.get("dense_mlx_baseline"),
+            registry.get("mlx_lm_8bit_kv"),
+            direct_packed,
+        ]
 
-    # Fix #8: Use the authoritative registry for baseline
-    baseline = registry.get("dense_mlx_baseline")
-
-    # Fix #8: Use the authoritative registry for direct-packed candidates
-    # Map bit-width config to registry names
-    # P0 #7: Canonical candidates use BS64; smoke variants use BS8 for fast tests
-    bit_config_to_name = {
-        "k16v16": "rfsn_direct_packed_k16v16",
-        "k8v16": "rfsn_direct_packed_k8v16",
-        "k16v8": "rfsn_direct_packed_k16v8",
-        "k8v8": "rfsn_direct_packed_k8v8",
-        "k8v6": "rfsn_direct_packed_k8v6",
-        "k8v5": "rfsn_direct_packed_k8v5",
-    }
-    # Quick mode uses smoke candidates for faster structural tests
-    # P0 Fix: canonical=True overrides quick mode to use BS64
-    if quick and not canonical:
-        bit_config_to_name["k8v8"] = "rfsn_direct_packed_k8v8_smoke"
-
-    candidate_name = bit_config_to_name.get(bit_width_config, "rfsn_direct_packed_k8v8")
-
-    # Phase 0: Freeze scope to only the direct-packed candidate for correctness validation
-    all_candidates: list[KVCompressionCandidate] = [
-        baseline,  # From authoritative registry
-        registry.get(candidate_name),  # Direct packed from authoritative registry
-    ]
-
-    # Other candidates temporarily removed from active promotion matrix:
-    # - RFSN K8/V5 dense reconstruction (RFSNV10Candidate)
-    # - Legacy gs32
-    # - RFSN v11 offline candidate (RFSNV11Candidate)
-    # - TurboQuant (TurboQuantV2Candidate)
-    # - Polar (PolarReferenceAdapter, TurboPolarAdapter)
-    # - QJL variants
-    # - Sparse variants
-    # These remain in source tree but don't participate in initial validation
-
-    # P0 Fix: Support both declared (portable test) and available (runtime) modes
     if not check_available:
-        # Return declared candidates without checking runtime dependencies
         return all_candidates
 
     available = []
@@ -1076,7 +1094,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--include-legacy", action="store_true",
-        help="Include legacy/deprecated candidates",
+        help="Include legacy/deprecated candidates (requires --experimental)",
+    )
+    parser.add_argument(
+        "--experimental", action="store_true",
+        help="Phase 0: Unlock full experimental registry (non-canonical candidates)",
     )
     parser.add_argument(
         "--require-model", action="store_true",
@@ -1246,6 +1268,7 @@ def main() -> None:
             include_legacy=args.include_legacy,
             bit_width_config=args.bit_width,
             canonical=args.canonical,
+            experimental=args.experimental,
         )
         candidates_requested += len(candidates)
         if not candidates:

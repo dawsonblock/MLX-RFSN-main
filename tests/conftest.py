@@ -9,6 +9,34 @@ import pytest
 from rfsn_v10.clickhouse_client import ClickHouseClient
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Phase 1: Add explicit portable / native-release test modes."""
+    parser.addoption(
+        "--rfsn-portable",
+        action="store_true",
+        default=False,
+        help="Portable CI mode: verify schema, structure, and safe defaults only",
+    )
+    parser.addoption(
+        "--rfsn-native-release",
+        action="store_true",
+        default=False,
+        help="Native release mode: require real execution evidence and provenance",
+    )
+
+
+@pytest.fixture
+def rfsn_portable(request: pytest.FixtureRequest) -> bool:
+    """Return True if --rfsn-portable was passed."""
+    return bool(request.config.getoption("--rfsn-portable"))
+
+
+@pytest.fixture
+def rfsn_native_release(request: pytest.FixtureRequest) -> bool:
+    """Return True if --rfsn-native-release was passed."""
+    return bool(request.config.getoption("--rfsn-native-release"))
+
+
 @pytest.fixture(autouse=True)
 def isolate_clickhouse_flush_path(tmp_path, monkeypatch):
     """Redirect the ClickHouseClient flush file to a per-test temp path.

@@ -269,10 +269,20 @@ class TestSchemaAndReport:
         assert data["summary"]["verdict_counts"]["REJECT"] == 1
 
     def test_candidate_registry_smoke(self):
-        from benchmarks.candidate_registry import build_default_registry
+        """Phase 0: default registry is frozen to three canonical candidates."""
+        from benchmarks.candidate_registry import (
+            build_default_registry,
+            build_experimental_registry,
+        )
         reg = build_default_registry()
-        assert "A1_wht_grouped_k8v4_gs64" in reg.names()
         assert "dense_mlx_baseline" in reg.names()
+        assert "mlx_lm_8bit_kv" in reg.names()
+        assert "rfsn_direct_packed_k8v8" in reg.names()
+        assert len(reg.names()) == 3
+
+        # Legacy candidates live in the experimental registry only
+        exp_reg = build_experimental_registry()
+        assert "A1_wht_grouped_k8v4_gs64" in exp_reg.names()
 
 
 # ---------------------------------------------------------------------------

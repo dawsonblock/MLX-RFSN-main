@@ -1,83 +1,48 @@
 #!/usr/bin/env bash
 # Release gate script for MLX-RFSN Fusion
-# Reads release identity from release.toml
-# Runs on any platform (Linux, macOS, Windows with bash)
+# Phase 2: Thin wrapper around the canonical Python gate.
+#
+# This script ONLY:
+#   1. Validates the Python version.
+#   2. Ensures the execution environment is ready.
+#   3. Invokes scripts/release_gate.py (the canonical implementation).
+#   4. Returns the Python gate's exit code verbatim.
+#
+# All actual checks (compilation, imports, tests, integrity, wheel) live
+# in release_gate.py so there is a single source of truth.
+
 set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 echo "=== MLX-RFSN Release Gate ==="
 
-# Load release identity
-if [ -f "release.toml" ]; then
-    RELEASE_ID=$(grep "^release_id" release.toml | cut -d'"' -f2)
-    DISPLAY_NAME=$(grep "^display_name" release.toml | cut -d'"' -f2)
-    echo "Release: $DISPLAY_NAME ($RELEASE_ID)"
-else
-    echo "Warning: release.toml not found, using defaults"
-    RELEASE_ID="unknown"
-    DISPLAY_NAME="MLX-RFSN Fusion"
-fi
+# 1. Validate Python version
+PYTHON="${PYTHON:-python3}"
+PY_MAJOR=$($PYTHON -c 'import sys; print(sys.version_info.major)')
+PY_MINOR=$($PYTHON -c 'import sys; print(sys.version_info.minor)')
 
-# Fix #13: Sync version from release.toml to pyproject.toml and README.md
-echo "[1/10] Syncing version from release.toml..."
-python scripts/sync_version.py
-echo "  Version sync completed."
-
-# 2. Compile check
-echo "[2/10] Compile check..."
-python -m compileall -q rfsn_v10 rfsn_v11 tests benchmarks scripts memory
-
-# 3. Test collection (must not fail — catches import/shadowing bugs)
-echo "[3/10] Test collection..."
-PYTHONPATH=. pytest --collect-only -q tests rfsn_v11/tests rfsn_v10/kernels/tests
-
-# 4. CPU tests (no MLX required)
-echo "[4/10] CPU tests..."
-PYTHONPATH=. RFSN_BACKEND=numpy RFSN_TELEMETRY_HMAC_KEY=test-secret \
-  pytest -q tests -m "not mlx and not slow and not benchmark and not experimental and not integration and not db"
-
-# 5. rfsn_v11 unit tests (skip MLX-dependent tests on non-MLX platforms)
-echo "[5/10] rfsn_v11 tests..."
-PYTHONPATH=. pytest -q rfsn_v11/tests -m "not mlx"
-
-# 6. Benchmark tests
-echo "[6/10] Benchmark tests..."
-PYTHONPATH=. pytest -q tests/benchmarks
-
-# 7. Quick shootout smoke (strict execution only — promotion is separate)
-# P0 Fix: Use strict-execution, not legacy --strict, and do not require a
-# real model so the gate can run on CPU-only hosts.
-echo "[7/10] Quick shootout smoke..."
-PYTHONPATH=. python benchmarks/kv_shootout.py --quick --strict-execution
-echo "  Quick shootout completed."
-
-# 8. Release integrity check (validate BEFORE archiving)
-echo "[8/10] Release integrity check..."
-PYTHONPATH=. python scripts/check_release_integrity.py
-
-# 9. Archive artifacts only after validation passes
-echo "[9/10] Archiving artifacts to history..."
-python scripts/archive_artifacts.py
-echo "  Artifact archiving completed."
-
-# 10. Build check (hermetic — do not mutate environment)
-echo "[10/10] Build check..."
-python -m build --wheel
-# Verify wheel can be imported without installing
-latest_wh=$(ls -t dist/*.whl 2>/dev/null | head -1)
-if [ -n "$latest_wh" ]; then
-    # Use zipimport to test without installing
-    python -c "import zipimport, sys; sys.path.insert(0, '$latest_wh'); import rfsn_v10, rfsn_v11; print('wheel import ok')"
-else
-    echo "  No wheel found in dist/"
+if ! [[ "$PY_MAJOR" -eq 3 && ( "$PY_MINOR" -eq 11 || "$PY_MINOR" -eq 12 ) ]]; then
+    echo "ERROR: Python $PY_MAJOR.$PY_MINOR is not supported. Use 3.11 or 3.12."
     exit 1
 fi
+echo "  Python $PY_MAJOR.$PY_MINOR OK"
 
-# Fix #14: Reject 0.0.0 wheels in release gate
-if [[ "$latest_wh" == *"0.0.0"* ]]; then
-    echo "  ERROR: Wheel version is 0.0.0, rejecting for release"
-    exit 1
+# 2. Ensure repo root is on PYTHONPATH
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+
+# 3. Forward to the canonical Python gate
+#    Pass through any arguments given to this shell script.
+echo "  Delegating to canonical gate: scripts/release_gate.py $*"
+$PYTHON scripts/release_gate.py "$@"
+
+# Return the Python gate's exit code exactly (set -e already handles this,
+# but we make it explicit for clarity).
+GATE_RC=$?
+if [ "$GATE_RC" -eq 0 ]; then
+    echo "=== Release Gate Passed ==="
 else
-    echo "  Wheel version check passed"
+    echo "=== Release Gate Failed (exit $GATE_RC) ==="
 fi
-
-echo "=== Release Gate Passed ==="
+exit "$GATE_RC"

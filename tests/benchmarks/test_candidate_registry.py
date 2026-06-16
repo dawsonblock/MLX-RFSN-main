@@ -35,81 +35,67 @@ def test_turboquant_v2_name_includes_config():
 
 @pytest.mark.unit
 def test_build_candidates_registry_valid():
-    """Verify _build_candidates() only uses valid config names (Phase 0 scope freeze).
+    """Verify default _build_candidates() returns exactly Phase 0 canonical set.
 
-    This test ensures that invalid candidate names like "k8_v5_gs32" cannot
-    silently enter the registry and cause runtime failures. The gs32 path
-    was explicitly moved to legacy status as "legacy_k8_v5_gs32".
-
-    Phase 0: Only direct-packed candidate is active for correctness validation.
+    Phase 0 Scope Freeze: The default registry must contain exactly three
+    candidates: dense baseline, MLX-LM 8-bit KV, and RFSN direct-packed K8/V8.
+    Anything else requires --experimental.
     """
     import sys
     from pathlib import Path
 
-    # Add benchmarks to path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / "benchmarks"))
 
     from benchmarks.kv_shootout import _build_candidates
 
-    # P0 Fix: Use check_available=False to test registry structure without requiring MLX
-    # This ensures the test is truly portable and validates declared candidates
-    try:
-        candidates = _build_candidates(quick=False, include_legacy=False, check_available=False)
-        candidate_names = [c.name for c in candidates]
+    candidates = _build_candidates(
+        quick=False, include_legacy=False, check_available=False
+    )
+    candidate_names = [c.name for c in candidates]
 
-        # Verify gs32 is NOT in the active registry
-        assert "rfsn_v10_k8_v5_gs32" not in candidate_names, (
-            "Invalid gs32 config should not be in active registry"
-        )
+    # Exactly three canonical candidates
+    assert "dense_mlx_baseline" in candidate_names
+    assert "mlx_lm_quantized_kv_b8" in candidate_names
+    assert "rfsn_direct_packed_k8v8_gs64" in candidate_names
 
-        # Phase 0: Verify direct-packed candidate IS in the active registry
-        assert "rfsn_direct_packed_k8v8_gs64" in candidate_names, (
-            "Direct-packed K8/V8 should be in active registry for correctness validation"
-        )
+    # Legacy candidates must NOT appear in default mode
+    assert "A1_wht_grouped_k8v4_gs64" not in candidate_names
+    assert "rfsn_direct_packed_k8v5" not in candidate_names
+    assert "rfsn_direct_packed_k8v6" not in candidate_names
 
-        # Verify baseline is always present (canonical name is dense_mlx_baseline)
-        assert "dense_mlx_baseline" in candidate_names, (
-            "Baseline should be in active registry for comparison"
-        )
-
-    except ValueError as e:
-        pytest.fail(f"_build_candidates() raised ValueError for valid registry: {e}")
+    # Experimental mode must unlock additional candidates
+    exp_candidates = _build_candidates(
+        quick=False, include_legacy=False, check_available=False, experimental=True
+    )
+    exp_names = [c.name for c in exp_candidates]
+    assert "rfsn_direct_packed_k8v8_gs64" in exp_names
 
 
 @pytest.mark.unit
 def test_declared_vs_available_candidates():
-    """Verify declared_candidates works without MLX, available_candidates requires MLX.
-    
-    This test ensures the separation between declared and available candidates:
-    - declared_candidates: returns all registered candidates (portable)
-    - available_candidates: returns only candidates with satisfied dependencies
+    """Verify frozen registry has exactly three declared candidates.
+
+    Phase 0: declared_candidates returns the canonical three.
+    available_candidates may return fewer if MLX is not installed.
     """
     import sys
     from pathlib import Path
 
-    # Add benchmarks to path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / "benchmarks"))
 
     from benchmarks.candidate_registry import get_registry
 
     registry = get_registry()
 
-    # declared_candidates should work without MLX (portable)
     declared = registry.declared_candidates()
     assert isinstance(declared, list)
-    assert len(declared) > 0, "Should have declared candidates"
-
-    # Verify baseline is always declared
+    # Phase 0 freeze: exactly 3 canonical candidates
+    assert len(declared) == 3, f"Expected 3 declared candidates, got {len(declared)}: {declared}"
     assert "dense_mlx_baseline" in declared
+    assert "mlx_lm_8bit_kv" in declared
+    assert "rfsn_direct_packed_k8v8" in declared
 
-    # available_candidates may return fewer candidates if MLX is not installed
     available = registry.available_candidates()
     assert isinstance(available, list)
-
-    # available should be a subset of declared
     for name in available:
         assert name in declared, f"Available candidate {name} not in declared list"
-
-    # If MLX is not installed, available may be empty or only baseline
-    # If MLX is installed, available should include MLX-dependent candidates
-    # This test is portable and works in both cases

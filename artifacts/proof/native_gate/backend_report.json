@@ -1,0 +1,13 @@
+{
+  "state": "ready",
+  "backend_name": "metal_true_packed",
+  "strict_mode": true,
+  "kernel_source_hash": "",
+  "kernel_configuration_hash": "cb181d8ba7712c20",
+  "mlx_version": "",
+  "mlx_lm_version": "0.20.6",
+  "macos_version": "26.2",
+  "chip_model": "",
+  "memory_capacity_gb": 0.0,
+  "reason": ""
+}

@@ -407,6 +407,33 @@ def check_wheel_installation() -> dict:
             shutil.rmtree(venv_dir, ignore_errors=True)
 
 
+def check_release_integrity() -> dict:
+    """Run the canonical release-integrity checker.
+
+    Phase 2: The Python gate is the single source of truth.  This check
+    delegates to scripts/check_release_integrity.py so that the same
+    validation rules are used everywhere (gate, CI, local runs).
+    """
+    try:
+        from scripts.check_release_integrity import check
+    except Exception as exc:
+        return {
+            "name": "release_integrity",
+            "passed": False,
+            "message": f"Failed to import integrity checker: {exc}",
+        }
+    errors = check()
+    ok = len(errors) == 0
+    return {
+        "name": "release_integrity",
+        "passed": ok,
+        "message": (
+            "Integrity check passed" if ok
+            else f"{len(errors)} error(s): " + "; ".join(errors[:5])
+        ),
+    }
+
+
 def run_pytest(markers: str, label: str, dirs: list[str] | None = None) -> dict:
     """Run pytest with the given marker expression.
 
@@ -493,6 +520,7 @@ def main() -> int:
     checks.append(check_config_defaults())
     checks.append(check_project_scripts())
     checks.append(check_wheel_installation())
+    checks.append(check_release_integrity())
 
     # CPU-safe pytest (exclude heavy/optional markers)
     checks.append(run_pytest(
